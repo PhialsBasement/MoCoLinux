@@ -36,6 +36,68 @@ def find_ddk_include(cross_prefix):
             return [pathjoin(line, 'ddk')]
     return []
 
+
+def make_ndis_compat_include(ddk_includes, output_dir):
+    """Repair mingw-w64's ddk/ndis.h so NDIS drivers can include it.
+
+    As of mingw-w64 16.1 the declaration of NdisMWanIndicateReceiveComplete()
+    is missing the comma between its two parameters:
+
+        NdisMWanIndicateReceiveComplete(
+                IN NDIS_HANDLE  MiniportAdapterHandle
+                IN NDIS_HANDLE  NdisLinkContext);
+
+    It sits in the body of the header rather than behind an optional guard, so
+    no NDIS driver can include ndis.h at all.
+
+    Rather than vendoring a snapshot of a 12,000-line header that would drift
+    from the installed one, derive a corrected copy from whatever is installed
+    and put it earlier on the driver's include path. If the installed header is
+    already correct -- because it was fixed upstream -- nothing is generated and
+    the system header is used directly.
+
+    Returns the include directories to prepend, or [] if none are needed.
+    """
+    import os
+    import re
+
+    source = None
+    for candidate in ddk_includes:
+        if os.path.exists(pathjoin(candidate, 'ndis.h')):
+            source = pathjoin(candidate, 'ndis.h')
+            break
+    if source is None:
+        return []
+
+    with open(source, encoding='latin-1') as handle:
+        lines = handle.read().splitlines(True)
+
+    # A parameter line ending in an identifier with no comma, whose successor is
+    # another IN/OUT/IN OUT parameter, is a missing comma.
+    parameter = re.compile(r'^(\s*(?:IN|OUT|IN OUT)\s+.*[A-Za-z0-9_])\s*$')
+    successor = re.compile(r'^\s*(?:IN|OUT|IN OUT)\s')
+    repaired = 0
+    for index in range(len(lines) - 1):
+        match = parameter.match(lines[index].rstrip('\n'))
+        if match and successor.match(lines[index + 1]):
+            lines[index] = match.group(1) + ',\n'
+            repaired += 1
+
+    if not repaired:
+        return []
+
+    generated = pathjoin(output_dir, 'ddk', 'ndis.h')
+    content = ''.join(lines)
+    if os.path.exists(generated):
+        with open(generated, encoding='latin-1') as handle:
+            if handle.read() == content:
+                return [output_dir]
+    os.makedirs(pathjoin(output_dir, 'ddk'), exist_ok=True)
+    with open(generated, 'w', encoding='latin-1') as handle:
+        handle.write(content)
+    print("Repaired %d missing comma(s) in a local copy of %s" % (repaired, source))
+    return [output_dir]
+
 settings.arch = os.getenv('COLINUX_ARCH')
 if not settings.arch:
     settings.arch = 'i386'
@@ -98,7 +160,11 @@ if settings.host_os == 'winnt':
 
     # Scoped onto the driver target only -- see colinux/os/winnt/build. The DDK
     # headers conflict with windows.h, so userspace must not see them.
-    settings.host_ddk_includes = find_ddk_include(cross_compilation_prefix)
+    ddk_includes = find_ddk_include(cross_compilation_prefix)
+    settings.host_ddk_includes = make_ndis_compat_include(
+        ddk_includes,
+        target_pathname(pathjoin('colinux', 'os', 'winnt', 'kernel', 'ndis-compat'))
+    ) + ddk_includes
 else:
     if settings.gcc_guest_target:
         cross_compilation_prefix = settings.gcc_guest_target + '-'

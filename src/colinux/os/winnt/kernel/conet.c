@@ -39,35 +39,14 @@ static void DDKAPI co_conet_proto_transfer_complete(
 	IN NDIS_STATUS		Status,
 	IN UINT			BytesTransferred);
 
-// missed NDIS event API
-static inline VOID NdisInitializeEvent(
-	IN PNDIS_EVENT  	Event
-	)
-{
-	KeInitializeEvent(&Event->Event, NotificationEvent , FALSE);
-}
-
-static inline BOOLEAN NdisWaitEvent(
-	IN PNDIS_EVENT  	Event,
-	IN UINT  		MsToWait
-	)
-{
-	return KeWaitForSingleObject(&Event->Event, Executive, KernelMode, TRUE, NULL) == STATUS_SUCCESS ;
-}
-
-static inline VOID NdisSetEvent(
-	IN PNDIS_EVENT  	Event
-	)
-{
-	KeSetEvent(&Event->Event, 1, FALSE);
-}
-
-static inline VOID NdisResetEvent(
-	IN PNDIS_EVENT  	Event
-	)
-{
-	KeResetEvent(&Event->Event);
-}
+/*
+ * NdisInitializeEvent/WaitEvent/SetEvent/ResetEvent used to be reimplemented
+ * here because the w32api NDIS headers of the time did not declare them.
+ * mingw-w64 declares all four and libndis exports them, so use the real ones.
+ *
+ * Both NdisWaitEvent call sites below pass MsToWait = 0, which the real
+ * function treats as an indefinite wait, matching what the local version did.
+ */
 
 static void co_FreeBuffersAndPacket(
 	IN PNDIS_PACKET		Packet
