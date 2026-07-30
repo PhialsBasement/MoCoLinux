@@ -96,6 +96,35 @@ static const char* co_alloc_method_names[CO_ALLOC_METHODS] = {
 	"MmAllocateContiguousMemory",
 };
 
+/*
+ * Measured on XP x64: NonPagedPool comes back NX-clear and cached, where
+ * MmAllocateNonCachedMemory comes back NX-set and uncached. Physical contiguity
+ * is not required -- the passage code takes virt_to_phys of each sub-structure
+ * separately -- so there is no reason to spend contiguous memory on it.
+ * Allocations of PAGE_SIZE or more are page-aligned, which the page-table
+ * sub-structures need.
+ */
+int co_os_exec_alloc_index(void)
+{
+	return CO_ALLOC_NONPAGED_POOL;
+}
+
+void* co_os_alloc_exec_pages(unsigned int pages)
+{
+	if (pages == 0)
+		return NULL;
+
+	return co_os_alloc_pages_by(CO_ALLOC_NONPAGED_POOL, pages);
+}
+
+void co_os_free_exec_pages(void* ptr, unsigned int pages)
+{
+	if (ptr == NULL)
+		return;
+
+	co_os_free_pages_by(CO_ALLOC_NONPAGED_POOL, ptr, pages);
+}
+
 bool_t co_os_alloc_method(int index, const char** name)
 {
 	if (index < 0 || index >= CO_ALLOC_METHODS)

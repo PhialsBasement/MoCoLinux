@@ -30,6 +30,18 @@ extern void co_os_put_page(struct co_manager *manager, co_pfn_t pfn);
  *
  * Index 0 is always what co_os_alloc_pages() itself uses.
  */
+/*
+ * Pages the passage code can execute from: executable and, ideally, cached.
+ * Separate from co_os_alloc_pages() on purpose -- that one also backs the
+ * pseudo-physical page tables, and there is no reason to change the caching of
+ * memory the CPU walks during a switch as a side effect of this.
+ */
+extern void* co_os_alloc_exec_pages(unsigned int pages);
+extern void  co_os_free_exec_pages(void* ptr, unsigned int pages);
+
+/* Which co_os_alloc_method() index co_os_alloc_exec_pages() uses. */
+extern int   co_os_exec_alloc_index(void);
+
 extern bool_t co_os_alloc_method(int index, const char** name);
 extern void*  co_os_alloc_pages_by(int index, unsigned int pages);
 extern void   co_os_free_pages_by(int index, void* ptr, unsigned int pages);

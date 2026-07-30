@@ -64,7 +64,13 @@ co_rc_t co_monitor_arch_passage_page_alloc(co_monitor_t *cmon)
 
 	co_memset(cmon->archdep, 0, sizeof(*cmon->archdep));
 
-	cmon->passage_page = co_os_alloc_pages(sizeof(co_arch_passage_page_t)/CO_ARCH_PAGE_SIZE);
+	/*
+	 * co_os_alloc_exec_pages(), not co_os_alloc_pages(): the passage code
+	 * executes from this page. Measured on XP x64, the default allocator
+	 * returns pages with NX set and PWT|PCD set -- neither executable nor
+	 * cached. This is what removes any need for an antinx equivalent here.
+	 */
+	cmon->passage_page = co_os_alloc_exec_pages(sizeof(co_arch_passage_page_t)/CO_ARCH_PAGE_SIZE);
 	if (cmon->passage_page == NULL) {
 		rc = CO_RC(OUT_OF_MEMORY);
 		goto error;
@@ -94,7 +100,7 @@ void co_monitor_arch_passage_page_free(co_monitor_t *cmon)
 		cmon->archdep = NULL;
 	}
 	if (cmon->passage_page) {
-		co_os_free_pages(cmon->passage_page, sizeof(co_arch_passage_page_t)/CO_ARCH_PAGE_SIZE);
+		co_os_free_exec_pages(cmon->passage_page, sizeof(co_arch_passage_page_t)/CO_ARCH_PAGE_SIZE);
 		cmon->passage_page = NULL;
 	}
 }

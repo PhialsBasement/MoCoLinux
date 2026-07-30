@@ -178,6 +178,8 @@ typedef struct {
 	unsigned long long	    va;		/* out: host virtual address	*/
 	unsigned long long	    pa;		/* out: physical address	*/
 	int			    ok;		/* out: allocation succeeded	*/
+	int			    used;	/* out: this is the one the passage
+						   page actually allocates from	*/
 	co_manager_ioctl_probe_va_t walk;	/* out: page-table walk of va	*/
 } co_probe_alloc_result_t;
 

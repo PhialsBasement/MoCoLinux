@@ -332,7 +332,8 @@ co_rc_t co_winnt_probe_passage(void)
 		unsigned long long pte;
 		bool_t nx, uncached;
 
-		co_terminal_print("[%d] %s\n", i, r->name);
+		co_terminal_print("[%d] %s%s\n", i, r->name,
+				  r->used ? "   <== the passage page uses this" : "");
 
 		if (!r->ok) {
 			co_terminal_print("      allocation FAILED\n\n");
