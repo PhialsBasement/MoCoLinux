@@ -27,7 +27,7 @@ struct co_manager_open_desc;
 
 typedef co_rc_t (*co_monitor_service_func_t)(struct co_monitor *cmon,
 					     struct co_monitor_device *device,
-					     unsigned long *params);
+					     co_param_t *params);
 typedef struct co_monitor_device {
 	co_monitor_service_func_t service;
 	unsigned long state;

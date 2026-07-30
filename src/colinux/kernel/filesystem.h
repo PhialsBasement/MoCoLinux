@@ -81,7 +81,7 @@ typedef struct co_filesystem_ops {
 
 struct co_monitor;
 extern void co_monitor_file_system(struct co_monitor *cmon, unsigned int unit,
-				   enum fuse_opcode opcode, unsigned long *params);
+				   enum fuse_opcode opcode, co_param_t *params);
 
 extern void co_filesystem_getdir_free(co_filesystem_dir_names_t *names);
 

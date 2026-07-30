@@ -23,11 +23,20 @@ void co_winnt_affinity_workaround(void)
 	// Prevent coLinux from using CPU0
 	env = getenv("COLINUX_NO_CPU0_WORKAROUND");
 	if (env && strcmp(env, "Y") == 0) {
-		DWORD ProcessMask, SystemMask, NewMask;
+		/*
+		 * DWORD_PTR, not DWORD: an affinity mask has one bit per logical
+		 * processor, so Get/SetProcessAffinityMask take pointer-width values.
+		 * DWORD would truncate to 32 CPUs on Win64, and taking its address
+		 * hands the API a pointer to the wrong-sized object.
+		 */
+		DWORD_PTR ProcessMask, SystemMask, NewMask;
 
 		if (GetProcessAffinityMask (hProcess, &ProcessMask, &SystemMask)) {
-			NewMask = SystemMask & ~1;
-			co_debug("AffinityMasks Process %lx, System %lx, New %lx", ProcessMask, SystemMask, NewMask);
+			NewMask = SystemMask & ~(DWORD_PTR)1;
+			co_debug("AffinityMasks Process %llx, System %llx, New %llx",
+				 (unsigned long long)ProcessMask,
+				 (unsigned long long)SystemMask,
+				 (unsigned long long)NewMask);
 			if (NewMask != ProcessMask) {
 				if (!SetProcessAffinityMask(hProcess, NewMask)) {
 					co_debug("SetProcessAffinityMask failed with 0x%lx", GetLastError());

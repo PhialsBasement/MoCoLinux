@@ -300,11 +300,25 @@ static NTSTATUS manager_dispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 		}
 
 		ioctl = (co_manager_ioctl_t)(CO_GET_IOCTL_METHOD(ioControlCode));
-		co_manager_ioctl(manager, ioctl, ioBuffer,
-				 inputBufferLength,
-				 outputBufferLength,
-				 &Irp->IoStatus.Information,
-				 opened);
+
+		/*
+		 * IoStatus.Information is a ULONG_PTR, so on Win64 it is wider than the
+		 * unsigned long co_manager_ioctl() reports through. Go via a local of
+		 * the type the OS-independent side declares rather than handing it a
+		 * pointer to a differently-sized object. The value is a count of bytes
+		 * written into the ioctl buffer, so it cannot exceed outputBufferLength.
+		 */
+		{
+			unsigned long return_size = 0;
+
+			co_manager_ioctl(manager, ioctl, ioBuffer,
+					 inputBufferLength,
+					 outputBufferLength,
+					 &return_size,
+					 opened);
+
+			Irp->IoStatus.Information = return_size;
+		}
 
 		/* Intrinsic Success / Failure indictation is returned per ioctl. */
 
