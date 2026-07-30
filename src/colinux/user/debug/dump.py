@@ -25,7 +25,7 @@ class docHandler(ContentHandler):
     def endElement(self, name):
         if name == u'log':
             log = {}
-            for key, value in self.log_elements.iteritems():
+            for key, value in self.log_elements.items():
                 log[key] = ''.join(value).strip()
             if log:
                 log['driver_index'] = int(log['driver_index'])
@@ -35,10 +35,10 @@ class docHandler(ContentHandler):
 dh = docHandler()
 parser = make_parser()
 parser.setContentHandler(dh)
-print "Loading..."
+print("Loading...")
 parser.parse(open(sys.argv[1]))
-print "Sorting %d logs..."  % (len(logs_list, ))
-logs_list.sort(lambda x,y: x['driver_index'].__cmp__(y['driver_index']))
+print("Sorting %d logs..." % (len(logs_list), ))
+logs_list.sort(key=lambda x: x['driver_index'])
 
 def print_logs(logs_list):
     last_index = [None]
@@ -51,14 +51,14 @@ def print_logs(logs_list):
             last_index[0] = driver_index
         f = "%s:" % (data['function'], )
         f = ''
-        print (str(driver_index) + '|' + data['timestamp'] + '|' +
-               data['module'] + '|' + data['file'] + ':' + data['function'] + ':' +
-               data['line'] + '|' + data['string'])
+        print(str(driver_index) + '|' + data['timestamp'] + '|' +
+              data['module'] + '|' + data['file'] + ':' + data['function'] + ':' +
+              data['line'] + '|' + data['string'])
 
     for data in logs_list:
         print_log(data)
 
     if missing_logs[0]:
-        print "Missing logs: %d\n" % (missing_logs[0], )
+        print("Missing logs: %d\n" % (missing_logs[0], ))
 
 print_logs(logs_list)

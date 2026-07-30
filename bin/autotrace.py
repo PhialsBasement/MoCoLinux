@@ -54,7 +54,7 @@ class CParser(object):
         self.parse_c()
 
     def token(self, token, type=None):
-        print [token, type]
+        print([token, type])
 
     def parse_c_comment(self):
         pos = self.data.find('*/', self.pos)
@@ -165,7 +165,7 @@ class CTracer(CParser):
 
     def error(self):
         for debug in self.debug_tokens:
-            print debug
+            print(debug)
 
     def token(self, token, type=None):
         self.debug_tokens.append((token, type))
