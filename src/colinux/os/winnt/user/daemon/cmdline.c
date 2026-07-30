@@ -29,6 +29,8 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("      --install-driver             Install the colinux-driver (linux.sys)\n");
 	co_terminal_print("      --remove-driver              Uninstall (remove) the colinux-driver (linux.sys)\n");
 	co_terminal_print("      --status-driver              Show status about the installed/running\n");
+	co_terminal_print("      --test-switch                Change CR3 into a one-page address space\n");
+	co_terminal_print("                                   and back. Porting aid.\n");
 	co_terminal_print("      --restore-state              Capture host CPU state and put it back\n");
 	co_terminal_print("                                   in place. Writes CRs, GDT/IDT/TR, MSRs.\n");
 	co_terminal_print("      --save-state                 Dump host CPU state as the switch would\n");
@@ -102,6 +104,14 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		cmdline,
 		"--status-driver",
 		&winnt_parameters->status_driver);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_argumentless_parameter(
+		cmdline,
+		"--test-switch",
+		&winnt_parameters->test_switch);
 
 	if (!CO_OK(rc))
 		return rc;

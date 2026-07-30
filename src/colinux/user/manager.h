@@ -40,6 +40,9 @@ extern co_rc_t co_manager_probe_passage(co_manager_handle_t handle,
 extern co_rc_t co_manager_save_state(co_manager_handle_t handle,
 				     co_manager_ioctl_save_state_t* out);
 
+extern co_rc_t co_manager_test_switch(co_manager_handle_t handle,
+				      co_manager_ioctl_test_switch_t* out);
+
 extern void co_manager_debug(co_manager_handle_t handle,
 			     const char *buf, long size);
 

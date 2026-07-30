@@ -202,6 +202,10 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		return co_winnt_status_driver(1); // arg 1 = View all driver details
 	}
 
+	if (winnt_parameters.test_switch) {
+		return co_winnt_test_switch();
+	}
+
 	if (winnt_parameters.save_state || winnt_parameters.restore_state) {
 		return co_winnt_save_state(winnt_parameters.restore_state);
 	}

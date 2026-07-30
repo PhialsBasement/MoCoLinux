@@ -476,6 +476,73 @@ co_rc_t co_winnt_save_state(bool_t restore)
 #endif
 }
 
+/*
+ * Change CR3 into a minimal guest address space and come back. See
+ * CO_MANAGER_IOCTL_TEST_SWITCH.
+ */
+co_rc_t co_winnt_test_switch(void)
+{
+	co_rc_t rc;
+	bool_t installed = PFALSE;
+	co_manager_handle_t handle;
+	co_manager_ioctl_test_switch_t r = {0, };
+
+	rc = co_win32_manager_is_installed(&installed);
+	if (!CO_OK(rc))
+		return rc;
+	if (!installed) {
+		co_terminal_print("driver not installed\n");
+		return CO_RC(ERROR_ACCESSING_DRIVER);
+	}
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		co_terminal_print("couldn't get driver handle\n");
+		return CO_RC(ERROR_MONITOR_NOT_LOADED);
+	}
+
+	co_terminal_print("switching CR3 into an address space that maps one page,\n");
+	co_terminal_print("storing a sentinel from code executing there, switching back\n");
+	co_terminal_print("\n");
+
+	rc = co_manager_test_switch(handle, &r);
+	co_os_manager_close(handle);
+
+	if (!CO_OK(rc)) {
+		co_terminal_print("switch test: ioctl failed (rc %x)\n", (int)rc);
+		return rc;
+	}
+	if (!r.supported) {
+		co_terminal_print("switch test: not implemented on this architecture\n");
+		return CO_RC(OK);
+	}
+	if (!CO_OK(r.rc)) {
+		co_terminal_print("switch test: driver reported failure (rc %x)\n", (int)r.rc);
+		return r.rc;
+	}
+
+	co_terminal_print("  passage page va 0x%016llx  pa 0x%016llx\n",
+			  r.passage_va, r.passage_pa);
+	co_terminal_print("  code va         0x%016llx  (%lu bytes)\n",
+			  r.code_va, r.code_size);
+	co_terminal_print("  host  cr3       0x%016llx\n", r.host_cr3);
+	co_terminal_print("  guest cr3       0x%016llx\n", r.guest_cr3);
+	co_terminal_print("\n");
+	co_terminal_print("  sentinel expected 0x%016llx\n", r.expected);
+	co_terminal_print("  sentinel observed 0x%016llx\n", r.observed);
+	co_terminal_print("\n");
+
+	if (r.succeeded) {
+		co_terminal_print("  SWITCHED. Execution continued across the CR3 write and the\n");
+		co_terminal_print("  store landed, so the passage page is reachable at the same\n");
+		co_terminal_print("  address in both address spaces.\n");
+	} else {
+		co_terminal_print("  returned, but the sentinel is wrong -- the store did not land\n");
+	}
+
+	return CO_RC(OK);
+}
+
 static co_rc_t co_winnt_install_driver_lowlevel(IN SC_HANDLE SchSCManager, IN LPCTSTR  DriverName, IN LPCTSTR ServiceExe)
 {
 	SC_HANDLE  schService;
