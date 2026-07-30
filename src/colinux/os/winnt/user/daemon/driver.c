@@ -628,7 +628,11 @@ co_rc_t co_winnt_test_switch(int mode)
 		return CO_RC(ERROR_MONITOR_NOT_LOADED);
 	}
 
-	if (mode == 5) {
+	if (mode == 6 || mode == 7) {
+		co_terminal_print("running a guest whose code and stack are outside the passage\n");
+		co_terminal_print("page, in an address space built a page at a time%s\n",
+				  (mode == 7) ? " -- and faulting there" : "");
+	} else if (mode == 5) {
 		co_terminal_print("destroying the guest stack pointer and then faulting --\n");
 		co_terminal_print("only an IST stack can deliver that\n");
 	} else if (mode == 4) {
@@ -688,6 +692,9 @@ co_rc_t co_winnt_test_switch(int mode)
 		co_terminal_print("  guest tss       0x%016llx  ist1 0x%016llx\n", r.guest_tss, r.ist_stack);
 		co_terminal_print("  fault handler   0x%016llx\n", r.fault_handler);
 	}
+	if (r.guest_text)
+		co_terminal_print("  guest text      0x%016llx  stack 0x%016llx  (%lu table pages)\n",
+				  r.guest_text, r.guest_stack, r.tables);
 	if (r.preflight_checked)
 		co_terminal_print("  preflight       %d addresses resolved in the guest tables\n",
 				  r.preflight_checked);
@@ -734,7 +741,15 @@ co_rc_t co_winnt_test_switch(int mode)
 	}
 
 	if (r.succeeded) {
-		if (mode == 5) {
+		if (mode == 7) {
+			co_terminal_print("  FAULTED OUTSIDE THE PASSAGE PAGE, AND CAME BACK. The guest\n");
+			co_terminal_print("  executed at 0x%016llx, faulted there, and its stubs -- which\n", r.guest_text);
+			co_terminal_print("  do live in the passage page -- still delivered and reported it.\n");
+		} else if (mode == 6) {
+			co_terminal_print("  RAN OUTSIDE THE PASSAGE PAGE. Instruction fetch after the CR3\n");
+			co_terminal_print("  write landed at 0x%016llx, in a page mapped only in the guest,\n", r.guest_text);
+			co_terminal_print("  on a stack of its own -- and it found its way back.\n");
+		} else if (mode == 5) {
 			if (r.faulted)
 				co_terminal_print("  IST WORKED. The guest faulted with an unusable stack pointer\n"
 						  "  and the fault was still delivered -- the CPU took the stack\n"

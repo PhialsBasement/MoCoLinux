@@ -36,3 +36,11 @@ co_rc_t co_arch_test_resume(co_manager_t* manager, co_arch_switch_test_t* out,
 	out->supported = PFALSE;
 	return CO_RC(OK);
 }
+
+co_rc_t co_arch_test_extern_guest(co_manager_t* manager, co_arch_switch_test_t* out,
+				  bool_t provoke_fault)
+{
+	co_memset(out, 0, sizeof(*out));
+	out->supported = PFALSE;
+	return CO_RC(OK);
+}

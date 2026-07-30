@@ -41,6 +41,7 @@
 #include <colinux/os/kernel/misc.h>
 #include <colinux/arch/switch.h>
 #include <colinux/arch/state.h>
+#include <colinux/arch/space.h>
 
 #include "mmu.h"
 #include "utils.h"
@@ -405,6 +406,46 @@ asm(".text                                                          \n"
     ".globl co_switch_full_end                                      \n"
     "co_switch_full_end:                                            \n");
 
+/*
+ * The guest for R4, which does not live in the passage page.
+ *
+ * Everything before this has executed from inside the passage page, so it could
+ * find its own bearings with `lea 0(%rip); and $-4096`. This one runs from a
+ * page mapped at a Linux-like address, several terabytes away, and neither
+ * trick works there: the RIP is in the wrong page, and a relative jmp cannot
+ * span the distance -- rel32 reaches +-2 GB and the gap is about 4.5 TB.
+ *
+ * So it navigates by r8, which the switch leaves pointing at params[0] inside
+ * the passage page. The address of the switch itself is left in params[19], and
+ * the jump is indirect. That is exactly how a real guest kernel will have to do
+ * it, since it is linked at its own address and knows the passage page only as
+ * a value it was handed.
+ */
+extern char co_extern_guest_code;
+extern char co_extern_guest_code_end;
+extern char co_extern_guest_fault_code;
+extern char co_extern_guest_fault_code_end;
+
+asm(".text                                                          \n"
+    ".globl co_extern_guest_code                                    \n"
+    "co_extern_guest_code:                                          \n"
+    "    mov %r9, (%r8)          /* sentinel, in the passage page */\n"
+    "    xchg %rcx, %rdx         /* swap leaving/entering */        \n"
+    "    mov 0x98(%r8), %rax     /* params[19]: switch entry */     \n"
+    "    jmp *%rax                                                  \n"
+    ".globl co_extern_guest_code_end                                \n"
+    "co_extern_guest_code_end:                                      \n"
+    /* the same, but faulting instead of returning */
+    ".globl co_extern_guest_fault_code                              \n"
+    "co_extern_guest_fault_code:                                    \n"
+    "    mov %r9, (%r8)                                             \n"
+    "    ud2                                                        \n"
+    ".globl co_extern_guest_fault_code_end                          \n"
+    "co_extern_guest_fault_code_end:                                \n");
+
+/* params[19]: where the guest finds the switch. Reached as 0x98(%r8). */
+#define CO_PP_SWITCH_ENTRY_N	0x960
+
 extern char co_switch_guest_fault;
 extern char co_switch_guest_entry_fault;
 extern char co_switch_guest_loop;
@@ -573,7 +614,10 @@ typedef char co_assert_fault_slots
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 7 * 8 == CO_PP_REGSUM_N &&
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 16 * 8 == CO_PP_VECTOR_N &&
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 17 * 8 == CO_PP_ERRCODE_N &&
-	  __builtin_offsetof(co_arch_passage_page_t, params) + 18 * 8 == CO_PP_CR2_N)
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 18 * 8 == CO_PP_CR2_N &&
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 19 * 8 == CO_PP_SWITCH_ENTRY_N &&
+	  /* the extern guest reads it as 0x98(%r8), r8 being &params[0] */
+	  CO_PP_SWITCH_ENTRY_N - __builtin_offsetof(co_arch_passage_page_t, params) == 0x98)
 	 ? 1 : -1];
 
 /* The blob reaches gdt.base by literal offset; keep it honest. */
@@ -1123,4 +1167,207 @@ co_rc_t co_arch_test_resume(co_manager_t* manager, co_arch_switch_test_t* out,
 	co_os_free_exec_pages(pp, pages);
 
 	return CO_RC(OK);
+}
+
+/*
+ * R4: a guest that lives outside the passage page.
+ *
+ * Every guest so far has been code sitting inside the passage page, entered in
+ * an address space that mapped nothing else. This one is the shape a real guest
+ * has: its own text page and its own stack page, at the addresses Linux uses,
+ * in a space built a page at a time by co_arch_guest_map -- with the passage
+ * page mapped alongside because the switch code, the state blocks, the GDT, the
+ * IDT, the stubs and the IST stack all live there and must stay reachable
+ * across the crossing.
+ *
+ * The step being taken is small and specific: instruction fetch after the CR3
+ * write now lands somewhere that is not the passage page. Everything else is
+ * held constant deliberately, so a failure means the address space is wrong and
+ * cannot mean anything else.
+ */
+#define CO_TEST_GUEST_TEXT	0xffffffff81000000ULL	/* where vmlinux's _text goes */
+#define CO_TEST_GUEST_STACK	0xffffffff81004000ULL	/* a gap above it, then a stack */
+
+static co_rc_t co_preflight_space(co_manager_t* manager, co_arch_guest_space_t* space,
+				  const char* what, unsigned long long va,
+				  co_pa_t expect, co_arch_switch_test_t* out)
+{
+	co_pa_t got = 0;
+	int level = -1;
+	co_rc_t rc;
+
+	rc = co_arch_guest_lookup(manager, space, va, &got, &level);
+
+	if (!CO_OK(rc) || (expect != 0 && got != (expect & CO_ARCH_PAGE_MASK))) {
+		co_debug_error("preflight: %s at 0x%llx -> 0x%llx (wanted 0x%llx), absent at level %d",
+			       what, va, (unsigned long long)got,
+			       (unsigned long long)expect, level);
+		out->preflight_failed = PTRUE;
+		out->preflight_va     = va;
+		out->preflight_level  = level;
+		return CO_RC(ERROR);
+	}
+
+	out->preflight_checked++;
+	return CO_RC(OK);
+}
+
+co_rc_t co_arch_test_extern_guest(co_manager_t* manager, co_arch_switch_test_t* out,
+				  bool_t provoke_fault)
+{
+	co_arch_passage_page_t* pp;
+	co_arch_guest_space_t* space = NULL;
+	co_switch_full_fn fn;
+	unsigned long long* sentinel;
+	co_pfn_t text_pfn = 0, stack_pfn = 0;
+	unsigned char* text;
+	co_pa_t text_pa, stack_pa;
+	unsigned long code_size;
+	char* code_start;
+	int pages = sizeof(co_arch_passage_page_t) / CO_ARCH_PAGE_SIZE;
+	int page;
+	co_rc_t rc;
+
+	/*
+	 * The result block is a caller's stack local and arrives full of whatever
+	 * was there. Clearing it is not hygiene -- preflight_failed is read by the
+	 * daemon to decide whether the entry happened at all, so leaving it as
+	 * stack litter reports a refusal that never occurred, at an address that
+	 * was never checked.
+	 */
+	co_memset(out, 0, sizeof(*out));
+	out->supported = PTRUE;
+
+	/*
+	 * Set up the passage page exactly as the round trip does -- same GDT, IDT,
+	 * stubs, TSS and state blocks -- then throw away the little hand-rolled
+	 * address space it built and construct a real one instead.
+	 */
+	pp = co_setup_guest_page(out,
+		(unsigned long)(&co_switch_guest_entry - &co_switch_full));
+	if (pp == NULL)
+		return CO_RC(ERROR);
+
+	rc = co_arch_guest_space_create(manager, &space);
+	if (!CO_OK(rc))
+		goto out_free_pp;
+
+	/* The passage page, at the same address the host has it. */
+	for (page = 0; page < pages; page++) {
+		unsigned char* p = (unsigned char*)pp + page * CO_ARCH_PAGE_SIZE;
+
+		rc = co_arch_guest_map(manager, space,
+				       (unsigned long long)(size_t)p,
+				       co_os_virt_to_phys(p), _KERNPG_TABLE);
+		if (!CO_OK(rc))
+			goto out_free_space;
+	}
+
+	/* A text page, holding a guest that knows nothing about where it is. */
+	rc = co_os_get_page(manager, &text_pfn);
+	if (!CO_OK(rc))
+		goto out_free_space;
+
+	code_start = provoke_fault ? &co_extern_guest_fault_code : &co_extern_guest_code;
+	code_size  = provoke_fault
+		? (unsigned long)(&co_extern_guest_fault_code_end - &co_extern_guest_fault_code)
+		: (unsigned long)(&co_extern_guest_code_end - &co_extern_guest_code);
+
+	text = co_os_map(manager, text_pfn);
+	if (text == NULL) {
+		rc = CO_RC(ERROR);
+		goto out_free_text;
+	}
+	co_memset(text, 0, CO_ARCH_PAGE_SIZE);
+	co_memcpy(text, code_start, code_size);
+	co_os_unmap(manager, text, text_pfn);
+
+	text_pa = ((co_pa_t)text_pfn) << CO_ARCH_PAGE_SHIFT;
+	rc = co_arch_guest_map(manager, space, CO_TEST_GUEST_TEXT, text_pa, _KERNPG_TABLE);
+	if (!CO_OK(rc))
+		goto out_free_text;
+
+	/* And a stack page of its own, rather than growing down into the state blocks. */
+	rc = co_os_get_page(manager, &stack_pfn);
+	if (!CO_OK(rc))
+		goto out_free_text;
+
+	stack_pa = ((co_pa_t)stack_pfn) << CO_ARCH_PAGE_SHIFT;
+	rc = co_arch_guest_map(manager, space, CO_TEST_GUEST_STACK, stack_pa, _KERNPG_TABLE);
+	if (!CO_OK(rc))
+		goto out_free_stack;
+
+	/*
+	 * Point the guest at its new home. Note return_rip and rsp are now
+	 * addresses in the guest's own space with no host meaning at all -- the
+	 * first time that has been true.
+	 */
+	pp->linuxvm_state.cr3        = co_arch_guest_space_root(space);
+	pp->linuxvm_state.return_rip = CO_TEST_GUEST_TEXT;
+	pp->linuxvm_state.rsp        = CO_TEST_GUEST_STACK + CO_ARCH_PAGE_SIZE - 0x40;
+
+	/* How the guest reaches the switch: it cannot jump there relatively. */
+	pp->params[19] = (unsigned long long)(size_t)pp->code;
+
+	fn       = (co_switch_full_fn)(void*)pp->code;
+	sentinel = (unsigned long long*)&pp->params[0];
+
+	out->guest_cr3   = pp->linuxvm_state.cr3;
+	out->code_va     = CO_TEST_GUEST_TEXT;
+	out->guest_text  = CO_TEST_GUEST_TEXT;
+	out->guest_stack = CO_TEST_GUEST_STACK;
+	out->tables      = co_arch_guest_space_tables(space);
+	out->expected    = CO_SWITCH_SENTINEL;
+
+	/*
+	 * Walk the real tables before trusting them. The passage page is checked
+	 * at its first and last page, since the whole run depends on every one of
+	 * them being present and a partial mapping is the likely mistake.
+	 */
+	if (!CO_OK(co_preflight_space(manager, space, "guest text", CO_TEST_GUEST_TEXT,
+				      text_pa, out)) ||
+	    !CO_OK(co_preflight_space(manager, space, "guest stack", CO_TEST_GUEST_STACK,
+				      stack_pa, out)) ||
+	    !CO_OK(co_preflight_space(manager, space, "passage page, first",
+				      (unsigned long long)(size_t)pp,
+				      co_os_virt_to_phys(pp), out)) ||
+	    !CO_OK(co_preflight_space(manager, space, "passage page, last",
+				      (unsigned long long)(size_t)pp + (pages - 1) * CO_ARCH_PAGE_SIZE,
+				      co_os_virt_to_phys((unsigned char*)pp
+							 + (pages - 1) * CO_ARCH_PAGE_SIZE),
+				      out)) ||
+	    !CO_OK(co_preflight_space(manager, space, "guest IDT",
+				      (unsigned long long)(size_t)pp->linuxvm_state.idt.table,
+				      co_os_virt_to_phys(pp->linuxvm_state.idt.table), out))) {
+		rc = CO_RC(ERROR);
+		goto out_free_stack;
+	}
+
+	fn(&pp->host_state, &pp->linuxvm_state, sentinel, CO_SWITCH_SENTINEL);
+
+	out->observed   = *sentinel;
+	out->faulted    = (int)pp->params[4];
+	out->fault_rip  = pp->params[5];
+	out->vector     = pp->params[16];
+	out->error_code = pp->params[17];
+	out->cr2        = pp->params[18];
+
+	out->succeeded = provoke_fault
+		? ((out->faulted && out->vector == 6) ? PTRUE : PFALSE)
+		: ((out->observed == CO_SWITCH_SENTINEL && !out->faulted) ? PTRUE : PFALSE);
+
+	rc = CO_RC(OK);
+
+out_free_stack:
+	if (stack_pfn)
+		co_os_put_page(manager, stack_pfn);
+out_free_text:
+	if (text_pfn)
+		co_os_put_page(manager, text_pfn);
+out_free_space:
+	co_arch_guest_space_destroy(manager, space);
+out_free_pp:
+	co_os_free_exec_pages(pp, pages);
+
+	return rc;
 }

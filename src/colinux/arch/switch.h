@@ -39,6 +39,9 @@ typedef struct {
 	unsigned long long guest_stubs;
 	unsigned long long guest_tss;
 	unsigned long long ist_stack;
+	unsigned long long guest_text;
+	unsigned long long guest_stack;
+	unsigned long	   tables;
 	unsigned long long vector;
 	unsigned long long error_code;
 	unsigned long long cr2;
@@ -54,6 +57,14 @@ extern co_rc_t co_arch_test_switch(co_manager_t* manager, co_arch_switch_test_t*
 /* Enter the guest address space, run code there, and come back. */
 extern co_rc_t co_arch_test_roundtrip(co_manager_t* manager, co_arch_switch_test_t* out,
 				      int provoke_fault);
+
+/*
+ * Enter a guest whose code and stack live outside the passage page, in an
+ * address space built a page at a time.
+ */
+extern co_rc_t co_arch_test_extern_guest(co_manager_t* manager,
+					 co_arch_switch_test_t* out,
+					 bool_t provoke_fault);
 
 /* Enter the guest N times and require it to continue from where it stopped. */
 extern co_rc_t co_arch_test_resume(co_manager_t* manager, co_arch_switch_test_t* out,
