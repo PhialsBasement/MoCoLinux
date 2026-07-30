@@ -23,23 +23,23 @@ class FileIdScript(Tool):
         return ''
 
     def _content(self):
-        from StringIO import StringIO
+        from io import StringIO
         from comake.defaults import file_id_allocator
         output_file = StringIO()
-        print >>output_file, "#include <stdlib.h>"
-        print >>output_file, "const char *colinux_obj_filenames[] = {"
+        print("#include <stdlib.h>", file=output_file)
+        print("const char *colinux_obj_filenames[] = {", file=output_file)
         for filename in file_id_allocator.path_list:
-            print >>output_file, '     "%s", ' % (filename, )
-        print >>output_file, ' NULL,'
-        print >>output_file, "};"
+            print('     "%s", ' % (filename, ), file=output_file)
+        print(' NULL,', file=output_file)
+        print("};", file=output_file)
         return output_file.getvalue()
 
     def make(self, target, reporter):
-        output_file = open(target.pathname, 'wb')
-        output_file.write(self._content())
+        with open(target.pathname, 'w') as output_file:
+            output_file.write(self._content())
 
     def rebuild_needed(self, target):
-        return open(target.pathname, 'rb').read() != self._content()
+        return open(target.pathname, 'r').read() != self._content()
 
 targets['file_ids.c'] = Target(
     tool = FileIdScript(),

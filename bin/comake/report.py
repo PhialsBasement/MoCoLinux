@@ -21,5 +21,5 @@ class Report(object):
         self._title_printed = True
 
     def print_text(self, text):
-        print (self._indent*'  ') + text
+        print((self._indent*'  ') + text)
 
