@@ -38,6 +38,8 @@ typedef enum {
 	CO_MANAGER_IOCTL_TEST_SPACE,
 	CO_MANAGER_IOCTL_TEST_PAGEFAULT,
 	CO_MANAGER_IOCTL_TEST_BADSTACK,
+	CO_MANAGER_IOCTL_TEST_GUEST,
+	CO_MANAGER_IOCTL_TEST_GUESTFAULT,
 } co_manager_ioctl_t;
 
 /*
@@ -246,6 +248,9 @@ typedef struct {
 	unsigned long long guest_stubs;
 	unsigned long long guest_tss;
 	unsigned long long ist_stack;
+	unsigned long long guest_text;
+	unsigned long long guest_stack;
+	unsigned long	   tables;
 	unsigned long long vector;
 	unsigned long long error_code;
 	unsigned long long cr2;

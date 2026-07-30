@@ -125,6 +125,8 @@ co_rc_t co_manager_test_switch(co_manager_handle_t handle,
 	unsigned long returned = 0;
 
 	return co_os_manager_ioctl(handle,
+				   mode == 7 ? CO_MANAGER_IOCTL_TEST_GUESTFAULT :
+				   mode == 6 ? CO_MANAGER_IOCTL_TEST_GUEST :
 				   mode == 5 ? CO_MANAGER_IOCTL_TEST_BADSTACK :
 				   mode == 4 ? CO_MANAGER_IOCTL_TEST_PAGEFAULT :
 				   mode == 3 ? CO_MANAGER_IOCTL_TEST_RESUME :

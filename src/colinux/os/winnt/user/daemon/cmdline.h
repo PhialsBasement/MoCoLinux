@@ -34,6 +34,8 @@ typedef struct co_winnt_parameters {
 	bool_t test_space;
 	bool_t test_pagefault;
 	bool_t test_badstack;
+	bool_t test_guest;
+	bool_t test_guestfault;
 	char   probe_va_arg[64];
 	bool_t show_status;
 	bool_t remove_driver;

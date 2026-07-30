@@ -203,6 +203,12 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		return co_winnt_status_driver(1); // arg 1 = View all driver details
 	}
 
+	if (winnt_parameters.test_guestfault)
+		return co_winnt_test_switch(7);
+
+	if (winnt_parameters.test_guest)
+		return co_winnt_test_switch(6);
+
 	if (winnt_parameters.test_badstack)
 		return co_winnt_test_switch(5);
 
