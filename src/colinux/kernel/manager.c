@@ -438,11 +438,19 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		if (in_size < sizeof(*params) || out_size < sizeof(*params))
 			return CO_RC(INVALID_PARAMETER);
 
-		co_memset(params, 0, sizeof(*params));
+		{
+			int restore = params->restore;
+
+			co_memset(params, 0, sizeof(*params));
+			params->restore = restore;
+		}
 
 #if defined(__x86_64__) || defined(CONFIG_X86_64)
 		params->supported = PTRUE;
-		co_arch_save_state(&params->state);
+		if (params->restore)
+			co_arch_test_save_restore(&params->state);
+		else
+			co_arch_save_state(&params->state);
 #else
 		params->supported = PFALSE;
 #endif
