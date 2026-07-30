@@ -394,22 +394,43 @@ M1. Make the ABI mechanical, still 32-bit.  DONE.
     with the x86-64 struct definition in M2, where the assertions added here are
     what make it safe -- every offset missed becomes a build failure.
 
-M2. 64-bit host scaffolding that compiles and loads.  BUILT, NOT YET RUN.
+M2. 64-bit host scaffolding that compiles and loads.  DONE, VERIFIED ON HARDWARE.
     COLINUX_ARCH=x86_64 produces a PE32+ x86-64 native-subsystem linux.sys with
-    minimum OS 5.02, entry point at DriverEntry, importing only ntoskrnl.exe,
-    HAL.dll and NDIS.SYS, plus seven 64-bit daemons. arch/x86_64 is written from
-    scratch; ref/CoLinux64's directory of that name is i386 copy-paste and was
-    useful only as a list of files needing attention.
+    minimum OS 5.02, entry at DriverEntry, importing ntoskrnl.exe, HAL.dll and
+    NDIS.SYS, plus seven 64-bit daemons. arch/x86_64 is written from scratch;
+    ref/CoLinux64's directory of that name is i386 copy-paste and was useful only
+    as a list of files needing attention.
 
-    co_host_switch_wrapper() refuses to switch, so a monitor cannot start. That
-    is deliberate: the driver is meant to load and answer ioctls and nothing
-    more, so that the load path is known good before any switch assembly exists
-    to debug on top of it.
+    Loaded and initialised on the M92p under XP x64. colinux-daemon
+    --status-driver reports:
 
-    Staged for testing in dist-x64/ with TESTING-M2.txt. The exit criterion is
-    unmet until it has actually run on the M92p: an unsigned driver installing
-    and colinux-daemon --status-driver answering. Until then items as basic as
-    "XP x64 loads unsigned drivers" remain assumptions.
+        current state: 4 (fully initialized)
+        current number of monitors: 0
+        current linux api version: 14
+        current periphery api version: 22
+
+    State 4 is CO_MANAGER_STATE_INITIALIZED, the top of the enum, so debug init,
+    arch init and OS-dependent init all succeeded -- arch init being the new
+    x86_64 CPUID query, long-mode check and APIC check. Note the periphery
+    version is confirmed by the output existing at all: co_manager_status()
+    returns VERSION_MISMATCHED and the caller bails before printing anything if
+    it is not 22.
+
+    So the assumptions the XP x64 target rests on are now facts: mingw-w64
+    produces a loadable x64 kernel driver, XP x64 loads it unsigned with no
+    test-signing, the PE32+ layout and undecorated DriverEntry are right, the
+    ioctl path works both directions, and PatchGuard does not object to the
+    driver being resident.
+
+    Two bugs were found by doing this, both in the previous commit: base
+    relocations applied twice (the build linked with --base-file plus dlltool
+    --output-exp, duplicating what modern ld already emits), and the driver
+    installing SERVICE_AUTO_START, which turned a bugcheck into a boot loop.
+    The relocation bug affected the i386 driver equally and had never been found
+    because nobody had run it.
+
+    Lesson worth keeping: simulate the loader applying every relocation before
+    shipping a driver. It is cheap, needs no hardware, and would have caught it.
 
 M3. The switch, tested against a trivial guest.
     Write the x86-64 passage code, and bring it up against a hand-written page
