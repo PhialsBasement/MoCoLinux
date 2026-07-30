@@ -87,3 +87,30 @@ void co_os_userspace_unmap(void *user_address, void *handle, unsigned int pages)
 
 	filp_close(filp, NULL);
 }
+
+/*
+ * The multi-allocator probe is a Windows-host porting aid: it exists to find an
+ * allocator whose pages are executable, because the default Windows one is not.
+ * Linux as host has no such problem, so only the default method is offered.
+ */
+bool_t co_os_alloc_method(int index, const char** name)
+{
+	if (index != 0)
+		return PFALSE;
+	if (name)
+		*name = "__get_free_pages";
+	return PTRUE;
+}
+
+void* co_os_alloc_pages_by(int index, unsigned int pages)
+{
+	if (index != 0)
+		return NULL;
+	return co_os_alloc_pages(pages);
+}
+
+void co_os_free_pages_by(int index, void* ptr, unsigned int pages)
+{
+	if (index == 0)
+		co_os_free_pages(ptr, pages);
+}

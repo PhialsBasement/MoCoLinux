@@ -21,6 +21,7 @@ typedef struct co_winnt_parameters {
 	bool_t install_driver;
 	bool_t status_driver;
 	bool_t probe_va;
+	bool_t probe_passage;
 	char   probe_va_arg[64];
 	bool_t show_status;
 	bool_t remove_driver;

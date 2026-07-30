@@ -29,6 +29,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_ATTACH,
 	CO_MANAGER_IOCTL_MONITOR_LIST,
 	CO_MANAGER_IOCTL_PROBE_VA,
+	CO_MANAGER_IOCTL_PROBE_PASSAGE,
 } co_manager_ioctl_t;
 
 /*
@@ -148,6 +149,44 @@ typedef struct {
 	int		   supported;	/* out: PFALSE on architectures
 					   without a 4-level walker	*/
 } co_manager_ioctl_probe_va_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_PROBE_PASSAGE
+ *
+ * Allocates a passage page exactly as the monitor would, reports where the host
+ * put it and what its own page tables say about it, then frees it. Two things are
+ * being asked:
+ *
+ *  - the host virtual address, because we do not choose it. If the guest can map
+ *    the page at the same address, other_map is zero and the switch never has to
+ *    relocate its own instruction pointer -- and, more importantly, no host page
+ *    table has to be modified to arrange it.
+ *
+ *  - whether the page is executable. The passage code runs from it. i386 deals
+ *    with Windows marking such allocations NX by hand-clearing the bit in the
+ *    host's live page tables (arch/i386/antinx.c), which is a four-level walk on
+ *    x86-64 and precisely the page-table tampering to avoid. If NX comes back
+ *    clear there is nothing to solve; if it is set, the allocator has to change
+ *    before any switch assembly is worth writing.
+ *
+ * Allocates and frees. Executes nothing, writes no page tables, touches no CR3.
+ */
+#define CO_PROBE_ALLOC_MAX 4
+
+typedef struct {
+	char			    name[40];	/* out: allocator name		*/
+	unsigned long long	    va;		/* out: host virtual address	*/
+	unsigned long long	    pa;		/* out: physical address	*/
+	int			    ok;		/* out: allocation succeeded	*/
+	co_manager_ioctl_probe_va_t walk;	/* out: page-table walk of va	*/
+} co_probe_alloc_result_t;
+
+typedef struct {
+	co_rc_t			rc;
+	int			pages;	/* out: pages requested per attempt	*/
+	int			count;	/* out: allocators reported		*/
+	co_probe_alloc_result_t	result[CO_PROBE_ALLOC_MAX];
+} co_manager_ioctl_probe_passage_t;
 
 /* interface for CO_MANAGER_IOCTL_MONITOR_LIST: */
 typedef struct {

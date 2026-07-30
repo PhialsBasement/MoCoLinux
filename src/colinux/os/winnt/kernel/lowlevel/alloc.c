@@ -64,6 +64,87 @@ void co_os_free_pages(void *ptr, unsigned int pages)
 	MmFreeNonCachedMemory(ptr, pages * CO_ARCH_PAGE_SIZE);
 }
 
+#define CO_OS_PROBE_TAG (('c' << 0) | ('o' << 8) | ('p' << 16) | ('b' << 24))
+
+/*
+ * Candidate page allocators.
+ *
+ * MmAllocateNonCachedMemory is what coLinux has always used, and on XP x64 it
+ * returns pages with NX set and PWT|PCD set -- neither executable nor cached,
+ * measured on hardware. The passage code has to execute from such a page, which
+ * is why arch/i386/antinx.c exists: it clears NX by editing the host's live page
+ * tables. That is a four-level walk on x86-64 and exactly the tampering
+ * PatchGuard watches for, so the intent here is to find an allocator that hands
+ * back executable memory in the first place.
+ *
+ * NonPagedPool is the interesting candidate: NonPagedPoolNx did not exist until
+ * Windows 8, so on XP x64 the non-paged pool should be executable and cached.
+ * Allocations of PAGE_SIZE or more are page-aligned, which is what is needed --
+ * physical contiguity is not, since the passage code takes virt_to_phys of each
+ * sub-structure separately.
+ */
+enum {
+	CO_ALLOC_NONCACHED = 0,		/* MmAllocateNonCachedMemory -- the default */
+	CO_ALLOC_NONPAGED_POOL,
+	CO_ALLOC_CONTIGUOUS,
+	CO_ALLOC_METHODS
+};
+
+static const char* co_alloc_method_names[CO_ALLOC_METHODS] = {
+	"MmAllocateNonCachedMemory",
+	"ExAllocatePool(NonPagedPool)",
+	"MmAllocateContiguousMemory",
+};
+
+bool_t co_os_alloc_method(int index, const char** name)
+{
+	if (index < 0 || index >= CO_ALLOC_METHODS)
+		return PFALSE;
+	if (name)
+		*name = co_alloc_method_names[index];
+	return PTRUE;
+}
+
+void* co_os_alloc_pages_by(int index, unsigned int pages)
+{
+	unsigned long bytes = pages * CO_ARCH_PAGE_SIZE;
+
+	switch (index) {
+	case CO_ALLOC_NONCACHED:
+		return MmAllocateNonCachedMemory(bytes);
+
+	case CO_ALLOC_NONPAGED_POOL:
+		return ExAllocatePoolWithTag(NonPagedPool, bytes, CO_OS_PROBE_TAG);
+
+	case CO_ALLOC_CONTIGUOUS: {
+		PHYSICAL_ADDRESS highest;
+
+		highest.QuadPart = ~0ULL;
+		return MmAllocateContiguousMemory(bytes, highest);
+	}
+	}
+
+	return NULL;
+}
+
+void co_os_free_pages_by(int index, void* ptr, unsigned int pages)
+{
+	if (ptr == NULL)
+		return;
+
+	switch (index) {
+	case CO_ALLOC_NONCACHED:
+		MmFreeNonCachedMemory(ptr, pages * CO_ARCH_PAGE_SIZE);
+		break;
+	case CO_ALLOC_NONPAGED_POOL:
+		ExFreePool(ptr);
+		break;
+	case CO_ALLOC_CONTIGUOUS:
+		MmFreeContiguousMemory(ptr);
+		break;
+	}
+}
+
 #define CO_OS_POOL_TAG (('c' << 0) | ('o' << 8) |  ('l' << 16) | ('x' << 24))
 
 void *co_os_malloc(unsigned long bytes)

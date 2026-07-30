@@ -86,6 +86,20 @@ co_rc_t co_manager_probe_va(co_manager_handle_t handle,
 	return rc;
 }
 
+co_rc_t co_manager_probe_passage(co_manager_handle_t handle,
+				 co_manager_ioctl_probe_passage_t* probe)
+{
+	unsigned long returned = 0;
+
+	return co_os_manager_ioctl(handle,
+				   CO_MANAGER_IOCTL_PROBE_PASSAGE,
+				   probe,
+				   sizeof(*probe),
+				   probe,
+				   sizeof(*probe),
+				   &returned);
+}
+
 co_rc_t co_manager_info(co_manager_handle_t handle, co_manager_ioctl_info_t* info)
 {
 	co_rc_t rc;

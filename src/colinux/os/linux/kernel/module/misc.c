@@ -12,7 +12,7 @@
 #include <asm/io.h>
 #include <colinux/os/kernel/misc.h>
 
-unsigned long co_os_virt_to_phys(void *addr)
+co_pa_t co_os_virt_to_phys(void *addr)
 {
 	return virt_to_phys(addr);
 }

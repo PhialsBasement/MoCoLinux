@@ -7,6 +7,9 @@
  * the root directory.
  */
 
+/* GCC's own freestanding stddef.h, for size_t as a pointer-sized integer. */
+#include <stddef.h>
+
 #include <colinux/common/libc.h>
 #include <colinux/common/version.h>
 #include <colinux/os/kernel/alloc.h>
@@ -362,6 +365,65 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 
 		co_arch_probe_va(manager, params);
 
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_PROBE_PASSAGE: {
+		co_manager_ioctl_probe_passage_t* params;
+		int pages = sizeof(co_arch_passage_page_t) / CO_ARCH_PAGE_SIZE;
+		int index;
+
+		params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		co_memset(params, 0, sizeof(*params));
+		params->pages = pages;
+
+		if (manager->state < CO_MANAGER_STATE_INITIALIZED) {
+			params->rc   = CO_RC(ERROR);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		/*
+		 * Try each allocator in turn: allocate a passage page's worth, note
+		 * where it landed, walk its own mapping, free it. What matters is the
+		 * PTE -- specifically NX, and the PWT/PCD caching bits, since the
+		 * passage code executes from this page on every world switch.
+		 */
+		for (index = 0; index < CO_PROBE_ALLOC_MAX; index++) {
+			co_probe_alloc_result_t* r = &params->result[index];
+			const char* name = NULL;
+			void* page;
+
+			if (!co_os_alloc_method(index, &name))
+				break;
+
+			params->count = index + 1;
+			co_snprintf(r->name, sizeof(r->name), "%s", name ? name : "?");
+
+			page = co_os_alloc_pages_by(index, pages);
+			if (page == NULL) {
+				r->ok = PFALSE;
+				continue;
+			}
+
+			r->ok = PTRUE;
+			/* size_t: unsigned long is 32 bits under LLP64 and would
+			 * truncate a kernel pointer. */
+			r->va = (unsigned long long)(size_t)page;
+			r->pa = co_os_virt_to_phys(page);
+
+			r->walk.va = r->va;
+			co_arch_probe_va(manager, &r->walk);
+
+			co_os_free_pages_by(index, page, pages);
+		}
+
+		params->rc   = CO_RC(OK);
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}
