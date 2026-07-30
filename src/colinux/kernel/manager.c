@@ -20,6 +20,7 @@
 #include <colinux/arch/mmu.h>
 #include <colinux/arch/probe.h>
 #include <colinux/arch/state.h>
+#include <colinux/arch/switch.h>
 
 #include "manager.h"
 #include "monitor.h"
@@ -455,6 +456,42 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->supported = PFALSE;
 #endif
 		params->rc   = CO_RC(OK);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_TEST_SWITCH: {
+		co_manager_ioctl_test_switch_t* params;
+		co_arch_switch_test_t result;
+		co_rc_t trc;
+
+		params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		co_memset(params, 0, sizeof(*params));
+
+		if (manager->state < CO_MANAGER_STATE_INITIALIZED) {
+			params->rc   = CO_RC(ERROR);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		trc = co_arch_test_switch(manager, &result);
+
+		params->rc         = trc;
+		params->supported  = result.supported;
+		params->succeeded  = result.succeeded;
+		params->passage_va = result.passage_va;
+		params->passage_pa = result.passage_pa;
+		params->code_va    = result.code_va;
+		params->host_cr3   = result.host_cr3;
+		params->guest_cr3  = result.guest_cr3;
+		params->expected   = result.expected;
+		params->observed   = result.observed;
+		params->code_size  = result.code_size;
+
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}

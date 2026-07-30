@@ -31,6 +31,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_PROBE_VA,
 	CO_MANAGER_IOCTL_PROBE_PASSAGE,
 	CO_MANAGER_IOCTL_SAVE_STATE,
+	CO_MANAGER_IOCTL_TEST_SWITCH,
 } co_manager_ioctl_t;
 
 /*
@@ -205,6 +206,30 @@ typedef struct {
 	int			restore;	/* in: also put the state back	*/
 	co_arch_state_stack_t	state;
 } co_manager_ioctl_save_state_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_TEST_SWITCH
+ *
+ * Change CR3 into an address space containing only the passage page, store a
+ * sentinel from code executing there, and change back. Tests the one property the
+ * whole passage design rests on: that execution continues across a CR3 write
+ * because the code page is mapped at the same address in both address spaces.
+ *
+ * The full result struct lives in arch/switch.h; this carries a copy of it.
+ */
+typedef struct {
+	co_rc_t	rc;
+	int	supported;
+	int	succeeded;
+	unsigned long long passage_va;
+	unsigned long long passage_pa;
+	unsigned long long code_va;
+	unsigned long long host_cr3;
+	unsigned long long guest_cr3;
+	unsigned long long expected;
+	unsigned long long observed;
+	unsigned long	   code_size;
+} co_manager_ioctl_test_switch_t;
 
 /* interface for CO_MANAGER_IOCTL_MONITOR_LIST: */
 typedef struct {
