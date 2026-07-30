@@ -472,15 +472,27 @@ M5. Devices: conet, cofs, scsi, the consoles.
 
 M6. Forward-port the guest to a current kernel.
 
-On M4, there is a real choice: port 2.6.33 to x86-64 first, or go straight to a
-modern kernel. Recommendation: 2.6.33 first. The dominant risk in this project
-is "the switch doesn't work and you cannot tell why", and 2.6.33's cooperative
-patch is a complete, known-good reference for every part of the design that
-isn't architecture-specific — you change one half and keep the other fixed.
-Modern kernels add KASLR, KPTI, eager FPU and a rewritten early boot on top of
-an unproven switch. The cost is doing the guest port roughly twice; that is
-worth paying for the ability to isolate failures. Revisit this after M3, when
-the switch is known to work.
+On M4 there is a real choice: port 2.6.33 to x86-64 first, or go straight to a
+modern kernel. OPEN, deliberately deferred until the switch works.
+
+The case for 2.6.33 first was that its cooperative patch is a known-good
+reference for everything that is not architecture-specific. Measuring the patch
+weakens that considerably: 22,809 added lines across 31 patches, the base patch
+alone touching 67 files, and seven mentions of x86_64 in the whole thing. What it
+patches is entry_32.S, head_32.S, init_32.c, pgtable-2level.h, pgtable_32.h,
+io_32.h -- the interrupt entry stubs, early boot, and two-level paging, which
+does not exist in long mode. Nearly all of the work is exactly the part with no
+x86-64 counterpart, so the reference buys less than claimed, and taking that road
+means doing the hard half twice.
+
+Against that, a modern kernel brings KASLR, KPTI, eager FPU and a rewritten early
+boot. But it is the target actually wanted, it builds with the toolchain already
+in use, and it sidesteps the __GXX_ABI_VERSION mismatch entirely.
+
+Either road needs the world switch working first, so this does not block M3.
+
+Superseded recommendation, kept because the reasoning is still worth weighing:
+2.6.33 first.
 
 
 6. Toolchain
