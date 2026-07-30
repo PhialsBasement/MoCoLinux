@@ -18,7 +18,7 @@ typedef int bool_t;
 #define PACKED_STRUCT __attribute__((packed))
 
 #define CO_MAX_MONITORS                   64
-#define CO_LINUX_PERIPHERY_API_VERSION    23
+#define CO_LINUX_PERIPHERY_API_VERSION    24
 
 #define CO_ERRORS_X_MACRO			\
 	X(ERROR)				\

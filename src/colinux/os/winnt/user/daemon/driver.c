@@ -280,6 +280,109 @@ co_rc_t co_winnt_probe_va(const char* arg)
 	return CO_RC(OK);
 }
 
+/*
+ * Try each available page allocator and report whether its pages could host the
+ * passage code. See CO_MANAGER_IOCTL_PROBE_PASSAGE in common/ioctl.h.
+ *
+ * Prints are kept short deliberately: co_terminal_print() has a fixed buffer and
+ * silently truncated a long multi-line message the first time round.
+ */
+co_rc_t co_winnt_probe_passage(void)
+{
+	co_rc_t rc;
+	bool_t installed = PFALSE;
+	co_manager_handle_t handle;
+	co_manager_ioctl_probe_passage_t probe = {0, };
+	int i, usable = 0;
+	static const char* level_name[CO_PROBE_VA_LEVELS] = { "PML4", "PDPT", "PD", "PT" };
+
+	rc = co_win32_manager_is_installed(&installed);
+	if (!CO_OK(rc))
+		return rc;
+	if (!installed) {
+		co_terminal_print("driver not installed\n");
+		return CO_RC(ERROR_ACCESSING_DRIVER);
+	}
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		co_terminal_print("couldn't get driver handle\n");
+		return CO_RC(ERROR_MONITOR_NOT_LOADED);
+	}
+
+	rc = co_manager_probe_passage(handle, &probe);
+	co_os_manager_close(handle);
+
+	if (!CO_OK(rc)) {
+		co_terminal_print("probe: ioctl failed (rc %x)\n", (int)rc);
+		return rc;
+	}
+	if (!CO_OK(probe.rc)) {
+		co_terminal_print("probe: driver reported failure (rc %x)\n", (int)probe.rc);
+		return probe.rc;
+	}
+
+	co_terminal_print("passage page is %d pages (%d bytes)\n",
+			  probe.pages, probe.pages * 4096);
+	co_terminal_print("the passage code executes from it, so it must be executable\n");
+	co_terminal_print("\n");
+
+	for (i = 0; i < probe.count; i++) {
+		co_probe_alloc_result_t* r = &probe.result[i];
+		unsigned long long pte;
+		bool_t nx, uncached;
+
+		co_terminal_print("[%d] %s\n", i, r->name);
+
+		if (!r->ok) {
+			co_terminal_print("      allocation FAILED\n\n");
+			continue;
+		}
+
+		co_terminal_print("      va 0x%016llx  pa 0x%016llx\n", r->va, r->pa);
+
+		if (!r->walk.supported) {
+			co_terminal_print("      (no page-table walker on this arch)\n\n");
+			continue;
+		}
+		if (!r->walk.present) {
+			co_terminal_print("      not mapped after %d levels -- unexpected\n\n",
+					  r->walk.levels_walked);
+			continue;
+		}
+
+		pte      = r->walk.entry[r->walk.levels_walked - 1];
+		nx       = (pte & 0x8000000000000000ULL) ? PTRUE : PFALSE;
+		uncached = (pte & 0x018) ? PTRUE : PFALSE;
+
+		co_terminal_print("      %s pte 0x%016llx\n",
+				  level_name[r->walk.levels_walked - 1], pte);
+		co_terminal_print("      NX %s   caching %s   %s\n",
+				  nx ? "SET    " : "clear  ",
+				  uncached ? "uncached" : "cached  ",
+				  (pte & 0x100) ? "global" : "");
+
+		if (nx)
+			co_terminal_print("      -> cannot execute from here\n");
+		else if (uncached)
+			co_terminal_print("      -> executable, but uncached: slow to run from\n");
+		else
+			co_terminal_print("      -> USABLE: executable and cached\n");
+
+		if (!nx)
+			usable++;
+
+		co_terminal_print("\n");
+	}
+
+	if (usable)
+		co_terminal_print("%d allocator(s) give executable pages, so no antinx\n", usable);
+	else
+		co_terminal_print("no allocator gives executable pages -- rethink needed\n");
+
+	return CO_RC(OK);
+}
+
 static co_rc_t co_winnt_install_driver_lowlevel(IN SC_HANDLE SchSCManager, IN LPCTSTR  DriverName, IN LPCTSTR ServiceExe)
 {
 	SC_HANDLE  schService;

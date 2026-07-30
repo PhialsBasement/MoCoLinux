@@ -184,13 +184,20 @@ static co_rc_t guest_address_space_init(co_monitor_t *cmon)
 		long 		io_buffer_page;
 		long 		io_buffer_num_pages = CO_VPTR_IO_AREA_SIZE >> CO_ARCH_PAGE_SHIFT;
 		long 		io_buffer_offset;
-		unsigned long 	io_buffer_host_address = (unsigned long)(cmon->io_buffer);
+		/*
+		 * Keep this a pointer. It used to be an unsigned long, which is 32
+		 * bits under LLP64, so on Win64 the kernel pointer was truncated and
+		 * then cast back to void* for co_os_virt_to_phys() -- yielding the
+		 * physical address of a bogus address, and wrong PFNs in the guest's
+		 * I/O area mappings.
+		 */
+		unsigned char*	io_buffer_host_address = (unsigned char*)(cmon->io_buffer);
 
 		io_buffer_offset = ((CO_VPTR_IO_AREA_START & ((1 << PGDIR_SHIFT) - 1)) >>
 				    CO_ARCH_PAGE_SHIFT) * sizeof(linux_pte_t);
 
 		for (io_buffer_page=0; io_buffer_page < io_buffer_num_pages; io_buffer_page++) {
-			co_pfn_t io_buffer_pfn = co_os_virt_to_phys((void*)io_buffer_host_address) >> CO_ARCH_PAGE_SHIFT;
+			co_pfn_t io_buffer_pfn = co_os_virt_to_phys(io_buffer_host_address) >> CO_ARCH_PAGE_SHIFT;
 
 			rc = co_monitor_create_ptes(cmon, CO_VPTR_SELF_MAP + io_buffer_offset,
 						    sizeof(linux_pte_t), &io_buffer_pfn);

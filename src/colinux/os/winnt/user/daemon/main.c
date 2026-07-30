@@ -202,6 +202,10 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		return co_winnt_status_driver(1); // arg 1 = View all driver details
 	}
 
+	if (winnt_parameters.probe_passage) {
+		return co_winnt_probe_passage();
+	}
+
 	if (winnt_parameters.probe_va) {
 		return co_winnt_probe_va(winnt_parameters.probe_va_arg);
 	}
