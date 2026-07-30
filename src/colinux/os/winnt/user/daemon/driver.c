@@ -628,7 +628,10 @@ co_rc_t co_winnt_test_switch(int mode)
 		return CO_RC(ERROR_MONITOR_NOT_LOADED);
 	}
 
-	if (mode == 4) {
+	if (mode == 5) {
+		co_terminal_print("destroying the guest stack pointer and then faulting --\n");
+		co_terminal_print("only an IST stack can deliver that\n");
+	} else if (mode == 4) {
 		co_terminal_print("reading an address the guest maps nothing at, and expecting\n");
 		co_terminal_print("its own IDT to report which fault, where, and why\n");
 	} else if (mode == 3) {
@@ -682,6 +685,7 @@ co_rc_t co_winnt_test_switch(int mode)
 	if (r.guest_idt) {
 		co_terminal_print("  guest idt       0x%016llx  (256 gates)\n", r.guest_idt);
 		co_terminal_print("  vector stubs    0x%016llx  (256 x 16 bytes)\n", r.guest_stubs);
+		co_terminal_print("  guest tss       0x%016llx  ist1 0x%016llx\n", r.guest_tss, r.ist_stack);
 		co_terminal_print("  fault handler   0x%016llx\n", r.fault_handler);
 	}
 	if (r.preflight_checked)
@@ -730,7 +734,15 @@ co_rc_t co_winnt_test_switch(int mode)
 	}
 
 	if (r.succeeded) {
-		if (mode == 4) {
+		if (mode == 5) {
+			if (r.faulted)
+				co_terminal_print("  IST WORKED. The guest faulted with an unusable stack pointer\n"
+						  "  and the fault was still delivered -- the CPU took the stack\n"
+						  "  from the TSS before pushing anything. Without IST this is a\n"
+						  "  double fault and a reset.\n");
+			else
+				co_terminal_print("  came back without recording a fault\n");
+		} else if (mode == 4) {
 			if (r.vector == 14)
 				co_terminal_print("  CAUGHT AND IDENTIFIED. The guest page faulted, its own stub\n"
 						  "  recorded which vector, the error code and CR2, and the handler\n"
