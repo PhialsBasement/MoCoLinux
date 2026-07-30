@@ -336,14 +336,23 @@ tuned.
 5. Milestones
 -------------
 
-M0. Build the 32-bit tree on a current host.
-    Nothing can be verified without a working baseline. The comake build system
-    was Python 2 and is now ported (commit "comake: port the build system from
-    Python 2 to Python 3"). Remaining: install mingw-w64, obtain a
-    period-appropriate GCC for the 2.6.33 guest kernel (a current GCC cannot
-    build it), and get `make` through to a linux.sys plus daemons.
-    Exit criterion: unmodified 0.7.9 builds, and ideally boots under 32-bit
-    Windows, so there is a known-good reference to diff against.
+M0. Build the 32-bit tree on a current host.  DONE for the Windows side.
+    comake is ported to Python 3, and the WinNT driver and daemons build clean
+    on mingw-w64 16.1 / GCC 16 against patched 2.6.33.7 headers. See
+    doc/building-modern for how to reproduce it and what is deliberately left
+    out (the FLTK/wx consoles, the WinPcap daemon, and conet.c, which cannot
+    compile because mingw-w64's ddk/ndis.h is itself broken).
+
+    Not done: a bootable 32-bit reference. That needs a built vmlinux, which
+    needs a period-appropriate GCC, and then runs into the daemon's
+    __GXX_ABI_VERSION check refusing a guest built by a different compiler than
+    the daemons (doc/building-modern section 5). The intended way out is M1,
+    which makes that check unnecessary, rather than reconstructing a 2011
+    toolchain.
+
+    Cheaper substitute for a behavioural reference: install the official
+    prebuilt 0.7.9 binaries on 32-bit XP. That establishes what correct
+    behaviour looks like on the target hardware at zero build cost.
 
 M1. Make the ABI mechanical, still 32-bit.
     Generate the CO_ARCH_STATE_STACK_* offsets from offsetof() instead of
@@ -401,24 +410,22 @@ the switch is known to work.
 6. Toolchain
 ------------
 
-Verified on this host (CachyOS, kernel 7.1.5):
+See doc/building-modern for the working recipe and the exact toolchain versions.
+Summary of what matters for the port:
 
-  Python 3.14        comake now runs on it (M0 done)
-  GCC 16.1.1         far too new to build a 2.6.33 kernel
-  gcc -m32           works, multilib present
-  mingw-w64          NOT INSTALLED — needed for any Windows target
+  Python 3.14        comake runs on it
+  GCC 16.1.1         builds the host side; far too new for a 2.6.33 kernel
+  mingw-w64 16.1     i686-w64-mingw32- and x86_64-w64-mingw32- both present,
+                     so the 64-bit host compiler is already available
   wine               not installed; only needed for `make installer`
-  nasm, mkisofs      not installed; not needed for the core build
 
-Two compilers are required and their versions must match closely: one targeting
-the guest architecture and one targeting the host. The daemon refuses to run if
-the kernel and daemon compiler versions differ. coLinux can build its own
-matched pair via configure --gcc-guest-build; alternatively build the old guest
-kernel in a container with an era-appropriate distro. For 64-bit the host
-compiler becomes x86_64-w64-mingw32-gcc.
+The cross prefix is now derived from COLINUX_ARCH, so building for x86-64 is
+COLINUX_ARCH=x86_64 once src/colinux/arch/x86_64 exists. WINVER is already set
+to 0x0502 for the x86_64 target and left at 0x0500 for i386.
 
-For XP x64 as a target, set WINVER/_WIN32_WINNT to 0x0502 rather than the
-current 0x0500.
+The guest kernel still needs a period-appropriate compiler, and the daemon's
+__GXX_ABI_VERSION check currently forbids mixing it with a modern host
+toolchain. M1 is what removes that constraint.
 
 
 7. Open questions and risks
