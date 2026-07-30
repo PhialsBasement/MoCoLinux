@@ -199,12 +199,10 @@ def script_cmdline(scripter, tool_run_inf):
         "-Wl,--file-alignment,0x1000 "
         "-Wl,--section-alignment,0x1000 "
         "-Wl,--entry,%s "
-        "-Wl,%s "
         "-mdll -nostartfiles -nostdlib "
         "-o %s %s -lndis -lntoskrnl -lhal -lgcc ") %
     (scripter.get_cross_build_tool('gcc', tool_run_inf),
      entry,
-     inputs[1].pathname,
      tool_run_inf.target.pathname,
      inputs[0].pathname))
     return command_line
@@ -213,7 +211,6 @@ targets['linux.sys'] = Target(
     tool = Script(script_cmdline),
     inputs = [
        Input('driver.o'),
-       Input('driver.base.exp'),
     ],
     options = Options(
         appenders = dict(
@@ -230,57 +227,22 @@ targets['linux.sys'] = Target(
     )
 )
 
-def script_cmdline(scripter, tool_run_inf):
-    inputs = tool_run_inf.target.get_actual_inputs()
-    command_line = ((
-        "%s "
-        "--dllname linux.sys "
-        "--base-file %s "
-        "--output-exp %s") %
-    (scripter.get_cross_build_tool('dlltool', tool_run_inf),
-     inputs[0].pathname,
-     tool_run_inf.target.pathname))
-    return command_line
+"""
+The driver used to be linked twice: once with --base-file to capture relocations,
+then dlltool --output-exp turned that base file into an object which was fed to a
+second link. That was necessary with the binutils of the time, which did not emit
+base relocations for this kind of image.
 
+Current binutils ld does emit them, so doing both put every fixup in .reloc
+twice. The Windows loader applies each one it finds, so every absolute address in
+the driver got the load-bias added twice and pointed into nowhere. On XP x64 that
+showed up as PAGE_FAULT_IN_NONPAGED_AREA on the first dereference of a .refptr
+slot in co_manager_load(), reading an address exactly (2 * bias + target) away.
+The i386 driver had the same duplication.
 
-targets['driver.base.exp'] = Target(
-    tool = Script(script_cmdline),
-    inputs = [
-       Input('driver.base.tmp'),
-    ],
-)
+Let ld generate them once.
+"""
 
-def script_cmdline(scripter, tool_run_inf):
-    from comake.settings import settings
-
-    inputs = tool_run_inf.target.get_actual_inputs()
-
-    # Same entry-symbol reasoning as the linux.sys link above.
-    if settings.arch == 'x86_64':
-        entry = 'DriverEntry'
-    else:
-        entry = '_DriverEntry@8'
-
-    command_line = ((
-        "%s "
-        "-Wl,--base-file,%s "
-        "-Wl,--entry,%s "
-        "-nostartfiles -nostdlib "
-        "-o junk.tmp %s -lndis -lntoskrnl -lhal -lgcc ; "
-        "rm -f junk.tmp") %
-    (scripter.get_cross_build_tool('gcc', tool_run_inf),
-     tool_run_inf.target.pathname,
-     entry,
-     inputs[0].pathname))
-    return command_line
-
-
-targets['driver.base.tmp'] = Target(
-    tool = Script(script_cmdline),
-    inputs = [
-       Input('driver.o'),
-    ],
-)
 
 targets['installer'] = Target(
     inputs = [
