@@ -394,20 +394,22 @@ M1. Make the ABI mechanical, still 32-bit.  DONE.
     with the x86-64 struct definition in M2, where the assertions added here are
     what make it safe -- every offset missed becomes a build failure.
 
-M2. 64-bit host scaffolding that compiles and loads.
-    Add src/colinux/arch/x86_64 (the arch/current symlink mechanism in
-    src/build.comake.py already supports this via COLINUX_ARCH); switch the
-    cross prefix to x86_64-w64-mingw32-; drop the 32-bit-only -mpush-args and
-    -mno-accumulate-outgoing-args flags; widen co_os_virt_to_phys and the PFN
-    types. co_host_switch_wrapper refuses to start a VM.
-    Exit criterion: a 64-bit linux.sys loads on XP x64 and
-    colinux-daemon --status-driver reports it.
+M2. 64-bit host scaffolding that compiles and loads.  BUILT, NOT YET RUN.
+    COLINUX_ARCH=x86_64 produces a PE32+ x86-64 native-subsystem linux.sys with
+    minimum OS 5.02, entry point at DriverEntry, importing only ntoskrnl.exe,
+    HAL.dll and NDIS.SYS, plus seven 64-bit daemons. arch/x86_64 is written from
+    scratch; ref/CoLinux64's directory of that name is i386 copy-paste and was
+    useful only as a list of files needing attention.
 
-    Note: ref/CoLinux64 (the 2013 GSoC project) already did much of this
-    type-widening and arch-splitting work against 0.7.8. Mine it, but base the
-    result on 0.7.9. Its arch/x86_64/passage.c is explicitly a placeholder —
-    it has no switch assembly at all and co_host_switch_wrapper terminates
-    immediately — so M3 is untouched ground.
+    co_host_switch_wrapper() refuses to switch, so a monitor cannot start. That
+    is deliberate: the driver is meant to load and answer ioctls and nothing
+    more, so that the load path is known good before any switch assembly exists
+    to debug on top of it.
+
+    Staged for testing in dist-x64/ with TESTING-M2.txt. The exit criterion is
+    unmet until it has actually run on the M92p: an unsigned driver installing
+    and colinux-daemon --status-driver answering. Until then items as basic as
+    "XP x64 loads unsigned drivers" remain assumptions.
 
 M3. The switch, tested against a trivial guest.
     Write the x86-64 passage code, and bring it up against a hand-written page
