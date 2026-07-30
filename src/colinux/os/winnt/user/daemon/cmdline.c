@@ -29,6 +29,9 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("      --install-driver             Install the colinux-driver (linux.sys)\n");
 	co_terminal_print("      --remove-driver              Uninstall (remove) the colinux-driver (linux.sys)\n");
 	co_terminal_print("      --status-driver              Show status about the installed/running\n");
+	co_terminal_print("      --test-fault                 Raise #UD in the guest and catch it\n");
+	co_terminal_print("      --test-resume                Enter the guest repeatedly and require\n");
+	co_terminal_print("                                   it to continue where it stopped\n");
 	co_terminal_print("      --test-roundtrip             Enter the guest address space and return\n");
 	co_terminal_print("      --test-switch                Change CR3 into a one-page address space\n");
 	co_terminal_print("                                   and back. Porting aid.\n");
@@ -38,7 +41,11 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("                                   capture it. Porting aid, reads only.\n");
 	co_terminal_print("      --probe-passage              Report where a passage page lands and\n");
 	co_terminal_print("                                   whether it is executable. Porting aid.\n");
-	co_terminal_print("      --probe-va[=ADDR]            Report what the host has mapped at a\n");
+	co_terminal_print("      --dump-vmlinux FILE          Parse an ELF kernel image and print its\n");
+	co_terminal_print("                                   sections and key symbols. Porting aid.\n");
+	co_terminal_print("      --probe-sweep                Map which of the 256 kernel PML4 slots\n");
+	co_terminal_print("                                   the host uses. x86-64 porting aid.\n");
+	co_terminal_print("      --probe-va [ADDR]            Report what the host has mapped at a\n");
 	co_terminal_print("                                   virtual address. x86-64 porting aid;\n");
 	co_terminal_print("                                   defaults to the guest window base.\n");
 	co_terminal_print("                                   driver\n");
@@ -111,6 +118,30 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 
 	rc = co_cmdline_params_argumentless_parameter(
 		cmdline,
+		"--test-fault",
+		&winnt_parameters->test_fault);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_argumentless_parameter(
+		cmdline,
+		"--test-resume",
+		&winnt_parameters->test_resume);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_argumentless_parameter(
+		cmdline,
+		"--probe-sweep",
+		&winnt_parameters->probe_sweep);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_argumentless_parameter(
+		cmdline,
 		"--test-roundtrip",
 		&winnt_parameters->test_roundtrip);
 
@@ -145,6 +176,15 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		cmdline,
 		"--probe-passage",
 		&winnt_parameters->probe_passage);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--dump-vmlinux",
+		&winnt_parameters->dump_vmlinux,
+		winnt_parameters->dump_vmlinux_arg,
+		sizeof(winnt_parameters->dump_vmlinux_arg));
 
 	if (!CO_OK(rc))
 		return rc;

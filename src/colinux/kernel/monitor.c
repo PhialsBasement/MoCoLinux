@@ -927,7 +927,7 @@ static co_rc_t load_section(co_monitor_t *cmon, co_monitor_ioctl_load_section_t 
 		return CO_RC(ERROR);
 
 	if (params->user_ptr) {
-		co_debug("loading section at 0x%lx (0x%lx bytes)", params->address, params->size);
+		co_debug("loading section at 0x%llx (0x%llx bytes)", params->address, params->size);
 		rc = co_monitor_copy_region(cmon, params->address, params->size, params->buf);
 	} else {
 		rc = co_monitor_copy_region(cmon, params->address, params->size, NULL);

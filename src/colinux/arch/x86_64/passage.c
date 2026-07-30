@@ -33,6 +33,9 @@
  *     self-modifying far jump that reloads CS has to become a far return.
  */
 
+/* GCC's own freestanding stddef.h, for size_t as a pointer-sized integer. */
+#include <stddef.h>
+
 #include <colinux/common/debug.h>
 #include <colinux/common/libc.h>
 #include <colinux/common/common.h>
@@ -114,8 +117,8 @@ static void co_passage_page_dump_state(const char *which, co_arch_state_stack_t 
 		 which, state->cr0, state->cr2, state->cr3, state->cr4, state->efer);
 
 	co_debug("%s gdt:%016llx:%04x idt:%016llx:%04x ldt:%04x tr:%04x",
-		 which, (unsigned long long)(unsigned long)state->gdt.base, state->gdt.limit,
-		 (unsigned long long)(unsigned long)state->idt.table, state->idt.size,
+		 which, (unsigned long long)(size_t)state->gdt.base, state->gdt.limit,
+		 (unsigned long long)(size_t)state->idt.table, state->idt.size,
 		 state->ldt, state->tr);
 
 	co_debug("%s rip:%016llx flags:%016llx rsp:%016llx",

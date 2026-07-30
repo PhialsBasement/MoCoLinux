@@ -26,12 +26,25 @@ typedef struct {
 	unsigned long long expected;
 	unsigned long long observed;
 	unsigned long long guest_gdt;
+	unsigned long long guest_idt;
+	unsigned long long fault_handler;
+	unsigned long long fault_rip;
+	int		   faulted;
 	unsigned long	   code_size;
+	/* resume test: how many times the guest was entered, and what it counted */
+	int		   iterations;
+	unsigned long long counter;
+	unsigned long long reg_accum;
 } co_arch_switch_test_t;
 
 extern co_rc_t co_arch_test_switch(co_manager_t* manager, co_arch_switch_test_t* out);
 
 /* Enter the guest address space, run code there, and come back. */
-extern co_rc_t co_arch_test_roundtrip(co_manager_t* manager, co_arch_switch_test_t* out);
+extern co_rc_t co_arch_test_roundtrip(co_manager_t* manager, co_arch_switch_test_t* out,
+				      bool_t provoke_fault);
+
+/* Enter the guest N times and require it to continue from where it stopped. */
+extern co_rc_t co_arch_test_resume(co_manager_t* manager, co_arch_switch_test_t* out,
+				   int iterations);
 
 #endif

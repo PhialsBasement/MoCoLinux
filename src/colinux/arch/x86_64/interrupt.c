@@ -5,6 +5,9 @@
  * the root directory.
  */
 
+/* GCC's own freestanding stddef.h, for size_t as a pointer-sized integer. */
+#include <stddef.h>
+
 #include <colinux/arch/interrupt.h>
 
 /*
@@ -83,7 +86,12 @@ void co_monitor_arch_real_hardware_interrupt(co_monitor_t *cmon)
 	 * machine check, NMI and double fault -- none of which should be arriving
 	 * through this path -- but it is a real gap to close alongside the rest.
 	 */
-	func = (void *)(unsigned long)offset;
+	/*
+	 * (size_t), not (unsigned long): Win64 is LLP64 and `unsigned long` is
+	 * four bytes, which would truncate the host ISR's address to its low
+	 * half and jump into nothing. Every Windows handler is above 4 GB.
+	 */
+	func = (void *)(size_t)offset;
 
 	call_intr(func);
 }

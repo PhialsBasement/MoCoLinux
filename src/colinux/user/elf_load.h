@@ -16,12 +16,27 @@
 typedef	struct co_elf_data co_elf_data_t;
 typedef	struct co_elf_symbol co_elf_symbol_t;
 
+/*
+ * Addresses and file offsets out of the image are 64-bit regardless of host.
+ * Windows is LLP64, so `unsigned long` is 4 bytes there and would silently
+ * truncate every kernel address above 4 GB -- which on x86-64 is all of them.
+ */
+typedef unsigned long long co_elf_addr_t;
+typedef unsigned long long co_elf_off_t;
+
 struct co_daemon;
 
 extern co_rc_t co_elf_image_read(co_elf_data_t **pl, void *elf_buf, unsigned long size);
 extern co_rc_t co_elf_image_load(struct co_daemon *daemon);
+
+/*
+ * Enumerate the image without loading it. An x86-64 bring-up aid: the parser
+ * had to grow an ELF64 path, and the only place the LLP64 truncation hazards
+ * are real is the Windows host, so the check has to run there.
+ */
+extern co_rc_t co_elf_dump(const char *filename);
 extern co_elf_symbol_t *co_get_symbol_by_name(co_elf_data_t *pl, const char *name);
 extern void *co_elf_get_symbol_data(co_elf_data_t *pl, co_elf_symbol_t *symbol);
-extern unsigned long co_elf_get_symbol_value(co_elf_symbol_t *symbol);
+extern co_elf_addr_t co_elf_get_symbol_value(co_elf_symbol_t *symbol);
 
 #endif

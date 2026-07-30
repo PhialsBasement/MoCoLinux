@@ -226,6 +226,31 @@ Remaining work here:
     with more than 4 GB, and fix co_monitor_getpp()'s hardcoded 4-byte stride.
   - PTE construction must carry NX and the high physical bits.
 
+Guest kernel configuration required by the above (each verified to exist as a
+real settable symbol in 7.1.5):
+
+    CONFIG_RANDOMIZE_MEMORY=n     MANDATORY, not a preference. The KASLR memory
+                                  span is ffff888000000000-fffffe0000000000 and
+                                  encloses our window, so leaving it on moves
+                                  the vmalloc/vmemmap hole out from under us.
+                                  With it off, kernel_randomize_memory() is an
+                                  empty inline and page_offset_base /
+                                  vmalloc_base / vmemmap_base keep the defaults
+                                  set at head64.c:63-68.
+    CONFIG_RANDOMIZE_BASE=n       deterministic kernel placement
+    CONFIG_MITIGATION_PAGE_TABLE_ISOLATION=n
+                                  otherwise the guest maintains two page-table
+                                  hierarchies and switches between them on entry
+    CONFIG_X86_FRED=n             keep the legacy IDT path
+    CONFIG_SMP=n                  uniprocessor first
+    CONFIG_PARAVIRT=y and a COOPERATIVE symbol that `select`s PARAVIRT_XXL,
+                                  since XXL is a hidden bool with no prompt
+
+The window itself is confirmed free on both sides -- see 4.5 for the measured
+host occupancy, and note the hole is derived from 7.1.5 source constants
+(__VMALLOC_BASE_L4 + VMALLOC_SIZE_TB_L4 vs __VMEMMAP_BASE_L4) rather than from
+documentation.
+
 4.2 Long-mode CPU state that is currently not saved at all
 
 None of the following is in the state block today, and all of it must be:
@@ -302,6 +327,45 @@ R8-R15 must be saved; they do not happen to be preserved the way EBX/ESI/EDI/
 EBP were. The Win64 callee-saved set is RBX, RBP, RDI, RSI, R12-R15 and
 XMM6-XMM15, which is considerably larger than what the prologue pushes today.
 
+What the blob does NOT have to save (verified against the i386 implementation
+2026-07-31, and initially got wrong in the other direction):
+
+The i386 passage code pushes only ebx/esi/edi/ebp -- plain C callee-saved
+discipline -- and there is no FPU save area anywhere in the passage page. That
+looks like an omission and is not. coLinux deliberately delegates state
+preservation to the guest kernel's own machinery, and the passage page stays
+minimal:
+
+  - The guest is never switched out mid-instruction. A hardware interrupt
+    vectors through the *guest's* IDT, Linux's own SAVE_ALL builds a full
+    pt_regs on the guest kernel stack, and only then does C code call
+    co_switch(). So the switch is always entered from a C context, where C-ABI
+    discipline is exactly correct. Re-entry returns into that C function, which
+    returns into Linux's interrupt entry, which does RESTORE_ALL; iret. This is
+    also why the patch adds only 7 lines to entry_32.S -- it is a hook, not a
+    rewrite.
+
+  - FPU/SSE state is handled guest-side. The guest kernel declares
+    co_host_fpu[0x200] (16-byte aligned) plus a co_host_fpu_saved flag, saves
+    the *host's* FPU lazily only if the guest actually touches it, and restores
+    it immediately before switching back. The guest's own per-task FPU state is
+    handled by wrapping the switch in kernel_fpu_begin()/kernel_fpu_end(). The
+    16-byte alignment of both state blocks -- asserted at build time as
+    sizeof(co_arch_state_stack_t) % 16 == 0 -- exists precisely so fxsave/fxrstor
+    can operate on them; that is the only trace of FPU handling in the header.
+
+  Consequence for the port: neither a full GPR frame nor an fxsave area belongs
+  in the switch blob or the passage page. Both are M4 guest-side work with a
+  proven design to copy. Adding them to the blob would be duplicated effort and
+  extra ABI surface for nothing.
+
+The host-side counterpart already exists in both arches:
+co_monitor_arch_real_hardware_interrupt() reads the *host's* IDT out of
+host_state.idt.table, indexes it by the vector the guest recorded in params[0],
+and calls Windows' real ISR with a synthesized interrupt frame. The x86-64
+version decodes 16-byte gates and builds a 40-byte iretq frame, and is still
+UNEXERCISED.
+
 4.5 Pseudo-physical memory and the guest address-space window
 
 The guest's fixed window is CO_VPTR_BASE = 0xffc00000 and about 20 MB below it,
@@ -322,6 +386,43 @@ or radix structure.
 CO_LOWMEMORY_MAX_MB (984) is a *derived* number — it is how much pseudo-RAM PTE
 array fits in the window — so it changes with the new layout rather than being
 tuned.
+
+How much room there actually is, measured on the M92p 2026-07-31 with
+--probe-sweep (one probe per kernel PML4 slot; a slot's PML4 entry is absent or
+present for the whole 512 GB it covers, so a miss at the slot base proves the
+slot is unclaimed):
+
+    slots      address range                       state
+    256-492    ffff800000000000-fffff67fffffffff   free   (237 slots, 118 TB)
+    493-496    fffff68000000000-fffff87fffffffff   USED   (2 TB)
+    497        fffff88000000000-fffff8ffffffffff   free
+    498-499    fffff90000000000-fffff9ffffffffff   USED   (1 TB)
+    500        fffffa0000000000-fffffa7fffffffff   free
+    501-502    fffffa8000000000-fffffb7fffffffff   USED   (1 TB)
+    503-510    fffffb8000000000-ffffff7fffffffff   free   (4 TB)
+    511        ffffff8000000000-ffffffffffffffff   USED
+
+Windows XP x64 uses 9 of 256 kernel slots -- 4.5 TB of 128 TB, 3.5% -- and every
+one is at slot 493 or above. Three are identifiable from our own measurements
+rather than guesswork: the positive control at fffff78000000000 (PTE 0x41163)
+and the three-level descent at fffff80000000000 (PML4 0x124063) both fall in
+493-496; and our own driver allocation at 0xfffffadf9... is inside slot 501,
+confirming that range as nonpaged pool / PFN database. 498-499 matches the
+documented session-space base.
+
+Every region Linux uses falls inside the free 118 TB block: direct map slot 273,
+vmalloc 402, our window 467, vmemmap 468, KASAN 472, cpu_entry_area 508. Not one
+collision. The two systems settled opposite ends of the space and never met.
+
+Linux's kernel text at ffffffff80000000 is in slot 511, which Windows does use,
+but that is not a conflict: the guest has its own CR3 and page tables, so guest
+kernel text and Windows' slot 511 never coexist in one address space. The only
+range that must be free on both sides is the passage page window.
+
+Consequence: host address space is not a constraint on this port. The 3 GB
+provisional CO_LOWMEMORY_MAX_MB is a 32-bit habit, not a limit — guest RAM will
+be bounded by physical memory and the guest's own layout, and there is room for
+many guests each in their own 512 GB slot.
 
 4.6 Things to delete rather than port
 
@@ -461,6 +562,34 @@ M3. The switch, tested against a trivial guest.
     to boot.
     Exit criterion: host to dummy-guest round trip on XP x64, repeatedly,
     without bugchecking, with all host state verifiably intact.
+    MET on the M92p (2026-07-31): --test-switch, --test-roundtrip and
+    --test-fault all pass repeatedly, the last one catching a deliberate #UD
+    raised in the guest and returning through the guest's own IDT.
+
+    Three bugs cost a machine reset each, and all three are the same bug wearing
+    different hats: a descriptor table is only usable if it is MAPPED in the
+    address space current when the CPU reads it, and identical CONTENTS are not
+    mapping.
+
+      - lretq reads the GDT. Fixed by giving the guest its own GDT inside the
+        passage page, sgdt on the way out and lgdt after the CR3 write.
+      - Any exception reads the IDT, and reads it at the linear address in IDTR.
+        The guest ran with the host's IDTR, so raising #UD faulted while fetching
+        the gate, and the #PF handler was unreachable for the same reason:
+        double, triple, reset. Fixed with sidt/lidt alongside sgdt/lgdt.
+        Note what hid this: a round trip passes without it, because interrupts
+        are off across the switch and nothing faults, so IDTR is never consulted.
+        The IDT is only load-bearing on the path that the round trip does not
+        take -- which is precisely why the fault test had to exist.
+      - The guest IDT was placed at pp + CO_ARCH_PAGE_SIZE, which the header
+        asserts is guest_temp.pml4, so building it overwrote the guest's
+        top-level page table after it had been filled in. Fixed by putting it in
+        host_temp, named as a member rather than reached by arithmetic.
+
+    Generalising: anything the CPU dereferences implicitly -- GDT, IDT, TSS, the
+    page tables themselves, and the stack -- has to be mapped on both sides
+    before control crosses. A test that does not provoke the dereference will not
+    tell you whether it is.
 
 M4. A 64-bit Linux guest.
     Port the cooperative patch's arch half: the address-space window, 4-level
@@ -472,27 +601,80 @@ M5. Devices: conet, cofs, scsi, the consoles.
 
 M6. Forward-port the guest to a current kernel.
 
-On M4 there is a real choice: port 2.6.33 to x86-64 first, or go straight to a
-modern kernel. OPEN, deliberately deferred until the switch works.
+On M4 there was a real choice: port 2.6.33 to x86-64 first, or go straight to a
+modern kernel. SETTLED 2026-07-31: go straight to a modern kernel, currently
+7.1.5. Read 2.6.33's arch half as a specification; do not build it.
 
-The case for 2.6.33 first was that its cooperative patch is a known-good
-reference for everything that is not architecture-specific. Measuring the patch
-weakens that considerably: 22,809 added lines across 31 patches, the base patch
-alone touching 67 files, and seven mentions of x86_64 in the whole thing. What it
-patches is entry_32.S, head_32.S, init_32.c, pgtable-2level.h, pgtable_32.h,
-io_32.h -- the interrupt entry stubs, early boot, and two-level paging, which
-does not exist in long mode. Nearly all of the work is exactly the part with no
-x86-64 counterpart, so the reference buys less than claimed, and taking that road
-means doing the hard half twice.
+An earlier version of this section argued the same conclusion from bad
+reasoning, and the bad reasoning is worth recording so it is not repeated. It
+said the 2.6.33 reference "buys less than claimed" because the patch touches
+entry_32.S, head_32.S, init_32.c and pgtable-2level.h -- files with no long-mode
+counterpart. That counts which files are touched, not how much is in them.
+Measured:
 
-Against that, a modern kernel brings KASLR, KPTI, eager FPU and a rewritten early
-boot. But it is the target actually wanted, it builds with the toolchain already
-in use, and it sidesteps the __GXX_ABI_VERSION mismatch entirely.
+    entry_32.S          7 added lines
+    head_32.S          10
+    init_32.c          75
+    pgtable-2level.h    2
 
-Either road needs the world switch working first, so this does not block M3.
+The 32-bit-only files everyone points at are almost empty. coLinux does not
+rewrite the interrupt entry path, it hooks it.
 
-Superseded recommendation, kept because the reasoning is still worth weighing:
-2.6.33 first.
+The honest measurement of the whole series is:
+
+    total added                            22607
+      unionfs   (optional, unrelated)      10813   47.8%
+      cloop     (optional, unrelated)       1068    4.7%
+      arch/x86  (2.6.33 paths)              2060    9.1%
+        of which cooperative.h (ported)      651
+        of which .S assembly hooks            18
+        => arch C to write for x86-64       1391
+      everything else: the device half and core, both arch-neutral
+
+Nearly half the headline figure is unionfs, a third-party filesystem unrelated
+to coLinux. The genuinely architecture-specific work is about 1,400 lines of C.
+
+The real argument for going modern is the hook surface, verified against
+pristine kernel.org 7.1.5 (sha256 matched):
+
+  - pv_ops is healthy. XEN_PV is `default y` with no deprecation anywhere, and
+    the hooks are wired rather than merely declared -- paravirt.h routes
+    cpu.load_gdt, cpu.load_idt, cpu.write_idt_entry, mmu.set_pte and mmu.set_pgd
+    through PVOP_VCALL, and desc.h switches load_idt/load_gdt/load_TR_desc onto
+    the paravirt path. Note 53 of the 61 hooks require PARAVIRT_XXL, a hidden
+    bool that must be `select`ed the way XEN_PV does; only 8 (safe_halt, halt,
+    the flush_tlb_* group, exit_mmap, notify_page_enc_status_changed) are
+    available under plain CONFIG_PARAVIRT.
+  - x86_init exposes 60 function pointers across 16 structs and is __initdata,
+    so genuinely writable during early boot. In 2.6.33 this had just been
+    introduced and was thin, which is *why* the old port hacks i8259 and setup.c
+    directly. Several 2.6.33 patterns are anti-patterns against a modern tree.
+  - objtool is not an obstacle: OBJECT_FILES_NON_STANDARD_<file>.o := y opts a
+    file out entirely (scripts/Makefile.build), and it still has in-tree users.
+  - FRED is irrelevant on the target hardware. It has three independent off
+    switches -- CONFIG_X86_FRED=n, the cpu_feature_enabled(X86_FEATURE_FRED)
+    runtime gate, and a fred=off command line option -- and Ivy Bridge has no
+    FRED, so the legacy IDT path (idt_setup_early_traps, idt_setup_traps,
+    idt_setup_apic_and_irq_gates) is taken regardless.
+  - The boot protocol is soft. x86_64_start_kernel(char *) is plain C taking a
+    pointer; copy_bootdata is a memcpy plus a command-line deref; and the memory
+    map arrives through x86_init.resources.memory_setup(), a supported override
+    rather than faked BIOS e820.
+
+Against modern: no worked example of where to intervene in boot, and a larger
+config surface. The config requirements are listed in section 4.1.
+
+One correction to an earlier claim in this document: the entry path is NOT "all
+C now". arch/x86/entry/entry_64.S is 1,570 lines (~486 real instructions after
+comments and annotations) and arch/x86/entry/common.c is only 61. What is C is
+the dispatch layer -- do_syscall_64 in arch/x86/entry/syscall_64.c,
+irqentry_enter/exit in kernel/entry/common.c. Register save/restore and the
+macro-generated IDT stubs remain assembly.
+
+The known-good-baseline argument for 2.6.33 does not survive inspection either:
+2.6.33-cooperative on x86-64 does not exist, so it would be new unproven code
+too. Where a live reference is genuinely needed, run stock i386 coLinux in a
+32-bit VM and compare against that instead.
 
 
 6. Toolchain
