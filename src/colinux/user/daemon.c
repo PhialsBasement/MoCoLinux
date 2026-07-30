@@ -110,7 +110,15 @@ co_rc_t co_daemon_parse_args(co_command_line_params_t cmdline, co_start_paramete
 	bool_t       verbose_specified   = PFALSE;
 	unsigned int verbose_level       = 0;
 
-	co_snprintf(start_parameters->console, sizeof(start_parameters->console), "fltk");
+	/*
+	 * Default to whichever console was actually built. The FLTK console needs
+	 * FLTK supplied by hand, and defaulting to a binary that is not there means
+	 * a plain "colinux-daemon @foo.conf" dies at "error launching console".
+	 * The build defines CO_DEFAULT_CONSOLE_FLTK when COLINUX_ENABLE_FLTK=yes,
+	 * so this follows the build rather than needing to be flipped by hand.
+	 */
+	co_snprintf(start_parameters->console, sizeof(start_parameters->console),
+		    CO_DEFAULT_CONSOLE);
 
 	/* Parse arguments specific for command line only */
 

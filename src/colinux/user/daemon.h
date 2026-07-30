@@ -19,6 +19,18 @@
 #include "monitor.h"
 #include "cmdline.h"
 
+/*
+ * Console launched when "-t" is not given. Follows what the build produced:
+ * colinux-console-fltk.exe is only built when FLTK has been supplied, and the
+ * NT console has no external dependency. Override with -t, or suppress the
+ * console entirely with -d.
+ */
+#ifdef CO_DEFAULT_CONSOLE_FLTK
+#define CO_DEFAULT_CONSOLE "fltk"
+#else
+#define CO_DEFAULT_CONSOLE "nt"
+#endif
+
 typedef struct co_daemon_start_parameters {
 	co_pathname_t config_path;
 	bool_t launch_console;

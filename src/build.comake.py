@@ -138,6 +138,11 @@ compiler_defines = dict(
     COLINUX_HOST_OS=settings.host_os,
 )
 
+# Lets the daemon default to a console that was actually built. See
+# CO_DEFAULT_CONSOLE in colinux/user/daemon.h.
+if os.getenv('COLINUX_ENABLE_FLTK') == 'yes':
+    compiler_defines['CO_DEFAULT_CONSOLE_FLTK'] = None
+
 if settings.host_os == 'winnt':
     # The i686-pc-mingw32- prefix predates mingw-w64 and no longer exists in
     # any current toolchain; mingw-w64 uses the *-w64-mingw32- triplets.
