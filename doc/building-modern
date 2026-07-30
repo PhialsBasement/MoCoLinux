@@ -56,7 +56,7 @@ All 29 patches apply cleanly. Confirm the shared ABI header landed:
 -----------
 
 ./configure refuses to write bin/user-build.cfg unless it finds a guest
-compiler whose version matches the host compiler's (see section 5), so drive
+compiler whose version matches the host compiler's (see section 6), so drive
 comake directly:
 
     cd src
@@ -91,45 +91,73 @@ Environment variables that matter:
     COLINUX_ENABLE_WX=yes       Build colinux-console-wx.exe. Needs wxWidgets.
     COLINUX_ENABLE_WINPCAP=yes  Build colinux-bridged-net-daemon.exe. Needs the
                                 WinPcap developer pack for pcap.h.
-    COLINUX_ENABLE_NDIS=yes     Build the real conet.c instead of conet-stub.c.
-                                Does not currently compile; see section 4.
 
 Sanity check on the driver:
 
     i686-w64-mingw32-objdump -p linux.sys | grep 'DLL Name'
 
-It should import only ntoskrnl.exe and HAL.dll.
+It should import ntoskrnl.exe, HAL.dll and NDIS.SYS, and nothing else.
 
 
-4. What is not built, and why
------------------------------
+4. The broken ndis.h, and how it is worked around
+-------------------------------------------------
 
-colinux-console-fltk.exe, colinux-console-wx.exe and
-colinux-bridged-net-daemon.exe each need an external library that has to be
-built by hand. They are opt-in. colinux-console-nt.exe needs nothing external
-and is sufficient for development.
-
-conet.c, the in-driver NDIS protocol binding behind the "ndis-bridge" network
-type, cannot be compiled at all right now. mingw-w64's ddk/ndis.h is broken:
+The whole driver builds, conet.c included, so linux.sys carries the NDIS protocol
+binding behind the "ndis-bridge" network type and imports NDIS.SYS. Getting there
+needs a workaround, because as of mingw-w64 16.1 ddk/ndis.h does not compile:
 
     NdisMWanIndicateReceiveComplete(
             IN NDIS_HANDLE  MiniportAdapterHandle     <- missing comma
             IN NDIS_HANDLE  NdisLinkContext);
 
-The declaration is in the body of the header rather than behind an optional
-guard, so no NDIS driver can include it. conet-stub.c stands in and reports the
-ndis-bridge path as unavailable. Guest networking over slirp or TAP goes through
-userspace daemons and is unaffected.
+The declaration is in the body of the header, not behind an optional guard, so
+no NDIS driver can include ndis.h at all. This is an upstream bug and is worth
+reporting.
 
-Worth reporting upstream. Fixing it locally would mean vendoring a corrected
-copy of ndis.h ahead of the system one on the driver's include path.
+make_ndis_compat_include() in src/build.comake.py derives a corrected copy from
+whatever ndis.h is installed, writes it to
+src/colinux/os/winnt/kernel/ndis-compat/ddk/ndis.h, and prepends that directory
+to the driver's include path. It reports what it did:
+
+    Repaired 1 missing comma(s) in a local copy of .../ddk/ndis.h
+
+Deriving the copy at build time rather than vendoring a snapshot of a 12,000-line
+header means it tracks whatever the distribution ships. If the bug is fixed
+upstream, zero commas are inserted, nothing is generated, and the system header
+is used directly -- so the workaround retires itself.
+
+The generated directory is gitignored. `make clean` does not remove it; delete
+src/colinux/os/winnt/kernel/ndis-compat by hand if you want to force it to be
+regenerated.
+
+conet.c also used to carry local reimplementations of NdisInitializeEvent,
+NdisWaitEvent, NdisSetEvent and NdisResetEvent, added because the w32api NDIS
+headers of the time did not declare them. mingw-w64 declares all four and libndis
+exports them, so those were removed in favour of the real ones. Both
+NdisWaitEvent call sites pass MsToWait = 0, which the real function treats as an
+indefinite wait, matching the behaviour of the code that was removed.
+
+
+5. What is genuinely not built
+------------------------------
+
+colinux-console-fltk.exe, colinux-console-wx.exe and
+colinux-bridged-net-daemon.exe each need a third-party library that is not
+present and has to be built by hand: a patched FLTK 1.1.10, wxWidgets, and the
+WinPcap developer pack respectively. All three are opt-in, as the wx console
+already was upstream. No coLinux code was changed for this and nothing is
+stubbed -- supply the library, set the flag, and they build.
+
+Upstream's `make download` fetches and builds FLTK and WinPcap. Wiring that back
+up is unfinished work, not a design decision. colinux-console-nt.exe needs
+nothing external and is sufficient for development in the meantime.
 
 The tap-win32 driver is a separate driver and is not part of this build. It uses
 the Rtl string helpers from ddk/ntstrsafe.h and will need that include added
 locally when it is built, since ddk.h deliberately does not provide it.
 
 
-5. The compiler-version check, and the guest kernel
+6. The compiler-version check, and the guest kernel
 ---------------------------------------------------
 
 A built vmlinux is not needed to build the Windows side, and none is built here.
@@ -153,7 +181,7 @@ types -- which is milestone M1 in doc/porting-x86_64. Relaxing it is the
 intended way out, not building an entire 2011 toolchain.
 
 
-6. Remaining warnings
+7. Remaining warnings
 ---------------------
 
 The build is clean but not silent. By volume:
