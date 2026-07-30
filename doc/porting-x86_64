@@ -350,15 +350,38 @@ M0. Build the 32-bit tree on a current host.  DONE for the Windows side.
     which makes that check unnecessary, rather than reconstructing a 2011
     toolchain.
 
-    Cheaper substitute for a behavioural reference: install the official
-    prebuilt 0.7.9 binaries on 32-bit XP. That establishes what correct
-    behaviour looks like on the target hardware at zero build cost.
+    Note the 32-bit build is not runnable on the XP x64 target at all: a
+    kernel-mode driver must match the kernel's architecture, so XP x64 will not
+    load a 32-bit linux.sys. WOW64 would run the 32-bit daemons, but the driver
+    is the part that matters. The first artifact testable on that hardware is
+    the 64-bit driver of M2.
 
-M1. Make the ABI mechanical, still 32-bit.
-    Generate the CO_ARCH_STATE_STACK_* offsets from offsetof() instead of
-    hand-written hex strings; convert the shared structs to fixed-width types.
-    Exit criterion: the 32-bit build still works, bit-for-bit equivalent
-    behaviour. This is the change that makes everything after it safe.
+    A behavioural reference therefore means a separate 32-bit environment. The
+    decision taken is not to install 32-bit XP on the M92p, and instead to stand
+    up a VM with the official prebuilt 0.7.9 binaries if and when something looks
+    suspicious. Worth validating that coLinux runs stably in that VM before
+    relying on it -- coLinux seizes CR3 and swaps the descriptor tables, its own
+    CR4.VMXE guard does not fire inside a guest, and an unvalidated reference is
+    worse than none because its quirks get blamed on the port.
+
+M1. Make the ABI mechanical, still 32-bit.  DONE.
+    All 31 CO_ARCH_STATE_STACK_* / CO_ARCH_STATE_SYSENTER_* offsets now have a
+    single numeric definition, stringified for the assembly, and an assertion
+    against __builtin_offsetof. patch/abi-offsets-asserted.diff.
+
+    Note the offsets cannot simply be replaced by offsetof(): the passage code
+    is a file-scope asm() blob built by string concatenation and top-level asm
+    takes no C operands, so they have to remain preprocessor strings. Asserting
+    them is the available win, and it is the important one -- a field widened
+    without its offset updated is now a compile error instead of the switch
+    silently reading the wrong words of the other side's saved state.
+
+    Deliberately not done here: widening the 44 unsigned long fields to explicit
+    fixed-width types. On i386 that is a no-op, so it buys nothing on its own,
+    and it drags in knock-on work (the %08lx formats in
+    co_passage_page_dump_state, narrowing at the assignment sites). It belongs
+    with the x86-64 struct definition in M2, where the assertions added here are
+    what make it safe -- every offset missed becomes a build failure.
 
 M2. 64-bit host scaffolding that compiles and loads.
     Add src/colinux/arch/x86_64 (the arch/current symlink mechanism in
