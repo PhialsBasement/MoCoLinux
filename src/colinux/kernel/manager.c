@@ -460,6 +460,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_TEST_ROUNDTRIP:
 	case CO_MANAGER_IOCTL_TEST_SWITCH: {
 		co_manager_ioctl_test_switch_t* params;
 		co_arch_switch_test_t result;
@@ -478,7 +479,10 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			return CO_RC(OK);
 		}
 
-		trc = co_arch_test_switch(manager, &result);
+		if (ioctl == CO_MANAGER_IOCTL_TEST_ROUNDTRIP)
+			trc = co_arch_test_roundtrip(manager, &result);
+		else
+			trc = co_arch_test_switch(manager, &result);
 
 		params->rc         = trc;
 		params->supported  = result.supported;
@@ -490,6 +494,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->guest_cr3  = result.guest_cr3;
 		params->expected   = result.expected;
 		params->observed   = result.observed;
+		params->guest_gdt  = result.guest_gdt;
 		params->code_size  = result.code_size;
 
 		*return_size = sizeof(*params);

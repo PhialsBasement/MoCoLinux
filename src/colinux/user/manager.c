@@ -110,11 +110,14 @@ co_rc_t co_manager_save_state(co_manager_handle_t handle,
 }
 
 co_rc_t co_manager_test_switch(co_manager_handle_t handle,
-			       co_manager_ioctl_test_switch_t* out)
+			       co_manager_ioctl_test_switch_t* out,
+			       bool_t roundtrip)
 {
 	unsigned long returned = 0;
 
-	return co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_TEST_SWITCH,
+	return co_os_manager_ioctl(handle,
+				   roundtrip ? CO_MANAGER_IOCTL_TEST_ROUNDTRIP
+					     : CO_MANAGER_IOCTL_TEST_SWITCH,
 				   out, sizeof(*out), out, sizeof(*out), &returned);
 }
 

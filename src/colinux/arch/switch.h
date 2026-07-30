@@ -25,9 +25,13 @@ typedef struct {
 	unsigned long long guest_cr3;
 	unsigned long long expected;
 	unsigned long long observed;
+	unsigned long long guest_gdt;
 	unsigned long	   code_size;
 } co_arch_switch_test_t;
 
 extern co_rc_t co_arch_test_switch(co_manager_t* manager, co_arch_switch_test_t* out);
+
+/* Enter the guest address space, run code there, and come back. */
+extern co_rc_t co_arch_test_roundtrip(co_manager_t* manager, co_arch_switch_test_t* out);
 
 #endif

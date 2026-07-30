@@ -480,7 +480,7 @@ co_rc_t co_winnt_save_state(bool_t restore)
  * Change CR3 into a minimal guest address space and come back. See
  * CO_MANAGER_IOCTL_TEST_SWITCH.
  */
-co_rc_t co_winnt_test_switch(void)
+co_rc_t co_winnt_test_switch(bool_t roundtrip)
 {
 	co_rc_t rc;
 	bool_t installed = PFALSE;
@@ -501,11 +501,16 @@ co_rc_t co_winnt_test_switch(void)
 		return CO_RC(ERROR_MONITOR_NOT_LOADED);
 	}
 
-	co_terminal_print("switching CR3 into an address space that maps one page,\n");
-	co_terminal_print("storing a sentinel from code executing there, switching back\n");
+	if (roundtrip) {
+		co_terminal_print("entering the guest address space by far return, running\n");
+		co_terminal_print("code there, and coming back the same way\n");
+	} else {
+		co_terminal_print("switching CR3 into an address space that maps one page,\n");
+		co_terminal_print("storing a sentinel from code executing there, switching back\n");
+	}
 	co_terminal_print("\n");
 
-	rc = co_manager_test_switch(handle, &r);
+	rc = co_manager_test_switch(handle, &r, roundtrip);
 	co_os_manager_close(handle);
 
 	if (!CO_OK(rc)) {
@@ -527,15 +532,23 @@ co_rc_t co_winnt_test_switch(void)
 			  r.code_va, r.code_size);
 	co_terminal_print("  host  cr3       0x%016llx\n", r.host_cr3);
 	co_terminal_print("  guest cr3       0x%016llx\n", r.guest_cr3);
+	if (r.guest_gdt)
+		co_terminal_print("  guest gdt       0x%016llx  (in the passage page)\n", r.guest_gdt);
 	co_terminal_print("\n");
 	co_terminal_print("  sentinel expected 0x%016llx\n", r.expected);
 	co_terminal_print("  sentinel observed 0x%016llx\n", r.observed);
 	co_terminal_print("\n");
 
 	if (r.succeeded) {
-		co_terminal_print("  SWITCHED. Execution continued across the CR3 write and the\n");
-		co_terminal_print("  store landed, so the passage page is reachable at the same\n");
-		co_terminal_print("  address in both address spaces.\n");
+		if (roundtrip) {
+			co_terminal_print("  ROUND TRIP COMPLETE. Control crossed into the guest address\n");
+			co_terminal_print("  space by far return, ran there, and came back -- so CS was\n");
+			co_terminal_print("  reloaded correctly in both directions.\n");
+		} else {
+			co_terminal_print("  SWITCHED. Execution continued across the CR3 write and the\n");
+			co_terminal_print("  store landed, so the passage page is reachable at the same\n");
+			co_terminal_print("  address in both address spaces.\n");
+		}
 	} else {
 		co_terminal_print("  returned, but the sentinel is wrong -- the store did not land\n");
 	}

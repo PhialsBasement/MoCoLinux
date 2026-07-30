@@ -20,3 +20,10 @@ co_rc_t co_arch_test_switch(co_manager_t* manager, co_arch_switch_test_t* out)
 	out->supported = PFALSE;
 	return CO_RC(OK);
 }
+
+co_rc_t co_arch_test_roundtrip(co_manager_t* manager, co_arch_switch_test_t* out)
+{
+	co_memset(out, 0, sizeof(*out));
+	out->supported = PFALSE;
+	return CO_RC(OK);
+}
