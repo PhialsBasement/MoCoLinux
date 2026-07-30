@@ -12,6 +12,7 @@
  *
  */
 
+#include <stdio.h>
 #include <windows.h>
 #include <shlwapi.h>
 
@@ -174,6 +175,87 @@ co_rc_t co_winnt_status_driver(int verbose)
 	co_os_manager_close(handle);
 
 	return rc;
+}
+
+/*
+ * Ask the driver what the host has mapped at a virtual address.
+ *
+ * An x86-64 porting aid. The passage page has to be reachable from both address
+ * spaces; if the guest's window is also unused by the host, it can sit at the
+ * same virtual address in both, which makes other_map zero and means the switch
+ * never relocates its own instruction pointer. See doc/porting-x86_64 4.1.
+ */
+co_rc_t co_winnt_probe_va(const char* arg)
+{
+	co_rc_t rc;
+	bool_t installed = PFALSE;
+	co_manager_handle_t handle;
+	co_manager_ioctl_probe_va_t probe = {0, };
+	unsigned long long va = CO_VPTR_BASE;
+	int level;
+	static const char* level_name[CO_PROBE_VA_LEVELS] = {
+		"PML4", "PDPT", "PD  ", "PT  "
+	};
+
+	if (arg && arg[0]) {
+		if (sscanf(arg, "%llx", &va) != 1 &&
+		    sscanf(arg, "0x%llx", &va) != 1) {
+			co_terminal_print("probe: cannot parse address '%s'\n", arg);
+			return CO_RC(INVALID_PARAMETER);
+		}
+	}
+
+	rc = co_win32_manager_is_installed(&installed);
+	if (!CO_OK(rc))
+		return rc;
+
+	if (!installed) {
+		co_terminal_print("driver not installed\n");
+		return CO_RC(ERROR_ACCESSING_DRIVER);
+	}
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		co_terminal_print("couldn't get driver handle\n");
+		return CO_RC(ERROR_MONITOR_NOT_LOADED);
+	}
+
+	probe.va = va;
+	rc = co_manager_probe_va(handle, &probe);
+	co_os_manager_close(handle);
+
+	if (!CO_OK(rc)) {
+		co_terminal_print("probe: ioctl failed (rc %x)\n", (int)rc);
+		return rc;
+	}
+
+	if (!probe.supported) {
+		co_terminal_print("probe: not implemented for this architecture\n");
+		return CO_RC(OK);
+	}
+
+	if (!CO_OK(probe.rc)) {
+		co_terminal_print("probe: driver reported failure (rc %x)\n", (int)probe.rc);
+		return probe.rc;
+	}
+
+	co_terminal_print("probing host mapping of 0x%016llx\n", va);
+	co_terminal_print("  host cr3: 0x%016llx\n", probe.cr3);
+
+	for (level = 0; level < probe.levels_walked; level++)
+		co_terminal_print("  %s entry: 0x%016llx%s\n",
+				  level_name[level], probe.entry[level],
+				  (probe.entry[level] & 1) ? "" : "   (not present)");
+
+	if (probe.present)
+		co_terminal_print("  RESULT: mapped%s -- the host is using this range\n",
+				  probe.large_page ? " (large page)" : "");
+	else
+		co_terminal_print("  RESULT: not mapped at the %s level -- free as far as the host\n"
+				  "          is concerned, so the same-address trick is available\n",
+				  level_name[probe.levels_walked - 1]);
+
+	return CO_RC(OK);
 }
 
 static co_rc_t co_winnt_install_driver_lowlevel(IN SC_HANDLE SchSCManager, IN LPCTSTR  DriverName, IN LPCTSTR ServiceExe)

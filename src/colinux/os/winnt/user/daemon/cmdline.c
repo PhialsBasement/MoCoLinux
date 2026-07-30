@@ -29,6 +29,9 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("      --install-driver             Install the colinux-driver (linux.sys)\n");
 	co_terminal_print("      --remove-driver              Uninstall (remove) the colinux-driver (linux.sys)\n");
 	co_terminal_print("      --status-driver              Show status about the installed/running\n");
+	co_terminal_print("      --probe-va[=ADDR]            Report what the host has mapped at a\n");
+	co_terminal_print("                                   virtual address. x86-64 porting aid;\n");
+	co_terminal_print("                                   defaults to the guest window base.\n");
 	co_terminal_print("                                   driver\n");
 }
 
@@ -93,6 +96,15 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		cmdline,
 		"--status-driver",
 		&winnt_parameters->status_driver);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--probe-va",
+		&winnt_parameters->probe_va,
+		winnt_parameters->probe_va_arg,
+		sizeof(winnt_parameters->probe_va_arg));
 
 	if (!CO_OK(rc))
 		return rc;

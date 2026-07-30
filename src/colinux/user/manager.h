@@ -31,6 +31,9 @@ extern co_rc_t co_manager_status(co_manager_handle_t handle,
 extern co_rc_t co_manager_info(co_manager_handle_t handle,
 				 co_manager_ioctl_info_t *status);
 
+extern co_rc_t co_manager_probe_va(co_manager_handle_t handle,
+				   co_manager_ioctl_probe_va_t* probe);
+
 extern void co_manager_debug(co_manager_handle_t handle,
 			     const char *buf, long size);
 
