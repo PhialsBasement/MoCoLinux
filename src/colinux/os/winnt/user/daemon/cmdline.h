@@ -25,6 +25,7 @@ typedef struct co_winnt_parameters {
 	bool_t save_state;
 	bool_t restore_state;
 	bool_t test_switch;
+	bool_t test_roundtrip;
 	char   probe_va_arg[64];
 	bool_t show_status;
 	bool_t remove_driver;

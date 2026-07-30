@@ -32,6 +32,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_PROBE_PASSAGE,
 	CO_MANAGER_IOCTL_SAVE_STATE,
 	CO_MANAGER_IOCTL_TEST_SWITCH,
+	CO_MANAGER_IOCTL_TEST_ROUNDTRIP,
 } co_manager_ioctl_t;
 
 /*
@@ -228,6 +229,7 @@ typedef struct {
 	unsigned long long guest_cr3;
 	unsigned long long expected;
 	unsigned long long observed;
+	unsigned long long guest_gdt;
 	unsigned long	   code_size;
 } co_manager_ioctl_test_switch_t;
 

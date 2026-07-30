@@ -17,7 +17,7 @@ extern co_rc_t co_winnt_status_driver(int verbose);
 extern co_rc_t co_winnt_probe_va(const char* arg);
 extern co_rc_t co_winnt_probe_passage(void);
 extern co_rc_t co_winnt_save_state(bool_t restore);
-extern co_rc_t co_winnt_test_switch(void);
+extern co_rc_t co_winnt_test_switch(bool_t roundtrip);
 
 extern co_rc_t co_winnt_install_driver(void);
 extern co_rc_t co_winnt_initialize_driver(void);
