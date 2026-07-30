@@ -28,15 +28,14 @@ class Empty(Tool):
 
 class MakefileKbuild(Tool):
     def _content(self, target):
-        from StringIO import StringIO
+        from io import StringIO
         import os
         from comake.defaults import file_id_allocator
         global colinux_file_id
 
         parameters = [os.path.dirname(target.pathname)]
         compiler_defines = target.options.get('compiler_defines', {})
-        defines = compiler_defines.items()
-        defines.sort()
+        defines = sorted(compiler_defines.items())
         for key, value in defines:
             if key == 'COLINUX_FILE_ID':
                 continue
@@ -49,8 +48,8 @@ class MakefileKbuild(Tool):
         libm = target.get_ext()[1:]
 
         output_file = StringIO()
-        print >>output_file, "include $(KBUILD_EXTMOD)/Makefile.include"
-        print >>output_file, "EXTRA_CFLAGS += -I$(COLINUX_BASE)/%s" % ' '.join(parameters)
+        print("include $(KBUILD_EXTMOD)/Makefile.include", file=output_file)
+        print("EXTRA_CFLAGS += -I$(COLINUX_BASE)/%s" % ' '.join(parameters), file=output_file)
 
         for names in target.inputs:
             name = os.path.basename(names.pathname)
@@ -59,17 +58,17 @@ class MakefileKbuild(Tool):
                 colinux_file_id = file_id_allocator.allocate(full_name)
 
                 oname = os.path.splitext(name)[0]+'.o'
-                print >>output_file, "%s += %s" % (libm, oname)
-                print >>output_file, "CFLAGS_%s = -DCOLINUX_FILE_ID=%d" % (oname, colinux_file_id)
+                print("%s += %s" % (libm, oname), file=output_file)
+                print("CFLAGS_%s = -DCOLINUX_FILE_ID=%d" % (oname, colinux_file_id), file=output_file)
 
         return output_file.getvalue()
 
     def make(self, target, reporter):
-        output_file = open(target.pathname, 'wb')
-        output_file.write(self._content(target))
+        with open(target.pathname, 'w') as output_file:
+            output_file.write(self._content(target))
 
     def rebuild_needed(self, target):
-        return open(target.pathname, 'rb').read() != self._content(target)
+        return open(target.pathname, 'r').read() != self._content(target)
 
 
 class Copy(Tool):
@@ -154,8 +153,7 @@ class Compiler(Executer):
             compiler_optimization = tool_run_inf.options.get('compiler_optimization', "-O2")
             parameters += [compiler_optimization]
             compiler_defines = tool_run_inf.options.get('compiler_defines', {})
-            defines = compiler_defines.items()
-            defines.sort()
+            defines = sorted(compiler_defines.items())
             for key, value in defines:
                 if value is not None:
                     parameters.append('-D%s=%s' % (key, value))

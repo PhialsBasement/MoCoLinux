@@ -32,8 +32,8 @@ file_id_allocator = FileIDAllocator()
 class DefaultObj(DefaultTarget):
     def format(self, mregex, pathname):
         global colinux_file_id
-        from target import RawTarget, RawInput, RawOptions
-        from tools import Compiler
+        from comake.target import RawTarget, RawInput, RawOptions
+        from comake.tools import Compiler
         base_dep_name = None
 
         full_name = mregex.groups(0)[0] + '.c'
@@ -49,7 +49,7 @@ class DefaultObj(DefaultTarget):
 
         inputs = [RawInput(base_dep_name)]
 
-        from cdeps import calc_deps
+        from comake.cdeps import calc_deps
         inputs.extend(calc_deps(full_name))
 
         colinux_file_id = file_id_allocator.allocate(full_name)
@@ -77,10 +77,10 @@ def get_default_tool(target):
             if tinput.get_ext() != '.o':
                 break
         else:
-            from tools import Linker
+            from comake.tools import Linker
             return Linker()
 
     if target.get_ext() == '.a':
-        from tools import Archiver
+        from comake.tools import Archiver
         return Archiver()
 
