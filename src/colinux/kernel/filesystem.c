@@ -292,7 +292,7 @@ static co_rc_t inode_dir_read(co_monitor_t *cmon,
 			      co_inode_t *inode,
 			      vm_ptr_t buff,
 			      unsigned long size,
-			      unsigned long *fill_size,
+			      co_param_t *fill_size,
 			      unsigned long file_pos)
 {
 	co_filesystem_name_t *name;
@@ -516,7 +516,7 @@ static co_rc_t fs_stat(co_filesystem_t *filesystem, struct fuse_statfs_out *stat
 }
 
 void co_monitor_file_system(co_monitor_t *cmon, unsigned int unit,
-			    enum fuse_opcode opcode, unsigned long *params)
+			    enum fuse_opcode opcode, co_param_t *params)
 {
 	int ino = -1;
 	co_filesystem_t *filesystem;

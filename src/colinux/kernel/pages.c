@@ -404,7 +404,7 @@ co_rc_t co_monitor_free_and_unmap_page(
 	vm_ptr_t address
 	)
 {
-	unsigned long physical_pfn = 0;
+	co_pfn_t physical_pfn = 0;
 	vm_ptr_t pte_address;
 	long virtual_pfn;
 	unsigned long current_pfn, pfn_group, pfn_index;

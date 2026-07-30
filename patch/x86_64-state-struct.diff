@@ -7,13 +7,37 @@
   Offsets are generated from the compiled layout rather than hand-counted, and
   all 40 are asserted, as are sizeof == 0x140 and 16-byte alignment.
 
+  Also adds co_param_t, the width of one passage-page parameter word, so that
+  shared code can name it instead of assuming unsigned long -- which is 4 bytes
+  on Win64 and truncates.
+
   The guest address window is provisional and unexercised; see the comment.
 
 Index: linux-2.6.33-source/arch/x86/include/asm/cooperative.h
 ===================================================================
 --- linux-2.6.33-source/arch/x86/include/asm/cooperative.h
 +++ linux-2.6.33-source/arch/x86/include/asm/cooperative.h
-@@ -45,6 +45,317 @@
+@@ -22,6 +22,19 @@
+ } __attribute__((packed)) x86_gdt_t;
+ 
+ /*
++ * Width of one passage-page parameter word.
++ *
++ * params[] is register-width, so it differs per architecture, and shared code
++ * has to name it rather than assume unsigned long -- which is 4 bytes on Win64
++ * and would silently truncate a pointer or offset passed through the page.
++ */
++#if defined(__x86_64__) || defined(CONFIG_X86_64)
++typedef unsigned long long co_param_t;
++#else
++typedef unsigned long co_param_t;
++#endif
++
++/*
+  * Offsets into co_arch_state_stack_t below are consumed by the passage assembly,
+  * which is a file-scope asm() blob built by string concatenation. Top-level asm
+  * takes no C operands, so there is no way to pass offsetof() in -- the offsets
+@@ -45,6 +58,317 @@
  		[(__builtin_offsetof(co_arch_state_stack_t, field)	\
  		  == (offset)) ? 1 : -1]
  
@@ -331,7 +355,7 @@ Index: linux-2.6.33-source/arch/x86/include/asm/cooperative.h
  typedef struct {
  	unsigned char border2[0x4];
  
-@@ -286,6 +597,8 @@
+@@ -286,6 +610,8 @@
  
  #define CO_LOWMEMORY_MAX_MB 984
  

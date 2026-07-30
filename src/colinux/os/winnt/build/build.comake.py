@@ -35,6 +35,16 @@ def generate_options(compiler_def_type, libs=None, lflags=None):
         libs = []
     if not lflags:
         lflags = []
+    # This file is exec'd with separate globals and locals, so the import at the
+    # top of it is not visible from inside a function body.
+    from comake.settings import settings
+
+    crt = ['msvcrt']
+    if settings.arch != 'x86_64':
+        # crtdll is the NT 3.x/4.0 C runtime. It predates Win64 entirely, so
+        # mingw-w64 ships libcrtdll.a for i686 only. msvcrt is the CRT either way.
+        crt.append('crtdll')
+
     return Options(
         overriders = dict(
             compiler_def_type = compiler_def_type,
@@ -45,8 +55,7 @@ def generate_options(compiler_def_type, libs=None, lflags=None):
         linker_flags = lflags,
         compiler_libs = libs + [
             'user32', 'gdi32', 'ws2_32', 'ntdll', 'kernel32', 'ole32', 'uuid', 'gdi32',
-            'msvcrt', 'crtdll', 'shlwapi',
-        ]),
+        ] + crt + ['shlwapi']),
     )
 
 def generate_wx_options():
@@ -169,7 +178,19 @@ targets['driver.o'] = Target(
 )
 
 def script_cmdline(scripter, tool_run_inf):
+    from comake.settings import settings
+
     inputs = tool_run_inf.target.get_actual_inputs()
+
+    # _DriverEntry@8 is the i386 stdcall decoration of DriverEntry. There is no
+    # stdcall name decoration in the Win64 ABI, so on x86-64 the symbol is plain
+    # DriverEntry -- get this wrong and the linker silently defaults the entry
+    # point to the start of the image, producing a driver that cannot load.
+    if settings.arch == 'x86_64':
+        entry = 'DriverEntry'
+    else:
+        entry = '_DriverEntry@8'
+
     command_line = ((
         "%s "
         "-Wl,--strip-debug "
@@ -177,11 +198,12 @@ def script_cmdline(scripter, tool_run_inf):
         "-Wl,--image-base,0x10000 "
         "-Wl,--file-alignment,0x1000 "
         "-Wl,--section-alignment,0x1000 "
-        "-Wl,--entry,_DriverEntry@8 "
+        "-Wl,--entry,%s "
         "-Wl,%s "
         "-mdll -nostartfiles -nostdlib "
         "-o %s %s -lndis -lntoskrnl -lhal -lgcc ") %
     (scripter.get_cross_build_tool('gcc', tool_run_inf),
+     entry,
      inputs[1].pathname,
      tool_run_inf.target.pathname,
      inputs[0].pathname))
@@ -229,16 +251,26 @@ targets['driver.base.exp'] = Target(
 )
 
 def script_cmdline(scripter, tool_run_inf):
+    from comake.settings import settings
+
     inputs = tool_run_inf.target.get_actual_inputs()
+
+    # Same entry-symbol reasoning as the linux.sys link above.
+    if settings.arch == 'x86_64':
+        entry = 'DriverEntry'
+    else:
+        entry = '_DriverEntry@8'
+
     command_line = ((
         "%s "
         "-Wl,--base-file,%s "
-        "-Wl,--entry,_DriverEntry@8 "
+        "-Wl,--entry,%s "
         "-nostartfiles -nostdlib "
         "-o junk.tmp %s -lndis -lntoskrnl -lhal -lgcc ; "
         "rm -f junk.tmp") %
     (scripter.get_cross_build_tool('gcc', tool_run_inf),
      tool_run_inf.target.pathname,
+     entry,
      inputs[0].pathname))
     return command_line
 
