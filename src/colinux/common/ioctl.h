@@ -28,6 +28,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_INFO,
 	CO_MANAGER_IOCTL_ATTACH,
 	CO_MANAGER_IOCTL_MONITOR_LIST,
+	CO_MANAGER_IOCTL_PROBE_VA,
 } co_manager_ioctl_t;
 
 /*
@@ -121,6 +122,32 @@ typedef struct {
 	bool_t            modify;
 } co_manager_ioctl_debug_levels_t;
 #endif
+
+/*
+ * interface for CO_MANAGER_IOCTL_PROBE_VA
+ *
+ * Walks the host's own page tables for one virtual address and reports what is
+ * mapped at each level. Used to answer a design question the x86-64 passage code
+ * hinges on: whether the address window the guest wants is free in the host's
+ * kernel address space too. If it is, the passage page can be mapped at the same
+ * virtual address on both sides, which makes other_map zero and removes the need
+ * for the passage code to relocate its own instruction pointer between mappings.
+ *
+ * Read-only. It maps each page-table page, reads one entry, and unmaps it.
+ */
+#define CO_PROBE_VA_LEVELS 4
+
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long va;		/* in:  address to walk		*/
+	unsigned long long cr3;		/* out: host CR3 at probe time	*/
+	unsigned long long entry[CO_PROBE_VA_LEVELS];	/* out: PML4,PDPT,PD,PT	*/
+	int		   levels_walked;	/* out: how far it got	*/
+	int		   present;	/* out: PTRUE if fully mapped	*/
+	int		   large_page;	/* out: stopped at a 2M/1G page	*/
+	int		   supported;	/* out: PFALSE on architectures
+					   without a 4-level walker	*/
+} co_manager_ioctl_probe_va_t;
 
 /* interface for CO_MANAGER_IOCTL_MONITOR_LIST: */
 typedef struct {

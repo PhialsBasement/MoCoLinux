@@ -69,6 +69,23 @@ co_rc_t co_manager_status(co_manager_handle_t handle, co_manager_ioctl_status_t*
 	return rc;
 }
 
+co_rc_t co_manager_probe_va(co_manager_handle_t handle,
+			    co_manager_ioctl_probe_va_t* probe)
+{
+	co_rc_t rc;
+	unsigned long returned = 0;
+
+	rc = co_os_manager_ioctl(handle,
+				 CO_MANAGER_IOCTL_PROBE_VA,
+				 probe,
+				 sizeof(*probe),
+				 probe,
+				 sizeof(*probe),
+				 &returned);
+
+	return rc;
+}
+
 co_rc_t co_manager_info(co_manager_handle_t handle, co_manager_ioctl_info_t* info)
 {
 	co_rc_t rc;

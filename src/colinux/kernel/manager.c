@@ -15,6 +15,7 @@
 #include <colinux/os/kernel/misc.h>
 #include <colinux/os/kernel/mutex.h>
 #include <colinux/arch/mmu.h>
+#include <colinux/arch/probe.h>
 
 #include "manager.h"
 #include "monitor.h"
@@ -335,6 +336,31 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			  compile_time,
 			  min(sizeof(params->compile_time) - 1,
 			      sizeof(compile_time)));
+
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_PROBE_VA: {
+		co_manager_ioctl_probe_va_t* params;
+
+		params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		/*
+		 * Needs the arch layer initialised, since the walk reads CR3 and maps
+		 * page frames through the manager.
+		 */
+		if (manager->state < CO_MANAGER_STATE_INITIALIZED) {
+			params->rc        = CO_RC(ERROR);
+			params->supported = PFALSE;
+			*return_size      = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		co_arch_probe_va(manager, params);
 
 		*return_size = sizeof(*params);
 		return CO_RC(OK);

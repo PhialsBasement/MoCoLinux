@@ -20,6 +20,8 @@ typedef struct co_winnt_parameters {
 	bool_t run_service;
 	bool_t install_driver;
 	bool_t status_driver;
+	bool_t probe_va;
+	char   probe_va_arg[64];
 	bool_t show_status;
 	bool_t remove_driver;
 	char service_name[128];
