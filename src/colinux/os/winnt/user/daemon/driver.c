@@ -180,12 +180,25 @@ static co_rc_t co_winnt_install_driver_lowlevel(IN SC_HANDLE SchSCManager, IN LP
 {
 	SC_HANDLE  schService;
 
+	/*
+	 * SERVICE_DEMAND_START, not SERVICE_AUTO_START.
+	 *
+	 * An auto-start kernel driver loads on every boot, so a driver that
+	 * bugchecks turns the machine into a boot loop: it dies during service
+	 * startup, every time, before a desktop exists to uninstall it from.
+	 * Recovering means Last Known Good, Safe Mode or a rescue disk.
+	 *
+	 * Nothing needs auto-start. co_winnt_load_driver_lowlevel_by_name() starts
+	 * the service explicitly right after creating it, and the daemon loads the
+	 * driver on demand, so demand-start behaves identically in use while
+	 * leaving a failed driver harmless across a reboot.
+	 */
 	schService = CreateService(SchSCManager,
 				   DriverName,
 				   DriverName,
 				   SERVICE_ALL_ACCESS,
 				   SERVICE_KERNEL_DRIVER,
-				   SERVICE_AUTO_START,
+				   SERVICE_DEMAND_START,
 				   SERVICE_ERROR_NORMAL,
 				   ServiceExe,
 				   NULL,
