@@ -936,3 +936,71 @@ static co_rc_t co_winnt_driver_install_lowlevel(void)
 {
 	return co_winnt_load_driver_lowlevel_by_name(CO_DRIVER_NAME, COLINUX_DRIVER_FILE);
 }
+
+/*
+ * Build a guest address space and verify it without ever entering it.
+ */
+co_rc_t co_winnt_test_space(void)
+{
+	co_rc_t rc;
+	bool_t installed = PFALSE;
+	co_manager_handle_t handle;
+	co_manager_ioctl_test_space_t r = {0, };
+
+	rc = co_win32_manager_is_installed(&installed);
+	if (!CO_OK(rc))
+		return rc;
+	if (!installed) {
+		co_terminal_print("driver not installed\n");
+		return CO_RC(ERROR_ACCESSING_DRIVER);
+	}
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		co_terminal_print("couldn't get driver handle\n");
+		return CO_RC(ERROR_MONITOR_NOT_LOADED);
+	}
+
+	co_terminal_print("building a four-level guest address space and reading it\n");
+	co_terminal_print("back, without ever loading it into CR3\n\n");
+
+	rc = co_manager_test_space(handle, &r);
+	co_os_manager_close(handle);
+
+	if (!CO_OK(rc)) {
+		co_terminal_print("space test: ioctl failed (rc %x)\n", (int)rc);
+		return rc;
+	}
+	if (!r.supported) {
+		co_terminal_print("space test: not implemented on this architecture\n");
+		return CO_RC(OK);
+	}
+	if (!CO_OK(r.rc)) {
+		co_terminal_print("space test: driver reported failure (rc %x)\n", (int)r.rc);
+		return r.rc;
+	}
+
+	co_terminal_print("  guest cr3 would be 0x%016llx\n", r.root);
+	co_terminal_print("  page-table pages   %lu\n", r.tables);
+	co_terminal_print("\n");
+	co_terminal_print("  pages mapped       %lu\n", r.mapped);
+	co_terminal_print("  verified by walk   %lu\n", r.verified);
+	co_terminal_print("  mismatched         %lu\n", r.mismatched);
+	co_terminal_print("  unmapped address   %s (missing at level %d)\n",
+			  r.unmapped_reported ? "correctly reported absent" : "WRONGLY REPORTED PRESENT",
+			  r.unmapped_level);
+	co_terminal_print("\n");
+
+	if (r.succeeded) {
+		co_terminal_print("  SPACE BUILT. Three regions in three different PML4 slots,\n");
+		co_terminal_print("  every page resolving to the physical address it was given,\n");
+		co_terminal_print("  and an unmapped address correctly reported as absent.\n");
+	} else if (r.mismatched) {
+		co_terminal_print("  MISMATCH at 0x%016llx: expected pa 0x%016llx, walk found 0x%016llx\n",
+				  r.first_bad_va, r.first_bad_expect, r.first_bad_got);
+	} else {
+		co_terminal_print("  the walker reported a never-mapped address as present\n");
+	}
+
+	return CO_RC(OK);
+}

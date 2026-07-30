@@ -40,7 +40,17 @@ typedef unsigned long long co_pfn_t;
 
 #define CO_ARCH_PAGE_SHIFT      12
 #define CO_ARCH_PAGE_SIZE       (1UL << CO_ARCH_PAGE_SHIFT)
-#define CO_ARCH_PAGE_MASK       (~(CO_ARCH_PAGE_SIZE-1))
+
+/*
+ * 64-bit explicitly. The obvious ~(CO_ARCH_PAGE_SIZE-1) is a trap here: Win64 is
+ * LLP64, so CO_ARCH_PAGE_SIZE's `1UL` is 32 bits, the complement is 0xFFFFF000,
+ * and masking a 64-bit address with it zero-extends to 0x00000000FFFFF000 --
+ * discarding everything above 4 GB. Generic code (monitor.c, transfer.c,
+ * pages.c) masks 64-bit guest addresses with this, so the width has to be stated
+ * here rather than inherited from the host's word size. The i386 mmu.h keeps the
+ * narrow form, which is correct there.
+ */
+#define CO_ARCH_PAGE_MASK       (~((unsigned long long)(CO_ARCH_PAGE_SIZE - 1)))
 
 /*
  * Four levels, 512 eight-byte entries each. Linux names them, from the top:

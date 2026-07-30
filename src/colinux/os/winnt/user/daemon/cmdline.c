@@ -32,6 +32,8 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("      --test-fault                 Raise #UD in the guest and catch it\n");
 	co_terminal_print("      --test-resume                Enter the guest repeatedly and require\n");
 	co_terminal_print("                                   it to continue where it stopped\n");
+	co_terminal_print("      --test-space                 Build a guest address space and verify\n");
+	co_terminal_print("                                   it by walking it. Never enters it.\n");
 	co_terminal_print("      --test-roundtrip             Enter the guest address space and return\n");
 	co_terminal_print("      --test-switch                Change CR3 into a one-page address space\n");
 	co_terminal_print("                                   and back. Porting aid.\n");
@@ -128,6 +130,14 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		cmdline,
 		"--test-resume",
 		&winnt_parameters->test_resume);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_argumentless_parameter(
+		cmdline,
+		"--test-space",
+		&winnt_parameters->test_space);
 
 	if (!CO_OK(rc))
 		return rc;

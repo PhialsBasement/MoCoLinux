@@ -35,6 +35,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_TEST_ROUNDTRIP,
 	CO_MANAGER_IOCTL_TEST_FAULT,
 	CO_MANAGER_IOCTL_TEST_RESUME,
+	CO_MANAGER_IOCTL_TEST_SPACE,
 } co_manager_ioctl_t;
 
 /*
@@ -241,6 +242,23 @@ typedef struct {
 	unsigned long long counter;
 	unsigned long long reg_accum;
 } co_manager_ioctl_test_switch_t;
+
+/* interface for CO_MANAGER_IOCTL_TEST_SPACE: mirrors co_arch_space_test_t */
+typedef struct {
+	co_rc_t		   rc;
+	int		   supported;
+	int		   succeeded;
+	unsigned long long root;
+	unsigned long	   mapped;
+	unsigned long	   verified;
+	unsigned long	   mismatched;
+	unsigned long	   tables;
+	unsigned long long first_bad_va;
+	unsigned long long first_bad_expect;
+	unsigned long long first_bad_got;
+	int		   unmapped_reported;
+	int		   unmapped_level;
+} co_manager_ioctl_test_space_t;
 
 /* interface for CO_MANAGER_IOCTL_MONITOR_LIST: */
 typedef struct {
