@@ -1,0 +1,179 @@
+Building MoCoLinux on a current Linux distribution
+===============================================================================
+
+doc/building is the original 2011 guide and still describes the intended design
+(configure, bin/*.sh, the comake system). This file records what actually works
+on a current host, and why the differences exist.
+
+Verified on CachyOS, kernel 7.1.5, on 2026-07-30:
+
+    Python      3.14.6      comake is ported to Python 3
+    GCC         16.1.1      host compiler
+    mingw-w64   16.1.0      i686-w64-mingw32- and x86_64-w64-mingw32-
+    binutils    2.46        mingw-w64 targets
+
+Result: linux.sys plus colinux-daemon, colinux-net-daemon,
+colinux-slirp-net-daemon, colinux-ndis-net-daemon, colinux-serial-daemon,
+colinux-debug-daemon and colinux-console-nt, from a clean tree, with no errors
+and no warning suppressions.
+
+
+1. Prerequisites
+----------------
+
+    pacman -S mingw-w64-gcc mingw-w64-binutils mingw-w64-crt mingw-w64-headers
+
+quilt is optional; bin/build-kernel.sh falls back to plain patch(1) without it.
+
+
+2. Guest kernel source
+----------------------
+
+The host driver includes the passage-page ABI header out of the guest kernel
+tree, so a patched tree is needed even to build the Windows side.
+
+    mkdir -p ../download ../build
+    curl -L -C - -o ../download/linux-2.6.33.7.tar.bz2 \
+      https://cdn.kernel.org/pub/linux/kernel/v2.6/linux-2.6.33.7.tar.bz2
+    bzip2 -t ../download/linux-2.6.33.7.tar.bz2
+
+Check the size: 66240255 bytes. A truncated download can still exit 0.
+
+    tar xf ../download/linux-2.6.33.7.tar.bz2 -C ../build
+    mv ../build/linux-2.6.33.7 ../build/linux-2.6.33.7-source
+    cd ../build/linux-2.6.33.7-source
+    grep -v '^#' <path-to-tree>/patch/series-2.6.33.7 | while read name level; do
+        patch ${level:--p1} -f -s --no-backup-if-mismatch \
+            < <path-to-tree>/patch/$name || echo "FAILED: $name"
+    done
+
+All 29 patches apply cleanly. Confirm the shared ABI header landed:
+
+    ls arch/x86/include/asm/cooperative.h include/linux/cooperative.h
+
+
+3. Building
+-----------
+
+./configure refuses to write bin/user-build.cfg unless it finds a guest
+compiler whose version matches the host compiler's (see section 5), so drive
+comake directly:
+
+    cd src
+    export COLINUX_ARCH=i386
+    export COLINUX_HOST_OS=winnt
+    export COLINUX_TARGET_KERNEL_SOURCE=$PWD/../../build/linux-2.6.33.7-source
+    export COLINUX_TARGET_KERNEL_BUILD=$PWD/../../build/linux-2.6.33.7-build
+    python3 ../bin/make.py colinux
+
+COLINUX_TARGET_KERNEL_BUILD does not have to exist. Set it to something other
+than the source directory: it selects the out-of-tree include list. (Both lists
+now carry arch/x86/include, so in-source builds work too, but out-of-tree is
+what has actually been exercised.)
+
+Output lands in src/colinux/os/winnt/build/. `python3 ../bin/make.py clean`
+removes it.
+
+Environment variables that matter:
+
+    COLINUX_ARCH                i386 (default) or, in future, x86_64. Selects
+                                src/colinux/arch/<arch> via the arch/current
+                                symlink.
+    COLINUX_HOST_OS             winnt (default) or linux.
+    COLINUX_HOST_CROSS_PREFIX   Override the cross prefix. Defaults to
+                                i686-w64-mingw32- for i386 and
+                                x86_64-w64-mingw32- for x86_64.
+    COLINUX_DDK_INCLUDE         Override the DDK include directory. Normally
+                                found by asking the compiler.
+    COLINUX_CFLAGS              Extra compiler flags.
+    COLINUX_ENABLE_FLTK=yes     Build colinux-console-fltk.exe. Needs a
+                                hand-built patched FLTK 1.1.10 for mingw.
+    COLINUX_ENABLE_WX=yes       Build colinux-console-wx.exe. Needs wxWidgets.
+    COLINUX_ENABLE_WINPCAP=yes  Build colinux-bridged-net-daemon.exe. Needs the
+                                WinPcap developer pack for pcap.h.
+    COLINUX_ENABLE_NDIS=yes     Build the real conet.c instead of conet-stub.c.
+                                Does not currently compile; see section 4.
+
+Sanity check on the driver:
+
+    i686-w64-mingw32-objdump -p linux.sys | grep 'DLL Name'
+
+It should import only ntoskrnl.exe and HAL.dll.
+
+
+4. What is not built, and why
+-----------------------------
+
+colinux-console-fltk.exe, colinux-console-wx.exe and
+colinux-bridged-net-daemon.exe each need an external library that has to be
+built by hand. They are opt-in. colinux-console-nt.exe needs nothing external
+and is sufficient for development.
+
+conet.c, the in-driver NDIS protocol binding behind the "ndis-bridge" network
+type, cannot be compiled at all right now. mingw-w64's ddk/ndis.h is broken:
+
+    NdisMWanIndicateReceiveComplete(
+            IN NDIS_HANDLE  MiniportAdapterHandle     <- missing comma
+            IN NDIS_HANDLE  NdisLinkContext);
+
+The declaration is in the body of the header rather than behind an optional
+guard, so no NDIS driver can include it. conet-stub.c stands in and reports the
+ndis-bridge path as unavailable. Guest networking over slirp or TAP goes through
+userspace daemons and is unaffected.
+
+Worth reporting upstream. Fixing it locally would mean vendoring a corrected
+copy of ndis.h ahead of the system one on the driver's include path.
+
+The tap-win32 driver is a separate driver and is not part of this build. It uses
+the Rtl string helpers from ddk/ntstrsafe.h and will need that include added
+locally when it is built, since ddk.h deliberately does not provide it.
+
+
+5. The compiler-version check, and the guest kernel
+---------------------------------------------------
+
+A built vmlinux is not needed to build the Windows side, and none is built here.
+Two things block it, both worth understanding before starting:
+
+GCC 16 cannot compile Linux 2.6.33. A period-appropriate compiler is needed,
+either built through configure --gcc-guest-build or supplied by a container with
+an era-appropriate distribution.
+
+More awkwardly, colinux-daemon refuses to start a kernel whose __GXX_ABI_VERSION
+differs from its own (src/colinux/user/daemon.c, CO_RC(COMPILER_MISMATCHED)).
+Modern GCC reports 1021; GCC 4.1 reports 1002. So a guest kernel built with an
+old compiler will be rejected by daemons built with a new one, and the two
+toolchains cannot simply be mixed.
+
+Note the check only compares __GXX_ABI_VERSION, a C++ ABI marker, as a proxy for
+"same compiler". The declared major/minor versions are printed but not compared.
+It is a crude test for what is really a plain-C struct layout question, and it
+becomes largely unnecessary once the shared structs use explicit fixed-width
+types -- which is milestone M1 in doc/porting-x86_64. Relaxing it is the
+intended way out, not building an entire 2011 toolchain.
+
+
+6. Remaining warnings
+---------------------
+
+The build is clean but not silent. By volume:
+
+  121  stack probing requires '-maccumulate-outgoing-args' for correctness
+   76  old-style function definition (slirp, K&R definitions)
+   23  array subscript 0 is outside the bounds of an interior zero-length array
+   20  Please include winsock2.h before windows.h
+   18  each of several errno macros redefined (slirp against mingw's errno.h)
+
+The first deserves attention rather than suppression. coLinux passes
+-mno-accumulate-outgoing-args on i386 specifically to pin the stack-argument ABI
+that the passage assembly reads at fixed %esp offsets, and GCC now says that
+interacts badly with stack probing. Nothing undefined appears at link time, so
+no probe helper is actually being emitted, but this is worth settling before
+trusting the i386 passage code -- and it is a reason the x86-64 port should not
+inherit that flag.
+
+The zero-length-array warnings are the flip side of the flexible-array-member
+change described in the commit "Build the WinNT driver and daemons with a current
+toolchain": GCC knows params[0] and extra_data[0] have no elements and objects
+to indexing them. The indexing is intentional and the arrays run into the space
+that follows.
