@@ -134,5 +134,5 @@ def win32_get_adapter_list():
     return adapters
 
 if __name__ == "__main__":
-    print get_adapter_list()
+    print(get_adapter_list())
     pass

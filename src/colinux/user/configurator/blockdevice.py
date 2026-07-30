@@ -76,7 +76,7 @@ X is the number identifying the storage device."""
 
         def get_path(self):
             path = self.path_text.GetValue()
-            m = re.match("[a-zA-Z]:[\/].*", path)
+            m = re.match(r"[a-zA-Z]:[\/].*", path)
             if m:
                 path = DOS_DEVICES + path
             return path
