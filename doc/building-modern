@@ -143,14 +143,43 @@ indefinite wait, matching the behaviour of the code that was removed.
 
 colinux-console-fltk.exe, colinux-console-wx.exe and
 colinux-bridged-net-daemon.exe each need a third-party library that is not
-present and has to be built by hand: a patched FLTK 1.1.10, wxWidgets, and the
-WinPcap developer pack respectively. All three are opt-in, as the wx console
-already was upstream. No coLinux code was changed for this and nothing is
-stubbed -- supply the library, set the flag, and they build.
+present and has to be built by hand: FLTK 1.1.10, wxWidgets, and the WinPcap
+developer pack respectively. All three are opt-in, as the wx console already was
+upstream. No coLinux code was changed for this and nothing is stubbed -- supply
+the library, set the flag, and they build. Upstream's `make download` fetches
+and builds them; wiring that back up is unfinished work, not a decision.
 
-Upstream's `make download` fetches and builds FLTK and WinPcap. Wiring that back
-up is unfinished work, not a design decision. colinux-console-nt.exe needs
-nothing external and is sufficient for development in the meantime.
+Notes on how much each is actually worth:
+
+FLTK is the one that matters, because daemon.c defaults start_parameters->console
+to "fltk", so a stock `colinux-daemon @foo.conf` fails at "error launching
+console" until you pass -t nt or -d. It is also the only console with scrollback,
+font selection and copy/paste, all added in 0.7.8. The dependency is lighter than
+it looks: patch/fltk-1.1.10-win32.diff is 799 bytes and does two unremarkable
+things, namely let FLTK's configure skip its X11 requirement when X is disabled,
+and #define NO_TRACK_MOUSE to avoid an undefined __TrackMouseEvent@4. It is stock
+FLTK plus two workarounds, not a fork. The fl_x_global_event_hook API hook that
+./configure looks for belongs to patch/fltk-1.1.10-linux-patch.diff and only
+matters for Linux as host. The open question is just whether 2009-vintage C++
+still compiles under GCC 16.
+
+wxWidgets buys nothing. The wx console was already opt-in upstream, so it was
+never part of the shipped product, and it is a third console doing what the FLTK
+and NT consoles already do.
+
+WinPcap serves exactly one of the six network types in
+src/colinux/common/config.h: pcap-bridge. The other five -- TAP, slirp,
+ndis-bridge, ndis-nat, ndis-host -- all build and work today. WinPcap itself has
+been discontinued since 2013 and superseded by Npcap, and ndis-bridge does host
+bridging from inside the driver without needing any third-party packet driver
+installed. If pcap bridging is ever wanted, target Npcap rather than reviving a
+2007 SDK.
+
+For development, colinux-console-nt.exe needs nothing external. Better still for
+early boot, the guest config has CONFIG_SERIAL_COOPERATIVE_CONSOLE=y and
+colinux-serial-daemon.exe builds, so the boot console can be taken over a virtual
+serial line into a file on the host -- which works before the console driver is
+up, and is the right tool for bring-up.
 
 The tap-win32 driver is a separate driver and is not part of this build. It uses
 the Rtl string helpers from ddk/ntstrsafe.h and will need that include added
