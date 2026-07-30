@@ -384,6 +384,90 @@ co_rc_t co_winnt_probe_passage(void)
 	return CO_RC(OK);
 }
 
+/*
+ * Show the host's CPU state as the switch would capture it. Reads only.
+ */
+co_rc_t co_winnt_save_state(void)
+{
+	co_rc_t rc;
+	bool_t installed = PFALSE;
+	co_manager_handle_t handle;
+	co_manager_ioctl_save_state_t r = {0, };
+#if defined(__x86_64__)
+	co_arch_state_stack_t* st = &r.state;
+#endif
+
+	rc = co_win32_manager_is_installed(&installed);
+	if (!CO_OK(rc))
+		return rc;
+	if (!installed) {
+		co_terminal_print("driver not installed\n");
+		return CO_RC(ERROR_ACCESSING_DRIVER);
+	}
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		co_terminal_print("couldn't get driver handle\n");
+		return CO_RC(ERROR_MONITOR_NOT_LOADED);
+	}
+
+	rc = co_manager_save_state(handle, &r);
+	co_os_manager_close(handle);
+
+	if (!CO_OK(rc)) {
+		co_terminal_print("save-state: ioctl failed (rc %x)\n", (int)rc);
+		return rc;
+	}
+	if (!r.supported) {
+		co_terminal_print("save-state: not implemented on this architecture\n");
+		return CO_RC(OK);
+	}
+
+#if !defined(__x86_64__)
+	/*
+	 * The long-mode fields below (EFER, the SYSCALL MSRs, the segment-base
+	 * MSRs) do not exist in the 32-bit co_arch_state_stack_t, so this whole
+	 * report is x86-64 only. The driver reports unsupported there anyway.
+	 */
+	co_terminal_print("save-state: x86-64 only\n");
+	return CO_RC(OK);
+#else
+	co_terminal_print("host CPU state as the switch would capture it\n");
+	co_terminal_print("\n");
+	co_terminal_print("  cs %04llx  ds %04llx  es %04llx\n", st->cs, st->ds, st->es);
+	co_terminal_print("  fs %04llx  gs %04llx  ss %04llx\n", st->fs, st->gs, st->ss);
+	co_terminal_print("  ldt %04x  tr %04x\n", st->ldt, st->tr);
+	co_terminal_print("\n");
+	co_terminal_print("  cr0 0x%016llx  cr2 0x%016llx\n", st->cr0, st->cr2);
+	co_terminal_print("  cr3 0x%016llx  cr4 0x%016llx\n", st->cr3, st->cr4);
+	co_terminal_print("\n");
+	co_terminal_print("  gdt base 0x%016llx limit %04x\n",
+			  (unsigned long long)(size_t)st->gdt.base, st->gdt.limit);
+	co_terminal_print("  idt base 0x%016llx limit %04x\n",
+			  (unsigned long long)(size_t)st->idt.table, st->idt.size);
+	co_terminal_print("\n");
+	co_terminal_print("  efer   0x%016llx  %s%s%s%s\n", st->efer,
+			  (st->efer & 0x001) ? "SCE " : "",
+			  (st->efer & 0x100) ? "LME " : "",
+			  (st->efer & 0x400) ? "LMA " : "",
+			  (st->efer & 0x800) ? "NXE " : "");
+	co_terminal_print("  star   0x%016llx\n", st->star);
+	co_terminal_print("  lstar  0x%016llx\n", st->lstar);
+	co_terminal_print("  cstar  0x%016llx\n", st->cstar);
+	co_terminal_print("  sfmask 0x%016llx\n", st->sfmask);
+	co_terminal_print("\n");
+	co_terminal_print("  fs_base        0x%016llx\n", st->fs_base);
+	co_terminal_print("  gs_base        0x%016llx\n", st->gs_base);
+	co_terminal_print("  kernel_gs_base 0x%016llx\n", st->kernel_gs_base);
+	co_terminal_print("\n");
+	co_terminal_print("  sysenter cs 0x%llx esp 0x%llx eip 0x%llx\n",
+			  st->sysenter_cs, st->sysenter_esp, st->sysenter_eip);
+	co_terminal_print("  dr7 0x%016llx  dr6 0x%016llx\n", st->dr7, st->dr6);
+
+	return CO_RC(OK);
+#endif
+}
+
 static co_rc_t co_winnt_install_driver_lowlevel(IN SC_HANDLE SchSCManager, IN LPCTSTR  DriverName, IN LPCTSTR ServiceExe)
 {
 	SC_HANDLE  schService;
