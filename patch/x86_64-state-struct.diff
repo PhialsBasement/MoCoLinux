@@ -1,0 +1,342 @@
+* Add the long-mode machine state and passage page.
+
+  Selected by __x86_64__ / CONFIG_X86_64, with the existing 32-bit definitions
+  moved into the #else. Explicit widths throughout, since this page is shared
+  between an LLP64 host driver and an LP64 guest kernel.
+
+  Offsets are generated from the compiled layout rather than hand-counted, and
+  all 40 are asserted, as are sizeof == 0x140 and 16-byte alignment.
+
+  The guest address window is provisional and unexercised; see the comment.
+
+Index: linux-2.6.33-source/arch/x86/include/asm/cooperative.h
+===================================================================
+--- linux-2.6.33-source/arch/x86/include/asm/cooperative.h
++++ linux-2.6.33-source/arch/x86/include/asm/cooperative.h
+@@ -45,6 +45,317 @@
+ 		[(__builtin_offsetof(co_arch_state_stack_t, field)	\
+ 		  == (offset)) ? 1 : -1]
+ 
++#if defined(__x86_64__) || defined(CONFIG_X86_64)
++
++/*
++ * Long-mode machine state.
++ *
++ * Explicit widths rather than unsigned long, because this page is shared
++ * between a Win64 host driver (LLP64, where unsigned long is 4 bytes) and an
++ * LP64 guest kernel (8 bytes). They would otherwise disagree about the layout
++ * of the very structure they use to hand control to one another.
++ *
++ * x86_gdt_t and x86_idt_t need no 64-bit variant: each holds a pointer, so
++ * packed they are the 6 bytes sgdt/sidt produce when built 32-bit and the 10
++ * bytes lgdt/lidt expect in long mode when built 64-bit.
++ *
++ * Two layout rules to preserve when editing. Every 8-byte field stays 8-byte
++ * aligned, and sizeof stays a multiple of 16 so both state blocks in the
++ * passage page are 16-byte aligned. The descriptor group -- gdt 10 + idt 10 +
++ * ldt 2 + tr 2 -- is exactly 24 bytes and so does not disturb what follows;
++ * do not insert padding into it.
++ *
++ * The offsets are generated from the compiled layout, not hand-counted, and
++ * every one is asserted below.
++ */
++typedef struct {
++	unsigned long long border2;
++	unsigned long long cs;
++	#define CO_ARCH_STATE_STACK_CS_N	0x08
++	#define CO_ARCH_STATE_STACK_CS	CO_STRINGIFY(CO_ARCH_STATE_STACK_CS_N)
++	unsigned long long ds;
++	#define CO_ARCH_STATE_STACK_DS_N	0x10
++	#define CO_ARCH_STATE_STACK_DS	CO_STRINGIFY(CO_ARCH_STATE_STACK_DS_N)
++	unsigned long long es;
++	#define CO_ARCH_STATE_STACK_ES_N	0x18
++	#define CO_ARCH_STATE_STACK_ES	CO_STRINGIFY(CO_ARCH_STATE_STACK_ES_N)
++	unsigned long long fs;
++	#define CO_ARCH_STATE_STACK_FS_N	0x20
++	#define CO_ARCH_STATE_STACK_FS	CO_STRINGIFY(CO_ARCH_STATE_STACK_FS_N)
++	unsigned long long gs;
++	#define CO_ARCH_STATE_STACK_GS_N	0x28
++	#define CO_ARCH_STATE_STACK_GS	CO_STRINGIFY(CO_ARCH_STATE_STACK_GS_N)
++	unsigned long long ss;
++	#define CO_ARCH_STATE_STACK_SS_N	0x30
++	#define CO_ARCH_STATE_STACK_SS	CO_STRINGIFY(CO_ARCH_STATE_STACK_SS_N)
++	unsigned long long cr0;
++	#define CO_ARCH_STATE_STACK_CR0_N	0x38
++	#define CO_ARCH_STATE_STACK_CR0	CO_STRINGIFY(CO_ARCH_STATE_STACK_CR0_N)
++	unsigned long long cr2;
++	#define CO_ARCH_STATE_STACK_CR2_N	0x40
++	#define CO_ARCH_STATE_STACK_CR2	CO_STRINGIFY(CO_ARCH_STATE_STACK_CR2_N)
++	unsigned long long cr3;
++	#define CO_ARCH_STATE_STACK_CR3_N	0x48
++	#define CO_ARCH_STATE_STACK_CR3	CO_STRINGIFY(CO_ARCH_STATE_STACK_CR3_N)
++	unsigned long long cr4;
++	#define CO_ARCH_STATE_STACK_CR4_N	0x50
++	#define CO_ARCH_STATE_STACK_CR4	CO_STRINGIFY(CO_ARCH_STATE_STACK_CR4_N)
++	unsigned long long efer;
++	#define CO_ARCH_STATE_STACK_EFER_N	0x58
++	#define CO_ARCH_STATE_STACK_EFER	CO_STRINGIFY(CO_ARCH_STATE_STACK_EFER_N)
++	x86_gdt_t gdt;
++	#define CO_ARCH_STATE_STACK_GDT_N	0x60
++	#define CO_ARCH_STATE_STACK_GDT	CO_STRINGIFY(CO_ARCH_STATE_STACK_GDT_N)
++	x86_idt_t idt;
++	#define CO_ARCH_STATE_STACK_IDT_N	0x6a
++	#define CO_ARCH_STATE_STACK_IDT	CO_STRINGIFY(CO_ARCH_STATE_STACK_IDT_N)
++	unsigned short ldt;
++	#define CO_ARCH_STATE_STACK_LDT_N	0x74
++	#define CO_ARCH_STATE_STACK_LDT	CO_STRINGIFY(CO_ARCH_STATE_STACK_LDT_N)
++	unsigned short tr;
++	#define CO_ARCH_STATE_STACK_TR_N	0x76
++	#define CO_ARCH_STATE_STACK_TR	CO_STRINGIFY(CO_ARCH_STATE_STACK_TR_N)
++	unsigned long long return_rip;
++	#define CO_ARCH_STATE_STACK_RETURN_RIP_N	0x78
++	#define CO_ARCH_STATE_STACK_RETURN_RIP	CO_STRINGIFY(CO_ARCH_STATE_STACK_RETURN_RIP_N)
++	unsigned long long flags;
++	#define CO_ARCH_STATE_STACK_FLAGS_N	0x80
++	#define CO_ARCH_STATE_STACK_FLAGS	CO_STRINGIFY(CO_ARCH_STATE_STACK_FLAGS_N)
++	unsigned long long rsp;
++	#define CO_ARCH_STATE_STACK_RSP_N	0x88
++	#define CO_ARCH_STATE_STACK_RSP	CO_STRINGIFY(CO_ARCH_STATE_STACK_RSP_N)
++	unsigned long long dr0;
++	#define CO_ARCH_STATE_STACK_DR0_N	0x90
++	#define CO_ARCH_STATE_STACK_DR0	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR0_N)
++	unsigned long long dr1;
++	#define CO_ARCH_STATE_STACK_DR1_N	0x98
++	#define CO_ARCH_STATE_STACK_DR1	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR1_N)
++	unsigned long long dr2;
++	#define CO_ARCH_STATE_STACK_DR2_N	0xa0
++	#define CO_ARCH_STATE_STACK_DR2	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR2_N)
++	unsigned long long dr3;
++	#define CO_ARCH_STATE_STACK_DR3_N	0xa8
++	#define CO_ARCH_STATE_STACK_DR3	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR3_N)
++	unsigned long long dr6;
++	#define CO_ARCH_STATE_STACK_DR6_N	0xb0
++	#define CO_ARCH_STATE_STACK_DR6	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR6_N)
++	unsigned long long dr7;
++	#define CO_ARCH_STATE_STACK_DR7_N	0xb8
++	#define CO_ARCH_STATE_STACK_DR7	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR7_N)
++	union {
++		unsigned long long temp_cr3;
++		unsigned long long other_map;
++	} __attribute__((packed));
++	#define CO_ARCH_STATE_STACK_TEMP_CR3_N	0xc0
++	#define CO_ARCH_STATE_STACK_TEMP_CR3	CO_STRINGIFY(CO_ARCH_STATE_STACK_TEMP_CR3_N)
++	#define CO_ARCH_STATE_STACK_OTHERMAP_N	0xc0
++	#define CO_ARCH_STATE_STACK_OTHERMAP	CO_STRINGIFY(CO_ARCH_STATE_STACK_OTHERMAP_N)
++	unsigned long long relocate_rip;
++	#define CO_ARCH_STATE_STACK_RELOCATE_RIP_N	0xc8
++	#define CO_ARCH_STATE_STACK_RELOCATE_RIP	CO_STRINGIFY(CO_ARCH_STATE_STACK_RELOCATE_RIP_N)
++	unsigned long long pad1;
++	#define CO_ARCH_STATE_STACK_RELOCATE_RIP_AFTER_N	0xd0
++	#define CO_ARCH_STATE_STACK_RELOCATE_RIP_AFTER	CO_STRINGIFY(CO_ARCH_STATE_STACK_RELOCATE_RIP_AFTER_N)
++	unsigned long long va;
++	#define CO_ARCH_STATE_STACK_VA_N	0xd8
++	#define CO_ARCH_STATE_STACK_VA	CO_STRINGIFY(CO_ARCH_STATE_STACK_VA_N)
++	unsigned long long fs_base;
++	#define CO_ARCH_STATE_FS_BASE_N	0xe0
++	#define CO_ARCH_STATE_FS_BASE	CO_STRINGIFY(CO_ARCH_STATE_FS_BASE_N)
++	unsigned long long gs_base;
++	#define CO_ARCH_STATE_GS_BASE_N	0xe8
++	#define CO_ARCH_STATE_GS_BASE	CO_STRINGIFY(CO_ARCH_STATE_GS_BASE_N)
++	unsigned long long kernel_gs_base;
++	#define CO_ARCH_STATE_KERNEL_GS_BASE_N	0xf0
++	#define CO_ARCH_STATE_KERNEL_GS_BASE	CO_STRINGIFY(CO_ARCH_STATE_KERNEL_GS_BASE_N)
++	unsigned long long star;
++	#define CO_ARCH_STATE_STAR_N	0xf8
++	#define CO_ARCH_STATE_STAR	CO_STRINGIFY(CO_ARCH_STATE_STAR_N)
++	unsigned long long lstar;
++	#define CO_ARCH_STATE_LSTAR_N	0x100
++	#define CO_ARCH_STATE_LSTAR	CO_STRINGIFY(CO_ARCH_STATE_LSTAR_N)
++	unsigned long long cstar;
++	#define CO_ARCH_STATE_CSTAR_N	0x108
++	#define CO_ARCH_STATE_CSTAR	CO_STRINGIFY(CO_ARCH_STATE_CSTAR_N)
++	unsigned long long sfmask;
++	#define CO_ARCH_STATE_SFMASK_N	0x110
++	#define CO_ARCH_STATE_SFMASK	CO_STRINGIFY(CO_ARCH_STATE_SFMASK_N)
++	unsigned long long sysenter_cs;
++	#define CO_ARCH_STATE_SYSENTER_CS_N	0x118
++	#define CO_ARCH_STATE_SYSENTER_CS	CO_STRINGIFY(CO_ARCH_STATE_SYSENTER_CS_N)
++	unsigned long long sysenter_esp;
++	#define CO_ARCH_STATE_SYSENTER_ESP_N	0x120
++	#define CO_ARCH_STATE_SYSENTER_ESP	CO_STRINGIFY(CO_ARCH_STATE_SYSENTER_ESP_N)
++	unsigned long long sysenter_eip;
++	#define CO_ARCH_STATE_SYSENTER_EIP_N	0x128
++	#define CO_ARCH_STATE_SYSENTER_EIP	CO_STRINGIFY(CO_ARCH_STATE_SYSENTER_EIP_N)
++	unsigned long long xcr0;
++	#define CO_ARCH_STATE_XCR0_N	0x130
++	#define CO_ARCH_STATE_XCR0	CO_STRINGIFY(CO_ARCH_STATE_XCR0_N)
++	unsigned long long pad2;
++} __attribute__((packed)) co_arch_state_stack_t;
++
++/* Generated offsets, checked against the struct they describe. */
++CO_ASSERT_STATE_OFFSET(cs, CO_ARCH_STATE_STACK_CS_N);
++CO_ASSERT_STATE_OFFSET(ds, CO_ARCH_STATE_STACK_DS_N);
++CO_ASSERT_STATE_OFFSET(es, CO_ARCH_STATE_STACK_ES_N);
++CO_ASSERT_STATE_OFFSET(fs, CO_ARCH_STATE_STACK_FS_N);
++CO_ASSERT_STATE_OFFSET(gs, CO_ARCH_STATE_STACK_GS_N);
++CO_ASSERT_STATE_OFFSET(ss, CO_ARCH_STATE_STACK_SS_N);
++CO_ASSERT_STATE_OFFSET(cr0, CO_ARCH_STATE_STACK_CR0_N);
++CO_ASSERT_STATE_OFFSET(cr2, CO_ARCH_STATE_STACK_CR2_N);
++CO_ASSERT_STATE_OFFSET(cr3, CO_ARCH_STATE_STACK_CR3_N);
++CO_ASSERT_STATE_OFFSET(cr4, CO_ARCH_STATE_STACK_CR4_N);
++CO_ASSERT_STATE_OFFSET(efer, CO_ARCH_STATE_STACK_EFER_N);
++CO_ASSERT_STATE_OFFSET(gdt, CO_ARCH_STATE_STACK_GDT_N);
++CO_ASSERT_STATE_OFFSET(idt, CO_ARCH_STATE_STACK_IDT_N);
++CO_ASSERT_STATE_OFFSET(ldt, CO_ARCH_STATE_STACK_LDT_N);
++CO_ASSERT_STATE_OFFSET(tr, CO_ARCH_STATE_STACK_TR_N);
++CO_ASSERT_STATE_OFFSET(return_rip, CO_ARCH_STATE_STACK_RETURN_RIP_N);
++CO_ASSERT_STATE_OFFSET(flags, CO_ARCH_STATE_STACK_FLAGS_N);
++CO_ASSERT_STATE_OFFSET(rsp, CO_ARCH_STATE_STACK_RSP_N);
++CO_ASSERT_STATE_OFFSET(dr0, CO_ARCH_STATE_STACK_DR0_N);
++CO_ASSERT_STATE_OFFSET(dr1, CO_ARCH_STATE_STACK_DR1_N);
++CO_ASSERT_STATE_OFFSET(dr2, CO_ARCH_STATE_STACK_DR2_N);
++CO_ASSERT_STATE_OFFSET(dr3, CO_ARCH_STATE_STACK_DR3_N);
++CO_ASSERT_STATE_OFFSET(dr6, CO_ARCH_STATE_STACK_DR6_N);
++CO_ASSERT_STATE_OFFSET(dr7, CO_ARCH_STATE_STACK_DR7_N);
++CO_ASSERT_STATE_OFFSET(temp_cr3, CO_ARCH_STATE_STACK_TEMP_CR3_N);
++CO_ASSERT_STATE_OFFSET(other_map, CO_ARCH_STATE_STACK_OTHERMAP_N);
++CO_ASSERT_STATE_OFFSET(relocate_rip, CO_ARCH_STATE_STACK_RELOCATE_RIP_N);
++CO_ASSERT_STATE_OFFSET(pad1, CO_ARCH_STATE_STACK_RELOCATE_RIP_AFTER_N);
++CO_ASSERT_STATE_OFFSET(va, CO_ARCH_STATE_STACK_VA_N);
++CO_ASSERT_STATE_OFFSET(fs_base, CO_ARCH_STATE_FS_BASE_N);
++CO_ASSERT_STATE_OFFSET(gs_base, CO_ARCH_STATE_GS_BASE_N);
++CO_ASSERT_STATE_OFFSET(kernel_gs_base, CO_ARCH_STATE_KERNEL_GS_BASE_N);
++CO_ASSERT_STATE_OFFSET(star, CO_ARCH_STATE_STAR_N);
++CO_ASSERT_STATE_OFFSET(lstar, CO_ARCH_STATE_LSTAR_N);
++CO_ASSERT_STATE_OFFSET(cstar, CO_ARCH_STATE_CSTAR_N);
++CO_ASSERT_STATE_OFFSET(sfmask, CO_ARCH_STATE_SFMASK_N);
++CO_ASSERT_STATE_OFFSET(sysenter_cs, CO_ARCH_STATE_SYSENTER_CS_N);
++CO_ASSERT_STATE_OFFSET(sysenter_esp, CO_ARCH_STATE_SYSENTER_ESP_N);
++CO_ASSERT_STATE_OFFSET(sysenter_eip, CO_ARCH_STATE_SYSENTER_EIP_N);
++CO_ASSERT_STATE_OFFSET(xcr0, CO_ARCH_STATE_XCR0_N);
++
++/* The passage page relies on both of these; see the layout rules above. */
++typedef char co_assert_state_stack_size
++	[(sizeof(co_arch_state_stack_t) == 0x140) ? 1 : -1];
++typedef char co_assert_state_stack_align
++	[((sizeof(co_arch_state_stack_t) % 16) == 0) ? 1 : -1];
++
++#define CO_MAX_PARAM_SIZE 0x400
++
++/*
++ * A temporary address space able to map the passage page at up to two virtual
++ * addresses. Long mode always walks four levels of 512 eight-byte entries, so
++ * there is one table per level per address: seven pages in total.
++ *
++ * There is deliberately no second variant. The i386 port carries both a 2-level
++ * and a 3-level address space because it has to switch CR4.PAE between a PAE
++ * host and a non-PAE guest; long mode has a single paging format, so with both
++ * sides in long mode there is nothing to toggle and no second layout to build.
++ */
++typedef struct co_arch_passage_page_4level_address_space {
++	unsigned long long pml4[0x200];
++	unsigned long long pdpt[2][0x200];
++	unsigned long long pd[2][0x200];
++	unsigned long long pt[2][0x200];
++} co_arch_passage_page_4level_address_space_t;
++
++typedef struct co_arch_passage_page {
++	union {
++		struct {
++			union {
++				struct {
++					union {
++						unsigned long long self_physical_address;
++						unsigned long long temp_pgd_physical;
++					} __attribute__((packed));
++					unsigned long long dr0;
++					unsigned long long dr1;
++					unsigned long long dr2;
++					unsigned long long dr3;
++					unsigned long long dr6;
++					unsigned long long dr7;
++					/*
++					 * Larger than the i386 code[0x260]: REX
++					 * prefixes, 64-bit immediates and the
++					 * extra MSR save/restore pairs do not fit
++					 * in 608 bytes.
++					 */
++					unsigned char code[0x600];
++				} __attribute__((packed));
++				unsigned char pad[0x640];
++			} __attribute__((packed));
++
++			/*
++			 * Both state blocks land on 16-byte boundaries: pad is
++			 * 0x640 and sizeof(co_arch_state_stack_t) is 0x140.
++			 */
++			co_arch_state_stack_t host_state;
++			co_arch_state_stack_t linuxvm_state;
++
++			unsigned long long operation;
++			unsigned long long params[0];	/* to end of page */
++		} __attribute__((packed));
++		unsigned char first_page[0x1000];
++	};
++
++	/* page tables for the passage address spaces */
++	union {
++		co_arch_passage_page_4level_address_space_t guest_temp;
++		co_arch_passage_page_4level_address_space_t temp_space;
++	} __attribute__((packed));
++	union {
++		co_arch_passage_page_4level_address_space_t host_temp;
++		co_arch_passage_page_4level_address_space_t host_pae;
++	} __attribute__((packed));
++} co_arch_passage_page_t;
++
++/* co_os_alloc_pages() takes a page count, so this has to divide evenly. */
++typedef char co_assert_passage_page_pages
++	[((sizeof(co_arch_passage_page_t) % 0x1000) == 0) ? 1 : -1];
++typedef char co_assert_passage_first_page
++	[(__builtin_offsetof(co_arch_passage_page_t, guest_temp) == 0x1000) ? 1 : -1];
++
++/*
++ * Guest address-space window.
++ *
++ * PROVISIONAL. These addresses are not yet validated and nothing exercises them:
++ * the 64-bit co_host_switch_wrapper() refuses to switch, so no monitor ever runs.
++ * They exist so the shared kernel code compiles. Settle them before M3.
++ *
++ * The base sits in the 1 TB hole Linux x86-64 leaves between the end of
++ * vmalloc/ioremap space (0xffffe8ffffffffff) and the start of vmemmap
++ * (0xffffea0000000000), so it is free on the guest side by construction.
++ *
++ * What is NOT established is whether the same range is free in the Windows x64
++ * kernel address space. That only matters for the optimisation described in
++ * doc/porting-x86_64 section 4.1 -- mapping the passage page at the *same*
++ * virtual address in both, which makes other_map zero and removes the
++ * EIP-relocation dance entirely. If Windows turns out to use this range, either
++ * pick another hole or accept two different addresses and keep the relocation.
++ *
++ * The region sizes are also provisional: the pseudo-physical page-table array is
++ * sized by how much guest RAM is supported and by 8-byte PTEs, which is part of
++ * the memory redesign in section 4.5 and not settled here.
++ */
++#define CO_VPTR_BASE                         (0xffffe9a000000000ULL)
++#define CO_VPTR_PHYSICAL_TO_PSEUDO_PFN_MAP   (CO_VPTR_BASE - 0x40000000ULL)
++#define CO_VPTR_PSEUDO_RAM_PAGE_TABLES       (CO_VPTR_BASE - 0x80000000ULL)
++#define CO_VPTR_PASSAGE_PAGE                 (CO_VPTR_BASE - 0x80010000ULL)
++#define CO_VPTR_IO_AREA_SIZE                 (0x10000ULL)
++#define CO_VPTR_IO_AREA_START                (CO_VPTR_BASE - 0x80100000ULL)
++#define CO_VPTR_SELF_MAP                     (CO_VPTR_BASE - 0x80200000ULL)
++
++#define CO_VPTR_BASE_START			CO_VPTR_SELF_MAP
++#define CO_VPTR_BASE_END			CO_VPTR_BASE
++
++/* Provisional, and no longer the 984 MB the i386 window geometry forced. */
++#define CO_LOWMEMORY_MAX_MB 3072
++
++#else /* 32-bit */
++
+ typedef struct {
+ 	unsigned char border2[0x4];
+ 
+@@ -286,6 +597,8 @@
+ 
+ #define CO_LOWMEMORY_MAX_MB 984
+ 
++#endif /* __x86_64__ || CONFIG_X86_64 */
++
+ typedef struct {
+ 	unsigned long kernel_cs;
+ 	unsigned long kernel_ds;
