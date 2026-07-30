@@ -36,6 +36,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_TEST_FAULT,
 	CO_MANAGER_IOCTL_TEST_RESUME,
 	CO_MANAGER_IOCTL_TEST_SPACE,
+	CO_MANAGER_IOCTL_TEST_PAGEFAULT,
 } co_manager_ioctl_t;
 
 /*
@@ -241,6 +242,14 @@ typedef struct {
 	int		   iterations;
 	unsigned long long counter;
 	unsigned long long reg_accum;
+	unsigned long long guest_stubs;
+	unsigned long long vector;
+	unsigned long long error_code;
+	unsigned long long cr2;
+	int		   preflight_checked;
+	int		   preflight_failed;
+	int		   preflight_level;
+	unsigned long long preflight_va;
 } co_manager_ioctl_test_switch_t;
 
 /* interface for CO_MANAGER_IOCTL_TEST_SPACE: mirrors co_arch_space_test_t */

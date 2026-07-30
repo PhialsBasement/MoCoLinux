@@ -628,7 +628,10 @@ co_rc_t co_winnt_test_switch(int mode)
 		return CO_RC(ERROR_MONITOR_NOT_LOADED);
 	}
 
-	if (mode == 3) {
+	if (mode == 4) {
+		co_terminal_print("reading an address the guest maps nothing at, and expecting\n");
+		co_terminal_print("its own IDT to report which fault, where, and why\n");
+	} else if (mode == 3) {
 		/* input field, read by the driver before it clears the struct */
 		r.iterations = 64;
 		co_terminal_print("entering the guest %d times over, requiring it to continue\n",
@@ -653,6 +656,12 @@ co_rc_t co_winnt_test_switch(int mode)
 		co_terminal_print("switch test: ioctl failed (rc %x)\n", (int)rc);
 		return rc;
 	}
+	if (r.preflight_failed) {
+		co_terminal_print("  PREFLIGHT REFUSED THE ENTRY.\n");
+		co_terminal_print("  0x%016llx is not usable in the guest address space\n", r.preflight_va);
+		co_terminal_print("  (absent at level %d, 0 = PML4). CR3 was never loaded.\n", r.preflight_level);
+		return CO_RC(OK);
+	}
 	if (!r.supported) {
 		co_terminal_print("switch test: not implemented on this architecture\n");
 		return CO_RC(OK);
@@ -672,8 +681,12 @@ co_rc_t co_winnt_test_switch(int mode)
 		co_terminal_print("  guest gdt       0x%016llx  (in the passage page)\n", r.guest_gdt);
 	if (r.guest_idt) {
 		co_terminal_print("  guest idt       0x%016llx  (256 gates)\n", r.guest_idt);
+		co_terminal_print("  vector stubs    0x%016llx  (256 x 16 bytes)\n", r.guest_stubs);
 		co_terminal_print("  fault handler   0x%016llx\n", r.fault_handler);
 	}
+	if (r.preflight_checked)
+		co_terminal_print("  preflight       %d addresses resolved in the guest tables\n",
+				  r.preflight_checked);
 	co_terminal_print("\n");
 	if (mode == 3) {
 		co_terminal_print("  entries requested %d\n", r.iterations);
@@ -687,8 +700,45 @@ co_rc_t co_winnt_test_switch(int mode)
 	}
 	co_terminal_print("\n");
 
+	if (r.faulted) {
+		static const struct { int v; const char* name; } names[] = {
+			{ 0, "#DE divide error" },   { 1, "#DB debug" },
+			{ 3, "#BP breakpoint" },     { 4, "#OF overflow" },
+			{ 6, "#UD invalid opcode" }, { 8, "#DF double fault" },
+			{ 11, "#NP segment not present" }, { 12, "#SS stack fault" },
+			{ 13, "#GP general protection" }, { 14, "#PF page fault" },
+			{ -1, NULL }
+		};
+		const char* name = "unknown";
+		int i;
+
+		for (i = 0; names[i].name; i++)
+			if (names[i].v == (int)r.vector)
+				name = names[i].name;
+
+		co_terminal_print("  FAULT: vector %llu -- %s\n", r.vector, name);
+		co_terminal_print("    at rip      0x%016llx\n", r.fault_rip);
+		co_terminal_print("    error code  0x%016llx\n", r.error_code);
+		if (r.vector == 14) {
+			co_terminal_print("    cr2         0x%016llx  (the address that faulted)\n", r.cr2);
+			co_terminal_print("    decoded     %s, %s, %s\n",
+					  (r.error_code & 1) ? "protection violation" : "page not present",
+					  (r.error_code & 2) ? "write" : "read",
+					  (r.error_code & 4) ? "user mode" : "supervisor mode");
+		}
+		co_terminal_print("\n");
+	}
+
 	if (r.succeeded) {
-		if (mode == 3) {
+		if (mode == 4) {
+			if (r.vector == 14)
+				co_terminal_print("  CAUGHT AND IDENTIFIED. The guest page faulted, its own stub\n"
+						  "  recorded which vector, the error code and CR2, and the handler\n"
+						  "  switched back -- no reset, and enough to say what went wrong.\n");
+			else
+				co_terminal_print("  came back, but the fault was vector %llu rather than #PF\n",
+						  r.vector);
+		} else if (mode == 3) {
 			co_terminal_print("  RESUMED. The guest was entered %d times and continued from\n",
 					  r.iterations);
 			co_terminal_print("  where it stopped each time -- the first entry landed at the\n");
