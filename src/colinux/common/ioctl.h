@@ -202,6 +202,7 @@ typedef struct {
 typedef struct {
 	co_rc_t			rc;
 	int			supported;
+	int			restore;	/* in: also put the state back	*/
 	co_arch_state_stack_t	state;
 } co_manager_ioctl_save_state_t;
 

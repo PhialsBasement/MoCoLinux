@@ -17,4 +17,12 @@
  */
 extern void co_arch_save_state(co_arch_state_stack_t* state);
 
+/* Put a previously captured state back. Writes control registers, descriptor
+ * tables and MSRs with interrupts off. */
+extern void co_arch_restore_state(co_arch_state_stack_t* state);
+
+/* Save then immediately restore, never changing address space. Returning at all
+ * is the result. */
+extern void co_arch_test_save_restore(co_arch_state_stack_t* state);
+
 #endif

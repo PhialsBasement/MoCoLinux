@@ -21,3 +21,12 @@ void co_arch_save_state(co_arch_state_stack_t* state)
 {
 	co_memset(state, 0, sizeof(*state));
 }
+
+void co_arch_restore_state(co_arch_state_stack_t* state)
+{
+}
+
+void co_arch_test_save_restore(co_arch_state_stack_t* state)
+{
+	co_memset(state, 0, sizeof(*state));
+}

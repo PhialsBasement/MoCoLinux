@@ -387,7 +387,7 @@ co_rc_t co_winnt_probe_passage(void)
 /*
  * Show the host's CPU state as the switch would capture it. Reads only.
  */
-co_rc_t co_winnt_save_state(void)
+co_rc_t co_winnt_save_state(bool_t restore)
 {
 	co_rc_t rc;
 	bool_t installed = PFALSE;
@@ -410,6 +410,11 @@ co_rc_t co_winnt_save_state(void)
 		co_terminal_print("couldn't get driver handle\n");
 		return CO_RC(ERROR_MONITOR_NOT_LOADED);
 	}
+
+	r.restore = restore ? 1 : 0;
+	if (restore)
+		co_terminal_print("restoring the captured state in place -- if this returns,\n"
+				  "the restore sequence survived\n\n");
 
 	rc = co_manager_save_state(handle, &r);
 	co_os_manager_close(handle);
@@ -463,6 +468,9 @@ co_rc_t co_winnt_save_state(void)
 	co_terminal_print("  sysenter cs 0x%llx esp 0x%llx eip 0x%llx\n",
 			  st->sysenter_cs, st->sysenter_esp, st->sysenter_eip);
 	co_terminal_print("  dr7 0x%016llx  dr6 0x%016llx\n", st->dr7, st->dr6);
+
+	if (restore)
+		co_terminal_print("\n  RESTORE SURVIVED -- ordering and TSS busy-bit handling are right\n");
 
 	return CO_RC(OK);
 #endif
