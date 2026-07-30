@@ -1,0 +1,240 @@
+* Assert the passage-page state offsets against the struct at build time.
+
+  The offsets the passage assembly indexes co_arch_state_stack_t with were
+  hand-written hex strings sitting next to the fields they describe, with no
+  check that the two agreed. Since this header is shared ABI between the host
+  driver and the guest kernel, a field widened on one side without its offset
+  updated desynchronises the assembly from the C declaration silently.
+
+  Each offset now has a single numeric definition, stringified for the asm,
+  and an assertion against __builtin_offsetof. A mismatch is a compile error.
+
+Index: linux-2.6.33-source/arch/x86/include/asm/cooperative.h
+===================================================================
+--- linux-2.6.33-source/arch/x86/include/asm/cooperative.h
++++ linux-2.6.33-source/arch/x86/include/asm/cooperative.h
+@@ -21,104 +21,193 @@
+ 	struct x86_dt_entry *base;
+ } __attribute__((packed)) x86_gdt_t;
+ 
++/*
++ * Offsets into co_arch_state_stack_t below are consumed by the passage assembly,
++ * which is a file-scope asm() blob built by string concatenation. Top-level asm
++ * takes no C operands, so there is no way to pass offsetof() in -- the offsets
++ * have to exist as preprocessor strings.
++ *
++ * So each one keeps a single numeric definition, stringified for the assembly,
++ * and is asserted against the struct after it is declared. Widening a field
++ * without updating its offset is then a compile error rather than a silent
++ * disagreement between the assembly and the C declaration -- which matters
++ * because this header is shared ABI between the host driver and the guest.
++ */
++#define CO_STRINGIFY_(x)	#x
++#define CO_STRINGIFY(x)		CO_STRINGIFY_(x)
++
++/*
++ * Deliberately not _Static_assert: the guest kernel is compiled by GCC 4, which
++ * predates C11. A negative array dimension fails on every compiler involved.
++ */
++#define CO_ASSERT_STATE_OFFSET(field, offset)				\
++	typedef char co_assert_state_offset_##field			\
++		[(__builtin_offsetof(co_arch_state_stack_t, field)	\
++		  == (offset)) ? 1 : -1]
++
+ typedef struct {
+ 	unsigned char border2[0x4];
+ 
+ 	unsigned long cs;
+-        #define CO_ARCH_STATE_STACK_CS "0x04"
++        #define CO_ARCH_STATE_STACK_CS_N	0x04
++        #define CO_ARCH_STATE_STACK_CS	CO_STRINGIFY(CO_ARCH_STATE_STACK_CS_N)
+ 
+ 	unsigned long ds;
+-        #define CO_ARCH_STATE_STACK_DS "0x08"
++        #define CO_ARCH_STATE_STACK_DS_N	0x08
++        #define CO_ARCH_STATE_STACK_DS	CO_STRINGIFY(CO_ARCH_STATE_STACK_DS_N)
+ 
+ 	unsigned long es;
+-        #define CO_ARCH_STATE_STACK_ES "0x0C"
++        #define CO_ARCH_STATE_STACK_ES_N	0x0C
++        #define CO_ARCH_STATE_STACK_ES	CO_STRINGIFY(CO_ARCH_STATE_STACK_ES_N)
+ 
+ 	unsigned long cr3;
+-        #define CO_ARCH_STATE_STACK_CR3 "0x10"
++        #define CO_ARCH_STATE_STACK_CR3_N	0x10
++        #define CO_ARCH_STATE_STACK_CR3	CO_STRINGIFY(CO_ARCH_STATE_STACK_CR3_N)
+ 
+ 	unsigned long cr4;
+-        #define CO_ARCH_STATE_STACK_CR4 "0x14"
++        #define CO_ARCH_STATE_STACK_CR4_N	0x14
++        #define CO_ARCH_STATE_STACK_CR4	CO_STRINGIFY(CO_ARCH_STATE_STACK_CR4_N)
+ 
+ 	unsigned long cr2;
+-        #define CO_ARCH_STATE_STACK_CR2 "0x18"
++        #define CO_ARCH_STATE_STACK_CR2_N	0x18
++        #define CO_ARCH_STATE_STACK_CR2	CO_STRINGIFY(CO_ARCH_STATE_STACK_CR2_N)
+ 
+ 	unsigned long cr0;
+-        #define CO_ARCH_STATE_STACK_CR0 "0x1C"
++        #define CO_ARCH_STATE_STACK_CR0_N	0x1C
++        #define CO_ARCH_STATE_STACK_CR0	CO_STRINGIFY(CO_ARCH_STATE_STACK_CR0_N)
+ 
+ 	x86_gdt_t gdt;
+-        #define CO_ARCH_STATE_STACK_GDT "0x20"
++        #define CO_ARCH_STATE_STACK_GDT_N	0x20
++        #define CO_ARCH_STATE_STACK_GDT	CO_STRINGIFY(CO_ARCH_STATE_STACK_GDT_N)
+ 
+ 	unsigned long fs;
+-        #define CO_ARCH_STATE_STACK_FS  "0x26"
++        #define CO_ARCH_STATE_STACK_FS_N	0x26
++        #define CO_ARCH_STATE_STACK_FS	CO_STRINGIFY(CO_ARCH_STATE_STACK_FS_N)
+ 
+ 	unsigned long gs;
+-        #define CO_ARCH_STATE_STACK_GS  "0x2A"
++        #define CO_ARCH_STATE_STACK_GS_N	0x2A
++        #define CO_ARCH_STATE_STACK_GS	CO_STRINGIFY(CO_ARCH_STATE_STACK_GS_N)
+ 
+ 	unsigned short ldt;
+-        #define CO_ARCH_STATE_STACK_LDT "0x2E"
++        #define CO_ARCH_STATE_STACK_LDT_N	0x2E
++        #define CO_ARCH_STATE_STACK_LDT	CO_STRINGIFY(CO_ARCH_STATE_STACK_LDT_N)
+ 
+ 	x86_idt_t idt;
+-        #define CO_ARCH_STATE_STACK_IDT "0x30"
++        #define CO_ARCH_STATE_STACK_IDT_N	0x30
++        #define CO_ARCH_STATE_STACK_IDT	CO_STRINGIFY(CO_ARCH_STATE_STACK_IDT_N)
+ 
+ 	unsigned short tr;
+-        #define CO_ARCH_STATE_STACK_TR  "0x36"
++        #define CO_ARCH_STATE_STACK_TR_N	0x36
++        #define CO_ARCH_STATE_STACK_TR	CO_STRINGIFY(CO_ARCH_STATE_STACK_TR_N)
+ 
+ 	unsigned long return_eip;
+-        #define CO_ARCH_STATE_STACK_RETURN_EIP  "0x38"
++        #define CO_ARCH_STATE_STACK_RETURN_EIP_N	0x38
++        #define CO_ARCH_STATE_STACK_RETURN_EIP	CO_STRINGIFY(CO_ARCH_STATE_STACK_RETURN_EIP_N)
+ 
+ 	unsigned long flags;
+-        #define CO_ARCH_STATE_STACK_FLAGS "0x3C"
++        #define CO_ARCH_STATE_STACK_FLAGS_N	0x3C
++        #define CO_ARCH_STATE_STACK_FLAGS	CO_STRINGIFY(CO_ARCH_STATE_STACK_FLAGS_N)
+ 
+ 	unsigned long esp;
+-        #define CO_ARCH_STATE_STACK_ESP "0x40"
++        #define CO_ARCH_STATE_STACK_ESP_N	0x40
++        #define CO_ARCH_STATE_STACK_ESP	CO_STRINGIFY(CO_ARCH_STATE_STACK_ESP_N)
+ 
+ 	unsigned long ss;
+-        #define CO_ARCH_STATE_STACK_SS "0x44"
++        #define CO_ARCH_STATE_STACK_SS_N	0x44
++        #define CO_ARCH_STATE_STACK_SS	CO_STRINGIFY(CO_ARCH_STATE_STACK_SS_N)
+ 
+ 	unsigned long dr0;
+-        #define CO_ARCH_STATE_STACK_DR0 "0x48"
++        #define CO_ARCH_STATE_STACK_DR0_N	0x48
++        #define CO_ARCH_STATE_STACK_DR0	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR0_N)
+ 
+ 	unsigned long dr1;
+-        #define CO_ARCH_STATE_STACK_DR1 "0x4C"
++        #define CO_ARCH_STATE_STACK_DR1_N	0x4C
++        #define CO_ARCH_STATE_STACK_DR1	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR1_N)
+ 
+ 	unsigned long dr2;
+-        #define CO_ARCH_STATE_STACK_DR2 "0x50"
++        #define CO_ARCH_STATE_STACK_DR2_N	0x50
++        #define CO_ARCH_STATE_STACK_DR2	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR2_N)
+ 
+ 	unsigned long dr3;
+-        #define CO_ARCH_STATE_STACK_DR3 "0x54"
++        #define CO_ARCH_STATE_STACK_DR3_N	0x54
++        #define CO_ARCH_STATE_STACK_DR3	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR3_N)
+ 
+ 	unsigned long dr6;
+-        #define CO_ARCH_STATE_STACK_DR6 "0x58"
++        #define CO_ARCH_STATE_STACK_DR6_N	0x58
++        #define CO_ARCH_STATE_STACK_DR6	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR6_N)
+ 
+ 	unsigned long dr7;
+-        #define CO_ARCH_STATE_STACK_DR7 "0x5C"
++        #define CO_ARCH_STATE_STACK_DR7_N	0x5C
++        #define CO_ARCH_STATE_STACK_DR7	CO_STRINGIFY(CO_ARCH_STATE_STACK_DR7_N)
+ 
+ 	union {
+ 		unsigned long temp_cr3;
+ 		unsigned long other_map;
+ 	} __attribute__((packed));
+-        #define CO_ARCH_STATE_STACK_TEMP_CR3 "0x60"
+-        #define CO_ARCH_STATE_STACK_OTHERMAP "0x60"
++        #define CO_ARCH_STATE_STACK_TEMP_CR3_N	0x60
++        #define CO_ARCH_STATE_STACK_TEMP_CR3	CO_STRINGIFY(CO_ARCH_STATE_STACK_TEMP_CR3_N)
++        #define CO_ARCH_STATE_STACK_OTHERMAP_N	0x60
++        #define CO_ARCH_STATE_STACK_OTHERMAP	CO_STRINGIFY(CO_ARCH_STATE_STACK_OTHERMAP_N)
+ 
+ 	unsigned long relocate_eip;
+-        #define CO_ARCH_STATE_STACK_RELOCATE_EIP "0x64"
++        #define CO_ARCH_STATE_STACK_RELOCATE_EIP_N	0x64
++        #define CO_ARCH_STATE_STACK_RELOCATE_EIP	CO_STRINGIFY(CO_ARCH_STATE_STACK_RELOCATE_EIP_N)
+ 
+ 	unsigned long pad1;
+-        #define CO_ARCH_STATE_STACK_RELOCATE_EIP_AFTER "0x68"
++        #define CO_ARCH_STATE_STACK_RELOCATE_EIP_AFTER_N	0x68
++        #define CO_ARCH_STATE_STACK_RELOCATE_EIP_AFTER	CO_STRINGIFY(CO_ARCH_STATE_STACK_RELOCATE_EIP_AFTER_N)
+ 
+ 	unsigned long va;
+-        #define CO_ARCH_STATE_STACK_VA "0x6C"
++        #define CO_ARCH_STATE_STACK_VA_N	0x6C
++        #define CO_ARCH_STATE_STACK_VA	CO_STRINGIFY(CO_ARCH_STATE_STACK_VA_N)
+ 
+ 	unsigned long sysenter_cs;
+-        #define CO_ARCH_STATE_SYSENTER_CS "0x70"
++        #define CO_ARCH_STATE_SYSENTER_CS_N	0x70
++        #define CO_ARCH_STATE_SYSENTER_CS	CO_STRINGIFY(CO_ARCH_STATE_SYSENTER_CS_N)
+ 
+ 	unsigned long sysenter_esp;
+-        #define CO_ARCH_STATE_SYSENTER_ESP "0x74"
++        #define CO_ARCH_STATE_SYSENTER_ESP_N	0x74
++        #define CO_ARCH_STATE_SYSENTER_ESP	CO_STRINGIFY(CO_ARCH_STATE_SYSENTER_ESP_N)
+ 
+ 	unsigned long sysenter_eip;
+-        #define CO_ARCH_STATE_SYSENTER_EIP "0x78"
++        #define CO_ARCH_STATE_SYSENTER_EIP_N	0x78
++        #define CO_ARCH_STATE_SYSENTER_EIP	CO_STRINGIFY(CO_ARCH_STATE_SYSENTER_EIP_N)
+ } __attribute__((packed)) co_arch_state_stack_t;
+ 
++/* The passage assembly reads the struct at these offsets; keep them honest. */
++CO_ASSERT_STATE_OFFSET(cs, CO_ARCH_STATE_STACK_CS_N);
++CO_ASSERT_STATE_OFFSET(ds, CO_ARCH_STATE_STACK_DS_N);
++CO_ASSERT_STATE_OFFSET(es, CO_ARCH_STATE_STACK_ES_N);
++CO_ASSERT_STATE_OFFSET(cr3, CO_ARCH_STATE_STACK_CR3_N);
++CO_ASSERT_STATE_OFFSET(cr4, CO_ARCH_STATE_STACK_CR4_N);
++CO_ASSERT_STATE_OFFSET(cr2, CO_ARCH_STATE_STACK_CR2_N);
++CO_ASSERT_STATE_OFFSET(cr0, CO_ARCH_STATE_STACK_CR0_N);
++CO_ASSERT_STATE_OFFSET(gdt, CO_ARCH_STATE_STACK_GDT_N);
++CO_ASSERT_STATE_OFFSET(fs, CO_ARCH_STATE_STACK_FS_N);
++CO_ASSERT_STATE_OFFSET(gs, CO_ARCH_STATE_STACK_GS_N);
++CO_ASSERT_STATE_OFFSET(ldt, CO_ARCH_STATE_STACK_LDT_N);
++CO_ASSERT_STATE_OFFSET(idt, CO_ARCH_STATE_STACK_IDT_N);
++CO_ASSERT_STATE_OFFSET(tr, CO_ARCH_STATE_STACK_TR_N);
++CO_ASSERT_STATE_OFFSET(return_eip, CO_ARCH_STATE_STACK_RETURN_EIP_N);
++CO_ASSERT_STATE_OFFSET(flags, CO_ARCH_STATE_STACK_FLAGS_N);
++CO_ASSERT_STATE_OFFSET(esp, CO_ARCH_STATE_STACK_ESP_N);
++CO_ASSERT_STATE_OFFSET(ss, CO_ARCH_STATE_STACK_SS_N);
++CO_ASSERT_STATE_OFFSET(dr0, CO_ARCH_STATE_STACK_DR0_N);
++CO_ASSERT_STATE_OFFSET(dr1, CO_ARCH_STATE_STACK_DR1_N);
++CO_ASSERT_STATE_OFFSET(dr2, CO_ARCH_STATE_STACK_DR2_N);
++CO_ASSERT_STATE_OFFSET(dr3, CO_ARCH_STATE_STACK_DR3_N);
++CO_ASSERT_STATE_OFFSET(dr6, CO_ARCH_STATE_STACK_DR6_N);
++CO_ASSERT_STATE_OFFSET(dr7, CO_ARCH_STATE_STACK_DR7_N);
++CO_ASSERT_STATE_OFFSET(temp_cr3, CO_ARCH_STATE_STACK_TEMP_CR3_N);
++CO_ASSERT_STATE_OFFSET(other_map, CO_ARCH_STATE_STACK_OTHERMAP_N);
++CO_ASSERT_STATE_OFFSET(relocate_eip, CO_ARCH_STATE_STACK_RELOCATE_EIP_N);
++CO_ASSERT_STATE_OFFSET(pad1, CO_ARCH_STATE_STACK_RELOCATE_EIP_AFTER_N);
++CO_ASSERT_STATE_OFFSET(va, CO_ARCH_STATE_STACK_VA_N);
++CO_ASSERT_STATE_OFFSET(sysenter_cs, CO_ARCH_STATE_SYSENTER_CS_N);
++CO_ASSERT_STATE_OFFSET(sysenter_esp, CO_ARCH_STATE_SYSENTER_ESP_N);
++CO_ASSERT_STATE_OFFSET(sysenter_eip, CO_ARCH_STATE_SYSENTER_EIP_N);
++
++
+ #define CO_MAX_PARAM_SIZE 0x400
+ 
+ typedef struct co_arch_passage_page_normal_address_space {
