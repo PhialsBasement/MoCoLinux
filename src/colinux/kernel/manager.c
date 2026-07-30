@@ -19,6 +19,7 @@
 #include <colinux/os/kernel/mutex.h>
 #include <colinux/arch/mmu.h>
 #include <colinux/arch/probe.h>
+#include <colinux/arch/state.h>
 
 #include "manager.h"
 #include "monitor.h"
@@ -424,6 +425,27 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			co_os_free_pages_by(index, page, pages);
 		}
 
+		params->rc   = CO_RC(OK);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_SAVE_STATE: {
+		co_manager_ioctl_save_state_t* params;
+
+		params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		co_memset(params, 0, sizeof(*params));
+
+#if defined(__x86_64__) || defined(CONFIG_X86_64)
+		params->supported = PTRUE;
+		co_arch_save_state(&params->state);
+#else
+		params->supported = PFALSE;
+#endif
 		params->rc   = CO_RC(OK);
 		*return_size = sizeof(*params);
 		return CO_RC(OK);

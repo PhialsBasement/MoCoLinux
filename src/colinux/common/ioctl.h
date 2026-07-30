@@ -30,6 +30,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_MONITOR_LIST,
 	CO_MANAGER_IOCTL_PROBE_VA,
 	CO_MANAGER_IOCTL_PROBE_PASSAGE,
+	CO_MANAGER_IOCTL_SAVE_STATE,
 } co_manager_ioctl_t;
 
 /*
@@ -189,6 +190,20 @@ typedef struct {
 	int			count;	/* out: allocators reported		*/
 	co_probe_alloc_result_t	result[CO_PROBE_ALLOC_MAX];
 } co_manager_ioctl_probe_passage_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_SAVE_STATE
+ *
+ * Capture the host's CPU state into a co_arch_state_stack_t and hand it back.
+ * Reads only. The save half of the world switch, exercised on its own so that
+ * the state layout and the values the restore half must reproduce are known
+ * before any of it is written.
+ */
+typedef struct {
+	co_rc_t			rc;
+	int			supported;
+	co_arch_state_stack_t	state;
+} co_manager_ioctl_save_state_t;
 
 /* interface for CO_MANAGER_IOCTL_MONITOR_LIST: */
 typedef struct {
