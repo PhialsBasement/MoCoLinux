@@ -147,15 +147,26 @@ They are created by the kernel patch, in
 and pulled into the host driver via <linux/cooperative.h> from
 src/colinux/common/common.h. Both halves must change in lockstep.
 
-Worse: every field offset used by the assembly is a hand-written hex *string*
-constant sitting next to the field it describes, e.g.
+Every field offset used by the assembly is a preprocessor string constant
+sitting next to the field it describes. It has to be: the passage code is a
+file-scope asm() blob assembled by string concatenation, and top-level asm
+accepts no C operands, so there is no way to pass offsetof() in.
+
+Upstream wrote those strings by hand with nothing checking them against the
+struct, so widening a field silently desynchronised the assembly from the C
+declaration. As of patch/abi-offsets-asserted.diff each offset has one numeric
+definition, stringified for the assembly, and an assertion against
+__builtin_offsetof, so that mismatch is now a compile error:
 
     unsigned long cr3;
-    #define CO_ARCH_STATE_STACK_CR3 "0x10"
+    #define CO_ARCH_STATE_STACK_CR3_N  0x10
+    #define CO_ARCH_STATE_STACK_CR3    CO_STRINGIFY(CO_ARCH_STATE_STACK_CR3_N)
+    ...
+    CO_ASSERT_STATE_OFFSET(cr3, CO_ARCH_STATE_STACK_CR3_N);
 
-There is no offsetof() and no build-time check that the strings match the
-struct. Widening any field silently desynchronises the assembly from the C
-declaration, with no diagnostic.
+All 31 are covered. This is what makes the widening described below safe: any
+offset not updated alongside its field fails the build instead of corrupting a
+world switch.
 
 Two independent hazards compound this:
 
