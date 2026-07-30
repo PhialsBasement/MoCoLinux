@@ -247,13 +247,35 @@ co_rc_t co_winnt_probe_va(const char* arg)
 				  level_name[level], probe.entry[level],
 				  (probe.entry[level] & 1) ? "" : "   (not present)");
 
-	if (probe.present)
-		co_terminal_print("  RESULT: mapped%s -- the host is using this range\n",
+	/*
+	 * The level it stopped at is the whole point, and conflating the cases
+	 * would be actively misleading. An absent PML4 entry means the host has
+	 * nothing anywhere in that 512 GB slot, so the range can be claimed. An
+	 * absent PTE means the opposite: the host owns the region and has page
+	 * tables built over it, and merely has not filled this one page yet -- it
+	 * could do so at any moment.
+	 */
+	if (probe.present) {
+		co_terminal_print("  RESULT: mapped%s -- the host is using this address\n",
 				  probe.large_page ? " (large page)" : "");
-	else
-		co_terminal_print("  RESULT: not mapped at the %s level -- free as far as the host\n"
-				  "          is concerned, so the same-address trick is available\n",
-				  level_name[probe.levels_walked - 1]);
+	} else {
+		static const char* span[CO_PROBE_VA_LEVELS] = {
+			"512 GB", "1 GB", "2 MB", "4 KB"
+		};
+		int level = probe.levels_walked - 1;
+
+		co_terminal_print("  RESULT: not present at the %s level\n",
+				  level_name[level]);
+
+		if (level == 0)
+			co_terminal_print("          the host has nothing in this entire %s slot,\n"
+					  "          so the range is free to claim\n", span[level]);
+		else
+			co_terminal_print("          but the host owns the enclosing region -- it has page\n"
+					  "          tables built down to this level, so only this %s is\n"
+					  "          currently unmapped and it may be filled at any time.\n"
+					  "          NOT safe to claim\n", span[level]);
+	}
 
 	return CO_RC(OK);
 }
