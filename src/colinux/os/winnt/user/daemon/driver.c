@@ -185,6 +185,133 @@ co_rc_t co_winnt_status_driver(int verbose)
  * same virtual address in both, which makes other_map zero and means the switch
  * never relocates its own instruction pointer. See doc/porting-x86_64 4.1.
  */
+/*
+ * Walk every PML4 slot in the kernel half and report which ones the host has
+ * anything mapped in at all.
+ *
+ * One probe per slot, at the slot's own base address. That is enough: a slot's
+ * PML4 entry is absent or present for the whole 512 GB it covers, so a single
+ * miss at the base proves the entire slot is unclaimed. Slots that are present
+ * say nothing about how much of the 512 GB is actually used -- only that the
+ * host owns the range, which is all we need in order to stay out of it.
+ *
+ * Purely user-space: it reuses the existing per-address ioctl in a loop rather
+ * than adding a kernel-side sweep, so the driver is untouched and this cannot
+ * fault the machine.
+ */
+co_rc_t co_winnt_probe_sweep(void)
+{
+	co_rc_t rc;
+	bool_t installed = PFALSE;
+	co_manager_handle_t handle;
+	int slot;
+	int run_start = -1;
+	bool_t run_present = PFALSE;
+	int free_slots = 0;
+	unsigned long long first_cr3 = 0;
+
+	rc = co_win32_manager_is_installed(&installed);
+	if (!CO_OK(rc))
+		return rc;
+
+	if (!installed) {
+		co_terminal_print("driver not installed\n");
+		return CO_RC(ERROR_ACCESSING_DRIVER);
+	}
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		co_terminal_print("couldn't get driver handle\n");
+		return CO_RC(ERROR_MONITOR_NOT_LOADED);
+	}
+
+	co_terminal_print("sweeping the kernel half of the address space\n");
+	co_terminal_print("256 PML4 slots, 512 GB each, 128 TB total\n\n");
+	co_terminal_print("  slots      address range                          state\n");
+	co_terminal_print("  ---------  -------------------------------------  -----\n");
+
+	/*
+	 * Slots 256..511 are the kernel half. Bit 47 is set for all of them, so the
+	 * canonical form needs bits 48..63 set as well.
+	 */
+	for (slot = 256; slot <= 512; slot++) {
+		bool_t present = PFALSE;
+
+		if (slot < 512) {
+			co_manager_ioctl_probe_va_t probe = {0, };
+
+			probe.va = 0xffff000000000000ULL |
+				   ((unsigned long long)slot << 39);
+
+			rc = co_manager_probe_va(handle, &probe);
+			if (!CO_OK(rc)) {
+				co_terminal_print("probe: ioctl failed at slot %d (rc %x)\n",
+						  slot, (int)rc);
+				co_os_manager_close(handle);
+				return rc;
+			}
+
+			if (!probe.supported) {
+				co_terminal_print("probe: not implemented for this architecture\n");
+				co_os_manager_close(handle);
+				return CO_RC(OK);
+			}
+
+			if (first_cr3 == 0)
+				first_cr3 = probe.cr3;
+
+			/*
+			 * levels_walked == 1 with nothing present means the PML4 entry
+			 * itself is absent -- the whole slot is unclaimed. Anything
+			 * deeper means the host owns at least part of the range.
+			 */
+			present = (probe.entry[0] & 1) ? PTRUE : PFALSE;
+			if (!present)
+				free_slots++;
+		}
+
+		/* Run-length encode, so 256 rows collapse to a readable map. */
+		if (run_start < 0) {
+			run_start = slot;
+			run_present = present;
+			continue;
+		}
+
+		if (present != run_present || slot == 512) {
+			unsigned long long lo = 0xffff000000000000ULL |
+						((unsigned long long)run_start << 39);
+			unsigned long long hi = (0xffff000000000000ULL |
+						 ((unsigned long long)(slot - 1) << 39))
+						+ ((1ULL << 39) - 1);
+			int count = slot - run_start;
+
+			if (count == 1)
+				co_terminal_print("  %3d        %016llx-%016llx  %s\n",
+						  run_start, lo, hi,
+						  run_present ? "USED" : "free");
+			else
+				co_terminal_print("  %3d-%-3d    %016llx-%016llx  %s   (%d slots, %d TB)\n",
+						  run_start, slot - 1, lo, hi,
+						  run_present ? "USED" : "free",
+						  count, (count * 512) / 1024);
+
+			run_start = slot;
+			run_present = present;
+		}
+	}
+
+	co_os_manager_close(handle);
+
+	co_terminal_print("\n  host cr3 0x%016llx\n", first_cr3);
+	co_terminal_print("  %d of 256 kernel slots unclaimed = %d TB free\n",
+			  free_slots, (free_slots * 512) / 1024);
+	co_terminal_print("  guest window CO_VPTR_BASE 0x%016llx is slot %d\n",
+			  (unsigned long long)CO_VPTR_BASE,
+			  (int)((CO_VPTR_BASE >> 39) & 0x1ff));
+
+	return CO_RC(OK);
+}
+
 co_rc_t co_winnt_probe_va(const char* arg)
 {
 	co_rc_t rc;
@@ -480,7 +607,7 @@ co_rc_t co_winnt_save_state(bool_t restore)
  * Change CR3 into a minimal guest address space and come back. See
  * CO_MANAGER_IOCTL_TEST_SWITCH.
  */
-co_rc_t co_winnt_test_switch(bool_t roundtrip)
+co_rc_t co_winnt_test_switch(int mode)
 {
 	co_rc_t rc;
 	bool_t installed = PFALSE;
@@ -501,7 +628,16 @@ co_rc_t co_winnt_test_switch(bool_t roundtrip)
 		return CO_RC(ERROR_MONITOR_NOT_LOADED);
 	}
 
-	if (roundtrip) {
+	if (mode == 3) {
+		/* input field, read by the driver before it clears the struct */
+		r.iterations = 64;
+		co_terminal_print("entering the guest %d times over, requiring it to continue\n",
+				  r.iterations);
+		co_terminal_print("from where it stopped rather than restarting\n");
+	} else if (mode == 2) {
+		co_terminal_print("entering the guest address space, raising #UD there, and\n");
+		co_terminal_print("expecting the guest's own IDT to hand control back cleanly\n");
+	} else if (mode == 1) {
 		co_terminal_print("entering the guest address space by far return, running\n");
 		co_terminal_print("code there, and coming back the same way\n");
 	} else {
@@ -510,7 +646,7 @@ co_rc_t co_winnt_test_switch(bool_t roundtrip)
 	}
 	co_terminal_print("\n");
 
-	rc = co_manager_test_switch(handle, &r, roundtrip);
+	rc = co_manager_test_switch(handle, &r, mode);
 	co_os_manager_close(handle);
 
 	if (!CO_OK(rc)) {
@@ -534,13 +670,40 @@ co_rc_t co_winnt_test_switch(bool_t roundtrip)
 	co_terminal_print("  guest cr3       0x%016llx\n", r.guest_cr3);
 	if (r.guest_gdt)
 		co_terminal_print("  guest gdt       0x%016llx  (in the passage page)\n", r.guest_gdt);
+	if (r.guest_idt) {
+		co_terminal_print("  guest idt       0x%016llx  (256 gates)\n", r.guest_idt);
+		co_terminal_print("  fault handler   0x%016llx\n", r.fault_handler);
+	}
 	co_terminal_print("\n");
-	co_terminal_print("  sentinel expected 0x%016llx\n", r.expected);
-	co_terminal_print("  sentinel observed 0x%016llx\n", r.observed);
+	if (mode == 3) {
+		co_terminal_print("  entries requested %d\n", r.iterations);
+		co_terminal_print("  guest counter     %llu   (memory in the passage page)\n",
+				  r.counter);
+		co_terminal_print("  guest rbx total   %llu   (callee-saved across each crossing)\n",
+				  r.reg_accum);
+	} else {
+		co_terminal_print("  sentinel expected 0x%016llx\n", r.expected);
+		co_terminal_print("  sentinel observed 0x%016llx\n", r.observed);
+	}
 	co_terminal_print("\n");
 
 	if (r.succeeded) {
-		if (roundtrip) {
+		if (mode == 3) {
+			co_terminal_print("  RESUMED. The guest was entered %d times and continued from\n",
+					  r.iterations);
+			co_terminal_print("  where it stopped each time -- the first entry landed at the\n");
+			co_terminal_print("  top of its loop, every later one resumed inside the switch.\n");
+			co_terminal_print("  Its callee-saved registers survived every crossing.\n");
+		} else if (mode == 2) {
+			if (r.faulted) {
+				co_terminal_print("  FAULT CAUGHT. The guest raised #UD at 0x%016llx, its own\n", r.fault_rip);
+				co_terminal_print("  IDT vectored to the handler in the passage page, and the\n");
+				co_terminal_print("  handler switched back instead of triple faulting.\n");
+			} else {
+				co_terminal_print("  came back, but no fault was recorded -- the ud2 did not\n");
+				co_terminal_print("  execute, or the flag was not written\n");
+			}
+		} else if (mode == 1) {
 			co_terminal_print("  ROUND TRIP COMPLETE. Control crossed into the guest address\n");
 			co_terminal_print("  space by far return, ran there, and came back -- so CS was\n");
 			co_terminal_print("  reloaded correctly in both directions.\n");
@@ -549,6 +712,17 @@ co_rc_t co_winnt_test_switch(bool_t roundtrip)
 			co_terminal_print("  store landed, so the passage page is reachable at the same\n");
 			co_terminal_print("  address in both address spaces.\n");
 		}
+	} else if (mode == 3) {
+		if (r.faulted)
+			co_terminal_print("  the guest FAULTED at 0x%016llx while looping\n", r.fault_rip);
+		else if (r.counter != (unsigned long long)r.iterations)
+			co_terminal_print("  the guest did NOT resume: counted %llu of %d entries -- it is\n"
+					  "  restarting, or never came back past the first crossing\n",
+					  r.counter, r.iterations);
+		else
+			co_terminal_print("  the guest resumed (counter %llu) but its registers did NOT\n"
+					  "  survive: rbx totalled %llu, expected %d\n",
+					  r.counter, r.reg_accum, r.iterations);
 	} else {
 		co_terminal_print("  returned, but the sentinel is wrong -- the store did not land\n");
 	}

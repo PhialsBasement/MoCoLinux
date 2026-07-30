@@ -33,6 +33,8 @@ typedef enum {
 	CO_MANAGER_IOCTL_SAVE_STATE,
 	CO_MANAGER_IOCTL_TEST_SWITCH,
 	CO_MANAGER_IOCTL_TEST_ROUNDTRIP,
+	CO_MANAGER_IOCTL_TEST_FAULT,
+	CO_MANAGER_IOCTL_TEST_RESUME,
 } co_manager_ioctl_t;
 
 /*
@@ -230,7 +232,14 @@ typedef struct {
 	unsigned long long expected;
 	unsigned long long observed;
 	unsigned long long guest_gdt;
+	unsigned long long guest_idt;
+	unsigned long long fault_handler;
+	unsigned long long fault_rip;
+	int		   faulted;
 	unsigned long	   code_size;
+	int		   iterations;
+	unsigned long long counter;
+	unsigned long long reg_accum;
 } co_manager_ioctl_test_switch_t;
 
 /* interface for CO_MANAGER_IOCTL_MONITOR_LIST: */
@@ -248,8 +257,10 @@ typedef struct {
 typedef struct {
 	co_manager_ioctl_monitor_t pc;
 	char*			   user_ptr;
-	unsigned long		   address;
-	unsigned long		   size;
+	/* 64-bit: these are guest kernel addresses, and LLP64 `unsigned long`
+	 * on the Windows host is only 4 bytes. */
+	unsigned long long	   address;
+	unsigned long long	   size;
 	unsigned long		   index;
 	unsigned char		   buf[0];
 } co_monitor_ioctl_load_section_t;

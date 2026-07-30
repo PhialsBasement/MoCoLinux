@@ -31,6 +31,7 @@
 #include "misc.h"
 #include "service.h"
 #include "driver.h"
+#include <colinux/user/elf_load.h>
 
 COLINUX_DEFINE_MODULE("colinux-daemon");
 
@@ -202,8 +203,13 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		return co_winnt_status_driver(1); // arg 1 = View all driver details
 	}
 
-	if (winnt_parameters.test_switch || winnt_parameters.test_roundtrip) {
-		return co_winnt_test_switch(winnt_parameters.test_roundtrip);
+	if (winnt_parameters.test_resume)
+		return co_winnt_test_switch(3);
+
+	if (winnt_parameters.test_switch || winnt_parameters.test_roundtrip ||
+	    winnt_parameters.test_fault) {
+		return co_winnt_test_switch(winnt_parameters.test_fault ? 2 :
+					    winnt_parameters.test_roundtrip ? 1 : 0);
 	}
 
 	if (winnt_parameters.save_state || winnt_parameters.restore_state) {
@@ -212,6 +218,14 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 
 	if (winnt_parameters.probe_passage) {
 		return co_winnt_probe_passage();
+	}
+
+	if (winnt_parameters.dump_vmlinux) {
+		return co_elf_dump(winnt_parameters.dump_vmlinux_arg);
+	}
+
+	if (winnt_parameters.probe_sweep) {
+		return co_winnt_probe_sweep();
 	}
 
 	if (winnt_parameters.probe_va) {

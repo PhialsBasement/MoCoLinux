@@ -460,16 +460,25 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_TEST_FAULT:
+	case CO_MANAGER_IOCTL_TEST_RESUME:
 	case CO_MANAGER_IOCTL_TEST_ROUNDTRIP:
 	case CO_MANAGER_IOCTL_TEST_SWITCH: {
 		co_manager_ioctl_test_switch_t* params;
 		co_arch_switch_test_t result;
 		co_rc_t trc;
+		int req_iterations;
 
 		params = (typeof(params))(io_buffer);
 
 		if (in_size < sizeof(*params) || out_size < sizeof(*params))
 			return CO_RC(INVALID_PARAMETER);
+
+		/*
+		 * iterations is the one field that travels inwards, so it has to be
+		 * read before the struct is cleared for the reply.
+		 */
+		req_iterations = params->iterations;
 
 		co_memset(params, 0, sizeof(*params));
 
@@ -480,7 +489,11 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		}
 
 		if (ioctl == CO_MANAGER_IOCTL_TEST_ROUNDTRIP)
-			trc = co_arch_test_roundtrip(manager, &result);
+			trc = co_arch_test_roundtrip(manager, &result, PFALSE);
+		else if (ioctl == CO_MANAGER_IOCTL_TEST_FAULT)
+			trc = co_arch_test_roundtrip(manager, &result, PTRUE);
+		else if (ioctl == CO_MANAGER_IOCTL_TEST_RESUME)
+			trc = co_arch_test_resume(manager, &result, req_iterations);
 		else
 			trc = co_arch_test_switch(manager, &result);
 
@@ -495,6 +508,13 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->expected   = result.expected;
 		params->observed   = result.observed;
 		params->guest_gdt  = result.guest_gdt;
+		params->iterations = result.iterations;
+		params->counter    = result.counter;
+		params->reg_accum  = result.reg_accum;
+		params->guest_idt  = result.guest_idt;
+		params->fault_handler = result.fault_handler;
+		params->fault_rip  = result.fault_rip;
+		params->faulted    = result.faulted;
 		params->code_size  = result.code_size;
 
 		*return_size = sizeof(*params);
