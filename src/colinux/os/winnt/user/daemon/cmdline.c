@@ -30,6 +30,8 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("      --remove-driver              Uninstall (remove) the colinux-driver (linux.sys)\n");
 	co_terminal_print("      --status-driver              Show status about the installed/running\n");
 	co_terminal_print("      --test-fault                 Raise #UD in the guest and catch it\n");
+	co_terminal_print("      --test-badstack              Fault with a destroyed stack pointer;\n");
+	co_terminal_print("                                   only IST can deliver it\n");
 	co_terminal_print("      --test-pagefault             Touch an unmapped guest address and\n");
 	co_terminal_print("                                   report vector, error code and CR2\n");
 	co_terminal_print("      --test-resume                Enter the guest repeatedly and require\n");
@@ -132,6 +134,14 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		cmdline,
 		"--test-resume",
 		&winnt_parameters->test_resume);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_argumentless_parameter(
+		cmdline,
+		"--test-badstack",
+		&winnt_parameters->test_badstack);
 
 	if (!CO_OK(rc))
 		return rc;

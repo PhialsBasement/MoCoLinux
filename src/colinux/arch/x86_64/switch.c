@@ -146,7 +146,23 @@ asm(".text                                          \n"
  */
 #define CO_PP_IDT_PAGE		 0		/* host_temp page 0 */
 #define CO_PP_STUBS_PAGE	 1		/* host_temp page 1 */
+#define CO_PP_ISTSTACK_PAGE	 2		/* the stack every fault lands on */
+/*
+ * Page 3 is deliberately left empty. IST1 is the *top* of the stack page, which
+ * is byte zero of the next one, so putting the TSS immediately above the stack
+ * would mean a single push past the top silently overwrites it -- the same shape
+ * as the bug that put the guest IDT on top of the guest PML4. A page of nothing
+ * is cheap; finding that corruption from a triple fault is not.
+ */
+#define CO_PP_TSS_PAGE		 4
 #define CO_PP_STUB_SIZE		16		/* uniform, so stub N is base + N*16 */
+
+/*
+ * gdt.base, which is two bytes into the ten-byte descriptor (limit first).
+ * The blob needs it as a literal; asserted against the struct below.
+ */
+#define CO_PP_GDT_BASE		"0x62"
+#define CO_PP_GDT_BASE_N	0x62
 
 extern char co_switch_full;
 extern char co_switch_guest_entry;
@@ -206,6 +222,31 @@ asm(".text                                                          \n"
      */
     "    lgdt " CO_ARCH_STATE_STACK_GDT "(%rdx)                     \n"
     "    lidt " CO_ARCH_STATE_STACK_IDT "(%rdx)                     \n"
+    /*
+     * And the task register, so the entering side has a TSS -- which is what
+     * makes IST work, and IST is what lets a fault be handled when the current
+     * stack is the thing that is broken. Without it a bad RSP is a double fault
+     * before any handler runs.
+     *
+     * The busy bit has to be cleared first, every time. The CPU sets it on ltr
+     * and refuses to load a descriptor that already has it, so this is needed
+     * both for the host (Windows marked its own busy at boot) and for the guest
+     * from the second entry onwards. The write goes into the entering side's
+     * live GDT, which is reachable because the CR3 write has already happened
+     * and that table is by definition mapped in the space we just entered.
+     *
+     * rax and r11 only: rcx, rdx, r8 and r9 carry state across the far return,
+     * and r10 is holding CR4.
+     */
+    "    movzwl " CO_ARCH_STATE_STACK_TR "(%rdx), %r11d             \n"
+    "    test %r11d, %r11d                                          \n"
+    "    jz 3f                                                      \n"
+    "    mov " CO_PP_GDT_BASE "(%rdx), %rax                         \n"
+    "    and $-8, %r11d                                             \n"
+    "    add %r11, %rax                                             \n"
+    "    andl $0xfffffdff, 4(%rax)     /* clear the busy bit */     \n"
+    "    ltr " CO_ARCH_STATE_STACK_TR "(%rdx)                       \n"
+    "3:                                                             \n"
     /* onto the other side's stack, then far-return to its cs:rip */
     "    mov " CO_ARCH_STATE_STACK_RSP "(%rdx), %rsp                \n"
     "    push " CO_ARCH_STATE_STACK_CS "(%rdx)                      \n"
@@ -301,6 +342,27 @@ asm(".text                                                          \n"
      * nothing at -- and reads. Position independent, and guaranteed unmapped
      * without needing to know where the page landed.
      */
+    /*
+     * A guest that destroys its own stack pointer and then faults.
+     *
+     * Without IST this is unsurvivable: delivering the #UD means pushing an
+     * interrupt frame, pushing it means touching RSP, RSP points at nothing
+     * mapped, so the fault handler faults -- double fault, triple fault, reset.
+     * With IST1 on every gate the CPU loads RSP from the TSS before it pushes
+     * anything, so the garbage RSP is never touched and the fault is delivered
+     * normally. Coming back at all is the proof; there is no other mechanism at
+     * the same privilege level that could have supplied a stack.
+     *
+     * The sentinel is stored first, while the stack is still good, so a failure
+     * here cannot be confused with never having entered.
+     */
+    ".globl co_switch_guest_entry_badstack                          \n"
+    "co_switch_guest_entry_badstack:                                \n"
+    "    mov %r9, (%r8)                                             \n"
+    "    lea 0(%rip), %rsp                                          \n"
+    "    and $-4096, %rsp                                           \n"
+    "    add $0x200000, %rsp        /* 2 MB out: nothing mapped */  \n"
+    "    ud2                                                        \n"
     ".globl co_switch_guest_entry_pf                                \n"
     "co_switch_guest_entry_pf:                                      \n"
     "    mov %r9, (%r8)                                             \n"
@@ -347,6 +409,7 @@ extern char co_switch_guest_fault;
 extern char co_switch_guest_entry_fault;
 extern char co_switch_guest_loop;
 extern char co_switch_guest_entry_pf;
+extern char co_switch_guest_entry_badstack;
 
 typedef void (*co_switch_full_fn)(co_arch_state_stack_t* leaving,
                                   co_arch_state_stack_t* entering,
@@ -513,10 +576,14 @@ typedef char co_assert_fault_slots
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 18 * 8 == CO_PP_CR2_N)
 	 ? 1 : -1];
 
+/* The blob reaches gdt.base by literal offset; keep it honest. */
+typedef char co_assert_gdt_base_offset
+	[(__builtin_offsetof(co_arch_state_stack_t, gdt) + 2 == CO_PP_GDT_BASE_N) ? 1 : -1];
+
 /* The stubs need a page to themselves, after the IDT's. */
 typedef char co_assert_stubs_fit_host_temp
 	[(sizeof(((co_arch_passage_page_t*)0)->host_temp)
-	  >= (CO_PP_STUBS_PAGE + 1) * 0x1000) ? 1 : -1];
+	  >= (CO_PP_TSS_PAGE + 1) * 0x1000) ? 1 : -1];
 typedef char co_assert_stub_table_is_a_page
 	[((256 * CO_PP_STUB_SIZE) == 0x1000) ? 1 : -1];
 
@@ -533,12 +600,55 @@ typedef char co_assert_idt_fits_host_temp
  * leave the interrupt frame shifted by eight bytes, so the RIP this records is
  * only correct for the vectors that do not. #UD, which the test raises, does not.
  */
+/*
+ * The 64-bit TSS. In long mode it no longer holds a task context at all -- what
+ * survives is RSP0..2 for privilege changes and IST1..7, and IST is the only
+ * reason we want one: a gate with a non-zero IST index makes the CPU load RSP
+ * from the TSS *before* pushing anything, so a fault is deliverable even when
+ * the interrupted stack pointer is garbage.
+ */
+struct co_x86_64_tss {
+	unsigned int	   reserved0;
+	unsigned long long rsp[3];
+	unsigned long long reserved1;
+	unsigned long long ist[7];	/* ist[0] is IST1 */
+	unsigned long long reserved2;
+	unsigned short	   reserved3;
+	unsigned short	   iomap_base;
+} __attribute__((packed));
+
+typedef char co_assert_tss_is_104[(sizeof(struct co_x86_64_tss) == 104) ? 1 : -1];
+
+/*
+ * A TSS descriptor is sixteen bytes and a system descriptor, so S is 0 and the
+ * type is 9 -- "available 64-bit TSS". Type 11 is the same thing already loaded;
+ * ltr refuses that, which is why the switch clears the busy bit first.
+ */
+static void co_build_tss_descriptor(unsigned long long* slot,
+				    unsigned long long base,
+				    unsigned long limit)
+{
+	slot[0] = (limit & 0xffffULL)
+		| ((base & 0xffffffULL) << 16)
+		| (0x9ULL << 40)			/* type 9, S=0 */
+		| (0x1ULL << 47)			/* present */
+		| (((unsigned long long)(limit >> 16) & 0xfULL) << 48)
+		| (((base >> 24) & 0xffULL) << 56);
+	slot[1] = (base >> 32) & 0xffffffffULL;
+}
+
 static void co_set_gate(struct co_x86_64_gate* gate, unsigned long long handler,
 			unsigned short selector)
 {
 	gate->offset_low  = (unsigned short)(handler & 0xffff);
 	gate->selector    = selector;
-	gate->flags       = 0x8e00;		/* present, DPL 0, interrupt gate */
+	/*
+	 * present, DPL 0, interrupt gate, IST1. Every vector uses the IST stack,
+	 * not just the ones that can arrive on a bad stack -- there is no vector
+	 * for which the interrupted RSP is more trustworthy, and a single answer
+	 * is one less thing to get wrong.
+	 */
+	gate->flags       = 0x8e01;
 	gate->offset_mid  = (unsigned short)((handler >> 16) & 0xffff);
 	gate->offset_high = (unsigned int)(handler >> 32);
 	gate->reserved    = 0;
@@ -699,15 +809,30 @@ static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 	 */
 	{
 		unsigned long long* guest_gdt = &pp->params[8];
+		unsigned char* host_temp = (unsigned char*)&pp->host_temp;
+		struct co_x86_64_tss* tss = (struct co_x86_64_tss*)
+			(host_temp + CO_PP_TSS_PAGE * CO_ARCH_PAGE_SIZE);
+		unsigned long long ist_top = (unsigned long long)(size_t)
+			(host_temp + (CO_PP_ISTSTACK_PAGE + 1) * CO_ARCH_PAGE_SIZE);
+
+		co_memset(tss, 0, sizeof(*tss));
+		tss->ist[0]     = ist_top;	/* IST1: a whole page, growing down */
+		tss->iomap_base = sizeof(*tss);	/* past the limit: no I/O bitmap */
 
 		guest_gdt[0] = 0x0000000000000000ULL;	/* null */
 		guest_gdt[1] = 0x00209a0000000000ULL;	/* 64-bit code, selector 0x08 */
+		co_build_tss_descriptor(&guest_gdt[2],
+					(unsigned long long)(size_t)tss,
+					sizeof(*tss) - 1);	/* selector 0x10 */
 
 		pp->linuxvm_state.gdt.base  = (struct x86_dt_entry*)guest_gdt;
-		pp->linuxvm_state.gdt.limit = (2 * 8) - 1;
+		pp->linuxvm_state.gdt.limit = (4 * 8) - 1;
 		pp->linuxvm_state.cs        = 0x08;
+		pp->linuxvm_state.tr        = 0x10;
 
 		out->guest_gdt = (unsigned long long)(size_t)guest_gdt;
+		out->guest_tss = (unsigned long long)(size_t)tss;
+		out->ist_stack = ist_top;
 	}
 
 	/*
@@ -853,6 +978,12 @@ static bool_t co_preflight_guest(co_arch_passage_page_t* pp, unsigned long long 
 		{ "guest GDT",    (unsigned long long)(size_t)pp->linuxvm_state.gdt.base },
 		{ "guest IDT",    (unsigned long long)(size_t)pp->linuxvm_state.idt.table },
 		{ "passage page", va },
+		{ "guest TSS",    (unsigned long long)(size_t)&pp->host_temp
+				  + CO_PP_TSS_PAGE * CO_ARCH_PAGE_SIZE },
+		{ "IST stack",    (unsigned long long)(size_t)&pp->host_temp
+				  + CO_PP_ISTSTACK_PAGE * CO_ARCH_PAGE_SIZE },
+		{ "vector stubs", (unsigned long long)(size_t)&pp->host_temp
+				  + CO_PP_STUBS_PAGE * CO_ARCH_PAGE_SIZE },
 	};
 	const int count = sizeof(required) / sizeof(required[0]);
 	int i;
@@ -888,6 +1019,8 @@ co_rc_t co_arch_test_roundtrip(co_manager_t* manager, co_arch_switch_test_t* out
 	out->supported = PTRUE;
 
 	entry_offset =
+		(provoke_fault == 3)
+			? (unsigned long)(&co_switch_guest_entry_badstack - &co_switch_full) :
 		(provoke_fault == 2)
 			? (unsigned long)(&co_switch_guest_entry_pf - &co_switch_full) :
 		(provoke_fault == 1)

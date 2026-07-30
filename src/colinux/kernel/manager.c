@@ -501,6 +501,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 
 	case CO_MANAGER_IOCTL_TEST_FAULT:
 	case CO_MANAGER_IOCTL_TEST_PAGEFAULT:
+	case CO_MANAGER_IOCTL_TEST_BADSTACK:
 	case CO_MANAGER_IOCTL_TEST_RESUME:
 	case CO_MANAGER_IOCTL_TEST_ROUNDTRIP:
 	case CO_MANAGER_IOCTL_TEST_SWITCH: {
@@ -534,6 +535,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			trc = co_arch_test_roundtrip(manager, &result, 1);
 		else if (ioctl == CO_MANAGER_IOCTL_TEST_PAGEFAULT)
 			trc = co_arch_test_roundtrip(manager, &result, 2);
+		else if (ioctl == CO_MANAGER_IOCTL_TEST_BADSTACK)
+			trc = co_arch_test_roundtrip(manager, &result, 3);
 		else if (ioctl == CO_MANAGER_IOCTL_TEST_RESUME)
 			trc = co_arch_test_resume(manager, &result, req_iterations);
 		else
@@ -554,6 +557,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->counter    = result.counter;
 		params->reg_accum  = result.reg_accum;
 		params->guest_stubs = result.guest_stubs;
+		params->guest_tss   = result.guest_tss;
+		params->ist_stack   = result.ist_stack;
 		params->vector      = result.vector;
 		params->error_code  = result.error_code;
 		params->cr2         = result.cr2;

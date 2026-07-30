@@ -37,6 +37,8 @@ typedef struct {
 	unsigned long long reg_accum;
 	/* what the fault stubs recorded */
 	unsigned long long guest_stubs;
+	unsigned long long guest_tss;
+	unsigned long long ist_stack;
 	unsigned long long vector;
 	unsigned long long error_code;
 	unsigned long long cr2;
