@@ -325,13 +325,32 @@ tuned.
 
 4.6 Things to delete rather than port
 
-  - antinx.c. It hand-walks the host's live page tables to clear the NX bit on
-    the passage page, because the page comes from MmAllocateNonCachedMemory and
-    Windows DEP may mark it non-executable. On x64 this gets worse (4-level
-    walk) and PatchGuard objects to page-table tampering. Use a supported
-    allocation instead: an executable non-paged pool allocation, or an MDL
-    mapped executable. The P4 erratum N76 TLB-flush workaround it also carries
-    is irrelevant on x64 hardware.
+  - antinx.c. RESOLVED, and it has no successor on x86-64.
+
+    It hand-walks the host's live page tables to clear NX on the passage page,
+    because MmAllocateNonCachedMemory returns non-executable memory. Measured on
+    XP x64 with CO_MANAGER_IOCTL_PROBE_PASSAGE, allocating a real 15-page passage
+    page through each allocator and reading back its own PTE:
+
+        MmAllocateNonCachedMemory     0x80000000b024b97b   NX set    uncached
+        ExAllocatePool(NonPagedPool)  0x00000000089ef963   NX clear  cached
+        MmAllocateContiguousMemory    0x000000000c058963   NX clear  cached
+
+    So the passage page now comes from co_os_alloc_exec_pages(), which uses
+    NonPagedPool -- NonPagedPoolNx did not exist until Windows 8. Nothing walks
+    or edits a host page table, which is what PatchGuard would object to.
+
+    NonPagedPool rather than contiguous memory because physical contiguity is not
+    required: the passage code takes virt_to_phys of each sub-structure
+    separately. Allocations of a page or more are page-aligned, which the
+    page-table sub-structures do need.
+
+    Note what else that table shows: the existing allocator is not merely
+    non-executable but *uncached*. The i386 port has been executing its world
+    switch out of uncached memory since 2004. Switching it to the same allocator
+    would remove antinx there too and make the switch considerably faster, but
+    that is an untestable change here -- there is no 32-bit host to try it on --
+    so it is left alone deliberately.
   - co_i386_has_cpuid(). It probes EFLAGS.ID with pushfl/popl, which is
     meaningless on x86-64 (CPUID is architectural) and will not assemble.
     The capability query itself needs leaf 0x80000001 for NX/LM and leaves

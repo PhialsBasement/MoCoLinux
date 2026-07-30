@@ -114,3 +114,18 @@ void co_os_free_pages_by(int index, void* ptr, unsigned int pages)
 	if (index == 0)
 		co_os_free_pages(ptr, pages);
 }
+
+int co_os_exec_alloc_index(void)
+{
+	return 0;
+}
+
+void* co_os_alloc_exec_pages(unsigned int pages)
+{
+	return co_os_alloc_pages(pages);
+}
+
+void co_os_free_exec_pages(void* ptr, unsigned int pages)
+{
+	co_os_free_pages(ptr, pages);
+}

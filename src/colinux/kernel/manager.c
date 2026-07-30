@@ -404,6 +404,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 
 			params->count = index + 1;
 			co_snprintf(r->name, sizeof(r->name), "%s", name ? name : "?");
+			r->used = (index == co_os_exec_alloc_index()) ? PTRUE : PFALSE;
 
 			page = co_os_alloc_pages_by(index, pages);
 			if (page == NULL) {
