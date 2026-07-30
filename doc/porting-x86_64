@@ -1,0 +1,454 @@
+Porting Cooperative Linux to x86-64 (MoCoLinux)
+===============================================================================
+
+Goal: a 64-bit coLinux whose first host target is Windows XP Professional x64
+Edition, then a forward-port of the guest to a current Linux kernel.
+
+This document is the design record for that work. It describes how the 32-bit
+world switch actually works, every place it assumes 32 bits, and the order in
+which to attack the problem. Read doc/building first for how the tree builds.
+
+
+Table of Contents
+
+  1. Why XP x64 first
+  2. How the 32-bit world switch works
+  3. The shared ABI problem (read this before touching anything)
+  4. What has to change
+  4.1 Paging and the nowhere-land trampoline
+  4.2 Long-mode CPU state that is currently not saved at all
+  4.3 Descriptors, TSS, interrupt delivery
+  4.4 Calling convention and register set
+  4.5 Pseudo-physical memory and the guest address-space window
+  4.6 Things to delete rather than port
+  5. Milestones
+  6. Toolchain
+  7. Open questions and risks
+
+
+1. Why XP x64 first
+-------------------
+
+XP x64 (and its sibling Server 2003 x64) is the only 64-bit Windows on which
+this design is straightforward to develop:
+
+  - No kernel-mode code signing enforcement. Load-time KMCS enforcement began
+    with Vista x64. On XP x64 an unsigned legacy/service driver loads without
+    test-signing mode, a cross-signing certificate, or boot-menu tricks.
+
+  - No Hyper-V, VBS, HVCI, or Credential Guard. coLinux's model is to take over
+    CR3 and the descriptor tables outright. That is unsound under a root
+    partition, and co_host_switch_wrapper() already refuses to run when
+    CR4.VMXE is set (src/colinux/arch/i386/passage.c). On any modern Windows
+    with virtualization-based security on, that bail-out fires permanently.
+
+  - Era-appropriate CPU features. No PCID in use, no SMEP/SMAP, no CET, no
+    5-level paging, no KPTI. Each of those is a separate hazard for code that
+    switches CR3 and CR4 by hand.
+
+Kernel Patch Protection (PatchGuard) *was* introduced with XP x64, so it is
+present. It is probably survivable because the passage code restores the GDT,
+IDT, LDT, TR, control registers and MSRs exactly before returning to the host,
+so PatchGuard should never observe a modified structure while the host runs.
+Treat this as an empirical risk, not a solved problem, and see section 7.
+
+The consequence to accept up front: this port targets a dead-end host. It is
+worth doing because it is the cheapest way to get the switch mechanism correct
+in 64-bit mode. Forward-porting the *host* side to a signed driver on modern
+Windows is a separate project, and under VBS it may not be possible at all.
+
+
+2. How the 32-bit world switch works
+------------------------------------
+
+The switch is a C function call into a hand-written assembly blob that never
+returns to its caller. It returns on the *other* operating system's stack.
+
+The blob lives in the "passage page": a 9-page allocation whose first page is
+mapped into both address spaces, at the host's own virtual address and at the
+guest's fixed CO_VPTR_PASSAGE_PAGE (0xfeaff000). The remaining 8 pages hold
+page tables for the temporary address spaces and are only touched by the host.
+
+It is one blob used in both directions. co_current and co_other are
+direction-relative macros: in the host driver co_current is host_state, in the
+guest kernel it is linuxvm_state.
+
+Sequence (src/colinux/arch/i386/passage.c, macros
+PASSAGE_CODE_WRAP_SWITCH / _PRESERVATION_* / _NOWHERE_LAND*):
+
+  a. Push EBX/ESI/EDI/EBP, then read the three arguments at fixed offsets
+     16/24/28(%esp). The literal offsets depend on cdecl plus exactly those
+     four pushes.
+
+  b. pushfl; cli. Interrupts stay off for the whole switch. There is no IRQL
+     manipulation and no CPU pinning on the Windows side; the cli is the only
+     safety mechanism.
+
+  c. Save the current side's state into its co_arch_state_stack_t: segment
+     selectors, CR0/2/3/4, GDTR/IDTR (6 bytes each), LDTR, TR, ESP/SS, flags,
+     return EIP, DR0-3/6/7, and the SYSENTER MSRs.
+
+     Two details worth knowing. TR's descriptor busy bit is cleared in the
+     live GDT (andl $0xfffffdff, 4(%edx,%eax,8)) so the eventual ltr does not
+     #GP. DR7 is forced to 0x00000700 to disable all breakpoints across the
+     transition, and DR0-7 have a shadow copy in the first 0x20 bytes of the
+     passage page so that restores can skip unchanged registers.
+
+  d. "Nowhere land": migrate execution from one address space into the other.
+     Two variants.
+
+     Non-PAE host: both sides use identical 2-level paging, so paging is never
+     disabled. Load a temporary CR3 whose address space maps the passage page
+     at *both* virtual addresses at once, then relocate EIP by adding the
+     precomputed other_map delta to a return address on a scratch stack inside
+     the passage page.
+
+     PAE host: the guest is always non-PAE (linuxvm_state.cr4 = 0), so CR4.PAE
+     must be toggled, which requires CR0.PG = 0, which requires running at
+     VA == PA. Each temporary address space therefore maps the passage page at
+     both its virtual address and its physical address. The code jumps into the
+     identity view, rebases every pointer from VA to PA, clears CR0.PG, sets
+     CR4 to just the PAE bit, loads the other side's temp CR3, sets CR0.PG,
+     rebases everything again, and returns.
+
+  e. Load the other side's real CR4/CR3/CR0/CR2, then lgdt/lidt/lldt, the
+     segment registers, and ltr. The real CR3 load is safe because EIP is
+     inside the passage page, mapped at the same VA in the target's real
+     address space.
+
+  f. Hand over control. Read the other side's saved ESP/SS with a single
+     lss (the two fields are deliberately adjacent for this), patch the other
+     side's return EIP and flags directly into its stack, switch to that stack,
+     then load CS via a *self-modifying* ljmp $0,$0 whose immediate operands
+     are written at runtime. popfl, pop the four GPRs, ret.
+
+Interrupts that arrive while the guest runs are not intercepted. The guest's
+own IDT is live, so the interrupt enters the guest's entry stub, which forwards
+it: the patched common_interrupt calls proxy_interrupt_handler, which sets
+operation = CO_OPERATION_FORWARD_INTERRUPT, stores the vector, clears IF in the
+*host's* saved flags so the host resumes with interrupts off, and switches. The
+host then decodes the vector out of its own saved IDTR by hand, synthesises an
+IRET frame with call/pop/pushfl/push %cs/push, and jumps to the real ISR.
+
+FPU and SSE state is never touched by the passage code. It is handled lazily in
+guest C code keyed off CR0.TS (which is part of the saved CR0): the guest's #NM
+handler fxsaves the host's FPU into a 0x200-byte global, and restores it before
+switching back.
+
+
+3. The shared ABI problem (read this before touching anything)
+--------------------------------------------------------------
+
+co_arch_state_stack_t and co_arch_passage_page_t are *not* defined in src/.
+They are created by the kernel patch, in
+
+    arch/x86/include/asm/cooperative.h
+
+and pulled into the host driver via <linux/cooperative.h> from
+src/colinux/common/common.h. Both halves must change in lockstep.
+
+Worse: every field offset used by the assembly is a hand-written hex *string*
+constant sitting next to the field it describes, e.g.
+
+    unsigned long cr3;
+    #define CO_ARCH_STATE_STACK_CR3 "0x10"
+
+There is no offsetof() and no build-time check that the strings match the
+struct. Widening any field silently desynchronises the assembly from the C
+declaration, with no diagnostic.
+
+Two independent hazards compound this:
+
+  - Every field is `unsigned long`. Win64 is LLP64, so `unsigned long` stays
+    4 bytes in the host driver; Linux x86-64 is LP64, so it becomes 8 bytes in
+    the guest kernel. A Win64 driver and an LP64 guest would disagree about the
+    layout of the page they share, including params[].
+
+  - The code buffer is code[0x260] (608 bytes), size-checked at runtime in
+    co_monitor_arch_passage_page_init(). REX prefixes, 64-bit immediates and
+    the extra MSR swaps will overflow it, and growing it moves the state
+    blocks, which is itself another ABI change.
+
+First concrete task of the port, before any assembly is written: replace the
+hex strings with generated constants. Emit them from a small host-side program
+that uses offsetof() on the real struct (the kernel's own asm-offsets.c is the
+model), make both the driver and the guest include the generated header, and
+switch every field to an explicit fixed-width type (uint64_t / co_u64_t). Do
+this while the tree is still 32-bit and still builds, so the change is
+verifiable against a working baseline.
+
+
+4. What has to change
+---------------------
+
+4.1 Paging and the nowhere-land trampoline
+
+The PAE variant's core trick is now illegal. Clearing CR0.PG while EFER.LMA is
+set faults; long mode requires PG=1 and PAE=1. Leaving long mode to toggle
+paging means clearing EFER.LME from a 1:1-mapped 32-bit code segment, which is
+a large amount of new machinery.
+
+The good news is that it is unnecessary. If host and guest are both long mode
+with 4-level paging, there is no paging-mode change to make, and a plain
+mov to CR3 between two PML4 trees suffices. The PAE variant collapses into
+something shaped like the current SHORT variant, and the PAE/non-PAE axis of
+blob selection disappears entirely — four blobs become two, split on the
+SYSCALL-MSR axis instead of SEP.
+
+Better still: pick a passage-page virtual address that is free in *both* the
+Windows x64 kernel half and the Linux x86-64 kernel half. The 64-bit address
+space is vast, so this is easy, and if the two VAs are identical then other_map
+is zero in both directions and the entire EIP-relocation dance disappears. This
+is the single largest simplification available in the port; design for it.
+
+Remaining work here:
+
+  - Add CO_ARCH_PML4_SHIFT (39) and friends to mmu.h; replace the 2-level and
+    3-level temporary address-space builders (short_/normal_/pae_temp_address_
+    space_init) with one 4-level builder.
+  - Use RIP-relative addressing instead of the call/pop EIP tricks.
+  - Widen the page-base masks: andl $0xFFFFF000 truncates any address above
+    4 GB and must become a 64-bit, sign-extension-aware mask.
+  - Widen physical addresses: co_pfn_t, linux_pte_t/pmd_t/pgd_t, and
+    co_os_virt_to_phys() (which currently truncates MmGetPhysicalAddress()'s
+    QuadPart to unsigned long). Drop the manager's refusal to run on hosts
+    with more than 4 GB, and fix co_monitor_getpp()'s hardcoded 4-byte stride.
+  - PTE construction must carry NX and the high physical bits.
+
+4.2 Long-mode CPU state that is currently not saved at all
+
+None of the following is in the state block today, and all of it must be:
+
+  - EFER (0xC0000080) — LME/LMA/NXE/SCE are per-context.
+  - The SYSCALL MSRs: STAR (0xC0000081), LSTAR (0xC0000082),
+    CSTAR (0xC0000083), FMASK (0xC0000084).
+  - The segment-base MSRs: FS_BASE (0xC0000100), GS_BASE (0xC0000101),
+    KERNEL_GS_BASE (0xC0000102).
+
+The segment-base MSRs are the dangerous one. In long mode, writing a selector
+to %fs or %gs does not restore the 64-bit base. So the existing code — which
+saves and restores only the selectors, and deliberately zeroes FS and GS
+mid-switch "to be on the safe side" — would destroy the host's per-CPU pointer.
+Windows x64 keeps the KPCR at GS base; Linux x86-64 keeps per-CPU data there.
+Swapping these via MSRs (or swapgs) is mandatory, and the ordering relative to
+the GDT reload matters.
+
+Also note the current SYSENTER handling truncates: rdmsr keeps only EAX, and
+the restore path does xor %edx,%edx before wrmsr. On a 64-bit host that
+destroys the upper half of SYSENTER_EIP/ESP. Every MSR save/restore must become
+a full 64-bit EDX:EAX pair.
+
+FPU/SSE needs rethinking rather than porting. The lazy CR0.TS scheme depends on
+#NM and clts, which modern kernels have moved away from (eager FPU), and a
+0x200-byte FXSAVE area cannot hold AVX state. Move to explicit XSAVE/XRSTOR
+with an XCR0-derived, 64-byte-aligned area saved on *both* sides, and add XCR0
+to the state block. This is not optional on x64: the Windows x64 ABI makes
+XMM6-XMM15 callee-saved, and compiler-generated code uses SSE pervasively.
+
+Consider also PAT, CR8/TPR, and on modern hosts SPEC_CTRL. For XP x64 these are
+mostly moot.
+
+4.3 Descriptors, TSS, interrupt delivery
+
+  - GDTR/IDTR grow from 6 to 10 bytes, which reshuffles every offset in the
+    state block. See section 3.
+  - The TSS descriptor is 16 bytes in long mode and spans two GDT slots, so the
+    busy-bit clear (scale-8 indexing, bit 9 of the second dword) needs a new
+    stride and bit position, on both the host and guest sides. The long-mode
+    TSS holds RSP0-2 and IST1-7 and has no per-task I/O permission semantics,
+    so the guest's co_early_cpu_init needs rewriting.
+  - IDT gates are 16 bytes: the guest's idt.size becomes 256*16 - 1. More
+    importantly, the host's interrupt re-injection decodes an 8-byte gate by
+    hand and must instead reassemble a 64-bit offset from three fields and
+    honour the IST index.
+  - ljmp with immediate operands does not exist in 64-bit mode, so the
+    self-modifying far jump must go. Replace it with push CS / push RIP /
+    lretq, or an indirect far jump through m16:64 — or drop it entirely if both
+    contexts share a flat 64-bit CS, since in long mode CS is essentially just
+    a mode and CPL selector. This also removes the requirement that the passage
+    page be writable-and-executable.
+  - lss survives in 64-bit mode (unlike lds/les) and can take m16:64 with
+    REX.W, but SS has no meaningful base or limit in long mode, so there is no
+    longer a reason to keep the SS and RSP fields adjacent. Prefer a plain
+    mov to RSP and drop the coupling from the struct layout.
+  - iretq always pops five quadwords, even for a same-CPL return, so the
+    synthesised interrupt frame becomes 40 bytes with a valid RSP/SS and 16-byte
+    alignment. The current frame pushes only flags/cs/eip.
+  - Guest entry state: CR4 must gain PAE (and PGE), EFER must have LME/LMA and
+    NXE set, and the initial stack must not hardcode 0x2000 — take THREAD_SIZE
+    from the guest's own headers, since it differs between architectures and
+    between kernel versions.
+
+4.4 Calling convention and register set
+
+The blob reads its arguments off the stack at literal offsets. On x86-64 they
+arrive in registers — and the two directions use *different* conventions, since
+the host driver is Win64 (RCX/RDX/R8) and the guest kernel is SysV
+(RDI/RSI/RDX). Either normalise with a small per-side thunk, or change the
+interface so the blob takes a single pointer argument.
+
+R8-R15 must be saved; they do not happen to be preserved the way EBX/ESI/EDI/
+EBP were. The Win64 callee-saved set is RBX, RBP, RDI, RSI, R12-R15 and
+XMM6-XMM15, which is considerably larger than what the prologue pushes today.
+
+4.5 Pseudo-physical memory and the guest address-space window
+
+The guest's fixed window is CO_VPTR_BASE = 0xffc00000 and about 20 MB below it,
+all 32-bit constants. It must move into the canonical 64-bit kernel half, and
+the self-map — where one PTE page happens to cover the whole 4 MB special
+region, letting the guest rewrite its own top-level PTEs — has to be re-derived
+for 4-level paging, where a PT page covers 2 MB.
+
+The pseudo-physical RAM design needs rebuilding, not adjusting. Today a flat
+array of 4-byte PTEs indexed by guest PFN simultaneously serves as the page
+tables for the linear map of pseudo-physical RAM at CO_ARCH_KERNEL_OFFSET
+(0xc0000000). For x86-64 that means 8-byte PTEs, 2 MB PD granularity, 4-level
+PGD population, and PAGE_OFFSET at 0xffff880000000000 (2.6.x) or
+0xffff888000000000 (modern kernels). Relatedly, pp_pfns is a fixed 1024x1024
+two-level shadow that exactly covers 4 GB and needs to become a real multi-level
+or radix structure.
+
+CO_LOWMEMORY_MAX_MB (984) is a *derived* number — it is how much pseudo-RAM PTE
+array fits in the window — so it changes with the new layout rather than being
+tuned.
+
+4.6 Things to delete rather than port
+
+  - antinx.c. It hand-walks the host's live page tables to clear the NX bit on
+    the passage page, because the page comes from MmAllocateNonCachedMemory and
+    Windows DEP may mark it non-executable. On x64 this gets worse (4-level
+    walk) and PatchGuard objects to page-table tampering. Use a supported
+    allocation instead: an executable non-paged pool allocation, or an MDL
+    mapped executable. The P4 erratum N76 TLB-flush workaround it also carries
+    is irrelevant on x64 hardware.
+  - co_i386_has_cpuid(). It probes EFLAGS.ID with pushfl/popl, which is
+    meaningless on x86-64 (CPUID is architectural) and will not assemble.
+    The capability query itself needs leaf 0x80000001 for NX/LM and leaves
+    0x7 and 0xD for XSAVE.
+  - The FS/GS-nullify step and the SS reload become no-ops or hazards in long
+    mode; the real work moves to the base MSRs (4.2).
+  - apic.c is a stub and its feature check is wrong anyway (it tests
+    caps[0] & CO_ARCH_X86_FEATURE_APIC, i.e. & 9, rather than & (1 << 9);
+    compare the correct 1 << CO_ARCH_X86_FEATURE_SEP test in passage.c). Fix
+    or remove it during the port.
+
+
+5. Milestones
+-------------
+
+M0. Build the 32-bit tree on a current host.
+    Nothing can be verified without a working baseline. The comake build system
+    was Python 2 and is now ported (commit "comake: port the build system from
+    Python 2 to Python 3"). Remaining: install mingw-w64, obtain a
+    period-appropriate GCC for the 2.6.33 guest kernel (a current GCC cannot
+    build it), and get `make` through to a linux.sys plus daemons.
+    Exit criterion: unmodified 0.7.9 builds, and ideally boots under 32-bit
+    Windows, so there is a known-good reference to diff against.
+
+M1. Make the ABI mechanical, still 32-bit.
+    Generate the CO_ARCH_STATE_STACK_* offsets from offsetof() instead of
+    hand-written hex strings; convert the shared structs to fixed-width types.
+    Exit criterion: the 32-bit build still works, bit-for-bit equivalent
+    behaviour. This is the change that makes everything after it safe.
+
+M2. 64-bit host scaffolding that compiles and loads.
+    Add src/colinux/arch/x86_64 (the arch/current symlink mechanism in
+    src/build.comake.py already supports this via COLINUX_ARCH); switch the
+    cross prefix to x86_64-w64-mingw32-; drop the 32-bit-only -mpush-args and
+    -mno-accumulate-outgoing-args flags; widen co_os_virt_to_phys and the PFN
+    types. co_host_switch_wrapper refuses to start a VM.
+    Exit criterion: a 64-bit linux.sys loads on XP x64 and
+    colinux-daemon --status-driver reports it.
+
+    Note: ref/CoLinux64 (the 2013 GSoC project) already did much of this
+    type-widening and arch-splitting work against 0.7.8. Mine it, but base the
+    result on 0.7.9. Its arch/x86_64/passage.c is explicitly a placeholder —
+    it has no switch assembly at all and co_host_switch_wrapper terminates
+    immediately — so M3 is untouched ground.
+
+M3. The switch, tested against a trivial guest.
+    Write the x86-64 passage code, and bring it up against a hand-written page
+    of 64-bit code that does nothing but write a sentinel value into the
+    passage page and switch back. Do not involve Linux.
+    This is the crux of the project and the milestone most likely to consume
+    the most time. Decoupling it from a Linux guest is what makes it debuggable
+    at all: a bugcheck here means the switch is wrong, not that a kernel failed
+    to boot.
+    Exit criterion: host to dummy-guest round trip on XP x64, repeatedly,
+    without bugchecking, with all host state verifiably intact.
+
+M4. A 64-bit Linux guest.
+    Port the cooperative patch's arch half: the address-space window, 4-level
+    page table handling, entry/exit stubs, interrupt forwarding, early printk
+    through the passage page. Then serial console, then a cobd root filesystem.
+    Exit criterion: 64-bit Linux boots to a shell under XP x64.
+
+M5. Devices: conet, cofs, scsi, the consoles.
+
+M6. Forward-port the guest to a current kernel.
+
+On M4, there is a real choice: port 2.6.33 to x86-64 first, or go straight to a
+modern kernel. Recommendation: 2.6.33 first. The dominant risk in this project
+is "the switch doesn't work and you cannot tell why", and 2.6.33's cooperative
+patch is a complete, known-good reference for every part of the design that
+isn't architecture-specific — you change one half and keep the other fixed.
+Modern kernels add KASLR, KPTI, eager FPU and a rewritten early boot on top of
+an unproven switch. The cost is doing the guest port roughly twice; that is
+worth paying for the ability to isolate failures. Revisit this after M3, when
+the switch is known to work.
+
+
+6. Toolchain
+------------
+
+Verified on this host (CachyOS, kernel 7.1.5):
+
+  Python 3.14        comake now runs on it (M0 done)
+  GCC 16.1.1         far too new to build a 2.6.33 kernel
+  gcc -m32           works, multilib present
+  mingw-w64          NOT INSTALLED — needed for any Windows target
+  wine               not installed; only needed for `make installer`
+  nasm, mkisofs      not installed; not needed for the core build
+
+Two compilers are required and their versions must match closely: one targeting
+the guest architecture and one targeting the host. The daemon refuses to run if
+the kernel and daemon compiler versions differ. coLinux can build its own
+matched pair via configure --gcc-guest-build; alternatively build the old guest
+kernel in a container with an era-appropriate distro. For 64-bit the host
+compiler becomes x86_64-w64-mingw32-gcc.
+
+For XP x64 as a target, set WINVER/_WIN32_WINNT to 0x0502 rather than the
+current 0x0500.
+
+
+7. Open questions and risks
+---------------------------
+
+  - PatchGuard on XP x64. Believed survivable because all state is restored
+    before the host resumes, but unproven. Mitigation if it bites: keep the
+    host's own GDT/IDT untouched (only ever load the guest's while the guest
+    runs), and avoid antinx-style page-table edits entirely (4.6).
+
+  - Test environment. XP x64 on real hardware or in a VM? Nested — running a
+    design that takes over CR3 and CR0 inside another hypervisor — is where
+    the CR4.VMXE bail-out was pointed in the first place. Expect to need real
+    hardware, or at minimum expect VM behaviour not to be representative. This
+    needs deciding before M3, because M3 cannot be validated without it.
+
+  - Debuggability. There is a doc/debugging for the 32-bit case. Plan the
+    equivalent for x64 before M3: WinDbg over serial or 1394 against XP x64,
+    plus the sentinel-in-passage-page technique, because printf debugging
+    across a half-completed world switch does not work.
+
+  - Whether the guest should be long mode at all. A compatibility-mode
+    (32-bit) guest under a 64-bit host would avoid the entire guest-kernel
+    port, keeping the existing i386 cooperative patch. It does not avoid the
+    switch work: the host side still needs long-mode state handling, and it
+    reintroduces the leave-long-mode problem that section 4.1 says to design
+    away. It is probably a false economy, but it is cheap to evaluate and worth
+    ten minutes of thought before committing to M4.
+
+  - This design does not generalise forward. See section 1. If the real goal is
+    modern Linux on modern Windows, the answer is a VT-x/AMD-V root-mode host,
+    not a passage page. The XP x64 target is worth pursuing on its own terms;
+    it is not a stepping stone to a modern host.
