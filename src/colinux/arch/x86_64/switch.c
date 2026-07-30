@@ -121,11 +121,32 @@ asm(".text                                          \n"
 #define CO_PP_FAULTED_N		0x8e8
 #define CO_PP_FAULT_RIP_N	0x8f0
 
-/* params[6] and params[7]; params[8..9] are the guest GDT, so these are free. */
+/* params[6] and params[7]; params[8..15] are reserved for the guest GDT. */
 #define CO_PP_COUNTER		"0x8f8"
 #define CO_PP_REGSUM		"0x900"
 #define CO_PP_COUNTER_N		0x8f8
 #define CO_PP_REGSUM_N		0x900
+
+/*
+ * What a fault leaves behind, at params[16..18]. Placed above the GDT's eight
+ * reserved slots so a TSS descriptor can be added there without moving these --
+ * the stubs reach them by literal offset and cannot be recompiled per layout.
+ */
+#define CO_PP_VECTOR		"0x948"
+#define CO_PP_ERRCODE		"0x950"
+#define CO_PP_CR2		"0x958"
+#define CO_PP_VECTOR_N		0x948
+#define CO_PP_ERRCODE_N		0x950
+#define CO_PP_CR2_N		0x958
+
+/*
+ * The 256 vector stubs get a page of their own in host_temp, right after the
+ * IDT. They have to be executable and mapped in the guest, which the whole
+ * passage page already is.
+ */
+#define CO_PP_IDT_PAGE		 0		/* host_temp page 0 */
+#define CO_PP_STUBS_PAGE	 1		/* host_temp page 1 */
+#define CO_PP_STUB_SIZE		16		/* uniform, so stub N is base + N*16 */
 
 extern char co_switch_full;
 extern char co_switch_guest_entry;
@@ -235,17 +256,59 @@ asm(".text                                                          \n"
     "co_switch_guest_entry_fault:                                   \n"
     "    mov %r9, (%r8)                                             \n"
     "    ud2                                                        \n"
+    /*
+     * Every vector arrives here, but by way of its own stub, which has already
+     * pushed two words so the frame is the same shape whatever faulted:
+     *
+     *   rsp+0x00  vector number      (pushed by the stub)
+     *   rsp+0x08  error code         (real, or a zero the stub pushed)
+     *   rsp+0x10  RIP                    <- CPU
+     *   rsp+0x18  CS                     <- CPU
+     *   rsp+0x20  RFLAGS                 <- CPU
+     *   rsp+0x28  RSP                    <- CPU
+     *   rsp+0x30  SS                     <- CPU
+     *
+     * Normalising the error code in the stub is the whole reason the stubs
+     * exist. Ten vectors push one and the rest do not, so without it the frame
+     * is shifted by eight bytes for exactly the faults that matter most -- #PF
+     * and #GP -- and the RIP read here would be the CS of a different fault.
+     *
+     * Registers are clobbered freely: a fault ends the guest's turn, so there is
+     * nothing to preserve. If a later rung wants to resume after a fault, this
+     * has to save the full register set first.
+     */
     ".globl co_switch_guest_fault                                   \n"
     "co_switch_guest_fault:                                         \n"
     "    lea 0(%rip), %rax                                          \n"
     "    and $-4096, %rax                                           \n"
     "    movq $1, " CO_PP_FAULTED "(%rax)                           \n"
-    /* the interrupt frame's RIP, before anything is pushed over it */
-    "    mov (%rsp), %rdx                                           \n"
+    "    mov 0(%rsp), %rdx                                          \n"
+    "    mov %rdx, " CO_PP_VECTOR "(%rax)                           \n"
+    "    mov 8(%rsp), %rdx                                          \n"
+    "    mov %rdx, " CO_PP_ERRCODE "(%rax)                          \n"
+    "    mov 16(%rsp), %rdx                                         \n"
     "    mov %rdx, " CO_PP_FAULT_RIP "(%rax)                        \n"
+    /* CR2 is only meaningful for #PF, but it costs nothing and is the whole
+     * diagnosis when it is: the address that could not be translated. */
+    "    mov %cr2, %rdx                                             \n"
+    "    mov %rdx, " CO_PP_CR2 "(%rax)                              \n"
     "    lea " CO_PP_LINUXVM_STATE "(%rax), %rcx                    \n"
     "    lea " CO_PP_HOST_STATE "(%rax), %rdx                       \n"
     "    jmp co_switch_full                                         \n"
+    /*
+     * A guest that takes a page fault on purpose: it computes an address inside
+     * its own passage page, walks a megabyte past it -- which the guest maps
+     * nothing at -- and reads. Position independent, and guaranteed unmapped
+     * without needing to know where the page landed.
+     */
+    ".globl co_switch_guest_entry_pf                                \n"
+    "co_switch_guest_entry_pf:                                      \n"
+    "    mov %r9, (%r8)                                             \n"
+    "    lea 0(%rip), %rdx                                          \n"
+    "    and $-4096, %rdx                                           \n"
+    "    add $0x100000, %rdx                                        \n"
+    "    mov (%rdx), %rax                                           \n"
+    "    ud2                                                        \n"
     /*
      * A guest that yields and expects to be resumed -- the shape the real
      * monitor loop has, reduced to something with no Linux in it.
@@ -283,6 +346,7 @@ asm(".text                                                          \n"
 extern char co_switch_guest_fault;
 extern char co_switch_guest_entry_fault;
 extern char co_switch_guest_loop;
+extern char co_switch_guest_entry_pf;
 
 typedef void (*co_switch_full_fn)(co_arch_state_stack_t* leaving,
                                   co_arch_state_stack_t* entering,
@@ -443,8 +507,18 @@ typedef char co_assert_fault_slots
 	[(__builtin_offsetof(co_arch_passage_page_t, params) + 4 * 8 == CO_PP_FAULTED_N &&
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 5 * 8 == CO_PP_FAULT_RIP_N &&
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 6 * 8 == CO_PP_COUNTER_N &&
-	  __builtin_offsetof(co_arch_passage_page_t, params) + 7 * 8 == CO_PP_REGSUM_N)
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 7 * 8 == CO_PP_REGSUM_N &&
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 16 * 8 == CO_PP_VECTOR_N &&
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 17 * 8 == CO_PP_ERRCODE_N &&
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 18 * 8 == CO_PP_CR2_N)
 	 ? 1 : -1];
+
+/* The stubs need a page to themselves, after the IDT's. */
+typedef char co_assert_stubs_fit_host_temp
+	[(sizeof(((co_arch_passage_page_t*)0)->host_temp)
+	  >= (CO_PP_STUBS_PAGE + 1) * 0x1000) ? 1 : -1];
+typedef char co_assert_stub_table_is_a_page
+	[((256 * CO_PP_STUB_SIZE) == 0x1000) ? 1 : -1];
 
 /* The IDT lives in host_temp; a full 256-gate table has to fit inside it. */
 typedef char co_assert_idt_fits_host_temp
@@ -459,20 +533,107 @@ typedef char co_assert_idt_fits_host_temp
  * leave the interrupt frame shifted by eight bytes, so the RIP this records is
  * only correct for the vectors that do not. #UD, which the test raises, does not.
  */
-static void co_build_guest_idt(struct co_x86_64_gate* idt,
-			       unsigned long long handler,
-			       unsigned short selector)
+static void co_set_gate(struct co_x86_64_gate* gate, unsigned long long handler,
+			unsigned short selector)
+{
+	gate->offset_low  = (unsigned short)(handler & 0xffff);
+	gate->selector    = selector;
+	gate->flags       = 0x8e00;		/* present, DPL 0, interrupt gate */
+	gate->offset_mid  = (unsigned short)((handler >> 16) & 0xffff);
+	gate->offset_high = (unsigned int)(handler >> 32);
+	gate->reserved    = 0;
+}
+
+/*
+ * Does this vector's exception push an error code?
+ *
+ * #DF(8), #TS(10), #NP(11), #SS(12), #GP(13), #PF(14), #AC(17), #CP(21),
+ * #VC(29) and #SX(30). Everything else does not, including every interrupt.
+ * Getting this list wrong is not a subtle failure: the handler reads the frame
+ * at fixed offsets, so one wrong entry means the reported RIP is whatever
+ * happened to be next on the stack.
+ */
+static bool_t co_vector_has_error_code(int vector)
+{
+	switch (vector) {
+	case 8: case 10: case 11: case 12: case 13:
+	case 14: case 17: case 21: case 29: case 30:
+		return PTRUE;
+	default:
+		return PFALSE;
+	}
+}
+
+/*
+ * Emit 256 stubs, one per vector, each pushing its own number and normalising
+ * the frame, then jumping to the common handler.
+ *
+ * Every stub is exactly CO_PP_STUB_SIZE bytes so stub N is simply base + N*16 --
+ * no table of addresses to get out of step with the code. Layout:
+ *
+ *   6a 00                    pushq $0        (or two nops if the CPU pushed one)
+ *   68 nn nn nn nn           pushq $vector
+ *   e9 rr rr rr rr           jmp   handler
+ *   90 ...                   pad to 16
+ *
+ * push $imm32 rather than the shorter push $imm8, because imm8 is sign-extended
+ * and vectors above 127 would arrive as negative numbers.
+ *
+ * stubs_va is where this page will live *in the guest*, which is the same
+ * address the host sees it at -- the passage page is mapped at one address in
+ * both. The jmp is relative, so it needs that address to compute its offset.
+ */
+static void co_build_guest_stubs(unsigned char* stubs, unsigned long long stubs_va,
+				 unsigned long long handler_va)
 {
 	int vector;
 
 	for (vector = 0; vector < 256; vector++) {
-		idt[vector].offset_low  = (unsigned short)(handler & 0xffff);
-		idt[vector].selector    = selector;
-		idt[vector].flags       = 0x8e00;	/* present, DPL 0, interrupt gate */
-		idt[vector].offset_mid  = (unsigned short)((handler >> 16) & 0xffff);
-		idt[vector].offset_high = (unsigned int)(handler >> 32);
-		idt[vector].reserved    = 0;
+		unsigned char* p = stubs + vector * CO_PP_STUB_SIZE;
+		unsigned long long stub_va = stubs_va + vector * CO_PP_STUB_SIZE;
+		unsigned long long next_va;
+		long long rel;
+		int i;
+
+		if (co_vector_has_error_code(vector)) {
+			p[0] = 0x90;			/* nop  */
+			p[1] = 0x90;			/* nop  */
+		} else {
+			p[0] = 0x6a;			/* pushq $0 -- a stand-in */
+			p[1] = 0x00;
+		}
+
+		p[2] = 0x68;				/* pushq $imm32 */
+		p[3] = (unsigned char)(vector & 0xff);
+		p[4] = 0;
+		p[5] = 0;
+		p[6] = 0;
+
+		/* jmp rel32, measured from the end of the instruction */
+		next_va = stub_va + 12;
+		rel     = (long long)handler_va - (long long)next_va;
+
+		p[7]  = 0xe9;
+		p[8]  = (unsigned char)(rel & 0xff);
+		p[9]  = (unsigned char)((rel >> 8) & 0xff);
+		p[10] = (unsigned char)((rel >> 16) & 0xff);
+		p[11] = (unsigned char)((rel >> 24) & 0xff);
+
+		for (i = 12; i < CO_PP_STUB_SIZE; i++)
+			p[i] = 0x90;
 	}
+}
+
+static void co_build_guest_idt(struct co_x86_64_gate* idt,
+			       unsigned long long stubs_va,
+			       unsigned short selector)
+{
+	int vector;
+
+	for (vector = 0; vector < 256; vector++)
+		co_set_gate(&idt[vector],
+			    stubs_va + vector * CO_PP_STUB_SIZE,
+			    selector);
 }
 
 /*
@@ -564,16 +725,26 @@ static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 	 * honest, so leave it named.
 	 */
 	{
-		struct co_x86_64_gate* idt = (struct co_x86_64_gate*)&pp->host_temp;
+		unsigned char* host_temp = (unsigned char*)&pp->host_temp;
+		struct co_x86_64_gate* idt =
+			(struct co_x86_64_gate*)(host_temp + CO_PP_IDT_PAGE * CO_ARCH_PAGE_SIZE);
+		unsigned char* stubs = host_temp + CO_PP_STUBS_PAGE * CO_ARCH_PAGE_SIZE;
+		unsigned long long stubs_va = (unsigned long long)(size_t)stubs;
 		unsigned long long handler = (unsigned long long)(size_t)pp->code
 			+ (unsigned long)(&co_switch_guest_fault - &co_switch_full);
 
-		co_build_guest_idt(idt, handler, 0x08);
+		/*
+		 * Stubs first, then gates pointing at them. 256 stubs of 16 bytes is
+		 * exactly a page, which is why they get one of their own.
+		 */
+		co_build_guest_stubs(stubs, stubs_va, handler);
+		co_build_guest_idt(idt, stubs_va, 0x08);
 
 		pp->linuxvm_state.idt.table = (struct x86_idt_entry*)idt;
 		pp->linuxvm_state.idt.size  = (256 * 16) - 1;
 
 		out->guest_idt     = (unsigned long long)(size_t)idt;
+		out->guest_stubs   = stubs_va;
 		out->fault_handler = handler;
 	}
 
@@ -591,8 +762,121 @@ static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 	return pp;
 }
 
+/*
+ * Walk the guest's own tables, in host memory, and confirm one address resolves
+ * to the physical page the host has at that same address.
+ *
+ * The tables are inside the passage page, so they can be read directly rather
+ * than through co_os_map(). Returns the level that was absent, or -1 on success.
+ */
+static int co_preflight_lookup(co_arch_passage_page_t* pp, unsigned long long va)
+{
+	unsigned long long* table = pp->guest_temp.pml4;
+	co_pa_t want = co_os_virt_to_phys((void*)(size_t)va);
+	int level;
+
+	for (level = 0; level < 4; level++) {
+		unsigned long index;
+		unsigned long long entry;
+
+		switch (level) {
+		case 0:  index = CO_ARCH_PGD_INDEX(va); break;
+		case 1:  index = CO_ARCH_PUD_INDEX(va); break;
+		case 2:  index = CO_ARCH_PMD_INDEX(va); break;
+		default: index = CO_ARCH_PTE_INDEX(va); break;
+		}
+
+		entry = table[index];
+		if (!(entry & _PAGE_PRESENT))
+			return level;
+
+		if (level == 3) {
+			co_pa_t got = (co_pa_t)(entry & CO_ARCH_PAGE_MASK & ~CO_ARCH_PAGE_NX);
+
+			if (got != (want & CO_ARCH_PAGE_MASK)) {
+				co_debug_error("preflight: 0x%llx maps to 0x%llx, host has 0x%llx",
+					       va, (unsigned long long)got,
+					       (unsigned long long)want);
+				return 3;
+			}
+			return -1;
+		}
+
+		/*
+		 * The next table is a page of this same allocation, so it can be
+		 * reached by its host virtual address rather than by mapping the
+		 * frame -- which is only true because guest_temp lives inside the
+		 * passage page.
+		 */
+		{
+			co_pa_t next_pa = (co_pa_t)(entry & CO_ARCH_PAGE_MASK & ~CO_ARCH_PAGE_NX);
+			unsigned long long* candidate = NULL;
+			int page;
+
+			for (page = 0; page < (int)(sizeof(*pp) / CO_ARCH_PAGE_SIZE); page++) {
+				unsigned char* p = (unsigned char*)pp + page * CO_ARCH_PAGE_SIZE;
+
+				if (co_os_virt_to_phys(p) == next_pa) {
+					candidate = (unsigned long long*)p;
+					break;
+				}
+			}
+
+			if (candidate == NULL) {
+				co_debug_error("preflight: table at level %d is outside the passage page",
+					       level);
+				return level;
+			}
+
+			table = candidate;
+		}
+	}
+
+	return -1;
+}
+
+/*
+ * Refuse to enter a guest address space that cannot run.
+ *
+ * Every one of the three resets this port has cost was an address the guest
+ * needed and did not have: the GDT that lretq reads, the IDT that an exception
+ * reads, and a PML4 that had been overwritten. All three are visible by reading
+ * the tables, and reading them costs microseconds against a reboot. So nothing
+ * loads CR3 until this has passed.
+ */
+static bool_t co_preflight_guest(co_arch_passage_page_t* pp, unsigned long long va,
+				 co_arch_switch_test_t* out)
+{
+	struct { const char* what; unsigned long long va; } required[] = {
+		{ "entry point",  pp->linuxvm_state.return_rip },
+		{ "stack",        pp->linuxvm_state.rsp - 8 },
+		{ "guest GDT",    (unsigned long long)(size_t)pp->linuxvm_state.gdt.base },
+		{ "guest IDT",    (unsigned long long)(size_t)pp->linuxvm_state.idt.table },
+		{ "passage page", va },
+	};
+	const int count = sizeof(required) / sizeof(required[0]);
+	int i;
+
+	for (i = 0; i < count; i++) {
+		int missing = co_preflight_lookup(pp, required[i].va);
+
+		if (missing >= 0) {
+			co_debug_error("preflight: %s at 0x%llx is not usable in the guest "
+				       "(absent at level %d) -- refusing to enter",
+				       required[i].what, required[i].va, missing);
+			out->preflight_failed = PTRUE;
+			out->preflight_va     = required[i].va;
+			out->preflight_level  = missing;
+			return PFALSE;
+		}
+		out->preflight_checked++;
+	}
+
+	return PTRUE;
+}
+
 co_rc_t co_arch_test_roundtrip(co_manager_t* manager, co_arch_switch_test_t* out,
-			       bool_t provoke_fault)
+			       int provoke_fault)
 {
 	co_arch_passage_page_t* pp;
 	co_switch_full_fn fn;
@@ -603,9 +887,12 @@ co_rc_t co_arch_test_roundtrip(co_manager_t* manager, co_arch_switch_test_t* out
 	co_memset(out, 0, sizeof(*out));
 	out->supported = PTRUE;
 
-	entry_offset = provoke_fault
-		? (unsigned long)(&co_switch_guest_entry_fault - &co_switch_full)
-		: (unsigned long)(&co_switch_guest_entry - &co_switch_full);
+	entry_offset =
+		(provoke_fault == 2)
+			? (unsigned long)(&co_switch_guest_entry_pf - &co_switch_full) :
+		(provoke_fault == 1)
+			? (unsigned long)(&co_switch_guest_entry_fault - &co_switch_full)
+			: (unsigned long)(&co_switch_guest_entry - &co_switch_full);
 
 	pp = co_setup_guest_page(out, entry_offset);
 	if (pp == NULL)
@@ -615,6 +902,11 @@ co_rc_t co_arch_test_roundtrip(co_manager_t* manager, co_arch_switch_test_t* out
 	sentinel = (unsigned long long*)&pp->params[0];
 	out->expected = CO_SWITCH_SENTINEL;
 
+	if (!co_preflight_guest(pp, out->passage_va, out)) {
+		co_os_free_exec_pages(pp, pages);
+		return CO_RC(ERROR);
+	}
+
 	fn(&pp->host_state, &pp->linuxvm_state, sentinel, CO_SWITCH_SENTINEL);
 
 	out->observed  = *sentinel;
@@ -623,9 +915,12 @@ co_rc_t co_arch_test_roundtrip(co_manager_t* manager, co_arch_switch_test_t* out
 	 * runs with no trustworthy register -- so it writes at fixed offsets into the
 	 * passage page, and params[4] and params[5] are those offsets (0x8e8, 0x8f0).
 	 */
-	out->faulted   = (int)pp->params[4];
-	out->fault_rip = pp->params[5];
-	out->succeeded = (out->observed == CO_SWITCH_SENTINEL) ? PTRUE : PFALSE;
+	out->faulted    = (int)pp->params[4];
+	out->fault_rip  = pp->params[5];
+	out->vector     = pp->params[16];
+	out->error_code = pp->params[17];
+	out->cr2        = pp->params[18];
+	out->succeeded  = (out->observed == CO_SWITCH_SENTINEL) ? PTRUE : PFALSE;
 
 	co_os_free_exec_pages(pp, pages);
 
@@ -673,6 +968,11 @@ co_rc_t co_arch_test_resume(co_manager_t* manager, co_arch_switch_test_t* out,
 
 	out->iterations = iterations;
 	out->expected   = (unsigned long long)iterations;
+
+	if (!co_preflight_guest(pp, out->passage_va, out)) {
+		co_os_free_exec_pages(pp, pages);
+		return CO_RC(ERROR);
+	}
 
 	for (i = 0; i < iterations; i++)
 		fn(&pp->host_state, &pp->linuxvm_state, sentinel, CO_SWITCH_SENTINEL);

@@ -22,7 +22,7 @@ co_rc_t co_arch_test_switch(co_manager_t* manager, co_arch_switch_test_t* out)
 }
 
 co_rc_t co_arch_test_roundtrip(co_manager_t* manager, co_arch_switch_test_t* out,
-			       bool_t provoke_fault)
+			       int provoke_fault)
 {
 	co_memset(out, 0, sizeof(*out));
 	out->supported = PFALSE;
