@@ -19,6 +19,7 @@ extern co_rc_t co_winnt_probe_passage(void);
 extern co_rc_t co_winnt_probe_sweep(void);
 extern co_rc_t co_winnt_save_state(bool_t restore);
 extern co_rc_t co_winnt_test_switch(int mode);
+extern co_rc_t co_winnt_test_space(void);
 
 extern co_rc_t co_winnt_install_driver(void);
 extern co_rc_t co_winnt_initialize_driver(void);

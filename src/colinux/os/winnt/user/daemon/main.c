@@ -203,6 +203,9 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		return co_winnt_status_driver(1); // arg 1 = View all driver details
 	}
 
+	if (winnt_parameters.test_space)
+		return co_winnt_test_space();
+
 	if (winnt_parameters.test_resume)
 		return co_winnt_test_switch(3);
 

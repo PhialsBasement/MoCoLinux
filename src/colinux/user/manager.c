@@ -109,6 +109,15 @@ co_rc_t co_manager_save_state(co_manager_handle_t handle,
 				   out, sizeof(*out), out, sizeof(*out), &returned);
 }
 
+co_rc_t co_manager_test_space(co_manager_handle_t handle,
+			      co_manager_ioctl_test_space_t* out)
+{
+	unsigned long returned = 0;
+
+	return co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_TEST_SPACE,
+				   out, sizeof(*out), out, sizeof(*out), &returned);
+}
+
 co_rc_t co_manager_test_switch(co_manager_handle_t handle,
 			       co_manager_ioctl_test_switch_t* out,
 			       int mode)

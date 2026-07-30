@@ -21,6 +21,7 @@
 #include <colinux/arch/probe.h>
 #include <colinux/arch/state.h>
 #include <colinux/arch/switch.h>
+#include <colinux/arch/space.h>
 
 #include "manager.h"
 #include "monitor.h"
@@ -456,6 +457,44 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->supported = PFALSE;
 #endif
 		params->rc   = CO_RC(OK);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_TEST_SPACE: {
+		co_manager_ioctl_test_space_t* params;
+		co_arch_space_test_t result;
+		co_rc_t trc;
+
+		params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		co_memset(params, 0, sizeof(*params));
+
+		if (manager->state < CO_MANAGER_STATE_INITIALIZED) {
+			params->rc   = CO_RC(ERROR);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		trc = co_arch_test_space(manager, &result);
+
+		params->rc		 = trc;
+		params->supported	 = result.supported;
+		params->succeeded	 = result.succeeded;
+		params->root		 = result.root;
+		params->mapped		 = result.mapped;
+		params->verified	 = result.verified;
+		params->mismatched	 = result.mismatched;
+		params->tables		 = result.tables;
+		params->first_bad_va	 = result.first_bad_va;
+		params->first_bad_expect = result.first_bad_expect;
+		params->first_bad_got	 = result.first_bad_got;
+		params->unmapped_reported = result.unmapped_reported;
+		params->unmapped_level	 = result.unmapped_level;
+
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}
