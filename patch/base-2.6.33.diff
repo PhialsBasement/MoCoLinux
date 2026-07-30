@@ -1621,7 +1621,7 @@ Index: linux-2.6.33-source/arch/x86/include/asm/cooperative.h
 +
 +			/* Control parameters */
 +			unsigned long operation;
-+			unsigned long params[];
++			unsigned long params[0];	/* to end of page */
 +		} __attribute__((packed));
 +		unsigned char first_page[0x1000];
 +	};

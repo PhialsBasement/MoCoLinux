@@ -11,8 +11,8 @@
 
 #include "ddk.h"
 #include <ddk/ntifs.h>
-#include <ddk/ntdddisk.h>
-#include <ddk/ntddscsi.h>
+#include <ntdddisk.h>
+#include <ntddscsi.h>
 
 #include <colinux/kernel/scsi.h>
 #include <colinux/kernel/transfer.h>
@@ -33,7 +33,31 @@ typedef /*NTOSAPI*/ NTSTATUS DDKAPI (*xfer_func_t)( /*IN*/ HANDLE  FileHandle, /
 
 extern PDEVICE_OBJECT coLinux_DeviceObject;
 
-#include <asm/scatterlist.h>
+/*
+ * Mirror of the guest kernel's struct scatterlist. The guest hands us an array
+ * of these through the passage page, so this is shared ABI and has to track the
+ * guest's configuration.
+ *
+ * This matches asm-generic/scatterlist.h in 2.6.33 as coLinux configures it:
+ * CONFIG_DEBUG_SG off (no leading sg_magic), 32-bit, and neither CONFIG_X86_64
+ * nor CONFIG_HIGHMEM64G set, so dma_addr_t is u32. See conf/linux-*-config.
+ *
+ * It is declared here rather than by including <asm/scatterlist.h> because that
+ * pulls linux/types.h into a host-driver translation unit, where it collides
+ * with the mingw-w64 headers over size_t, ssize_t, ptrdiff_t and uintptr_t, and
+ * with C23 over bool/false.
+ */
+struct co_guest_scatterlist {
+	ULONG	page_link;
+	ULONG	offset;
+	ULONG	length;
+	ULONG	dma_address;
+	ULONG	dma_length;
+};
+
+/* Fails to compile if the mirrored layout ever stops being 20 bytes. */
+typedef char co_guest_scatterlist_size_check
+	[(sizeof(struct co_guest_scatterlist) == 20) ? 1 : -1];
 
 struct _io_req {
 	int in_use;
@@ -222,7 +246,7 @@ static VOID DDKAPI _scsi_dio(PDEVICE_OBJECT DeviceObject, PVOID Context) {
 static int _scsi_dio(PDEVICE_OBJECT DeviceObject, PVOID Context) {
 #endif
 	struct _io_req *r = Context;
-	struct scatterlist *sg, *sg_buf;
+	struct co_guest_scatterlist *sg, *sg_buf;
 	int x;
 	co_rc_t rc;
 	scsi_transfer_file_block_data_t data;
@@ -234,7 +258,7 @@ static int _scsi_dio(PDEVICE_OBJECT DeviceObject, PVOID Context) {
 	data.func = r->func;
 
 	/* Copy the SG from Guest */
-	sg_size = r->io.count * sizeof(struct scatterlist);
+	sg_size = r->io.count * sizeof(struct co_guest_scatterlist);
 	sg_buf = co_os_malloc(sg_size);
 	if (!sg_buf) {
 		rc = CO_RC(ERROR);
