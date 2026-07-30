@@ -10,7 +10,7 @@
 
 #include "ddk.h"
 #include <ddk/ntifs.h>
-#include <ddk/ntdddisk.h>
+#include <ntdddisk.h>
 
 #include <colinux/os/alloc.h>
 #include <colinux/common/libc.h>
@@ -531,7 +531,7 @@ co_rc_t co_os_file_rename(char *filename, char *dest_filename)
 
 	// Check, that nobody move parent directory as new subdirectory
 	len = strlen(filename);
-	if (strncasecmp(filename, dest_filename, len) == 0 && dest_filename[len] == '\\') {
+	if (_strnicmp(filename, dest_filename, len) == 0 && dest_filename[len] == '\\') {
 		// Workarround, prevents memory corruption from upper-lower side effect
 		// Example: mv /cofs/testdir /cofs/TESTDIR/somedir
 		co_debug("Parent can not rename itself (%s,%s)", filename, dest_filename);

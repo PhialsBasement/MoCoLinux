@@ -13,10 +13,6 @@
 #include <stdio.h>
 #include <windows.h>
 
-#include <ddk/ntapi.h>
-#include <ddk/winddk.h>
-#include <ddk/ntddk.h>
-
 #include <colinux/common/common.h>
 #include <colinux/os/user/misc.h>
 #include <colinux/os/winnt/user/misc.h>

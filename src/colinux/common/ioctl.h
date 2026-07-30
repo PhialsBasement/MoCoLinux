@@ -72,7 +72,12 @@ typedef enum {
 typedef struct {
 	co_rc_t			rc;
 	co_monitor_ioctl_op_t	op;
-	char			extra_data[];
+	/*
+	 * Zero-length, not a C99 flexible array: this struct is embedded as the
+	 * leading member of the per-operation structs below, so a flexible array
+	 * here is not at the end of the enclosing struct and GCC rejects it.
+	 */
+	char			extra_data[0];
 } co_manager_ioctl_monitor_t;
 
 /* interface for CO_MANAGER_IOCTL_STATUS: */

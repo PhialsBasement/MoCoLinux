@@ -10,6 +10,7 @@
 
 #include <colinux/os/current/memory.h>
 #include <colinux/os/alloc.h>
+#include <colinux/common/libc.h>
 
 #include "console.h"
 
@@ -35,7 +36,7 @@ co_rc_t co_console_create(co_console_config_t* config_par,
 	if (console == NULL)
 		return CO_RC(OUT_OF_MEMORY);
 
-	memset(console, 0, struct_size);
+	co_memset(console, 0, struct_size);
 
 	console->size	= struct_size;
 	console->config	= *config_par;
@@ -106,7 +107,7 @@ co_rc_t co_console_op(co_console_t* console, co_console_message_t* message)
 
 			offs = config_x * b - s_count;
 
-			memmove(console->screen + t_count,
+			co_memmove(console->screen + t_count,
 				console->screen + t_count + s_count,
 				(offs - t_count) * sizeof(co_console_cell_t));
 
@@ -117,7 +118,7 @@ co_rc_t co_console_op(co_console_t* console, co_console_message_t* message)
 			// regular scroll, i.e., shell ; now we scroll the buffer as well
 			offs = config_x * console->config.max_y - s_count;
 
-			memmove(console->buffer,
+			co_memmove(console->buffer,
 				console->buffer + s_count,
 				offs * sizeof(co_console_cell_t));
 
@@ -154,7 +155,7 @@ co_rc_t co_console_op(co_console_t* console, co_console_message_t* message)
 				return CO_RC(ERROR);
 
 			dest = console->screen + t_count;
-			memmove(dest + s_count,
+			co_memmove(dest + s_count,
 				dest,
 				(config_x * b - t_count - s_count) * sizeof(co_console_cell_t));
 
@@ -163,7 +164,7 @@ co_rc_t co_console_op(co_console_t* console, co_console_message_t* message)
 		{
 			// regular scroll, i.e., shell ; now we scroll the buffer as well
 			dest = console->screen;
-			memmove(dest + s_count,
+			co_memmove(dest + s_count,
 				dest,
 				(config_x * console->config.y - s_count) * sizeof(co_console_cell_t));
 		}
@@ -246,7 +247,7 @@ co_rc_t co_console_op(co_console_t* console, co_console_message_t* message)
 
 		if (y < t) {
 			while (t <= b) {
-				memmove(console->screen + config_x * y + x,
+				co_memmove(console->screen + config_x * y + x,
 					console->screen + config_x * t + l,
 					(r - l + 1) * sizeof(co_console_cell_t));
 				t++;
@@ -255,7 +256,7 @@ co_rc_t co_console_op(co_console_t* console, co_console_message_t* message)
 		} else	{
 			y += b-t;
 			while (t <= b) {
-				memmove(console->screen + config_x * y + x,
+				co_memmove(console->screen + config_x * y + x,
 					console->screen + config_x * b + l,
 					(r - l + 1) * sizeof(co_console_cell_t));
 				b--;
@@ -299,7 +300,7 @@ co_rc_t co_console_op(co_console_t* console, co_console_message_t* message)
 		// clear scroll buffer
 		if (console == NULL)
 			return CO_RC(OUT_OF_MEMORY);
-		memset(console->buffer, 0,
+		co_memset(console->buffer, 0,
 			sizeof(co_console_cell_t) * console->config.x * (console->config.max_y-console->config.y));
 		break;
 

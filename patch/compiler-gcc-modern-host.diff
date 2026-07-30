@@ -1,0 +1,22 @@
+* Tolerate host compilers newer than GCC 4 when the coLinux host driver
+  includes these kernel headers. Only compiler-gcc3.h and compiler-gcc4.h
+  exist, so gcc_header(__GNUC__) resolves to a missing file on GCC >= 5.
+
+Index: linux-2.6.33-source/include/linux/compiler-gcc.h
+===================================================================
+--- linux-2.6.33-source/include/linux/compiler-gcc.h
++++ linux-2.6.33-source/include/linux/compiler-gcc.h
+@@ -84,4 +84,13 @@
+ #define __gcc_header(x) #x
+ #define _gcc_header(x) __gcc_header(linux/compiler-gcc##x.h)
+ #define gcc_header(x) _gcc_header(x)
++/*
++ * Only compiler-gcc3.h and compiler-gcc4.h exist in this tree. Anything
++ * newer than 4 behaves like 4 for the attributes used here, and the host
++ * driver includes these headers with whatever compiler it was built with.
++ */
++#if __GNUC__ > 4
++#include <linux/compiler-gcc4.h>
++#else
+ #include gcc_header(__GNUC__)
++#endif

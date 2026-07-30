@@ -11,7 +11,7 @@
 #define NDIS50
 
 #include "ddk.h"
-#include <ddk/ntdddisk.h>
+#include <ntdddisk.h>
 #include <ddk/ndis.h>
 #include <ddk/xfilter.h>
 

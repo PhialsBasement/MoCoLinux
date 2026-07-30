@@ -14,7 +14,10 @@ def calc_deps(pathname):
 
         set_union = set()
         set_union.add(pathname)
-        for line in open(pathname):
+        # Sources are not necessarily UTF-8 -- slirp/tcp_subr.c has raw bytes
+        # from a packet dump in a comment. latin-1 maps every byte to a
+        # character, so scanning for #include lines can never fail on encoding.
+        for line in open(pathname, encoding='latin-1'):
             m = re.match("# *include <([^>]+)>", line.strip())
             result_set = None
             if m:

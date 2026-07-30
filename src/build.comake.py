@@ -2,8 +2,39 @@
 # to be read by bin/make.py. Please run bin/make.py --help.
 
 import os
+import subprocess
 
 from comake.settings import settings
+
+
+def find_ddk_include(cross_prefix):
+    """Locate mingw-w64's DDK headers.
+
+    coLinux includes <ddk/ntddk.h>, which resolves off the standard include
+    path, but mingw-w64's ntddk.h then includes <wdm.h> unqualified -- so the
+    ddk directory has to be a search path in its own right. The old w32api 3.13
+    headers coLinux was written against did not need this.
+
+    Ask the compiler where it actually looks rather than guessing a layout.
+    """
+    # This file is exec'd with separate globals and locals, so the imports at
+    # the top of it are not visible from inside a function body.
+    import os
+    import subprocess
+
+    override = os.getenv('COLINUX_DDK_INCLUDE')
+    if override:
+        return [override]
+    try:
+        result = subprocess.run([cross_prefix + 'gcc', '-xc', '-E', '-v', os.devnull],
+                                capture_output=True, text=True)
+    except OSError:
+        return []
+    for line in result.stderr.splitlines():
+        line = line.strip()
+        if line.endswith('/include') and os.path.isdir(pathjoin(line, 'ddk')):
+            return [pathjoin(line, 'ddk')]
+    return []
 
 settings.arch = os.getenv('COLINUX_ARCH')
 if not settings.arch:
@@ -41,19 +72,40 @@ compiler_defines = dict(
     COLINUX=None,
     CO_HOST_API=None,
     COLINUX_DEBUG=None,
-    COLINUX_ARCH=settings.host_os,
+    COLINUX_ARCH=settings.arch,
+    COLINUX_HOST_OS=settings.host_os,
 )
 
 if settings.host_os == 'winnt':
-    cross_compilation_prefix = 'i686-pc-mingw32-'
-    compiler_flags = ['-mpush-args', '-mno-accumulate-outgoing-args']
-    compiler_defines['WINVER'] = '0x0500'
+    # The i686-pc-mingw32- prefix predates mingw-w64 and no longer exists in
+    # any current toolchain; mingw-w64 uses the *-w64-mingw32- triplets.
+    cross_compilation_prefix = os.getenv('COLINUX_HOST_CROSS_PREFIX')
+    if not cross_compilation_prefix:
+        if settings.arch == 'x86_64':
+            cross_compilation_prefix = 'x86_64-w64-mingw32-'
+        else:
+            cross_compilation_prefix = 'i686-w64-mingw32-'
+
+    if settings.arch == 'x86_64':
+        compiler_flags = []
+        # 0x0502 is Windows Server 2003 / XP x64, the oldest 64-bit target.
+        compiler_defines['WINVER'] = '0x0502'
+    else:
+        # These pin down the stack-argument ABI that the i386 passage assembly
+        # reads by hand at fixed %esp offsets. They mean nothing on x86-64.
+        compiler_flags = ['-mpush-args', '-mno-accumulate-outgoing-args']
+        compiler_defines['WINVER'] = '0x0500'
+
+    # Scoped onto the driver target only -- see colinux/os/winnt/build. The DDK
+    # headers conflict with windows.h, so userspace must not see them.
+    settings.host_ddk_includes = find_ddk_include(cross_compilation_prefix)
 else:
     if settings.gcc_guest_target:
         cross_compilation_prefix = settings.gcc_guest_target + '-'
     else:
         cross_compilation_prefix = ''
     compiler_flags = []
+    settings.host_ddk_includes = []
 
 settings.target_kernel_source = getenv('COLINUX_TARGET_KERNEL_SOURCE')
 
@@ -75,6 +127,7 @@ if not settings.target_kernel_build:
 
 if settings.target_kernel_build == settings.target_kernel_source:
     settings.target_kernel_includes = [
+        pathjoin(settings.target_kernel_source, 'arch/x86/include'),
         pathjoin(settings.target_kernel_source, 'include') ]
 else:
     settings.target_kernel_includes = [

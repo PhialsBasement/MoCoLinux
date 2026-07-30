@@ -12,8 +12,13 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <windows.h>
-#include <ddk/ntddk.h>
-#include <ddk/winddk.h>
+/*
+ * The Rtl* string and path helpers below live in ntdll and are declared by
+ * winternl.h. The kernel-mode DDK headers this used to include cannot be
+ * combined with windows.h under mingw-w64: both define UNICODE_STRING,
+ * EXCEPTION_RECORD and much else.
+ */
+#include <winternl.h>
 #include <unistd.h>
 
 #include <colinux/common/libc.h>
