@@ -328,6 +328,7 @@ typedef struct {
 	int		   returned_voluntarily;
 	int		   hit_limit;
 	int		   unforwardable;
+	int		   vmx_present;
 	unsigned long	   switches;
 	unsigned long	   interrupts;
 	unsigned long	   steps;
