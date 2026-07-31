@@ -51,6 +51,16 @@ extern co_rc_t co_arch_guest_map(co_manager_t* manager,
 				 unsigned long long flags);
 
 /*
+ * Map two megabytes with a single PMD entry, as init_mem_mapping() does for the
+ * direct map. va and pa must both be 2 MB aligned.
+ */
+extern co_rc_t co_arch_guest_map_large(co_manager_t* manager,
+				       co_arch_guest_space_t* space,
+				       unsigned long long va,
+				       co_pa_t pa,
+				       unsigned long long flags);
+
+/*
  * What the hardware would find at va. On success *pa_out is the mapped page.
  * On a miss *level_out says which level was absent, counting from the top
  * (0 = PML4, 3 = PT), which is the difference between "nothing here at all" and
