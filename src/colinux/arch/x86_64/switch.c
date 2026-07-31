@@ -2283,6 +2283,34 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 					out->fault_rip;
 				out->trace_next++;
 
+				/*
+				 * Re-arm the trap flag in the frame the guest is
+				 * about to be resumed from.
+				 *
+				 * Setting TF once is not a bound. The guest can
+				 * clear it with popfq or iretq -- kernels do,
+				 * constantly, restoring saved flags -- and the
+				 * moment it does, stepping stops and nothing
+				 * limits it again. But the flags it resumes with
+				 * are in a frame this code owns, so TF goes back
+				 * on before every single instruction. The guest
+				 * may clear it as often as it likes; it never
+				 * begins an instruction without it.
+				 *
+				 * The frame is at params[28] and RFLAGS sits at
+				 * +0x98 in it, after fifteen registers, the
+				 * vector, the error code, RIP and CS. It is
+				 * readable directly because the passage page has
+				 * the same address in both spaces.
+				 */
+				{
+					unsigned long long* frame =
+						(unsigned long long*)(size_t)pp->params[28];
+
+					if (frame)
+						frame[0x98 / 8] |= 0x100ULL;
+				}
+
 				pp->linuxvm_state.return_rip = resume_rip;
 				pp->linuxvm_state.rsp        = ist_top - 0x200;
 				continue;
