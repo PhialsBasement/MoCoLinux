@@ -2059,25 +2059,38 @@ out_free_pp:
  * quadwords whether or not the privilege level changed, so SS and RSP have to
  * be there and not just flags, CS and RIP.
  */
-static void co_forward_host_interrupt(co_arch_passage_page_t* pp, unsigned long long vector)
+bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long vector)
 {
-	struct co_x86_64_gate* idt =
-		(struct co_x86_64_gate*)pp->host_state.idt.table;
+	struct co_x86_64_gate* idt = (struct co_x86_64_gate*)host_idt;
 	struct co_x86_64_gate* gate;
 	unsigned long long offset;
 	void* func;
 
 	if (idt == NULL || vector > 255)
-		return;
+		return PFALSE;
 
 	gate = &idt[vector];
+
+	if (!(gate->flags & 0x8000))		/* not present */
+		return PFALSE;
+
+	/*
+	 * Refuse gates that ask for an IST stack.
+	 *
+	 * A non-zero IST index means the hardware path would have switched to a
+	 * dedicated stack out of the TSS before entering the handler, and this
+	 * synthesised entry does not. Windows uses IST for NMI, machine check and
+	 * double fault -- precisely the handlers where running on the wrong stack
+	 * turns a recoverable event into an unrecoverable one. Report rather than
+	 * call: losing an NMI is bad, corrupting whatever is under the current
+	 * stack pointer while handling one is worse.
+	 */
+	if (gate->flags & 0x7)
+		return PFALSE;
 
 	offset = (unsigned long long)gate->offset_low
 	       | ((unsigned long long)gate->offset_mid  << 16)
 	       | ((unsigned long long)gate->offset_high << 32);
-
-	if (!(gate->flags & 0x8000))		/* not present */
-		return;
 
 	/* (size_t): unsigned long is four bytes here and every ISR is above 4 GB. */
 	func = (void*)(size_t)offset;
@@ -2097,6 +2110,8 @@ static void co_forward_host_interrupt(co_arch_passage_page_t* pp, unsigned long 
 	    "    jmp *%0"			"\n"
 	    "1:"				"\n"
 	    : : "r"(func) : "rax", "r11", "memory", "cc");
+
+	return PTRUE;
 }
 
 co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
@@ -2232,8 +2247,17 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				break;
 			}
 
+			if (!co_arch_forward_host_interrupt(pp->host_state.idt.table,
+							    out->vector)) {
+				/*
+				 * Not forwardable -- an IST gate, or absent. Stop
+				 * rather than drop it silently and carry on with
+				 * the host missing an interrupt it needed.
+				 */
+				out->unforwardable = PTRUE;
+				break;
+			}
 			out->interrupts++;
-			co_forward_host_interrupt(pp, out->vector);
 
 			/*
 			 * Back in, exactly where it was.
