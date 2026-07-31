@@ -111,6 +111,46 @@ extern co_rc_t co_arch_test_kernel_code(co_manager_t* manager,
 					unsigned long long ring_symbol_va,
 					co_arch_kcall_test_t* out);
 
+/* Booting the loaded kernel: enter co_arch_start_kernel and see how far it gets. */
+typedef struct {
+	unsigned long long entry_va;
+	unsigned long long initial_code_va;
+	unsigned long long start_kernel_va;
+	unsigned long long early_console_va;
+	unsigned long long colinux_console_va;
+	unsigned long long ring_symbol_va;
+	int		   max_switches;
+} co_arch_boot_t;
+
+typedef struct {
+	int		   supported;
+	unsigned long long entry_va;
+	unsigned long long guest_cr3;
+	unsigned long	   tables;
+	unsigned long long console_ring_va;
+	unsigned long long console_written;
+	unsigned long long console_capacity;
+	char		   console_text[2048];
+	int		   faulted;
+	int		   returned_voluntarily;
+	int		   hit_limit;
+	unsigned long	   switches;
+	unsigned long	   interrupts;
+	unsigned long long vector;
+	unsigned long long fault_rip;
+	unsigned long long error_code;
+	unsigned long long cr2;
+	int		   preflight_checked;
+	int		   preflight_failed;
+	int		   preflight_level;
+	unsigned long long preflight_va;
+} co_arch_boot_result_t;
+
+struct co_arch_guest_space;
+extern co_rc_t co_arch_boot_loaded(co_manager_t* manager,
+				   struct co_arch_guest_space* space,
+				   co_arch_boot_t* in, co_arch_boot_result_t* out);
+
 /* Enter an address space that already holds a loaded kernel image. */
 struct co_arch_guest_space;
 extern co_rc_t co_arch_enter_loaded(co_manager_t* manager,

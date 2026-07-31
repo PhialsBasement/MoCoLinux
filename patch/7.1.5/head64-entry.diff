@@ -1,0 +1,52 @@
+An entry point for Cooperative Linux, partway into head_64.S.
+
+Everything above common_startup_64 exists to get from a bootloader's world into
+the kernel's: relocation fixups, building early_top_pgt, and two CR3 writes to
+install it and then init_top_pgt. A cooperative guest is already in the kernel's
+world when it arrives -- the host built its address space, mapped the image at
+its link addresses, and switched CR3 to it on purpose. Running that code throws
+all of it away and installs page tables describing an identity-mapped physical
+machine that never existed; the instruction after the CR3 write would be fetched
+from an address space that does not contain it.
+
+From this label down there is no CR3 write, so the remainder runs unmodified.
+
+This mirrors what the i386 port has done since 2004, where ENTRY(co_arch_start_kernel)
+sits at checkCPUtype in head_32.S for the same reason.
+
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@ -195,6 +195,33 @@
+ 	 */
+ 	movq	%rax, %cr3
+ 
++/*
++ * Cooperative Linux enters here, and not at startup_64.
++ *
++ * Everything above this point exists to get from a bootloader's world into the
++ * kernel's: __startup_64 does the relocation fixups, builds early_top_pgt, and
++ * two `movq %rax, %cr3` install it and then init_top_pgt. A cooperative guest
++ * is already in the kernel's world when it arrives -- the host built its
++ * address space, mapped the image at its link addresses, and switched CR3 to it
++ * deliberately. Running that code would throw all of it away and install page
++ * tables describing an identity-mapped physical machine that was never there,
++ * and the instruction after the CR3 write would be fetched from an address
++ * space that does not contain it.
++ *
++ * From here down there is no CR3 write, so the rest runs unmodified: the CR4
++ * mask, the boot stack out of current_task, the kernel's own GDT, the data
++ * segments, EFER. The GDT load is not a problem -- the world switch saves the
++ * guest's GDTR on the way out and restores it on the way back in, so whichever
++ * table the guest adopts travels with it.
++ *
++ * initial_code is left alone here. The host points it at start_kernel before
++ * entry, because x86_64_start_kernel would call reset_early_page_tables() and
++ * assign init_top_pgt[511] -- CR3 hostility again -- and idt_setup_early_handler(),
++ * which would replace the fault stubs during the window they are most needed.
++ */
++SYM_INNER_LABEL(co_arch_start_kernel, SYM_L_GLOBAL)
++	ANNOTATE_NOENDBR
++
+ SYM_INNER_LABEL(common_startup_64, SYM_L_LOCAL)
+ 	UNWIND_HINT_END_OF_STACK
+ 	ANNOTATE_NOENDBR

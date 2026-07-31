@@ -644,6 +644,90 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 		goto out_end;
 	}
 
+	if (enter == 3) {
+		co_manager_ioctl_kboot_t b = {0, };
+		static const char* want[] = { "co_arch_start_kernel", "initial_code",
+					      "start_kernel", "early_console",
+					      "early_colinux_console",
+					      "co_colinux_console_ring", NULL };
+		unsigned long long addr[6];
+		int i;
+
+		for (i = 0; want[i]; i++) {
+			co_elf_symbol_t* sym = co_get_symbol_by_name(pl, want[i]);
+
+			if (!sym) {
+				co_terminal_print("\n  %s not found -- is the kernel patched?\n",
+						  want[i]);
+				goto out_end;
+			}
+			addr[i] = co_elf_get_symbol_value(sym);
+		}
+
+		b.entry_va           = addr[0];
+		b.initial_code_va    = addr[1];
+		b.start_kernel_va    = addr[2];
+		b.early_console_va   = addr[3];
+		b.colinux_console_va = addr[4];
+		b.ring_symbol_va     = addr[5];
+
+		co_terminal_print("\n  booting:\n");
+		for (i = 0; want[i]; i++)
+			co_terminal_print("    %-24s 0x%016llx\n", want[i], addr[i]);
+
+		b.max_switches = 4096;
+
+		co_terminal_print("\n  entering co_arch_start_kernel with interrupts enabled,\n");
+		co_terminal_print("  initial_code pointed at start_kernel, the early console\n");
+		co_terminal_print("  wired, and host interrupts forwarded back to Windows\n\n");
+
+		rc = co_manager_kboot(handle, &b);
+		if (!CO_OK(rc) || !CO_OK(b.rc)) {
+			co_terminal_print("  kboot failed (rc %x / %x)\n", (int)rc, (int)b.rc);
+			goto out_end;
+		}
+		if (b.preflight_failed) {
+			co_terminal_print("  PREFLIGHT REFUSED at 0x%016llx (level %d)\n",
+					  b.preflight_va, b.preflight_level);
+			goto out_end;
+		}
+
+		co_terminal_print("  guest cr3 0x%016llx, %lu table pages, preflight %d ok\n",
+				  b.guest_cr3, b.tables, b.preflight_checked);
+		co_terminal_print("  %lu world switches, %lu host interrupts forwarded%s\n",
+				  b.switches, b.interrupts,
+				  b.hit_limit ? "  (hit the switch limit)" : "");
+		co_terminal_print("\n");
+		co_terminal_print("  ---------------- what the kernel printed ----------------\n");
+		if (b.console_written == 0)
+			co_terminal_print("  (nothing)\n");
+		else
+			co_terminal_print("%s", b.console_text);
+		co_terminal_print("  --------------------------------------------------------\n");
+		co_terminal_print("  %llu bytes%s\n", b.console_written,
+				  (b.console_written > b.console_capacity) ? "  TRUNCATED" : "");
+		co_terminal_print("\n");
+
+		if (b.faulted) {
+			co_terminal_print("  stopped on an exception the guest took:\n");
+			co_terminal_print("    vector %llu at rip 0x%016llx\n", b.vector, b.fault_rip);
+			co_terminal_print("    error code 0x%llx", b.error_code);
+			if (b.vector == 14)
+				co_terminal_print("  cr2 0x%016llx  (%s, %s)",
+						  b.cr2,
+						  (b.error_code & 1) ? "protection" : "not present",
+						  (b.error_code & 2) ? "write" : "read");
+			co_terminal_print("\n");
+		} else if (b.hit_limit) {
+			co_terminal_print("  still running after %lu switches -- stopped it on purpose\n",
+					  b.switches);
+		} else if (b.returned_voluntarily) {
+			co_terminal_print("  the guest switched back on its own\n");
+		}
+
+		goto out_end;
+	}
+
 	if (!enter) {
 		co_terminal_print("\n  LOADED AND VERIFIED. Not entered.\n");
 		goto out_end;
