@@ -51,8 +51,8 @@ static unsigned long long     kload_end_phys;
 static unsigned long	      kload_ram_pages;
 
 /*
- * The guest's physical memory: one physically contiguous block, and the rule
- * that guest physical address N is host physical address kload_block_pa + N.
+ * The guest's physical memory: a handful of physically contiguous blocks, and
+ * the rule that guest physical addresses *are* host physical addresses.
  *
  * Scattered per-page allocations cannot work, and the reason is not efficiency.
  * Linux reads its own page tables and calls __va() on what it finds -- that is
@@ -62,15 +62,36 @@ static unsigned long	      kload_ram_pages;
  * physical addresses have to *be* host physical addresses, for every page it
  * can reach: its RAM, its image, and the page tables themselves.
  *
- * One contiguous block gives exactly that, with a single e820 entry and a
- * direct map that is one identity-offset range. It also removes the whole
- * class of teardown bug: there is one allocation to free, not thirty thousand.
+ * What identity does not require is that the memory be one piece. Linux is
+ * entirely happy with a fragmented e820 -- real machines have holes -- so each
+ * block is simply one more usable range, described where it really is. That
+ * matters because one contiguous allocation of over a hundred megabytes is the
+ * first thing a host that has been up for a while refuses; a 32 MB fallback was
+ * tried and is strictly worse than failing, because the image cannot fit and
+ * nothing said so.
+ *
+ * Two things still have to be contiguous, and they set the floor:
+ *
+ *   - the image. __pa() is linear -- x - __START_KERNEL_map + phys_base -- so
+ *     the image's physical placement is one unbroken run, about 40 MB for this
+ *     kernel. phys_base is ours to choose, so the image starts at block 0's
+ *     base rather than 16 MB into it as CONFIG_PHYSICAL_START would imply.
+ *   - the page-table region, which lives at the top of block 0.
+ *
+ * Block 0 is therefore exactly image + tables, and everything else is ordinary
+ * RAM in whatever pieces the host can spare.
  */
-static void*		      kload_block_raw;	/* exactly what the allocator returned */
-static void*		      kload_block;	/* the 2 MB-aligned view inside it */
-static co_pa_t		      kload_block_pa;	/* host physical, == guest physical 0 */
-static unsigned long long     kload_block_bytes;
-static unsigned long long     kload_table_top;	/* tables grow down from here */
+typedef struct {
+	void*		   raw;		/* exactly what the allocator returned */
+	void*		   va;		/* the 2 MB-aligned view inside it */
+	co_pa_t		   pa;		/* host physical of that view */
+	unsigned long long bytes;	/* size of the aligned view, 2 MB multiple */
+} co_kload_block_t;
+
+static co_kload_block_t	      kload_block[CO_KLOAD_MAX_BLOCKS];
+static int		      kload_block_count;
+static unsigned long long     kload_phys_base;	/* what the guest's __pa() adds */
+static unsigned long long     kload_table_top;	/* block 0 offset; tables grow down */
 
 /*
  * Page tables come out of the top of the block and that region is reported to
@@ -98,67 +119,127 @@ static unsigned long long     kload_table_top;	/* tables grow down from here */
 void* co_kload_frame_va(co_pfn_t pfn)
 {
 	co_pa_t pa = ((co_pa_t)pfn) << CO_ARCH_PAGE_SHIFT;
+	int i;
 
-	if (kload_block == NULL || pa < kload_block_pa ||
-	    pa >= kload_block_pa + kload_block_bytes)
-		return NULL;
+	for (i = 0; i < kload_block_count; i++) {
+		if (pa >= kload_block[i].pa &&
+		    pa < kload_block[i].pa + kload_block[i].bytes)
+			return (void*)((char*)kload_block[i].va
+				       + (unsigned long)(pa - kload_block[i].pa));
+	}
 
-	return (void*)((char*)kload_block + (unsigned long)(pa - kload_block_pa));
+	return NULL;
 }
 
-co_pa_t co_kload_block_pa(void)
+unsigned long long co_kload_phys_base(void)
 {
-	return kload_block_pa;
+	return kload_phys_base;
 }
 
-unsigned long long co_kload_usable_bytes(void)
+int co_kload_range_count(void)
 {
-	return kload_block_bytes - CO_KLOAD_TABLE_BYTES;
-}
-
-unsigned long long co_kload_block_bytes(void)
-{
-	return kload_block_bytes;
+	return kload_block_count;
 }
 
 /*
- * A frame from the block, by guest physical offset. Zeroed, because a page
- * table with a stale bit in it is a present entry pointing anywhere.
+ * One block as the guest should hear about it: a usable range, and for block 0
+ * the reserved page-table region above it. The e820 is built from exactly this.
  */
-static co_rc_t kload_frame_at(co_manager_t* manager, unsigned long long offset,
-			      co_pfn_t* pfn_out)
+void co_kload_range(int i, unsigned long long* pa, unsigned long long* usable,
+		    unsigned long long* reserved)
 {
-	co_pa_t pa;
+	*pa = *usable = *reserved = 0;
 
-	if (kload_block == NULL || offset + CO_ARCH_PAGE_SIZE > kload_block_bytes)
-		return CO_RC(INVALID_PARAMETER);
+	if (i < 0 || i >= kload_block_count)
+		return;
 
-	pa = kload_block_pa + offset;
-	*pfn_out = (co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT);
+	*pa	  = kload_block[i].pa;
+	*usable	  = kload_block[i].bytes;
+	*reserved = 0;
 
-	return CO_RC(OK);
+	if (i == 0) {
+		*usable	 -= CO_KLOAD_TABLE_BYTES;
+		*reserved = CO_KLOAD_TABLE_BYTES;
+	}
 }
 
-/* A page-table frame, taken from the reserved region at the top of the block. */
+/* The host physical address the guest's own __pa() would compute for kva. */
+static co_pa_t kload_kva_pa(unsigned long long kva)
+{
+	return (co_pa_t)(kva - CO_ARCH_KERNEL_MAP + kload_phys_base);
+}
+
+/*
+ * One more contiguous block, 2 MB aligned by overallocation because the
+ * allocator promises nothing beyond a page, and a base that is merely page
+ * aligned puts bits into a PSE entry's reserved field. The original pointer is
+ * what gets freed.
+ *
+ * Anywhere in physical memory, including above 4 GB.
+ *
+ * There was a ceiling here for a while and it was the wrong layer. A block at
+ * 0x104200000 appeared in the guest's e820 and then vanished from the kernel's
+ * own map a moment later -- last_pfn 0x106200 -> 0x2bc00 -- and the answer to
+ * that was to stop allocating up there. But nothing about this is an
+ * addressing limit; the driver is 64-bit throughout. What removed the block
+ * was mtrr_trim_uncached_memory(), discarding RAM the host's MTRRs do not
+ * describe as write-back, and the guest is told not to do that instead
+ * (disable_mtrr_trim, see the command line in elf_load.c).
+ *
+ * The ceiling also cost more than it saved. It halved the space this search
+ * runs in, on the one allocation that still needs a long unbroken run, and on
+ * a host that has been up for a day the image block then cannot be found at
+ * all -- which is a worse failure than the one it was avoiding.
+ */
+static co_kload_block_t* kload_block_alloc(unsigned long long bytes)
+{
+	co_kload_block_t* b;
+	void* raw;
+
+	if (kload_block_count >= CO_KLOAD_MAX_BLOCKS)
+		return NULL;
+
+	raw = co_os_alloc_contiguous_pages(
+			(unsigned int)((bytes + CO_ARCH_PMD_SIZE)
+				       >> CO_ARCH_PAGE_SHIFT));
+	if (raw == NULL)
+		return NULL;
+
+	b = &kload_block[kload_block_count++];
+	b->raw	 = raw;
+	b->bytes = bytes;
+
+	{
+		co_pa_t raw_pa = co_os_virt_to_phys(raw);
+		unsigned long long adjust =
+			(CO_ARCH_PMD_SIZE - (raw_pa & (CO_ARCH_PMD_SIZE - 1)))
+			& (CO_ARCH_PMD_SIZE - 1);
+
+		b->va = (void*)((char*)raw + (unsigned long)adjust);
+		b->pa = raw_pa + adjust;
+	}
+
+	return b;
+}
+
+/* A page-table frame, taken from the reserved region at the top of block 0. */
 co_rc_t co_kload_table_frame(co_manager_t* manager, co_pfn_t* pfn_out)
 {
 	unsigned long long* table;
 	co_pfn_t pfn;
-	co_rc_t rc;
 
-	if (kload_block == NULL)
+	if (kload_block_count == 0)
 		return CO_RC(ERROR);
 
-	if (kload_table_top < kload_block_bytes - CO_KLOAD_TABLE_BYTES + CO_ARCH_PAGE_SIZE) {
+	if (kload_table_top < kload_block[0].bytes - CO_KLOAD_TABLE_BYTES
+			      + CO_ARCH_PAGE_SIZE) {
 		co_debug_error("kload: out of page-table space in the guest block");
 		return CO_RC(OUT_OF_MEMORY);
 	}
 
 	kload_table_top -= CO_ARCH_PAGE_SIZE;
 
-	rc = kload_frame_at(manager, kload_table_top, &pfn);
-	if (!CO_OK(rc))
-		return rc;
+	pfn = (co_pfn_t)((kload_block[0].pa + kload_table_top) >> CO_ARCH_PAGE_SHIFT);
 
 	table = co_kload_frame_va(pfn);
 	if (table == NULL)
@@ -181,30 +262,37 @@ static void kload_release_pages(co_manager_t* manager)
 	 * Nothing to walk any more.
 	 *
 	 * Every page the guest can see -- RAM, image, page tables -- is part of
-	 * one contiguous allocation, so teardown frees that and is done. The
+	 * one of these allocations, so teardown frees each and is done. The
 	 * previous version walked the address ranges and freed each present
 	 * leaf, taking care not to visit the image twice because it has two
 	 * virtual addresses; every mapping added since had to be checked
 	 * against that walk, and the one that was not was a page freed twice
 	 * and then handed to something else by the host.
 	 */
-	if (kload_block_raw == NULL)
-		return;
+	int i;
 
-	co_os_free_contiguous_pages(kload_block_raw,
-				    (unsigned int)((kload_block_bytes + CO_ARCH_PMD_SIZE)
-						   >> CO_ARCH_PAGE_SHIFT));
+	for (i = 0; i < kload_block_count; i++) {
+		if (kload_block[i].raw == NULL)
+			continue;
 
-	kload_block_raw   = NULL;
-	kload_block       = NULL;
-	kload_block_pa    = 0;
-	kload_block_bytes = 0;
-	kload_table_top   = 0;
+		co_os_free_contiguous_pages(kload_block[i].raw,
+					    (unsigned int)((kload_block[i].bytes
+							    + CO_ARCH_PMD_SIZE)
+							   >> CO_ARCH_PAGE_SHIFT));
+		kload_block[i].raw   = NULL;
+		kload_block[i].va    = NULL;
+		kload_block[i].pa    = 0;
+		kload_block[i].bytes = 0;
+	}
+
+	kload_block_count = 0;
+	kload_phys_base	  = 0;
+	kload_table_top	  = 0;
 }
 
 void co_kload_free(co_manager_t* manager)
 {
-	if (kload_space == NULL)
+	if (kload_space == NULL && kload_block_count == 0)
 		return;
 
 	/*
@@ -216,7 +304,8 @@ void co_kload_free(co_manager_t* manager)
 	 * of the allocation, so Driver Verifier caught it every single time at
 	 * exactly that frame.
 	 */
-	co_arch_guest_space_destroy(manager, kload_space);
+	if (kload_space != NULL)
+		co_arch_guest_space_destroy(manager, kload_space);
 	co_arch_guest_space_set_frame_source(NULL, NULL);
 	kload_release_pages(manager);
 
@@ -230,6 +319,8 @@ void co_kload_free(co_manager_t* manager)
 co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 		       unsigned long long max_va)
 {
+	unsigned long long image_lo, image_hi, need;
+	co_kload_block_t* b;
 	co_rc_t rc;
 
 	co_kload_free(manager);
@@ -237,66 +328,51 @@ co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 	if (min_va >= max_va || !CO_ARCH_VA_CANONICAL(min_va) || !CO_ARCH_VA_CANONICAL(max_va - 1))
 		return CO_RC(INVALID_PARAMETER);
 
-	/*
-	 * The guest's physical memory, allocated once and contiguously so that
-	 * guest physical N is host physical block_pa + N. Everything the guest
-	 * can reach comes out of this.
-	 */
-	/*
-	 * Two megabyte aligned, which is not a preference.
-	 *
-	 * level2_kernel_pgt maps the kernel's text with 2 MB PSE entries, and in
-	 * a PSE entry bits 12 to 20 are reserved and must be zero. Relocating
-	 * those entries means adding the block's physical base to them, so a
-	 * base that is merely page aligned puts bits into that field: the walk
-	 * then faults with the reserved bit set in the error code -- 0x19,
-	 * present, instruction fetch -- on the first instruction of the kernel.
-	 *
-	 * The allocator makes no alignment promise beyond a page, so take an
-	 * extra 2 MB and use the aligned window inside it. The original pointer
-	 * is what has to be freed.
-	 */
-	/*
-	 * As much as the host will give, not a fixed demand.
-	 *
-	 * This is one contiguous allocation of over a hundred megabytes from a
-	 * machine that has been up for a while, and contiguous memory is the
-	 * first thing to fragment. Asking for a fixed 128 MB works until it does
-	 * not, and then the whole run fails with nothing but an out-of-memory
-	 * code -- which is a bad way to learn that the host is merely busy.
-	 */
-	kload_block_raw = NULL;
-	for (kload_block_bytes = CO_KLOAD_RAM_BYTES;
-	     kload_block_bytes >= (32ULL << 20);
-	     kload_block_bytes >>= 1) {
-		kload_block_raw = co_os_alloc_contiguous_pages(
-				(unsigned int)((kload_block_bytes + CO_ARCH_PMD_SIZE)
-					       >> CO_ARCH_PAGE_SHIFT));
-		if (kload_block_raw)
-			break;
+	if (min_va < CO_ARCH_KERNEL_MAP)
+		return CO_RC(INVALID_PARAMETER);
 
-		co_debug("kload: %lld MB contiguous refused, trying less",
-			 kload_block_bytes >> 20);
-	}
+	/*
+	 * Block 0 holds the image and the page tables, and is sized to exactly
+	 * that -- the one contiguous run this design still requires.
+	 *
+	 * The image has to be physically unbroken because __pa() is linear:
+	 * x - __START_KERNEL_map + phys_base, with one phys_base for the whole
+	 * kernel window. But phys_base itself is ours to choose, so the image
+	 * begins at the block's base rather than 16 MB into it -- the link
+	 * address's CONFIG_PHYSICAL_START offset is absorbed into phys_base
+	 * instead of demanded from the allocator. That takes the contiguous
+	 * requirement from image + 16 MB + tables down to image + tables.
+	 *
+	 * Asking for more than this here would be repeating the mistake this
+	 * replaces: a fixed 128 MB demand fails on a fragmented host, and the
+	 * fallback that was tried instead -- halve until something fits -- had
+	 * a rung below the image's own size. What a 32 MB block produced was
+	 * image frames landing on the page tables at the top of the block,
+	 * reported as nothing more than a failed chunk. Any further RAM comes
+	 * later, in whatever pieces the host can spare.
+	 *
+	 * 2 MB granularity throughout: the base because relocated PSE entries
+	 * have reserved low bits, the size so the direct map can be built with
+	 * 2 MB pages, and phys_base because it is added to those PSE entries.
+	 */
+	image_lo = min_va & ~(CO_ARCH_PMD_SIZE - 1);
+	image_hi = (max_va + CO_ARCH_PMD_SIZE - 1) & ~(CO_ARCH_PMD_SIZE - 1);
+	need	 = (image_hi - image_lo) + CO_KLOAD_TABLE_BYTES;
 
-	if (kload_block_raw == NULL) {
-		co_debug_error("kload: no contiguous block of even 32 MB available");
+	b = kload_block_alloc(need);
+	if (b == NULL) {
+		co_debug_error("kload: no contiguous %lld MB for image + tables"
+			       " -- that is the floor, and the host cannot supply it",
+			       need >> 20);
 		return CO_RC(OUT_OF_MEMORY);
 	}
 
-	{
-		co_pa_t raw_pa = co_os_virt_to_phys(kload_block_raw);
-		unsigned long long adjust =
-			(CO_ARCH_PMD_SIZE - (raw_pa & (CO_ARCH_PMD_SIZE - 1)))
-			& (CO_ARCH_PMD_SIZE - 1);
+	kload_phys_base = b->pa - (image_lo - CO_ARCH_KERNEL_MAP);
+	kload_table_top = b->bytes;
 
-		kload_block    = (void*)((char*)kload_block_raw + (unsigned long)adjust);
-		kload_block_pa = raw_pa + adjust;
-	}
-	kload_table_top = kload_block_bytes;
-
-	co_debug("kload: guest RAM is %lld MB at host physical 0x%llx (2 MB aligned)",
-		 kload_block_bytes >> 20, (unsigned long long)kload_block_pa);
+	co_debug("kload: image + tables is %lld MB at host physical 0x%llx,"
+		 " phys_base 0x%llx",
+		 b->bytes >> 20, (unsigned long long)b->pa, kload_phys_base);
 
 	/* page tables out of the block too, or Linux cannot walk them */
 	co_arch_guest_space_set_frame_source(co_kload_table_frame, co_kload_frame_va);
@@ -337,19 +413,32 @@ static co_rc_t kload_page_for(co_manager_t* manager, unsigned long long va,
 
 	/*
 	 * The frame is not chosen, it is implied. The image is linked at
-	 * __START_KERNEL_map + its physical address, so the page backing kernel
-	 * virtual address V has to be guest physical V - __START_KERNEL_map --
-	 * that is what __pa() will compute later, and what the linear map has to
-	 * agree with.
+	 * __START_KERNEL_map + an offset, so the page backing kernel virtual
+	 * address V has to be host physical V - __START_KERNEL_map + phys_base
+	 * -- that is what __pa() will compute later, and what the linear map
+	 * has to agree with.
+	 *
+	 * The bound is the table region, not the block's end. Block 0 is sized
+	 * so the image fits below the tables, so this refusal should never
+	 * fire -- but when the 32 MB fallback undersized the block, image
+	 * frames walked straight into the live page tables at its top, and
+	 * what surfaced was not this but a later lookup returning garbage. A
+	 * frame that would land in the tables is refused by name instead.
 	 */
 	if (page_va < CO_ARCH_KERNEL_MAP)
 		return CO_RC(INVALID_PARAMETER);
 
-	rc = kload_frame_at(manager, page_va - CO_ARCH_KERNEL_MAP, &pfn);
-	if (!CO_OK(rc)) {
-		co_debug_error("kload: 0x%llx is past the end of guest RAM", page_va);
-		return rc;
+	pa = kload_kva_pa(page_va);
+	if (kload_block_count == 0 ||
+	    pa < kload_block[0].pa ||
+	    pa + CO_ARCH_PAGE_SIZE >
+	    kload_block[0].pa + kload_block[0].bytes - CO_KLOAD_TABLE_BYTES) {
+		co_debug_error("kload: 0x%llx implies frame 0x%llx, outside the"
+			       " image block's usable range", page_va,
+			       (unsigned long long)pa);
+		return CO_RC(INVALID_PARAMETER);
 	}
+	pfn = (co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT);
 
 	/*
 	 * Zero before mapping, not after. A section that only partly fills its
@@ -516,25 +605,65 @@ co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_bytes,
 {
 	unsigned long long phys;
 	unsigned long long text_phys, end_phys;
+	unsigned long long have;
+	int i;
 
-	if (kload_space == NULL)
+	if (kload_space == NULL || kload_block_count == 0)
 		return CO_RC(ERROR);
 
 	if (text_va < CO_ARCH_KERNEL_MAP || end_va <= text_va)
 		return CO_RC(INVALID_PARAMETER);
 
-	text_phys = (text_va - CO_ARCH_KERNEL_MAP) & CO_ARCH_PAGE_MASK;
-	end_phys  = (end_va - CO_ARCH_KERNEL_MAP + CO_ARCH_PAGE_SIZE - 1) & CO_ARCH_PAGE_MASK;
+	text_phys = kload_kva_pa(text_va) & CO_ARCH_PAGE_MASK;
+	end_phys  = (kload_kva_pa(end_va) + CO_ARCH_PAGE_SIZE - 1) & CO_ARCH_PAGE_MASK;
 
-	if (end_phys > ram_bytes) {
-		co_debug_error("kload: image ends at guest phys 0x%llx, past %lld MB of RAM",
-			       end_phys, ram_bytes >> 20);
+	if (text_phys < kload_block[0].pa ||
+	    end_phys > kload_block[0].pa + kload_block[0].bytes - CO_KLOAD_TABLE_BYTES) {
+		co_debug_error("kload: image 0x%llx..0x%llx is not inside block 0",
+			       text_phys, end_phys);
 		return CO_RC(INVALID_PARAMETER);
 	}
 
 	kload_ram_bytes = ram_bytes;
 	kload_text_phys = text_phys;
 	kload_end_phys  = end_phys;
+
+	/*
+	 * The rest of the guest's RAM, in whatever pieces the host can spare.
+	 *
+	 * ram_bytes is a target, not a demand. Block 0 already exists and is
+	 * counted against it; the remainder is requested in blocks no bigger
+	 * than 32 MB, halving on refusal, floor 4 MB -- small enough that a
+	 * host too fragmented for it has essentially nothing left. Falling
+	 * short is reported and is not a failure: a guest with less memory
+	 * boots further than a guest with none, and the e820 tells it exactly
+	 * what it has.
+	 */
+	have = kload_block[0].bytes - CO_KLOAD_TABLE_BYTES;
+	while (have < ram_bytes && kload_block_count < CO_KLOAD_MAX_BLOCKS) {
+		unsigned long long want = ram_bytes - have;
+		unsigned long long try_bytes;
+
+		want = (want + CO_ARCH_PMD_SIZE - 1) & ~(CO_ARCH_PMD_SIZE - 1);
+		if (want > (32ULL << 20))
+			want = 32ULL << 20;
+
+		for (try_bytes = want; try_bytes >= (4ULL << 20); try_bytes >>= 1) {
+			if (kload_block_alloc(try_bytes))
+				break;
+		}
+		if (try_bytes < (4ULL << 20)) {
+			co_debug("kload: host has no contiguous 4 MB left,"
+				 " stopping at %lld MB of %lld MB",
+				 have >> 20, ram_bytes >> 20);
+			break;
+		}
+
+		have += try_bytes;
+	}
+
+	co_debug("kload: %d blocks, %lld MB of RAM against a %lld MB target",
+		 kload_block_count, have >> 20, ram_bytes >> 20);
 
 	/*
 	 * The direct map, over the reserved region only -- not over RAM.
@@ -565,16 +694,18 @@ co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_bytes,
 	 * builder to install a PMD with _PAGE_PSE rather than always descending
 	 * to a PT.
 	 */
-	for (phys = 0; phys < kload_block_bytes; phys += CO_ARCH_PMD_SIZE) {
-		co_pa_t pa = kload_block_pa + phys;
-		co_rc_t rc = co_arch_guest_map_large(manager, kload_space,
-						     CO_ARCH_DIRECT_MAP + pa, pa,
-						     _KERNPG_TABLE | _PAGE_GLOBAL);
+	for (i = 0; i < kload_block_count; i++) {
+		for (phys = 0; phys < kload_block[i].bytes; phys += CO_ARCH_PMD_SIZE) {
+			co_pa_t pa = kload_block[i].pa + phys;
+			co_rc_t rc = co_arch_guest_map_large(manager, kload_space,
+							     CO_ARCH_DIRECT_MAP + pa, pa,
+							     _KERNPG_TABLE | _PAGE_GLOBAL);
 
-		if (!CO_OK(rc))
-			return rc;
+			if (!CO_OK(rc))
+				return rc;
 
-		kload_ram_pages += CO_ARCH_PMD_SIZE >> CO_ARCH_PAGE_SHIFT;
+			kload_ram_pages += CO_ARCH_PMD_SIZE >> CO_ARCH_PAGE_SHIFT;
+		}
 	}
 
 	/*
@@ -658,7 +789,7 @@ static void kload_fixup_table(co_manager_t* manager, unsigned long long table_va
 	co_pa_t pa;
 	int i, fixed = 0;
 
-	pa = kload_block_pa + (table_va - CO_ARCH_KERNEL_MAP);
+	pa = kload_kva_pa(table_va);
 	t  = (unsigned long long*)co_kload_frame_va((co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT));
 	if (t == NULL) {
 		co_debug_error("kload: %s is not inside the guest block", what);
@@ -685,19 +816,23 @@ co_rc_t co_kload_adopt_kernel_tables(co_manager_t* manager,
 	co_pa_t pml4_pa;
 	int i, grafted = 0;
 
-	if (kload_space == NULL || kload_block == NULL || table_count < 1)
+	if (kload_space == NULL || kload_block_count == 0 || table_count < 1)
 		return CO_RC(ERROR);
 
 	/*
 	 * Relocate every static table first. init_top_pgt must be table_va[0]:
 	 * it is the one CR3 ends up holding, and the grafting below writes into
 	 * it after it has been fixed up.
+	 *
+	 * The delta is phys_base: the entries hold (target - __START_KERNEL_map),
+	 * which is what __startup_64 would have added the load offset to, and
+	 * phys_base is exactly that offset here.
 	 */
 	for (i = 0; i < table_count; i++)
-		kload_fixup_table(manager, table_va[i], kload_block_pa, 512,
+		kload_fixup_table(manager, table_va[i], kload_phys_base, 512,
 				  i == 0 ? "init_top_pgt" : "a static kernel table");
 
-	pml4_pa = kload_block_pa + (table_va[0] - CO_ARCH_KERNEL_MAP);
+	pml4_pa = kload_kva_pa(table_va[0]);
 	kernel_pml4 = (unsigned long long*)
 		co_kload_frame_va((co_pfn_t)(pml4_pa >> CO_ARCH_PAGE_SHIFT));
 	if (kernel_pml4 == NULL)
@@ -725,7 +860,7 @@ co_rc_t co_kload_adopt_kernel_tables(co_manager_t* manager,
 	 */
 	if (table_count > 1 &&
 	    !(kernel_pml4[CO_ARCH_PGD_INDEX(CO_ARCH_KERNEL_MAP)] & _PAGE_PRESENT)) {
-		co_pa_t l3 = kload_block_pa + (table_va[1] - CO_ARCH_KERNEL_MAP);
+		co_pa_t l3 = kload_kva_pa(table_va[1]);
 
 		kernel_pml4[CO_ARCH_PGD_INDEX(CO_ARCH_KERNEL_MAP)] = l3 | _KERNPG_TABLE;
 		co_debug("kload: wired init_top_pgt[%d] -> level3_kernel_pgt at 0x%llx",

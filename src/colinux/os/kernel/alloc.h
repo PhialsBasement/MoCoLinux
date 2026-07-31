@@ -44,12 +44,12 @@ extern int   co_os_exec_alloc_index(void);
 
 extern bool_t co_os_alloc_method(int index, const char** name);
 /*
- * Physically contiguous pages.
+ * Physically contiguous pages, from anywhere in physical memory.
  *
- * The guest's physical memory has to be one contiguous host range: Linux reads
- * its own page tables and calls __va() on the entries, so a guest physical
- * address has to be a host physical address, which only works if the guest's
- * memory is one block with a known base. See colinux/kernel/kload.c.
+ * The guest's physical memory has to be host physical memory at its true
+ * address: Linux reads its own page tables and calls __va() on the entries, so
+ * a guest physical address has to be a host physical address. It comes in
+ * several contiguous blocks rather than one. See colinux/kernel/kload.c.
  */
 extern void*  co_os_alloc_contiguous_pages(unsigned int pages);
 extern void   co_os_free_contiguous_pages(void* ptr, unsigned int pages);

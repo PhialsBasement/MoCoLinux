@@ -826,9 +826,8 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		}
 		co_terminal_print("    %lu pages mapped, %lu page-table pages total\n",
 				  m.ram_pages, m.tables);
-		co_terminal_print("    guest physical 0 is host physical 0x%llx,"
-				  " %llu MB usable\n",
-				  m.block_pa, m.usable_bytes >> 20);
+		co_terminal_print("    %d blocks, %llu MB usable of %llu MB asked\n",
+				  m.range_count, m.total_usable >> 20, ram >> 20);
 
 		/*
 		 * boot_params, written straight into the guest at its symbol.
@@ -848,18 +847,51 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		/*
 		 * The e820 describes where the memory really is.
 		 *
-		 * Guest physical N is host physical block_pa + N, so the guest's
-		 * RAM starts at block_pa, not at zero -- there is no low memory
-		 * and no hole, because there is no emulated machine underneath,
-		 * just one contiguous allocation. The reserved entry is the
-		 * region at the top holding the page tables the host built: the
-		 * guest must not allocate over its own address space.
+		 * Guest physical addresses are host physical addresses, and the
+		 * memory comes in several contiguous blocks -- one usable entry
+		 * per block, at its true address. There is no low memory and no
+		 * hole to invent, because there is no emulated machine
+		 * underneath; a fragmented map is nothing unusual to Linux,
+		 * real machines have holes too.
+		 *
+		 * The page-table region at the top of block 0 goes in as type
+		 * 3, E820_TYPE_ACPI, and the type is load bearing rather than
+		 * decorative. phys_pmd_init() walks the direct map two
+		 * megabytes at a time and, for any span past what it is
+		 * currently mapping, does this:
+		 *
+		 *     if (!e820__mapped_any(.., E820_TYPE_RAM) &&
+		 *         !e820__mapped_any(.., E820_TYPE_ACPI))
+		 *             set_pmd_init(pmd, __pmd(0), init);
+		 *
+		 * -- it *zeroes* the entry. Described as type 2 the region is
+		 * neither RAM nor ACPI, so the kernel deleted the host's
+		 * mapping for the very pages its own page tables live in: two
+		 * warnings from set_pmd_safe, one per 2 MB, and then a fault
+		 * the next time anything called __va() on a table page.
+		 *
+		 * ACPI memory is spared by that test because it is exactly this
+		 * kind of region -- must stay mapped, must never be allocated
+		 * over -- and memblock still does not hand it out, since only
+		 * RAM becomes available memory. Which is the whole requirement.
 		 */
 		memset(bp, 0, sizeof(bp));
-		bp[0x1e8] = 2;					/* e820_entries */
-		co_e820_entry(bp + 0x2d0 +  0, m.block_pa, m.usable_bytes, 1);
-		co_e820_entry(bp + 0x2d0 + 20, m.block_pa + m.usable_bytes,
-			      m.block_bytes - m.usable_bytes, 2);
+		{
+			int n = 0;
+
+			for (i = 0; i < m.range_count; i++) {
+				co_e820_entry(bp + 0x2d0 + n * 20,
+					      m.range[i].pa, m.range[i].usable, 1);
+				n++;
+				if (m.range[i].reserved) {
+					co_e820_entry(bp + 0x2d0 + n * 20,
+						      m.range[i].pa + m.range[i].usable,
+						      m.range[i].reserved, 3);
+					n++;
+				}
+			}
+			bp[0x1e8] = (unsigned char)n;		/* e820_entries */
+		}
 
 		rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_bp),
 					    bp, sizeof(bp), 0);
@@ -882,11 +914,12 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 *
 		 *     __pa(x) = x - __START_KERNEL_map + phys_base
 		 *
-		 * The image was loaded at guest physical (link address -
-		 * __START_KERNEL_map), and guest physical is offset from host
-		 * physical by the block base, so phys_base is that base. Left at
-		 * zero the kernel would compute physical addresses for its own
-		 * text that are 128 MB below where it actually is.
+		 * The driver chose where the image landed -- at the base of its
+		 * block, with the link address's 16 MB offset absorbed into
+		 * phys_base rather than allocated -- so phys_base is whatever
+		 * it reports, not something derived here. Left at zero the
+		 * kernel would compute physical addresses for its own text
+		 * that are nowhere near where it actually is.
 		 */
 		{
 			co_elf_symbol_t* s_pb = co_get_symbol_by_name(pl, "phys_base");
@@ -897,22 +930,29 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			}
 
 			rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_pb),
-						    (unsigned char*)&m.block_pa,
-						    sizeof(m.block_pa), 0);
+						    (unsigned char*)&m.phys_base,
+						    sizeof(m.phys_base), 0);
 			if (!CO_OK(rc)) {
 				co_terminal_print("  writing phys_base failed (rc %x)\n", (int)rc);
 				goto out_end;
 			}
-			co_terminal_print("    phys_base = 0x%llx\n", m.block_pa);
+			co_terminal_print("    phys_base = 0x%llx\n", m.phys_base);
 		}
 
-		co_terminal_print("    e820: 0x%llx-0x%llx usable (%llu MB),"
-				  " 0x%llx-0x%llx reserved (%llu MB)\n",
-				  m.block_pa, m.block_pa + m.usable_bytes,
-				  m.usable_bytes >> 20,
-				  m.block_pa + m.usable_bytes,
-				  m.block_pa + m.block_bytes,
-				  (m.block_bytes - m.usable_bytes) >> 20);
+		for (i = 0; i < m.range_count; i++) {
+			co_terminal_print("    e820: 0x%llx-0x%llx usable (%llu MB)%s\n",
+					  m.range[i].pa,
+					  m.range[i].pa + m.range[i].usable,
+					  m.range[i].usable >> 20,
+					  m.range[i].reserved ? ", then the tables" : "");
+			if (m.range[i].reserved)
+				co_terminal_print("          0x%llx-0x%llx ACPI, so the kernel"
+						  " keeps it mapped (%llu MB)\n",
+						  m.range[i].pa + m.range[i].usable,
+						  m.range[i].pa + m.range[i].usable
+						  + m.range[i].reserved,
+						  m.range[i].reserved >> 20);
+		}
 		co_terminal_print("    cmdline: %s\n", cmdline);
 
 		b.entry_va           = addr[0];

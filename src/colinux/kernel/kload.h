@@ -13,15 +13,19 @@
 #include <colinux/arch/space.h>
 
 /*
- * The guest's physical memory: one contiguous host allocation, with guest
- * physical N at host physical base + N. See kload.c for why it cannot be
- * scattered pages.
+ * The guest's physical memory: a few contiguous host allocations, each one a
+ * usable e820 range at its true host physical address. Block 0 is the image
+ * plus the page-table region and is the only sizeable contiguous run required;
+ * see kload.c for why the memory cannot be scattered pages.
  */
 #define CO_KLOAD_RAM_BYTES	(128ULL << 20)
+#define CO_KLOAD_MAX_BLOCKS	16
 
-extern co_pa_t		  co_kload_block_pa(void);
-extern unsigned long long co_kload_usable_bytes(void);
-extern unsigned long long co_kload_block_bytes(void);
+extern unsigned long long co_kload_phys_base(void);
+extern int		  co_kload_range_count(void);
+extern void		  co_kload_range(int i, unsigned long long* pa,
+					 unsigned long long* usable,
+					 unsigned long long* reserved);
 extern co_rc_t		  co_kload_table_frame(co_manager_t* manager, co_pfn_t* pfn_out);
 extern void*		  co_kload_frame_va(co_pfn_t pfn);
 
