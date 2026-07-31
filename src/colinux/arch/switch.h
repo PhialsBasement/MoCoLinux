@@ -111,6 +111,13 @@ extern co_rc_t co_arch_test_kernel_code(co_manager_t* manager,
 					unsigned long long ring_symbol_va,
 					co_arch_kcall_test_t* out);
 
+/*
+ * Hand an interrupt taken in the guest to the host handler that owns it.
+ * Returns false if the gate cannot be entered this way, which the caller must
+ * treat as a reason to stop rather than as a no-op.
+ */
+extern bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long vector);
+
 /* Booting the loaded kernel: enter co_arch_start_kernel and see how far it gets. */
 typedef struct {
 	unsigned long long entry_va;
@@ -134,6 +141,7 @@ typedef struct {
 	int		   faulted;
 	int		   returned_voluntarily;
 	int		   hit_limit;
+	int		   unforwardable;
 	unsigned long	   switches;
 	unsigned long	   interrupts;
 	unsigned long long vector;

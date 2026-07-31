@@ -314,6 +314,7 @@ typedef struct {
 	int		   faulted;
 	int		   returned_voluntarily;
 	int		   hit_limit;
+	int		   unforwardable;
 	unsigned long	   switches;
 	unsigned long	   interrupts;
 	unsigned long long vector;
