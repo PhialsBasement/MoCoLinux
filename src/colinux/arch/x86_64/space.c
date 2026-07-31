@@ -266,6 +266,96 @@ co_rc_t co_arch_guest_map(co_manager_t* manager,
 	return CO_RC(OK);
 }
 
+/*
+ * Map two megabytes with one PMD entry.
+ *
+ * Same walk as above but stopping a level short and setting _PAGE_PSE, which
+ * is what init_mem_mapping() installs for the direct map. Matching its geometry
+ * is the point: where the host had built the same region out of page tables,
+ * set_pmd_safe found an entry that differed in kind rather than in what it
+ * addressed, warned -- arch/x86/mm/init_64.c:90 -- and overwrote it, and the
+ * next read through the replaced region faulted.
+ */
+co_rc_t co_arch_guest_map_large(co_manager_t* manager,
+				co_arch_guest_space_t* space,
+				unsigned long long va,
+				co_pa_t pa,
+				unsigned long long flags)
+{
+	co_pfn_t pfn = space->pml4_pfn;
+	int level;
+
+	if (!CO_ARCH_VA_CANONICAL(va))
+		return CO_RC(INVALID_PARAMETER);
+
+	/* A 2 MB entry describes a 2 MB-aligned frame at a 2 MB-aligned address. */
+	if ((va & (CO_ARCH_PMD_SIZE - 1)) || (pa & (CO_ARCH_PMD_SIZE - 1))) {
+		co_debug_error("guest map large: 0x%llx -> 0x%llx is not 2 MB aligned",
+			       va, (unsigned long long)pa);
+		return CO_RC(INVALID_PARAMETER);
+	}
+
+	for (level = 0; level < CO_SPACE_LEVELS - 1; level++) {
+		unsigned long long* table;
+		unsigned long long entry;
+		unsigned long index = co_space_index(va, level);
+		co_pfn_t next;
+		co_rc_t rc;
+
+		table = co_space_map(manager, pfn);
+		if (table == NULL)
+			return CO_RC(ERROR);
+
+		/* level 2 is the page directory: the entry itself is the mapping */
+		if (level == CO_SPACE_LEVELS - 2) {
+			table[index] = (pa & CO_ARCH_PMD_MASK) | flags | _PAGE_PSE;
+			co_space_unmap(manager, table, pfn);
+			return CO_RC(OK);
+		}
+
+		entry = table[index];
+
+		if (entry & _PAGE_PRESENT) {
+			if (entry & _PAGE_PSE) {
+				co_space_unmap(manager, table, pfn);
+				return CO_RC(ERROR);
+			}
+			next = (co_pfn_t)((entry & CO_ARCH_PAGE_MASK & ~CO_ARCH_PAGE_NX)
+					  >> CO_ARCH_PAGE_SHIFT);
+			co_space_unmap(manager, table, pfn);
+			pfn = next;
+			continue;
+		}
+
+		co_space_unmap(manager, table, pfn);
+
+		rc = co_space_new_table(manager, &next);
+		if (!CO_OK(rc))
+			return rc;
+
+		table = co_space_map(manager, pfn);
+		if (table == NULL)
+			return CO_RC(ERROR);
+
+		entry = table[index];
+		if (entry & _PAGE_PRESENT) {
+			co_space_unmap(manager, table, pfn);
+			pfn = (co_pfn_t)((entry & CO_ARCH_PAGE_MASK & ~CO_ARCH_PAGE_NX)
+					 >> CO_ARCH_PAGE_SHIFT);
+			continue;
+		}
+
+		table[index] = (((unsigned long long)next) << CO_ARCH_PAGE_SHIFT)
+			       | _KERNPG_TABLE;
+		co_space_unmap(manager, table, pfn);
+
+		space->tables++;
+		pfn = next;
+	}
+
+	return CO_RC(ERROR);
+}
+
 co_rc_t co_arch_guest_lookup(co_manager_t* manager,
 			     co_arch_guest_space_t* space,
 			     unsigned long long va,

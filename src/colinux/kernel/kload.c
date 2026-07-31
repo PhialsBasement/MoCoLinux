@@ -565,16 +565,16 @@ co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_bytes,
 	 * builder to install a PMD with _PAGE_PSE rather than always descending
 	 * to a PT.
 	 */
-	for (phys = 0; phys < kload_block_bytes; phys += CO_ARCH_PAGE_SIZE) {
+	for (phys = 0; phys < kload_block_bytes; phys += CO_ARCH_PMD_SIZE) {
 		co_pa_t pa = kload_block_pa + phys;
-		co_rc_t rc = co_arch_guest_map(manager, kload_space,
-					       CO_ARCH_DIRECT_MAP + pa, pa,
-					       _KERNPG_TABLE);
+		co_rc_t rc = co_arch_guest_map_large(manager, kload_space,
+						     CO_ARCH_DIRECT_MAP + pa, pa,
+						     _KERNPG_TABLE | _PAGE_GLOBAL);
 
 		if (!CO_OK(rc))
 			return rc;
 
-		kload_ram_pages++;
+		kload_ram_pages += CO_ARCH_PMD_SIZE >> CO_ARCH_PAGE_SHIFT;
 	}
 
 	/*
