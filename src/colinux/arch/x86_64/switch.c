@@ -157,6 +157,22 @@ asm(".text                                          \n"
  */
 #define CO_PP_TSS_PAGE		 4
 #define CO_PP_STUB_SIZE		16		/* uniform, so stub N is base + N*16 */
+/*
+ * params[20..24]: calling a function that the loaded kernel compiled.
+ *
+ * The kernel is SysV -- arguments in rdi, rsi, rdx -- while the switch leaves
+ * rcx, rdx, r8 and r9 set for its own purposes, so the two conventions cannot
+ * simply meet. A shim in the passage page loads the arguments from here, pushes
+ * a return address, and jumps; the callee returns into that address like any
+ * other caller, and the trampoline there switches back.
+ */
+#define CO_PP_CALL_TARGET	"0x968"
+#define CO_PP_CALL_ARG0		"0x970"
+#define CO_PP_CALL_ARG1		"0x978"
+#define CO_PP_CALL_ARG2		"0x980"
+#define CO_PP_CALL_RET		"0x988"
+#define CO_PP_CALL_TARGET_N	0x968
+#define CO_PP_CALL_RET_N	0x988
 
 /*
  * gdt.base, which is two bytes into the ten-byte descriptor (limit first).
@@ -403,8 +419,42 @@ asm(".text                                                          \n"
     "    lea " CO_PP_HOST_STATE "(%rax), %rdx                       \n"
     "    call co_switch_full                                        \n"
     "    jmp 2b                                                     \n"
+    /*
+     * Call into code the kernel compiled, and come back.
+     *
+     * The shim runs in the passage page, so it can find itself by RIP. It sets
+     * up a SysV call, pushes the trampoline below as the return address, and
+     * jumps. Nothing about the callee is assumed except that it returns -- the
+     * unpatched return thunk in this build is a plain ret, so it does.
+     *
+     * The trampoline cannot rely on r8 still pointing anywhere useful: r8 is
+     * caller-saved in SysV and the callee may have used it. It recovers the
+     * passage page from its own RIP instead, exactly as the fault handler does.
+     */
+    ".globl co_call_shim                                            \n"
+    "co_call_shim:                                                  \n"
+    "    lea 0(%rip), %rax                                          \n"
+    "    and $-4096, %rax                                           \n"
+    "    mov " CO_PP_CALL_ARG0 "(%rax), %rdi                        \n"
+    "    mov " CO_PP_CALL_ARG1 "(%rax), %rsi                        \n"
+    "    mov " CO_PP_CALL_ARG2 "(%rax), %rdx                        \n"
+    "    mov " CO_PP_CALL_TARGET "(%rax), %r10                      \n"
+    "    lea co_call_return(%rip), %r11                             \n"
+    "    push %r11                  /* the callee's return address */\n"
+    "    jmp *%r10                                                  \n"
+    ".globl co_call_return                                          \n"
+    "co_call_return:                                                \n"
+    "    mov %rax, %r11             /* the function's return value */\n"
+    "    lea 0(%rip), %rax                                          \n"
+    "    and $-4096, %rax                                           \n"
+    "    mov %r11, " CO_PP_CALL_RET "(%rax)                         \n"
+    "    lea " CO_PP_LINUXVM_STATE "(%rax), %rcx                    \n"
+    "    lea " CO_PP_HOST_STATE "(%rax), %rdx                       \n"
+    "    jmp co_switch_full                                         \n"
     ".globl co_switch_full_end                                      \n"
     "co_switch_full_end:                                            \n");
+
+extern char co_call_shim;
 
 /*
  * The guest for R4, which does not live in the passage page.
@@ -445,6 +495,7 @@ asm(".text                                                          \n"
 
 /* params[19]: where the guest finds the switch. Reached as 0x98(%r8). */
 #define CO_PP_SWITCH_ENTRY_N	0x960
+
 
 extern char co_switch_guest_fault;
 extern char co_switch_guest_entry_fault;
@@ -617,7 +668,9 @@ typedef char co_assert_fault_slots
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 18 * 8 == CO_PP_CR2_N &&
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 19 * 8 == CO_PP_SWITCH_ENTRY_N &&
 	  /* the extern guest reads it as 0x98(%r8), r8 being &params[0] */
-	  CO_PP_SWITCH_ENTRY_N - __builtin_offsetof(co_arch_passage_page_t, params) == 0x98)
+	  CO_PP_SWITCH_ENTRY_N - __builtin_offsetof(co_arch_passage_page_t, params) == 0x98 &&
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 20 * 8 == CO_PP_CALL_TARGET_N &&
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 24 * 8 == CO_PP_CALL_RET_N)
 	 ? 1 : -1];
 
 /* The blob reaches gdt.base by literal offset; keep it honest. */
@@ -1492,6 +1545,195 @@ co_rc_t co_arch_enter_loaded(co_manager_t* manager, co_arch_guest_space_t* space
 
 	rc = CO_RC(OK);
 
+out_free_stack:
+	if (stack_pfn)
+		co_os_put_page(manager, stack_pfn);
+out_free_pp:
+	co_os_free_exec_pages(pp, pages);
+
+	return rc;
+}
+
+/*
+ * Run functions the loaded kernel compiled.
+ *
+ * Everything up to R5 executed instructions this project wrote. This executes
+ * Linux's own: memset and strlen, called with a SysV frame, returning through
+ * the unpatched return thunk like any other caller.
+ *
+ * Both are chosen because they are leaves -- they touch their arguments and
+ * nothing else, no per-cpu data, no other kernel state -- and because each is
+ * checkable in a different way. memset is confirmed by reading the bytes it
+ * claims to have written; strlen by the number it returns. A stub that merely
+ * returned plausibly would fail one or the other.
+ *
+ * Note memset here is the unpatched alternative, which jumps straight to
+ * memset_orig, the generic byte loop. apply_alternatives() has never run, so the
+ * default instruction stream is what executes -- still code the kernel's own
+ * assembler emitted, just not the ERMS variant a booted kernel would select.
+ */
+#define CO_TEST_SCRATCH		0xffffffff91000000ULL
+#define CO_TEST_PATTERN		0x5a
+#define CO_TEST_STRING		"hello from a cooperative guest"
+
+static co_rc_t co_call_loaded_once(co_manager_t* manager, co_arch_passage_page_t* pp,
+				   co_switch_full_fn fn, unsigned long long stack_va,
+				   unsigned long long target,
+				   unsigned long long a0, unsigned long long a1,
+				   unsigned long long a2, unsigned long long* ret)
+{
+	pp->params[20] = target;
+	pp->params[21] = a0;
+	pp->params[22] = a1;
+	pp->params[23] = a2;
+	pp->params[24] = 0;
+
+	/*
+	 * Both have to be reset before every call. The outbound switch overwrites
+	 * return_rip and rsp with wherever the guest was when it left, so a second
+	 * call that did not restore them would resume the previous one instead of
+	 * starting a new one.
+	 */
+	pp->linuxvm_state.return_rip = (unsigned long long)(size_t)pp->code
+		+ (unsigned long)(&co_call_shim - &co_switch_full);
+	pp->linuxvm_state.rsp = stack_va + CO_ARCH_PAGE_SIZE - 0x40;
+
+	pp->params[4] = 0;	/* faulted */
+
+	fn(&pp->host_state, &pp->linuxvm_state, NULL, 0);
+
+	if (pp->params[4]) {
+		co_debug_error("call to 0x%llx faulted: vector %llu at 0x%llx",
+			       target, pp->params[16], pp->params[5]);
+		return CO_RC(ERROR);
+	}
+
+	*ret = pp->params[24];
+
+	return CO_RC(OK);
+}
+
+co_rc_t co_arch_test_kernel_code(co_manager_t* manager, co_arch_guest_space_t* space,
+				 unsigned long long memset_va,
+				 unsigned long long strlen_va,
+				 co_arch_kcall_test_t* out)
+{
+	co_arch_passage_page_t* pp;
+	co_arch_switch_test_t setup = {0, };
+	co_switch_full_fn fn;
+	unsigned long long stack_va = 0xffffffff90000000ULL;
+	co_pfn_t stack_pfn = 0, scratch_pfn = 0;
+	unsigned char* p;
+	int pages = sizeof(co_arch_passage_page_t) / CO_ARCH_PAGE_SIZE;
+	int page, i;
+	co_rc_t rc;
+
+	co_memset(out, 0, sizeof(*out));
+	out->supported  = PTRUE;
+	out->scratch_va = CO_TEST_SCRATCH;
+
+	if (space == NULL || !memset_va || !strlen_va)
+		return CO_RC(ERROR);
+
+	pp = co_setup_guest_page(&setup,
+		(unsigned long)(&co_switch_guest_entry - &co_switch_full));
+	if (pp == NULL)
+		return CO_RC(ERROR);
+
+	for (page = 0; page < pages; page++) {
+		unsigned char* q = (unsigned char*)pp + page * CO_ARCH_PAGE_SIZE;
+
+		rc = co_arch_guest_map(manager, space, (unsigned long long)(size_t)q,
+				       co_os_virt_to_phys(q), _KERNPG_TABLE);
+		if (!CO_OK(rc))
+			goto out_free_pp;
+	}
+
+	rc = co_os_get_page(manager, &stack_pfn);
+	if (!CO_OK(rc))
+		goto out_free_pp;
+	rc = co_arch_guest_map(manager, space, stack_va,
+			       ((co_pa_t)stack_pfn) << CO_ARCH_PAGE_SHIFT, _KERNPG_TABLE);
+	if (!CO_OK(rc))
+		goto out_free_stack;
+
+	rc = co_os_get_page(manager, &scratch_pfn);
+	if (!CO_OK(rc))
+		goto out_free_stack;
+	rc = co_arch_guest_map(manager, space, CO_TEST_SCRATCH,
+			       ((co_pa_t)scratch_pfn) << CO_ARCH_PAGE_SHIFT, _KERNPG_TABLE);
+	if (!CO_OK(rc))
+		goto out_free_scratch;
+
+	/* Fill the scratch page with something memset must overwrite. */
+	p = co_os_map(manager, scratch_pfn);
+	if (p == NULL) {
+		rc = CO_RC(ERROR);
+		goto out_free_scratch;
+	}
+	co_memset(p, 0xa5, CO_ARCH_PAGE_SIZE);
+	co_os_unmap(manager, p, scratch_pfn);
+
+	pp->linuxvm_state.cr3 = co_arch_guest_space_root(space);
+	pp->params[19]        = (unsigned long long)(size_t)pp->code;
+	fn                    = (co_switch_full_fn)(void*)pp->code;
+
+	/* --- memset(scratch, 0x5a, 4096) --- */
+	out->memset_va = memset_va;
+	rc = co_call_loaded_once(manager, pp, fn, stack_va, memset_va,
+				 CO_TEST_SCRATCH, CO_TEST_PATTERN, CO_ARCH_PAGE_SIZE,
+				 &out->memset_ret);
+	if (!CO_OK(rc)) {
+		out->faulted   = (int)pp->params[4];
+		out->vector    = pp->params[16];
+		out->fault_rip = pp->params[5];
+		out->cr2       = pp->params[18];
+		goto out_free_scratch;
+	}
+
+	/* Did it actually write? Read the page the guest wrote, not its word for it. */
+	p = co_os_map(manager, scratch_pfn);
+	if (p == NULL) {
+		rc = CO_RC(ERROR);
+		goto out_free_scratch;
+	}
+	out->pattern_ok = PTRUE;
+	for (i = 0; i < (int)CO_ARCH_PAGE_SIZE; i++) {
+		if (p[i] != CO_TEST_PATTERN) {
+			out->pattern_ok  = PFALSE;
+			out->first_bad   = i;
+			out->first_bad_byte = p[i];
+			break;
+		}
+	}
+
+	/* Now a string for strlen, placed after memset so it cannot be a leftover. */
+	co_memcpy(p, CO_TEST_STRING, sizeof(CO_TEST_STRING));
+	co_os_unmap(manager, p, scratch_pfn);
+
+	/* --- strlen(scratch) --- */
+	out->strlen_va = strlen_va;
+	rc = co_call_loaded_once(manager, pp, fn, stack_va, strlen_va,
+				 CO_TEST_SCRATCH, 0, 0, &out->strlen_ret);
+	if (!CO_OK(rc)) {
+		out->faulted   = (int)pp->params[4];
+		out->vector    = pp->params[16];
+		out->fault_rip = pp->params[5];
+		out->cr2       = pp->params[18];
+		goto out_free_scratch;
+	}
+
+	out->strlen_expected = sizeof(CO_TEST_STRING) - 1;
+
+	out->succeeded = (out->pattern_ok &&
+			  out->memset_ret == CO_TEST_SCRATCH &&
+			  out->strlen_ret == out->strlen_expected) ? PTRUE : PFALSE;
+
+	rc = CO_RC(OK);
+
+out_free_scratch:
+	if (scratch_pfn)
+		co_os_put_page(manager, scratch_pfn);
 out_free_stack:
 	if (stack_pfn)
 		co_os_put_page(manager, stack_pfn);

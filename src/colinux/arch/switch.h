@@ -66,6 +66,36 @@ extern co_rc_t co_arch_test_extern_guest(co_manager_t* manager,
 					 co_arch_switch_test_t* out,
 					 bool_t provoke_fault);
 
+/*
+ * Calling functions the loaded kernel compiled. memset is checked by reading
+ * back what it wrote, strlen by what it returns -- two different kinds of
+ * evidence, so a stub that merely returned plausibly fails one of them.
+ */
+typedef struct {
+	int		   supported;
+	int		   succeeded;
+	unsigned long long memset_va;
+	unsigned long long strlen_va;
+	unsigned long long scratch_va;
+	unsigned long long memset_ret;
+	unsigned long long strlen_ret;
+	unsigned long long strlen_expected;
+	int		   pattern_ok;
+	int		   first_bad;
+	int		   first_bad_byte;
+	int		   faulted;
+	unsigned long long vector;
+	unsigned long long fault_rip;
+	unsigned long long cr2;
+} co_arch_kcall_test_t;
+
+struct co_arch_guest_space;
+extern co_rc_t co_arch_test_kernel_code(co_manager_t* manager,
+					struct co_arch_guest_space* space,
+					unsigned long long memset_va,
+					unsigned long long strlen_va,
+					co_arch_kcall_test_t* out);
+
 /* Enter an address space that already holds a loaded kernel image. */
 struct co_arch_guest_space;
 extern co_rc_t co_arch_enter_loaded(co_manager_t* manager,

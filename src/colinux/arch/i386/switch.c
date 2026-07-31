@@ -52,3 +52,12 @@ co_rc_t co_arch_enter_loaded(co_manager_t* manager, struct co_arch_guest_space* 
 	out->supported = PFALSE;
 	return CO_RC(OK);
 }
+
+co_rc_t co_arch_test_kernel_code(co_manager_t* manager, struct co_arch_guest_space* space,
+				 unsigned long long memset_va, unsigned long long strlen_va,
+				 co_arch_kcall_test_t* out)
+{
+	co_memset(out, 0, sizeof(*out));
+	out->supported = PFALSE;
+	return CO_RC(OK);
+}

@@ -359,7 +359,7 @@ co_rc_t co_elf_dump(const char *filename)
  */
 #define CO_KLOAD_CHUNK	0x8000
 
-co_rc_t co_elf_load_into_guest(const char* filename, bool_t enter)
+co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 {
 	co_elf_data_t* pl;
 	co_manager_handle_t handle;
@@ -522,6 +522,71 @@ co_rc_t co_elf_load_into_guest(const char* filename, bool_t enter)
 				goto out_end;
 			}
 		}
+	}
+
+	if (enter == 2) {
+		/*
+		 * Run code the kernel compiled, rather than a stub of ours placed
+		 * inside it. memset and strlen are leaves -- they touch their
+		 * arguments and nothing else -- so they can run before a single
+		 * line of kernel initialisation has.
+		 */
+		co_manager_ioctl_kcall_t k = {0, };
+		co_elf_symbol_t* ms = co_get_symbol_by_name(pl, "memset");
+		co_elf_symbol_t* sl = co_get_symbol_by_name(pl, "strlen");
+
+		if (!ms || !sl) {
+			co_terminal_print("\n  memset or strlen not found in the image\n");
+			goto out_end;
+		}
+
+		k.memset_va = co_elf_get_symbol_value(ms);
+		k.strlen_va = co_elf_get_symbol_value(sl);
+
+		co_terminal_print("\n  calling code the kernel compiled:\n");
+		co_terminal_print("    memset  0x%016llx\n", k.memset_va);
+		co_terminal_print("    strlen  0x%016llx\n", k.strlen_va);
+		co_terminal_print("\n");
+
+		rc = co_manager_kcall(handle, &k);
+		if (!CO_OK(rc) || !CO_OK(k.rc)) {
+			co_terminal_print("  kcall failed (rc %x / %x)\n", (int)rc, (int)k.rc);
+			goto out_end;
+		}
+		if (!k.supported) {
+			co_terminal_print("  not implemented on this architecture\n");
+			goto out_end;
+		}
+		if (k.faulted) {
+			co_terminal_print("  FAULT: vector %llu at rip 0x%016llx, cr2 0x%016llx\n",
+					  k.vector, k.fault_rip, k.cr2);
+			goto out_end;
+		}
+
+		co_terminal_print("  memset(0x%016llx, 0x5a, 4096)\n", k.scratch_va);
+		co_terminal_print("    returned      0x%016llx   %s\n", k.memset_ret,
+				  (k.memset_ret == k.scratch_va) ? "(the destination, as it should)" : "WRONG");
+		co_terminal_print("    page contents %s\n",
+				  k.pattern_ok ? "all 0x5a -- it really wrote them"
+					       : "NOT all 0x5a");
+		if (!k.pattern_ok)
+			co_terminal_print("      first wrong byte at offset %d: 0x%02x\n",
+					  k.first_bad, k.first_bad_byte);
+
+		co_terminal_print("\n  strlen(\"%s\")\n", "hello from a cooperative guest");
+		co_terminal_print("    returned      %llu   (expected %llu)   %s\n",
+				  k.strlen_ret, k.strlen_expected,
+				  (k.strlen_ret == k.strlen_expected) ? "MATCH" : "WRONG");
+		co_terminal_print("\n");
+
+		if (k.succeeded)
+			co_terminal_print("  RAN LINUX'S OWN COMPILED CODE. Two functions out of the\n"
+					  "  loaded image executed in the guest address space: one\n"
+					  "  verified by the bytes it wrote, one by the value it returned.\n");
+		else
+			co_terminal_print("  the calls returned but did not do what they should have\n");
+
+		goto out_end;
 	}
 
 	if (!enter) {
