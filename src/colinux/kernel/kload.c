@@ -66,7 +66,8 @@ static unsigned long	      kload_ram_pages;
  * direct map that is one identity-offset range. It also removes the whole
  * class of teardown bug: there is one allocation to free, not thirty thousand.
  */
-static void*		      kload_block;	/* host virtual, from the allocator */
+static void*		      kload_block_raw;	/* exactly what the allocator returned */
+static void*		      kload_block;	/* the 2 MB-aligned view inside it */
 static co_pa_t		      kload_block_pa;	/* host physical, == guest physical 0 */
 static unsigned long long     kload_block_bytes;
 static unsigned long long     kload_table_top;	/* tables grow down from here */
@@ -182,12 +183,14 @@ static void kload_release_pages(co_manager_t* manager)
 	 * against that walk, and the one that was not was a page freed twice
 	 * and then handed to something else by the host.
 	 */
-	if (kload_block == NULL)
+	if (kload_block_raw == NULL)
 		return;
 
-	co_os_free_contiguous_pages(kload_block,
-				    (unsigned int)(kload_block_bytes >> CO_ARCH_PAGE_SHIFT));
+	co_os_free_contiguous_pages(kload_block_raw,
+				    (unsigned int)((kload_block_bytes + CO_ARCH_PMD_SIZE)
+						   >> CO_ARCH_PAGE_SHIFT));
 
+	kload_block_raw   = NULL;
 	kload_block       = NULL;
 	kload_block_pa    = 0;
 	kload_block_bytes = 0;
@@ -234,19 +237,60 @@ co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 	 * guest physical N is host physical block_pa + N. Everything the guest
 	 * can reach comes out of this.
 	 */
-	kload_block_bytes = CO_KLOAD_RAM_BYTES;
-	kload_block = co_os_alloc_contiguous_pages(
-			(unsigned int)(kload_block_bytes >> CO_ARCH_PAGE_SHIFT));
-	if (kload_block == NULL) {
-		co_debug_error("kload: could not get %lld MB of contiguous memory",
-			       kload_block_bytes >> 20);
+	/*
+	 * Two megabyte aligned, which is not a preference.
+	 *
+	 * level2_kernel_pgt maps the kernel's text with 2 MB PSE entries, and in
+	 * a PSE entry bits 12 to 20 are reserved and must be zero. Relocating
+	 * those entries means adding the block's physical base to them, so a
+	 * base that is merely page aligned puts bits into that field: the walk
+	 * then faults with the reserved bit set in the error code -- 0x19,
+	 * present, instruction fetch -- on the first instruction of the kernel.
+	 *
+	 * The allocator makes no alignment promise beyond a page, so take an
+	 * extra 2 MB and use the aligned window inside it. The original pointer
+	 * is what has to be freed.
+	 */
+	/*
+	 * As much as the host will give, not a fixed demand.
+	 *
+	 * This is one contiguous allocation of over a hundred megabytes from a
+	 * machine that has been up for a while, and contiguous memory is the
+	 * first thing to fragment. Asking for a fixed 128 MB works until it does
+	 * not, and then the whole run fails with nothing but an out-of-memory
+	 * code -- which is a bad way to learn that the host is merely busy.
+	 */
+	kload_block_raw = NULL;
+	for (kload_block_bytes = CO_KLOAD_RAM_BYTES;
+	     kload_block_bytes >= (32ULL << 20);
+	     kload_block_bytes >>= 1) {
+		kload_block_raw = co_os_alloc_contiguous_pages(
+				(unsigned int)((kload_block_bytes + CO_ARCH_PMD_SIZE)
+					       >> CO_ARCH_PAGE_SHIFT));
+		if (kload_block_raw)
+			break;
+
+		co_debug("kload: %lld MB contiguous refused, trying less",
+			 kload_block_bytes >> 20);
+	}
+
+	if (kload_block_raw == NULL) {
+		co_debug_error("kload: no contiguous block of even 32 MB available");
 		return CO_RC(OUT_OF_MEMORY);
 	}
 
-	kload_block_pa  = co_os_virt_to_phys(kload_block);
+	{
+		co_pa_t raw_pa = co_os_virt_to_phys(kload_block_raw);
+		unsigned long long adjust =
+			(CO_ARCH_PMD_SIZE - (raw_pa & (CO_ARCH_PMD_SIZE - 1)))
+			& (CO_ARCH_PMD_SIZE - 1);
+
+		kload_block    = (void*)((char*)kload_block_raw + (unsigned long)adjust);
+		kload_block_pa = raw_pa + adjust;
+	}
 	kload_table_top = kload_block_bytes;
 
-	co_debug("kload: guest RAM is %lld MB at host physical 0x%llx",
+	co_debug("kload: guest RAM is %lld MB at host physical 0x%llx (2 MB aligned)",
 		 kload_block_bytes >> 20, (unsigned long long)kload_block_pa);
 
 	/* page tables out of the block too, or Linux cannot walk them */
@@ -506,6 +550,37 @@ co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_bytes,
 			return rc;
 
 		kload_ram_pages++;
+	}
+
+	/*
+	 * The first megabyte, which on a real machine is BIOS and option ROMs.
+	 *
+	 * The guest's memory starts wherever the host had a contiguous block, so
+	 * guest physical 0 is nothing at all -- but the kernel reads down there
+	 * regardless of what the e820 says, looking for signatures: DMI, the
+	 * EBDA, the video ROM. It faulted reading __va(0xc0000).
+	 *
+	 * One zeroed frame, mapped read-only across the whole megabyte. Reads
+	 * find no signatures and the scans conclude there is nothing there,
+	 * which is true. Read-only because nothing should be writing to ROM, and
+	 * if something does the fault says so rather than quietly corrupting
+	 * whatever else the frame is aliased to.
+	 */
+	{
+		co_pfn_t rom;
+		co_rc_t rrc = co_kload_table_frame(manager, &rom);
+
+		if (!CO_OK(rrc))
+			return rrc;
+
+		for (phys = 0; phys < 0x100000ULL; phys += CO_ARCH_PAGE_SIZE) {
+			rrc = co_arch_guest_map(manager, kload_space,
+						CO_ARCH_DIRECT_MAP + phys,
+						((co_pa_t)rom) << CO_ARCH_PAGE_SHIFT,
+						_PAGE_PRESENT | _PAGE_ACCESSED);
+			if (!CO_OK(rrc))
+				return rrc;
+		}
 	}
 
 	co_debug("kload: %lld MB of guest RAM, %ld pages allocated for it",
