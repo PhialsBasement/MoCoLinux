@@ -1067,8 +1067,87 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			goto out_end;
 		}
 
+		/*
+		 * Keep the guest's hands off the interrupt hardware.
+		 *
+		 * There is one physical machine here and Windows is using it.
+		 * The guest has already read the host's real firmware -- its
+		 * DMI strings, its MP-table, its ACPI tables -- because guest
+		 * physical is host physical and early_ioremap() of 0xf0000
+		 * finds the M92p's actual BIOS. Reading is survivable. What
+		 * comes next is not: apic_bsp_setup() calls setup_local_APIC()
+		 * and setup_IO_APIC(), which write the enable bit, the task
+		 * priority, the logical destination and the whole IOAPIC
+		 * redirection table of the chips Windows takes its timer,
+		 * keyboard and disk interrupts through.
+		 *
+		 * That this can happen is not a guess. The guest has already
+		 * driven real hardware once: "Fast TSC calibration using PIT"
+		 * is it programming the 8254 through ports 0x40-0x43 and
+		 * reading back the M92p's true 3193 MHz. The PIT is vestigial
+		 * under XP x64, so nothing came of it. The APIC is not.
+		 *
+		 *   nolapic         apic_is_disabled, so apic_intr_mode is
+		 *                   APIC_PIC and apic_intr_mode_init() returns
+		 *                   before any of those four calls.
+		 *   acpi=off        no table parsing and no interpreter. The
+		 *                   wider hazard of the two: acpi_enable()
+		 *                   writes SMI_CMD to take ACPI ownership from
+		 *                   firmware that has already given it to
+		 *                   Windows, and AML, once running, can write
+		 *                   any port or physical address it likes.
+		 *   noapic, nohpet,
+		 *   no_timer_check  explicit rather than implied by the above.
+		 *
+		 * None of it is a loss. This guest runs with interrupts
+		 * disabled and never takes one -- the host forwards its own in
+		 * host context -- so an interrupt controller of its own is
+		 * machinery it cannot use, pointed at hardware it must not
+		 * touch. The i386 port gives the guest a virtual controller
+		 * instead, and that is where this ends up.
+		 */
+		/*
+		 * noxsave, so the two sides agree on what "extended state" is.
+		 *
+		 * fpu__init_cpu_xstate() sets CR4.OSXSAVE and then executes
+		 * xsetbv, which raises #UD if that bit did not take -- and it
+		 * does not take here. cr4_set_bits() computes from
+		 * cpu_tlbstate.cr4, a shadow primed by cr4_init_shadow() from
+		 * x86_64_start_kernel(), which a cooperative guest never runs.
+		 * It reads back as all ones, and the host refuses to write a
+		 * CR4 with bits above 31 set, correctly.
+		 *
+		 * The shadow is worth priming eventually; every other
+		 * cr4_set_bits() caller meets the same wall. But it is the
+		 * wrong fix for this one. The passage page saves 512 bytes of
+		 * FXSAVE state per crossing, and that was measured as the whole
+		 * of it because this host runs with OSXSAVE clear -- CR4 0x6f8.
+		 * A guest that turns XSAVE on invalidates that measurement and
+		 * needs XSAVE-sized state handling on both sides of every
+		 * switch. Declining the feature keeps one save format across
+		 * the crossing, which is the same answer the host already gave.
+		 */
+		/*
+		 * disable_mtrr_trim, so the guest keeps the memory it is given.
+		 *
+		 * mtrr_trim_uncached_memory() discards RAM the host's MTRRs do
+		 * not describe as write-back. It took a block at 0x104200000
+		 * away after the guest had already counted it -- last_pfn went
+		 * 0x106200 to 0x2bc00 in the space of one log line.
+		 *
+		 * The first answer to that was to stop allocating above 4 GB,
+		 * which was the wrong layer: it left the trimming in place and
+		 * halved the range the allocator searches, so on a host that
+		 * had been up a day the image block could not be found at all.
+		 * This turns off the trimming instead, which is the thing that
+		 * was actually wrong. The host's MTRRs describe the host's
+		 * memory correctly; it is the guest's idea of which RAM is its
+		 * own that they say nothing useful about.
+		 */
 		memset(cmdline, 0, sizeof(cmdline));
-		strcpy(cmdline, "earlyprintk=colinux,keep console=earlycolinux");
+		strcpy(cmdline, "earlyprintk=colinux,keep console=earlycolinux"
+				" acpi=off noapic nolapic nohpet no_timer_check"
+				" noxsave noxsaveopt noxsaves disable_mtrr_trim");
 		rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_cl),
 					    cmdline, sizeof(cmdline), 0);
 		if (!CO_OK(rc)) {
