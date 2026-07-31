@@ -27,6 +27,7 @@
 #include "monitor.h"
 #include "pages.h"
 #include "reversedpfns.h"
+#include "kload.h"
 
 #ifndef min
 # define min(a,b) 	((a)<(b)?(a):(b))
@@ -458,6 +459,108 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 #endif
 		params->rc   = CO_RC(OK);
 		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KLOAD_BEGIN: {
+		co_manager_ioctl_kload_begin_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+		if (manager->state < CO_MANAGER_STATE_INITIALIZED) {
+			params->rc = CO_RC(ERROR);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		params->rc = co_kload_begin(manager, params->min_va, params->max_va);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KLOAD_CHUNK: {
+		co_manager_ioctl_kload_chunk_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+		if (!params->zero && in_size < sizeof(*params) + params->size)
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_kload_chunk(manager, params->va, params->data,
+					    params->size, params->zero ? PTRUE : PFALSE);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KLOAD_VERIFY: {
+		co_manager_ioctl_kload_verify_t* params = (typeof(params))(io_buffer);
+		unsigned long long sum = 0;
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc     = co_kload_verify(manager, params->va, params->size, &sum);
+		params->checksum = sum;
+		params->pages  = co_kload_pages();
+		params->chunks = co_kload_chunks();
+		params->tables = co_kload_space()
+				 ? co_arch_guest_space_tables(co_kload_space()) : 0;
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KLOAD_ENTER: {
+		co_manager_ioctl_test_switch_t* params = (typeof(params))(io_buffer);
+		co_arch_switch_test_t result;
+		unsigned long long entry_va;
+		co_rc_t trc;
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		/* the entry address travels inwards in code_va */
+		entry_va = params->code_va;
+		co_memset(params, 0, sizeof(*params));
+
+		trc = co_arch_enter_loaded(manager, co_kload_space(), entry_va, &result);
+
+		params->rc         = trc;
+		params->supported  = result.supported;
+		params->succeeded  = result.succeeded;
+		params->code_va    = result.code_va;
+		params->guest_cr3  = result.guest_cr3;
+		params->guest_gdt  = result.guest_gdt;
+		params->guest_idt  = result.guest_idt;
+		params->guest_stubs = result.guest_stubs;
+		params->guest_tss  = result.guest_tss;
+		params->ist_stack  = result.ist_stack;
+		params->guest_text = result.guest_text;
+		params->guest_stack = result.guest_stack;
+		params->tables     = result.tables;
+		params->fault_handler = result.fault_handler;
+		params->expected   = result.expected;
+		params->observed   = result.observed;
+		params->faulted    = result.faulted;
+		params->fault_rip  = result.fault_rip;
+		params->vector     = result.vector;
+		params->error_code = result.error_code;
+		params->cr2        = result.cr2;
+		params->preflight_checked = result.preflight_checked;
+		params->preflight_failed  = result.preflight_failed;
+		params->preflight_level   = result.preflight_level;
+		params->preflight_va      = result.preflight_va;
+		params->passage_va = result.passage_va;
+		params->passage_pa = result.passage_pa;
+		params->host_cr3   = result.host_cr3;
+		params->code_size  = result.code_size;
+
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KLOAD_END: {
+		co_kload_free(manager);
+		*return_size = 0;
 		return CO_RC(OK);
 	}
 

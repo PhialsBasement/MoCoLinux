@@ -1371,3 +1371,132 @@ out_free_pp:
 
 	return rc;
 }
+
+/*
+ * Enter a guest address space that already holds a loaded kernel image.
+ *
+ * The image is mapped at its link addresses by co_kload_*; what is missing is
+ * everything the crossing itself needs -- the passage page with the switch code,
+ * the state blocks, the GDT, the IDT, the stubs, the TSS and the IST stack. Those
+ * are mapped in alongside, at the addresses the host has them, which is what
+ * keeps other_map zero.
+ *
+ * entry_va is somewhere inside the loaded image, and the few bytes there are
+ * replaced with the same stub R4 used. That is a stand-in for a cooperative
+ * entry point compiled into the kernel: the real thing will be a symbol the
+ * image already contains, but the mechanism being tested -- transfer control to
+ * an address inside a mapped kernel image, and get back -- is the same either
+ * way, and it can be tested before the kernel is patched at all.
+ */
+co_rc_t co_arch_enter_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
+			     unsigned long long entry_va, co_arch_switch_test_t* out)
+{
+	co_arch_passage_page_t* pp;
+	co_switch_full_fn fn;
+	unsigned long long* sentinel;
+	unsigned long long stack_va = 0xffffffff90000000ULL;
+	co_pfn_t stack_pfn = 0;
+	co_pa_t entry_pa = 0;
+	unsigned char* p;
+	unsigned long code_size;
+	int pages = sizeof(co_arch_passage_page_t) / CO_ARCH_PAGE_SIZE;
+	int page, level = -1;
+	co_rc_t rc;
+
+	co_memset(out, 0, sizeof(*out));
+	out->supported = PTRUE;
+
+	if (space == NULL)
+		return CO_RC(ERROR);
+
+	pp = co_setup_guest_page(out,
+		(unsigned long)(&co_switch_guest_entry - &co_switch_full));
+	if (pp == NULL)
+		return CO_RC(ERROR);
+
+	for (page = 0; page < pages; page++) {
+		unsigned char* q = (unsigned char*)pp + page * CO_ARCH_PAGE_SIZE;
+
+		rc = co_arch_guest_map(manager, space, (unsigned long long)(size_t)q,
+				       co_os_virt_to_phys(q), _KERNPG_TABLE);
+		if (!CO_OK(rc))
+			goto out_free_pp;
+	}
+
+	/* A stack above the image, rather than anywhere the kernel believes it owns. */
+	rc = co_os_get_page(manager, &stack_pfn);
+	if (!CO_OK(rc))
+		goto out_free_pp;
+
+	rc = co_arch_guest_map(manager, space, stack_va,
+			       ((co_pa_t)stack_pfn) << CO_ARCH_PAGE_SHIFT, _KERNPG_TABLE);
+	if (!CO_OK(rc))
+		goto out_free_stack;
+
+	/* Write the stub into the image, through the guest's own tables. */
+	rc = co_arch_guest_lookup(manager, space, entry_va, &entry_pa, &level);
+	if (!CO_OK(rc) || !entry_pa) {
+		co_debug_error("enter: 0x%llx is not mapped in the loaded image (level %d)",
+			       entry_va, level);
+		rc = CO_RC(ERROR);
+		goto out_free_stack;
+	}
+
+	code_size = (unsigned long)(&co_extern_guest_code_end - &co_extern_guest_code);
+
+	p = co_os_map(manager, (co_pfn_t)(entry_pa >> CO_ARCH_PAGE_SHIFT));
+	if (p == NULL) {
+		rc = CO_RC(ERROR);
+		goto out_free_stack;
+	}
+	co_memcpy(p + (entry_va & ~CO_ARCH_PAGE_MASK), &co_extern_guest_code, code_size);
+	co_os_unmap(manager, p, (co_pfn_t)(entry_pa >> CO_ARCH_PAGE_SHIFT));
+
+	pp->linuxvm_state.cr3        = co_arch_guest_space_root(space);
+	pp->linuxvm_state.return_rip = entry_va;
+	pp->linuxvm_state.rsp        = stack_va + CO_ARCH_PAGE_SIZE - 0x40;
+	pp->params[19]               = (unsigned long long)(size_t)pp->code;
+
+	fn       = (co_switch_full_fn)(void*)pp->code;
+	sentinel = (unsigned long long*)&pp->params[0];
+
+	out->guest_cr3   = pp->linuxvm_state.cr3;
+	out->code_va     = entry_va;
+	out->guest_text  = entry_va;
+	out->guest_stack = stack_va;
+	out->tables      = co_arch_guest_space_tables(space);
+	out->expected    = CO_SWITCH_SENTINEL;
+
+	if (!CO_OK(co_preflight_space(manager, space, "entry point", entry_va, entry_pa, out)) ||
+	    !CO_OK(co_preflight_space(manager, space, "stack", stack_va,
+				      ((co_pa_t)stack_pfn) << CO_ARCH_PAGE_SHIFT, out)) ||
+	    !CO_OK(co_preflight_space(manager, space, "passage page",
+				      (unsigned long long)(size_t)pp,
+				      co_os_virt_to_phys(pp), out)) ||
+	    !CO_OK(co_preflight_space(manager, space, "guest IDT",
+				      (unsigned long long)(size_t)pp->linuxvm_state.idt.table,
+				      co_os_virt_to_phys(pp->linuxvm_state.idt.table), out))) {
+		rc = CO_RC(ERROR);
+		goto out_free_stack;
+	}
+
+	fn(&pp->host_state, &pp->linuxvm_state, sentinel, CO_SWITCH_SENTINEL);
+
+	out->observed   = *sentinel;
+	out->faulted    = (int)pp->params[4];
+	out->fault_rip  = pp->params[5];
+	out->vector     = pp->params[16];
+	out->error_code = pp->params[17];
+	out->cr2        = pp->params[18];
+	out->succeeded  = (out->observed == CO_SWITCH_SENTINEL && !out->faulted) ? PTRUE : PFALSE;
+
+	rc = CO_RC(OK);
+
+out_free_stack:
+	if (stack_pfn)
+		co_os_put_page(manager, stack_pfn);
+out_free_pp:
+	co_os_free_exec_pages(pp, pages);
+
+	return rc;
+}

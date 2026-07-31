@@ -24,6 +24,8 @@
 #include <colinux/os/alloc.h>
 #include <colinux/os/user/file.h>
 #include <colinux/os/user/misc.h>
+#include <colinux/os/user/manager.h>
+#include <colinux/user/manager.h>
 
 /*
  * ELF32 or ELF64 by target architecture.
@@ -340,4 +342,235 @@ co_rc_t co_elf_dump(const char *filename)
 
 	co_os_file_free(buf);
 	return CO_RC(OK);
+}
+
+/*
+ * Load a kernel image into a guest address space in the driver, then enter it.
+ *
+ * The sections go over in chunks rather than whole: a section can be megabytes
+ * and the ioctl buffer is copied for every call, so streaming keeps the peak
+ * allocation bounded and the failure, if there is one, attributable to a
+ * particular range rather than to "the kernel".
+ *
+ * SHT_NOBITS sections -- .bss and .brk, about a megabyte and a half here -- are
+ * sent as zeroing chunks. They have no file content but they do need pages, and
+ * a guest that finds its .bss unmapped fails in ways that look nothing like the
+ * cause.
+ */
+#define CO_KLOAD_CHUNK	0x8000
+
+co_rc_t co_elf_load_into_guest(const char* filename, bool_t enter)
+{
+	co_elf_data_t* pl;
+	co_manager_handle_t handle;
+	co_manager_ioctl_kload_verify_t v = {0, };
+	co_manager_ioctl_test_switch_t r = {0, };
+	co_elf_off_t index, sections;
+	unsigned long long lo = ~0ULL, hi = 0;
+	unsigned long long text_va = 0;
+	unsigned long size;
+	unsigned long alloc_sections = 0, nobits_sections = 0;
+	unsigned long long bytes = 0;
+	char* buf;
+	co_rc_t rc;
+	bool_t installed = PFALSE;
+
+	rc = co_os_file_load((char*)filename, &buf, &size, 0);
+	if (!CO_OK(rc)) {
+		co_terminal_print("cannot read %s\n", filename);
+		return rc;
+	}
+
+	rc = co_elf_image_read(&pl, buf, size);
+	if (!CO_OK(rc)) {
+		co_terminal_print("not a usable ELF image for this build (rc %x)\n", (int)rc);
+		co_os_file_free(buf);
+		return rc;
+	}
+
+	/* The span the image needs, so the driver can bound every write to it. */
+	sections = co_get_section_count(pl);
+	for (index = 1; index < sections; index++) {
+		co_elf_shdr_t* section = co_get_section_header(pl, index);
+
+		if (!(section->sh_flags & SHF_ALLOC) || section->sh_size == 0)
+			continue;
+
+		if (section->sh_addr < lo)
+			lo = section->sh_addr;
+		if (section->sh_addr + section->sh_size > hi)
+			hi = section->sh_addr + section->sh_size;
+	}
+
+	if (lo >= hi) {
+		co_terminal_print("no allocatable sections\n");
+		co_os_file_free(buf);
+		return CO_RC(ERROR);
+	}
+
+	{
+		co_elf_symbol_t* sym = co_get_symbol_by_name(pl, "_text");
+
+		text_va = sym ? co_elf_get_symbol_value(sym) : lo;
+	}
+
+	co_terminal_print("%s\n", filename);
+	co_terminal_print("  image spans 0x%016llx..0x%016llx  (%llu KB, %llu pages)\n",
+			  lo, hi, (hi - lo) / 1024, (hi - lo + 4095) / 4096);
+
+	rc = co_os_manager_is_installed(&installed);
+	if (!CO_OK(rc) || !installed) {
+		co_terminal_print("driver not installed\n");
+		co_os_file_free(buf);
+		return CO_RC(ERROR_ACCESSING_DRIVER);
+	}
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		co_terminal_print("couldn't get driver handle\n");
+		co_os_file_free(buf);
+		return CO_RC(ERROR_MONITOR_NOT_LOADED);
+	}
+
+	rc = co_manager_kload_begin(handle, lo, hi);
+	if (!CO_OK(rc)) {
+		co_terminal_print("kload begin failed (rc %x)\n", (int)rc);
+		goto out;
+	}
+
+	for (index = 1; index < sections; index++) {
+		co_elf_shdr_t* section = co_get_section_header(pl, index);
+		unsigned long long va;
+		unsigned long long left;
+		const unsigned char* p;
+		int zero;
+
+		if (!(section->sh_flags & SHF_ALLOC) || section->sh_size == 0)
+			continue;
+
+		zero = (section->sh_type == SHT_NOBITS);
+		va   = section->sh_addr;
+		left = section->sh_size;
+		p    = zero ? NULL : co_get_at_offset(pl, section, 0);
+
+		alloc_sections++;
+		if (zero)
+			nobits_sections++;
+		bytes += left;
+
+		while (left) {
+			unsigned long part = (left > CO_KLOAD_CHUNK)
+					   ? CO_KLOAD_CHUNK : (unsigned long)left;
+
+			rc = co_manager_kload_chunk(handle, va, p, part, zero);
+			if (!CO_OK(rc)) {
+				co_terminal_print("  chunk at 0x%016llx (%lu bytes) failed (rc %x)\n",
+						  va, part, (int)rc);
+				goto out_end;
+			}
+
+			va   += part;
+			left -= part;
+			if (!zero)
+				p += part;
+		}
+	}
+
+	co_terminal_print("  %lu allocatable sections loaded (%lu of them nobits), %llu KB\n",
+			  alloc_sections, nobits_sections, bytes / 1024);
+
+	/*
+	 * Read a stretch of .text back through the guest's page tables and compare
+	 * against the same bytes in the file. This is what distinguishes a loader
+	 * that wrote the image correctly from one that wrote it somewhere the guest
+	 * cannot reach.
+	 */
+	{
+		co_elf_shdr_t* text = co_get_section_by_name(pl, ".text");
+		unsigned long check = 0x10000;
+		unsigned long long want = 1469598103934665603ULL;
+		const unsigned char* p;
+		unsigned long i;
+
+		if (text && text->sh_size >= check) {
+			v.va   = text->sh_addr;
+			v.size = check;
+
+			rc = co_manager_kload_verify(handle, &v);
+			if (!CO_OK(rc) || !CO_OK(v.rc)) {
+				co_terminal_print("  verify failed (rc %x / %x)\n",
+						  (int)rc, (int)v.rc);
+				goto out_end;
+			}
+
+			p = co_get_at_offset(pl, text, 0);
+			for (i = 0; i < check; i++) {
+				want ^= p[i];
+				want *= 1099511628211ULL;
+			}
+
+			co_terminal_print("  pages allocated    %lu\n", v.pages);
+			co_terminal_print("  page-table pages   %lu\n", v.tables);
+			co_terminal_print("  chunks written     %lu\n", v.chunks);
+			co_terminal_print("\n");
+			co_terminal_print("  .text first %lu bytes, read back through the guest tables:\n", check);
+			co_terminal_print("    in the file  0x%016llx\n", want);
+			co_terminal_print("    in the guest 0x%016llx   %s\n", v.checksum,
+					  (want == v.checksum) ? "MATCH" : "DIFFERENT");
+			if (want != v.checksum) {
+				co_terminal_print("\n  the image is not where the guest would look for it\n");
+				goto out_end;
+			}
+		}
+	}
+
+	if (!enter) {
+		co_terminal_print("\n  LOADED AND VERIFIED. Not entered.\n");
+		goto out_end;
+	}
+
+	co_terminal_print("\n  entering the loaded image at 0x%016llx\n\n", text_va);
+
+	r.code_va = text_va;		/* travels inwards */
+	rc = co_manager_kload_enter(handle, &r);
+	if (!CO_OK(rc)) {
+		co_terminal_print("  enter ioctl failed (rc %x)\n", (int)rc);
+		goto out_end;
+	}
+	if (r.preflight_failed) {
+		co_terminal_print("  PREFLIGHT REFUSED THE ENTRY at 0x%016llx (level %d)\n",
+				  r.preflight_va, r.preflight_level);
+		goto out_end;
+	}
+	if (!CO_OK(r.rc)) {
+		co_terminal_print("  driver reported failure (rc %x)\n", (int)r.rc);
+		goto out_end;
+	}
+
+	co_terminal_print("  guest cr3       0x%016llx  (%lu table pages)\n", r.guest_cr3, r.tables);
+	co_terminal_print("  entry           0x%016llx\n", r.code_va);
+	co_terminal_print("  stack           0x%016llx\n", r.guest_stack);
+	co_terminal_print("  preflight       %d addresses resolved\n", r.preflight_checked);
+	co_terminal_print("\n");
+	co_terminal_print("  sentinel expected 0x%016llx\n", r.expected);
+	co_terminal_print("  sentinel observed 0x%016llx\n", r.observed);
+	co_terminal_print("\n");
+
+	if (r.faulted)
+		co_terminal_print("  FAULT: vector %llu at rip 0x%016llx, cr2 0x%016llx\n",
+				  r.vector, r.fault_rip, r.cr2);
+	else if (r.succeeded)
+		co_terminal_print("  ENTERED THE LOADED KERNEL IMAGE AND RETURNED.\n"
+				  "  Thirty-odd megabytes of vmlinux mapped at its link\n"
+				  "  addresses, control transferred into it, and back.\n");
+	else
+		co_terminal_print("  returned, but the sentinel is wrong\n");
+
+out_end:
+	co_manager_kload_end(handle);
+out:
+	co_os_manager_close(handle);
+	co_os_file_free(buf);
+
+	return rc;
 }

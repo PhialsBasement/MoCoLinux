@@ -50,6 +50,10 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("                                   capture it. Porting aid, reads only.\n");
 	co_terminal_print("      --probe-passage              Report where a passage page lands and\n");
 	co_terminal_print("                                   whether it is executable. Porting aid.\n");
+	co_terminal_print("      --load-kernel FILE           Load a vmlinux into a guest address\n");
+	co_terminal_print("                                   space and verify it. Does not enter.\n");
+	co_terminal_print("      --enter-kernel FILE          The same, then transfer control into\n");
+	co_terminal_print("                                   the loaded image and back.\n");
 	co_terminal_print("      --dump-vmlinux FILE          Parse an ELF kernel image and print its\n");
 	co_terminal_print("                                   sections and key symbols. Porting aid.\n");
 	co_terminal_print("      --probe-sweep                Map which of the 256 kernel PML4 slots\n");
@@ -225,6 +229,24 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		cmdline,
 		"--probe-passage",
 		&winnt_parameters->probe_passage);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--load-kernel",
+		&winnt_parameters->load_kernel,
+		winnt_parameters->load_kernel_arg,
+		sizeof(winnt_parameters->load_kernel_arg));
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--enter-kernel",
+		&winnt_parameters->enter_kernel,
+		winnt_parameters->enter_kernel_arg,
+		sizeof(winnt_parameters->enter_kernel_arg));
 
 	if (!CO_OK(rc))
 		return rc;
