@@ -297,6 +297,65 @@ asm(".text                                                          \n"
     "3:                                                             \n"
     /* onto the other side's stack, then far-return to its cs:rip */
     "    mov " CO_ARCH_STATE_STACK_RSP "(%rdx), %rsp                \n"
+    /*
+     * Put the entering side's segment-base and syscall MSRs back.
+     *
+     * These are per-CPU registers, not per-address-space, so a guest that
+     * writes one leaves it written for whoever runs next -- and Windows keeps
+     * the KPCR in GS_BASE. cpu_init() writes GS_BASE during early boot, so a
+     * guest that gets that far would hand the host back a null KPCR pointer and
+     * kill it on the next interrupt. LSTAR is the same shape: the guest could
+     * leave host syscalls pointing into guest code.
+     *
+     * wrmsr wants the value in edx:eax and the register number in ecx, which
+     * are the two registers carrying the state pointers, so both are saved
+     * across the sequence. The stack is the entering side's and is already
+     * valid here.
+     *
+     * EFER is deliberately not restored: LMA is read-only and writing it back
+     * raises #GP on some parts, so it needs masking, and a guest that had
+     * corrupted LME would have triple faulted before reaching here anyway.
+     */
+    "    push %rcx                                                  \n"
+    "    push %rdx                                                  \n"
+    "    mov %rdx, %r11                                             \n"
+    "    mov $0xc0000100, %ecx      /* FS_BASE */                   \n"
+    "    mov " CO_ARCH_STATE_FS_BASE "(%r11), %rax                  \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    "    mov $0xc0000101, %ecx      /* GS_BASE -- the KPCR */       \n"
+    "    mov " CO_ARCH_STATE_GS_BASE "(%r11), %rax                  \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    "    mov $0xc0000102, %ecx      /* KERNEL_GS_BASE */            \n"
+    "    mov " CO_ARCH_STATE_KERNEL_GS_BASE "(%r11), %rax           \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    "    mov $0xc0000081, %ecx      /* STAR */                      \n"
+    "    mov " CO_ARCH_STATE_STAR "(%r11), %rax                     \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    "    mov $0xc0000082, %ecx      /* LSTAR */                     \n"
+    "    mov " CO_ARCH_STATE_LSTAR "(%r11), %rax                    \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    "    mov $0xc0000083, %ecx      /* CSTAR */                     \n"
+    "    mov " CO_ARCH_STATE_CSTAR "(%r11), %rax                    \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    "    mov $0xc0000084, %ecx      /* SFMASK */                    \n"
+    "    mov " CO_ARCH_STATE_SFMASK "(%r11), %rax                   \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    "    pop %rdx                                                   \n"
+    "    pop %rcx                                                   \n"
     "    push " CO_ARCH_STATE_STACK_CS "(%rdx)                      \n"
     "    push " CO_ARCH_STATE_STACK_RETURN_RIP "(%rdx)              \n"
     "    lretq                                                      \n"
