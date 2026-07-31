@@ -27,6 +27,16 @@ typedef struct co_winnt_parameters {
 	char   load_kernel_arg[0x100];
 	bool_t boot_kernel;
 	char   boot_kernel_arg[0x100];
+	/*
+	 * How many world switches --boot-kernel is allowed before it stops on
+	 * purpose. The point is bisection: when the guest takes the machine down
+	 * hard there is no bugcheck, no dump, and the driver's debug ring never
+	 * gets drained -- the only channel that survives is the ioctl return, and
+	 * that only comes back on a run that stops in time. Halving the count until
+	 * the box lives, then walking it up, names the exact instruction.
+	 */
+	bool_t max_switches;
+	char   max_switches_arg[0x20];
 	bool_t call_kernel;
 	char   call_kernel_arg[0x100];
 	bool_t enter_kernel;

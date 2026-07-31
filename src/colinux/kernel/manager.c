@@ -681,6 +681,10 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->preflight_failed  = result.preflight_failed;
 		params->preflight_level	  = result.preflight_level;
 		params->preflight_va	  = result.preflight_va;
+		params->host_corrupt_field    = result.host_corrupt_field;
+		params->host_corrupt_step     = result.host_corrupt_step;
+		params->host_corrupt_expected = result.host_corrupt_expected;
+		params->host_corrupt_actual   = result.host_corrupt_actual;
 
 		*return_size = sizeof(*params);
 		return CO_RC(OK);

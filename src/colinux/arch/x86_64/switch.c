@@ -295,15 +295,47 @@ asm(".text                                                          \n"
      * reset. The IDT travels with the address space, just like the GDT.
      */
     "    sidt " CO_ARCH_STATE_STACK_IDT "(%rcx)                     \n"
-    /* drop global TLB entries, or the old address space stays visible */
+    /*
+     * CR4 and CR0 belong to whichever side is running, and until now they did
+     * not travel: CR4 was read once, stashed in r10 across the CR3 write purely
+     * to drop global TLB entries, and put back unchanged. That is correct only
+     * while neither side writes them -- and the first thing Linux does on entry
+     * is write CR4:
+     *
+     *     movl  $(X86_CR4_PAE|X86_CR4_LA57), %edx
+     *     orl   $X86_CR4_MCE, %edx
+     *     movq  %cr4, %rcx
+     *     andl  %edx, %ecx          <- keeps three bits, drops every other one
+     *     btsl  $X86_CR4_PSE_BIT, %ecx
+     *     movq  %rcx, %cr4
+     *
+     * which clears OSFXSR and OSXSAVE. Carried back into Windows that is fatal
+     * and not survivably so: every SSE instruction in the kernel starts raising
+     * #UD, including the ones in the fault handlers, and the machine stops dead
+     * with no bugcheck and no dump. That is exactly what it did -- a freeze that
+     * needed the power button, not a reset.
+     *
+     * So both are saved into the leaving side's state and loaded from the
+     * entering side's, like CR3 and the descriptor tables. PGE still has to be
+     * cleared before the CR3 write to flush global entries; the entering side's
+     * CR4 is written after it, which is also what re-enables PGE if that side
+     * had it.
+     *
+     * CR0 is restored later, after the FXRSTOR, rather than here: FXRSTOR with
+     * CR0.TS set raises #NM, and the entering side's TS is not knowable here.
+     * Doing it after leaves the FPU sequence running under exactly the CR0 it
+     * has always run under.
+     */
     "    mov %cr4, %rax                                             \n"
-    "    mov %rax, %r10                                             \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_CR4 "(%rcx)                \n"
     "    btr $7, %rax                                               \n"
     "    mov %rax, %cr4                                             \n"
+    "    mov %cr0, %rax                                             \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_CR0 "(%rcx)                \n"
     /* --- the crossing --- */
     "    mov " CO_ARCH_STATE_STACK_CR3 "(%rdx), %rax                \n"
     "    mov %rax, %cr3                                             \n"
-    "    mov %r10, %rax                                             \n"
+    "    mov " CO_ARCH_STATE_STACK_CR4 "(%rdx), %rax                \n"
     "    mov %rax, %cr4                                             \n"
     /*
      * Now in the other address space, so its GDT is reachable. This must come
@@ -339,8 +371,7 @@ asm(".text                                                          \n"
      * live GDT, which is reachable because the CR3 write has already happened
      * and that table is by definition mapped in the space we just entered.
      *
-     * rax and r11 only: rcx, rdx, r8 and r9 carry state across the far return,
-     * and r10 is holding CR4.
+     * rax and r11 only: rcx, rdx, r8 and r9 carry state across the far return.
      */
     "    movzwl " CO_ARCH_STATE_STACK_TR "(%rdx), %r11d             \n"
     "    test %r11d, %r11d                                          \n"
@@ -423,6 +454,14 @@ asm(".text                                                          \n"
     "    jmp 8f                                                     \n"
     "7:  lea " CO_PP_FPU_HOST "(%rax), %rax                         \n"
     "8:  fxrstor64 (%rax)                                           \n"
+    /*
+     * CR0 last, once the FPU state is in place -- see the note at the CR4 swap.
+     * Linux writes CR0_STATE a few instructions after its CR4 write, and TS is
+     * the bit that differs between the two sides, so this is the register that
+     * decides whether Windows' lazy-FPU bookkeeping still means anything.
+     */
+    "    mov " CO_ARCH_STATE_STACK_CR0 "(%rdx), %rax                \n"
+    "    mov %rax, %cr0                                             \n"
     "    push " CO_ARCH_STATE_STACK_CS "(%rdx)                      \n"
     "    push " CO_ARCH_STATE_STACK_RETURN_RIP "(%rdx)              \n"
     "    lretq                                                      \n"
@@ -662,17 +701,43 @@ asm(".text                                                          \n"
     "    lea 0(%rip), %rax                                          \n"
     "    and $-4096, %rax                                           \n"
     "    mov " CO_PP_CALL_TARGET "(%rax), %r10                      \n"
-    "    sti                                                        \n"
+    /*
+     * A stepped guest runs with interrupts disabled, deliberately.
+     *
+     * This used to `sti` here, on the reasoning that a guest which cannot be
+     * interrupted cannot be taken away from -- but stepping is the bound, and a
+     * far better one. What `sti` bought instead was that host interrupts got
+     * delivered while the guest was current, so they vectored through the
+     * *guest's* IDT into a stub, and the host's handler then had to be called
+     * by hand from the monitor loop off a synthesised frame, at whatever IRQL
+     * the ioctl happened to be at rather than the device's. Windows' dispatch
+     * ends by lowering IRQL and draining DPCs; doing that from the middle of a
+     * driver ioctl on a hand-built frame is not something the host survives
+     * reliably. Every run that forwarded even one interrupt died; every run
+     * that forwarded none was clean.
+     *
+     * With IF clear the interrupt simply stays pending. The world switch back
+     * restores the host's flags, so it is delivered a few instructions later in
+     * host context, through the host's own IDT, by Windows' own dispatch, at
+     * the right IRQL -- which is to say, correctly, and with no code of ours
+     * involved. The cost is interrupt latency of about one step.
+     *
+     * The monitor loop clears IF in the guest's frame before every resume, the
+     * same way it sets TF, so this holds for the whole run and not just the
+     * first instruction.
+     */
     "    cmpq $0, " CO_PP_STEP "(%rax)                              \n"
-    "    je 4f                                                      \n"
+    "    jne 4f                                                     \n"
+    "    sti                                                        \n"
+    "    jmp 5f                                                     \n"
     /*
      * Set TF last. Every instruction after this one traps, so anything between
      * here and the jump would cost a world switch for nothing.
      */
-    "    pushfq                                                     \n"
+    "4:  pushfq                                                     \n"
     "    orq $0x100, (%rsp)                                         \n"
     "    popfq                                                      \n"
-    "4:  jmp *%r10                                                  \n"
+    "5:  jmp *%r10                                                  \n"
     ".globl co_call_shim                                            \n"
     "co_call_shim:                                                  \n"
     "    lea 0(%rip), %rax                                          \n"
@@ -2238,6 +2303,109 @@ out_free_pp:
  * quadwords whether or not the privilege level changed, so SS and RSP have to
  * be there and not just flags, CS and RIP.
  */
+/*
+ * A snapshot of everything about the host CPU that a crossing could damage.
+ *
+ * Deliberately wider than what the switch saves and restores. The registers it
+ * already handles are checked to prove it handled them; the ones it does not
+ * are checked because "the guest cannot have touched that" is exactly the kind
+ * of assumption that has been wrong three times today -- CR4 was carried across
+ * unchanged, the guest's IDT load was believed harmless, and the GDT was
+ * believed to travel safely with the address space.
+ */
+typedef struct {
+	unsigned long long cr0, cr4, cr3;
+	unsigned long long gdt_base, idt_base;
+	unsigned long long fs_base, gs_base, kernel_gs_base;
+	unsigned long long lstar, star, sfmask, efer;
+	unsigned short	   gdt_limit, idt_limit, tr, cs, ss;
+} co_host_snapshot_t;
+
+static unsigned long long co_rdmsr(unsigned int msr)
+{
+	unsigned int lo, hi;
+
+	asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+
+	return ((unsigned long long)hi << 32) | lo;
+}
+
+static void co_host_snapshot(co_host_snapshot_t* s)
+{
+	struct { unsigned short limit; unsigned long long base; } __attribute__((packed)) dt;
+	unsigned long long v;
+	unsigned short w;
+
+	asm volatile("mov %%cr0, %0" : "=r"(v)); s->cr0 = v;
+	asm volatile("mov %%cr4, %0" : "=r"(v)); s->cr4 = v;
+	asm volatile("mov %%cr3, %0" : "=r"(v)); s->cr3 = v;
+
+	asm volatile("sgdt %0" : "=m"(dt));
+	s->gdt_base = dt.base; s->gdt_limit = dt.limit;
+	asm volatile("sidt %0" : "=m"(dt));
+	s->idt_base = dt.base; s->idt_limit = dt.limit;
+
+	asm volatile("str %0"    : "=r"(w)); s->tr = w;
+	asm volatile("mov %%cs, %0" : "=r"(w)); s->cs = w;
+	asm volatile("mov %%ss, %0" : "=r"(w)); s->ss = w;
+
+	s->fs_base	  = co_rdmsr(0xc0000100);
+	s->gs_base	  = co_rdmsr(0xc0000101);
+	s->kernel_gs_base = co_rdmsr(0xc0000102);
+	s->star		  = co_rdmsr(0xc0000081);
+	s->lstar	  = co_rdmsr(0xc0000082);
+	s->sfmask	  = co_rdmsr(0xc0000084);
+	s->efer		  = co_rdmsr(0xc0000080);
+}
+
+/*
+ * Compare against the snapshot and report the first field that moved.
+ *
+ * Returns CO_HOST_FIELD_NONE when the host came back exactly as it left, which
+ * is the only acceptable outcome: this runs inside a driver on the machine
+ * itself, so "mostly restored" means the box dies later, somewhere else, for no
+ * visible reason.
+ */
+static co_host_field_t co_host_verify(const co_host_snapshot_t* want,
+				      unsigned long long* expected,
+				      unsigned long long* actual)
+{
+	co_host_snapshot_t now;
+
+#define CO_CHECK(field, id)						\
+	do {								\
+		if (now.field != want->field) {				\
+			*expected = (unsigned long long)want->field;	\
+			*actual   = (unsigned long long)now.field;	\
+			return (id);					\
+		}							\
+	} while (0)
+
+	co_host_snapshot(&now);
+
+	CO_CHECK(cr0,		 CO_HOST_FIELD_CR0);
+	CO_CHECK(cr4,		 CO_HOST_FIELD_CR4);
+	CO_CHECK(cr3,		 CO_HOST_FIELD_CR3);
+	CO_CHECK(gdt_base,	 CO_HOST_FIELD_GDT_BASE);
+	CO_CHECK(gdt_limit,	 CO_HOST_FIELD_GDT_LIMIT);
+	CO_CHECK(idt_base,	 CO_HOST_FIELD_IDT_BASE);
+	CO_CHECK(idt_limit,	 CO_HOST_FIELD_IDT_LIMIT);
+	CO_CHECK(tr,		 CO_HOST_FIELD_TR);
+	CO_CHECK(fs_base,	 CO_HOST_FIELD_FS_BASE);
+	CO_CHECK(gs_base,	 CO_HOST_FIELD_GS_BASE);
+	CO_CHECK(kernel_gs_base, CO_HOST_FIELD_KERNEL_GS_BASE);
+	CO_CHECK(lstar,		 CO_HOST_FIELD_LSTAR);
+	CO_CHECK(star,		 CO_HOST_FIELD_STAR);
+	CO_CHECK(sfmask,	 CO_HOST_FIELD_SFMASK);
+	CO_CHECK(efer,		 CO_HOST_FIELD_EFER);
+	CO_CHECK(cs,		 CO_HOST_FIELD_CS);
+	CO_CHECK(ss,		 CO_HOST_FIELD_SS);
+
+#undef CO_CHECK
+
+	return CO_HOST_FIELD_NONE;
+}
+
 bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long vector)
 {
 	struct co_x86_64_gate* idt = (struct co_x86_64_gate*)host_idt;
@@ -2407,6 +2575,24 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	out->preflight_checked = setup.preflight_checked;
 
 	/*
+	 * Say where we are before every step that could be the last one.
+	 *
+	 * The previous attempt logged nothing between co_kload_build_ram and the
+	 * reset, so all it established was "somewhere after the RAM was built" --
+	 * which is most of the work. Each of these is one UDP packet already on the
+	 * host by the time the instruction after it runs, so whatever the machine
+	 * does next, the log says what it was about to do.
+	 */
+	co_debug("boot: passage page 0x%llx, guest cr3 0x%llx, %ld tables",
+		 (unsigned long long)(size_t)pp, out->guest_cr3, out->tables);
+	co_debug("boot: entry 0x%llx, stack 0x%llx, ring 0x%llx",
+		 in->entry_va, stack_va, ring_va);
+	co_debug("boot: globals poked -- initial_code -> 0x%llx, guest flag at 0x%llx",
+		 in->start_kernel_va, in->guest_flag_va);
+	co_debug("boot: preflight passed %d addresses; entering now, step=%d",
+		 out->preflight_checked, in->step);
+
+	/*
 	 * The monitor loop.
 	 *
 	 * The guest runs until something interrupts it. External vectors (32 and
@@ -2422,14 +2608,69 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			+ (unsigned long)(&co_guest_resume - &co_switch_full);
 		unsigned long long ist_top = (unsigned long long)(size_t)&pp->host_temp
 			+ (CO_PP_ISTSTACK_PAGE + 1) * CO_ARCH_PAGE_SIZE;
+		co_host_snapshot_t host_was;
 		int i;
+
+		/*
+		 * What the host looks like before any of this happens. Every
+		 * crossing has to hand it back exactly.
+		 */
+		co_host_snapshot(&host_was);
 
 		for (i = 0; i < in->max_switches; i++) {
 			pp->params[4] = 0;		/* faulted */
 
+			/*
+			 * A progress mark every 64 steps, and the address the
+			 * guest is about to resume at.
+			 *
+			 * This is the only diagnostic that survives the guest
+			 * running away. Everything else -- the trace ring, the
+			 * fault record, the step count -- travels home in the
+			 * ioctl return, and there is no return: the guest keeps
+			 * executing inside this loop's world switch, the thread
+			 * never comes back, and the machine has to be power
+			 * cycled. These records leave the box while it is still
+			 * running, drained by a separate process on another
+			 * core, so the last one written says where the guest was
+			 * when control was lost, to within 64 instructions.
+			 *
+			 * Every instruction would be a packet per instruction
+			 * and would change what is being measured; every 64 is
+			 * about 1500 packets over a full run.
+			 */
+			/* nothing here: the guest's address is only known after
+			 * the switch returns, and is logged there */
+
 			fn(&pp->host_state, &pp->linuxvm_state, NULL, 0);
 
 			out->switches++;
+
+			/*
+			 * Before anything else, and before any of the state
+			 * that just came back is used or logged: did the host
+			 * survive intact? A crossing that returns with the
+			 * wrong IDTR or the wrong GS base has already killed
+			 * the machine, it just has not fallen over yet.
+			 */
+			{
+				co_host_field_t bad =
+					co_host_verify(&host_was,
+						       &out->host_corrupt_expected,
+						       &out->host_corrupt_actual);
+
+				if (bad != CO_HOST_FIELD_NONE) {
+					out->host_corrupt_field = (int)bad;
+					out->host_corrupt_step  = out->steps;
+					co_debug("boot: HOST STATE DAMAGED after "
+						 "%ld steps: field %d, was 0x%llx, "
+						 "now 0x%llx",
+						 out->steps, (int)bad,
+						 out->host_corrupt_expected,
+						 out->host_corrupt_actual);
+					break;
+				}
+			}
 
 			if (!pp->params[4]) {
 				/* came back on its own -- nothing here does that yet */
@@ -2456,6 +2697,26 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				out->trace_next++;
 
 				/*
+				 * Every step on a short run, every 64th on a
+				 * long one.
+				 *
+				 * Every 64 is enough to say roughly where a
+				 * runaway happened and cheap enough for a full
+				 * boot, but it is not enough to name the
+				 * instruction: the last record can point at an
+				 * `add` in the middle of a string loop, which
+				 * cannot possibly be what lost control. Once a
+				 * failure has been bracketed, re-running it
+				 * with a short budget logs every instruction,
+				 * and then the last record is the answer
+				 * rather than a hint.
+				 */
+				if (in->max_switches <= 8192 || out->steps < 8 ||
+				    (out->steps & 0x3f) == 0)
+					co_debug("boot: step %ld at 0x%llx",
+						 out->steps, out->fault_rip);
+
+				/*
 				 * Re-arm the trap flag in the frame the guest is
 				 * about to be resumed from.
 				 *
@@ -2479,8 +2740,31 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 					unsigned long long* frame =
 						(unsigned long long*)(size_t)pp->params[28];
 
-					if (frame)
+					/*
+					 * TF on, IF off, on every resume.
+					 *
+					 * IF matters as much as TF and for the
+					 * same reason: both are the guest's to
+					 * change and neither may be left to it.
+					 * A guest running with interrupts
+					 * enabled takes the host's interrupts
+					 * through the guest's IDT, which means
+					 * the host's handler has to be called
+					 * by hand afterwards, off a synthesised
+					 * frame, from inside a driver ioctl.
+					 * Clearing it here leaves the interrupt
+					 * pending until the switch back
+					 * restores the host's own flags, and
+					 * Windows takes it normally.
+					 *
+					 * The kernel will execute `sti` during
+					 * boot; this undoes it before the next
+					 * instruction runs.
+					 */
+					if (frame) {
 						frame[0x98 / 8] |= 0x100ULL;
+						frame[0x98 / 8] &= ~0x200ULL;
+					}
 				}
 
 				pp->linuxvm_state.return_rip = resume_rip;
@@ -2490,6 +2774,10 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 
 			if (out->vector < 32) {
 				out->faulted = PTRUE;
+				co_debug("boot: guest exception vector %lld at rip 0x%llx, "
+					 "err 0x%llx, cr2 0x%llx, after %ld switches",
+					 out->vector, out->fault_rip, out->error_code,
+					 out->cr2, out->switches);
 				break;
 			}
 
@@ -2525,6 +2813,10 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		if (out->switches >= in->max_switches)
 			out->hit_limit = PTRUE;
 	}
+
+	co_debug("boot: loop ended -- %ld switches, %ld steps, %ld interrupts, "
+		 "%lld bytes printed", out->switches, out->steps, out->interrupts,
+		 ring->written);
 
 	out->console_written  = ring->written;
 	out->console_capacity = ring->capacity;
