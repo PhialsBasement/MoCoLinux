@@ -47,6 +47,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KLOAD_END,
 	CO_MANAGER_IOCTL_KCALL,
 	CO_MANAGER_IOCTL_KBOOT,
+	CO_MANAGER_IOCTL_KRAM,
 } co_manager_ioctl_t;
 
 /*
@@ -291,6 +292,16 @@ typedef struct {
 	unsigned long	   chunks;
 	unsigned long	   tables;
 } co_manager_ioctl_kload_verify_t;
+
+/* interface for CO_MANAGER_IOCTL_KRAM: give the guest physical memory */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long ram_bytes;	/* in */
+	unsigned long long text_va;	/* in */
+	unsigned long long end_va;	/* in */
+	unsigned long	   ram_pages;	/* out: pages allocated for RAM */
+	unsigned long	   tables;	/* out */
+} co_manager_ioctl_kram_t;
 
 /* interface for CO_MANAGER_IOCTL_KBOOT */
 typedef struct {

@@ -45,6 +45,10 @@ static unsigned long long     kload_min_va;
 static unsigned long long     kload_max_va;
 static unsigned long	      kload_pages;
 static unsigned long	      kload_chunks;
+static unsigned long long     kload_ram_bytes;
+static unsigned long long     kload_text_phys;
+static unsigned long long     kload_end_phys;
+static unsigned long	      kload_ram_pages;
 
 /*
  * Pages are found again at teardown by walking the address range rather than
@@ -66,6 +70,24 @@ static void kload_release_pages(co_manager_t* manager)
 		if (CO_OK(co_arch_guest_lookup(manager, kload_space, va, &pa, &level)) && pa)
 			co_os_put_page(manager, (co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT));
 	}
+
+	/*
+	 * The linear map, skipping the stretch that is the image. Those pages have
+	 * two virtual addresses and were already released above; freeing them again
+	 * here would be a double free of a page the host may have handed out in the
+	 * meantime, which is far worse than leaking one.
+	 */
+	for (va = 0; va < kload_ram_bytes; va += CO_ARCH_PAGE_SIZE) {
+		co_pa_t pa = 0;
+		int level = -1;
+
+		if (va >= kload_text_phys && va < kload_end_phys)
+			continue;
+
+		if (CO_OK(co_arch_guest_lookup(manager, kload_space,
+					       CO_ARCH_DIRECT_MAP + va, &pa, &level)) && pa)
+			co_os_put_page(manager, (co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT));
+	}
 }
 
 void co_kload_free(co_manager_t* manager)
@@ -76,9 +98,11 @@ void co_kload_free(co_manager_t* manager)
 	kload_release_pages(manager);
 	co_arch_guest_space_destroy(manager, kload_space);
 
-	kload_space  = NULL;
-	kload_pages  = 0;
-	kload_chunks = 0;
+	kload_space     = NULL;
+	kload_pages     = 0;
+	kload_chunks    = 0;
+	kload_ram_bytes = 0;
+	kload_ram_pages = 0;
 }
 
 co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
@@ -267,4 +291,109 @@ unsigned long co_kload_pages(void)
 unsigned long co_kload_chunks(void)
 {
 	return kload_chunks;
+}
+
+/*
+ * Give the guest some physical memory, and a linear map of it.
+ *
+ * Loading the image is not enough to reach start_kernel. The kernel thinks in
+ * physical addresses: setup_arch reads an e820 map, hands the ranges to
+ * memblock, and from then on every allocation is a physical address turned back
+ * into a virtual one with __va(), which is PAGE_OFFSET + phys. If that linear
+ * map does not exist, the first allocation the kernel dereferences is a fault --
+ * and by that point in setup_arch it has already replaced our IDT, so the fault
+ * is unreportable.
+ *
+ * So: decide a physical layout, back every page of it, and map the whole thing
+ * at PAGE_OFFSET.
+ *
+ * The image is already mapped at its link addresses, and those same pages have
+ * to appear in the linear map too -- one physical page, two virtual addresses,
+ * which is exactly what a real kernel has. Their physical address follows from
+ * the link address, since phys_base is zero and the kernel is linked at
+ * __START_KERNEL_map + CONFIG_PHYSICAL_START.
+ */
+co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_bytes,
+			   unsigned long long text_va, unsigned long long end_va)
+{
+	unsigned long long phys;
+	unsigned long long text_phys, end_phys;
+
+	if (kload_space == NULL)
+		return CO_RC(ERROR);
+
+	if (text_va < CO_ARCH_KERNEL_MAP || end_va <= text_va)
+		return CO_RC(INVALID_PARAMETER);
+
+	text_phys = (text_va - CO_ARCH_KERNEL_MAP) & CO_ARCH_PAGE_MASK;
+	end_phys  = (end_va - CO_ARCH_KERNEL_MAP + CO_ARCH_PAGE_SIZE - 1) & CO_ARCH_PAGE_MASK;
+
+	if (end_phys > ram_bytes) {
+		co_debug_error("kload: image ends at guest phys 0x%llx, past %lld MB of RAM",
+			       end_phys, ram_bytes >> 20);
+		return CO_RC(INVALID_PARAMETER);
+	}
+
+	kload_ram_bytes = ram_bytes;
+	kload_text_phys = text_phys;
+	kload_end_phys  = end_phys;
+
+	for (phys = 0; phys < ram_bytes; phys += CO_ARCH_PAGE_SIZE) {
+		unsigned long long lin_va = CO_ARCH_DIRECT_MAP + phys;
+		co_pa_t pa = 0;
+		int level = -1;
+		co_rc_t rc;
+
+		if (phys >= text_phys && phys < end_phys) {
+			/*
+			 * Part of the image. It already has a host page behind it;
+			 * find that page and give it its second virtual address
+			 * rather than allocating a new one, or the linear map would
+			 * show a blank copy of the kernel.
+			 */
+			unsigned long long kva = CO_ARCH_KERNEL_MAP + phys;
+
+			if (!CO_OK(co_arch_guest_lookup(manager, kload_space, kva, &pa, &level))
+			    || !pa) {
+				/* a gap between sections -- back it like ordinary RAM */
+				pa = 0;
+			}
+		}
+
+		if (!pa) {
+			co_pfn_t pfn;
+			void* p;
+
+			rc = co_os_get_page(manager, &pfn);
+			if (!CO_OK(rc)) {
+				co_debug_error("kload: out of pages at guest phys 0x%llx", phys);
+				return rc;
+			}
+
+			p = co_os_map(manager, pfn);
+			if (p == NULL) {
+				co_os_put_page(manager, pfn);
+				return CO_RC(ERROR);
+			}
+			co_memset(p, 0, CO_ARCH_PAGE_SIZE);
+			co_os_unmap(manager, p, pfn);
+
+			pa = ((co_pa_t)pfn) << CO_ARCH_PAGE_SHIFT;
+			kload_ram_pages++;
+		}
+
+		rc = co_arch_guest_map(manager, kload_space, lin_va, pa, _KERNPG_TABLE);
+		if (!CO_OK(rc))
+			return rc;
+	}
+
+	co_debug("kload: %lld MB of guest RAM, %ld pages allocated for it",
+		 ram_bytes >> 20, kload_ram_pages);
+
+	return CO_RC(OK);
+}
+
+unsigned long co_kload_ram_pages(void)
+{
+	return kload_ram_pages;
 }

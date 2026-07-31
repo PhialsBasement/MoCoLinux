@@ -180,6 +180,14 @@ co_rc_t co_manager_kcall(co_manager_handle_t handle, co_manager_ioctl_kcall_t* o
 				   out, sizeof(*out), out, sizeof(*out), &returned);
 }
 
+co_rc_t co_manager_kram(co_manager_handle_t handle, co_manager_ioctl_kram_t* out)
+{
+	unsigned long returned = 0;
+
+	return co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KRAM,
+				   out, sizeof(*out), out, sizeof(*out), &returned);
+}
+
 co_rc_t co_manager_kboot(co_manager_handle_t handle, co_manager_ioctl_kboot_t* out)
 {
 	unsigned long returned = 0;

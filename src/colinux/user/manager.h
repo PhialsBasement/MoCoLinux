@@ -50,6 +50,8 @@ extern co_rc_t co_manager_kload_enter(co_manager_handle_t handle,
 				      co_manager_ioctl_test_switch_t* out);
 extern co_rc_t co_manager_kcall(co_manager_handle_t handle,
 				co_manager_ioctl_kcall_t* out);
+extern co_rc_t co_manager_kram(co_manager_handle_t handle,
+			       co_manager_ioctl_kram_t* out);
 extern co_rc_t co_manager_kboot(co_manager_handle_t handle,
 				co_manager_ioctl_kboot_t* out);
 extern co_rc_t co_manager_kload_end(co_manager_handle_t handle);

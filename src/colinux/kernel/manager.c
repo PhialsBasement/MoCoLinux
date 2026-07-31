@@ -612,6 +612,25 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_KRAM: {
+		co_manager_ioctl_kram_t* params = (typeof(params))(io_buffer);
+		unsigned long long ram, text, end;
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		ram = params->ram_bytes; text = params->text_va; end = params->end_va;
+		co_memset(params, 0, sizeof(*params));
+
+		params->rc = co_kload_build_ram(manager, ram, text, end);
+		params->ram_pages = co_kload_ram_pages();
+		params->tables = co_kload_space()
+				 ? co_arch_guest_space_tables(co_kload_space()) : 0;
+
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_KBOOT: {
 		co_manager_ioctl_kboot_t* params = (typeof(params))(io_buffer);
 		co_arch_boot_t in;

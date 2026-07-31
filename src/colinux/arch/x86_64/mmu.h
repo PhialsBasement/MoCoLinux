@@ -96,8 +96,18 @@ typedef unsigned long long co_pfn_t;
  * 0xffff880000000000 is the 2.6.x value; it moved to 0xffff888000000000 when
  * KASLR arrived, so this has to be revisited for a modern guest (M6).
  */
-#define CO_ARCH_KERNEL_OFFSET   0xffff880000000000ULL
-#define CO_ARCH_KERNEL_MAP      0xffffffff80000000ULL
+/*
+ * PAGE_OFFSET, the base of the linear map of all physical memory.
+ *
+ * 0xffff880000000000 is the 2.6.x value and is what CO_ARCH_KERNEL_OFFSET has
+ * always meant here. Modern kernels moved it to 0xffff888000000000 to make room
+ * for the PTI LDT remap below it, so the two are kept apart rather than one
+ * being quietly redefined -- they differ by 512 GB and picking the wrong one
+ * produces a direct map that is entirely absent rather than slightly wrong.
+ */
+#define CO_ARCH_KERNEL_OFFSET   0xffff880000000000ULL	/* 2.6.x  PAGE_OFFSET */
+#define CO_ARCH_DIRECT_MAP      0xffff888000000000ULL	/* modern PAGE_OFFSET */
+#define CO_ARCH_KERNEL_MAP      0xffffffff80000000ULL	/* __START_KERNEL_map */
 
 /*
  * Canonical-address test. Bits 63:48 must all equal bit 47, so there is a
