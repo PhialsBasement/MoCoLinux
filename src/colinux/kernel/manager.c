@@ -652,9 +652,20 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 
 		params->rc = co_kload_build_ram(manager, ram, text, end);
 		params->ram_pages    = co_kload_ram_pages();
-		params->block_pa     = co_kload_block_pa();
-		params->usable_bytes = co_kload_usable_bytes();
-		params->block_bytes  = co_kload_block_bytes();
+		params->phys_base    = co_kload_phys_base();
+		params->range_count  = co_kload_range_count();
+		if (params->range_count > CO_KRAM_MAX_RANGES)
+			params->range_count = CO_KRAM_MAX_RANGES;
+		{
+			int i;
+
+			for (i = 0; i < params->range_count; i++) {
+				co_kload_range(i, &params->range[i].pa,
+					       &params->range[i].usable,
+					       &params->range[i].reserved);
+				params->total_usable += params->range[i].usable;
+			}
+		}
 		params->tables = co_kload_space()
 				 ? co_arch_guest_space_tables(co_kload_space()) : 0;
 

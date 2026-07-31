@@ -304,14 +304,22 @@ typedef struct {
 	/*
 	 * Where the guest's memory actually is.
 	 *
-	 * Guest physical N is host physical block_pa + N, because Linux calls
-	 * __va() on what it reads out of its own page tables and those entries
-	 * hold host physical addresses. So the daemon has to build the e820 and
-	 * phys_base from these rather than from 0.
+	 * Guest physical addresses are host physical addresses, because Linux
+	 * calls __va() on what it reads out of its own page tables and those
+	 * entries hold host physical addresses. The memory comes in several
+	 * contiguous blocks, each one a usable e820 range at its true address;
+	 * range 0 additionally carries the reserved page-table region at its
+	 * top. The daemon builds the e820 and phys_base from these rather than
+	 * inventing a layout.
 	 */
-	unsigned long long block_pa;	/* out: host physical base of the block */
-	unsigned long long usable_bytes;/* out: RAM below the reserved tables */
-	unsigned long long block_bytes;	/* out: what was actually allocated */
+	unsigned long long phys_base;	/* out: what the guest's __pa() adds */
+	unsigned long long total_usable;/* out: usable bytes across all ranges */
+	int		   range_count;	/* out */
+	struct {
+		unsigned long long pa;		/* host physical base */
+		unsigned long long usable;	/* usable RAM bytes */
+		unsigned long long reserved;	/* reserved bytes above usable */
+	} range[CO_KRAM_MAX_RANGES];
 } co_manager_ioctl_kram_t;
 
 /* interface for CO_MANAGER_IOCTL_KBOOT */
