@@ -20,38 +20,7 @@ Table of Contents
   4.3 Descriptors, TSS, interrupt delivery
   4.4 Calling convention and register set
   4.4.1 Invariants taken from coLinux's changelog rather than its code
-
-These cost the original project real time and are not visible by reading the
-sources.
-
-  - Nothing that can cause a host switch may run while the passage page is
-    held. Two separate bugs came from breaking it: kmalloc must be called
-    outside passage-page holding because it can trigger a switch, and
-    co_callback must free the passage page before adding to the incoming
-    message queue, because kmalloc needs to call the host to map pages. It
-    produced a BUG under heavy network load and is nowhere in the code as a
-    comment.
-
-  - Another hypervisor is fatal, not degraded. With VMX claimed the machine is
-    in non-root mode and CR4 writes belong to that hypervisor; the switch
-    clears CR4.PGE on every crossing, and the result recorded is STOP 0x7F,
-    UNEXPECTED_KERNEL_MODE_TRAP, a double fault. The only correct response is
-    to refuse to run a guest, which co_arch_boot_loaded now does by testing
-    CR4.VMXE.
-
-  - Their VMALLOC_END overlapped coLinux's shared region and the fix was a
-    runtime overlap check, not just a constant moved. Same class as the KASLR
-    finding in 4.1, and the same conclusion: check it, do not assume the
-    configuration.
-
-  - The passage page's free function was never called, so it leaked for years.
-    Worth re-reading our own teardown paths against that.
-
-  - COLINUX_NO_CPU0_WORKAROUND made coLinux avoid the first processor entirely
-    to survive heavy interrupts. That is an argument for pinning affinity
-    explicitly rather than relying on the cli window being short.
-
-4.5 Pseudo-physical memory and the guest address-space window
+  4.5 Pseudo-physical memory and the guest address-space window
   4.6 Things to delete rather than port
   5. Milestones
   6. Toolchain
@@ -417,10 +386,14 @@ The host-side counterpart already exists in both arches:
 co_monitor_arch_real_hardware_interrupt() reads the *host's* IDT out of
 host_state.idt.table, indexes it by the vector the guest recorded in params[0],
 and calls Windows' real ISR with a synthesized interrupt frame. The x86-64
-version decodes 16-byte gates and builds a 40-byte iretq frame, and is still
-UNEXERCISED.
+version decodes 16-byte gates and builds a 40-byte iretq frame. It is now one
+implementation shared by the monitor loop and interrupt.c rather than two
+copies, and it refuses gates with a non-zero IST index -- hardware would have
+switched to a dedicated stack out of the TSS before entering those, and this
+synthesised entry does not.
 
 4.4.1 Invariants taken from coLinux's changelog rather than its code
+----------------------------------------------------------------
 
 These cost the original project real time and are not visible by reading the
 sources.
