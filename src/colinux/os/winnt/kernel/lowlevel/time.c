@@ -23,6 +23,16 @@ unsigned long co_os_get_time()
 	return windows_time_to_unix_time(CurrentTime);
 }
 
+unsigned long long co_os_monotonic_100ns(void)
+{
+	/*
+	 * KeQueryInterruptTime: 100 ns since boot, monotonic, safe at any
+	 * IRQL, and cheap -- it reads the shared-data tick, it does not take
+	 * the HAL's timer path the way KeQueryPerformanceCounter can.
+	 */
+	return KeQueryInterruptTime();
+}
+
 void co_os_get_timestamp(co_timestamp_t *dts)
 {
 	co_os_get_timestamp_freq(dts, NULL);

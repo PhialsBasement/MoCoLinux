@@ -19,6 +19,13 @@ unsigned long co_os_get_time(void)
 	return get_seconds();
 }
 
+unsigned long long co_os_monotonic_100ns(void)
+{
+	/* jiffies-based: coarse but monotonic, and this host is not the
+	 * one the x86-64 port runs on. */
+	return (unsigned long long)get_jiffies_64() * (10000000ULL / HZ);
+}
+
 void co_os_get_timestamp(co_timestamp_t *dts)
 {
 	struct timeval tv;
