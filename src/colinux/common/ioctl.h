@@ -342,6 +342,11 @@ typedef struct {
 	int		   preflight_failed;
 	int		   preflight_level;
 	unsigned long long preflight_va;
+	/* mirrors co_arch_boot_result_t: which host register a crossing moved */
+	int		   host_corrupt_field;
+	unsigned long	   host_corrupt_step;
+	unsigned long long host_corrupt_expected;
+	unsigned long long host_corrupt_actual;
 } co_manager_ioctl_kboot_t;
 
 /* interface for CO_MANAGER_IOCTL_KCALL: mirrors co_arch_kcall_test_t */

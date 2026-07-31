@@ -236,19 +236,32 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 	}
 
 	if (winnt_parameters.boot_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.boot_kernel_arg, 3);
+		unsigned long limit = 0;
+
+		if (winnt_parameters.max_switches) {
+			const char* p = winnt_parameters.max_switches_arg;
+
+			while (*p >= '0' && *p <= '9')
+				limit = limit * 10 + (unsigned long)(*p++ - '0');
+			if (*p || !limit) {
+				co_terminal_print("--max-switches wants a positive decimal count\n");
+				return CO_RC(INVALID_PARAMETER);
+			}
+		}
+
+		return co_elf_load_into_guest(winnt_parameters.boot_kernel_arg, 3, limit);
 	}
 
 	if (winnt_parameters.call_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2);
+		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0);
 	}
 
 	if (winnt_parameters.enter_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1);
+		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0);
 	}
 
 	if (winnt_parameters.load_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0);
+		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0);
 	}
 
 	if (winnt_parameters.dump_vmlinux) {

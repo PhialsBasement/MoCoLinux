@@ -160,7 +160,56 @@ typedef struct {
 	int		   preflight_failed;
 	int		   preflight_level;
 	unsigned long long preflight_va;
+	/*
+	 * What the host's own CPU state looked like after the crossing that
+	 * broke it.
+	 *
+	 * The failures that cost the most time were not the ones that faulted.
+	 * They were the ones where the guest ran, control came back, and the
+	 * machine died some thousands of instructions later -- once in the
+	 * middle of two consecutive co_debug() calls that do nothing but log.
+	 * A death at an arbitrary later instruction is the signature of host
+	 * state that was quietly corrupted and then used, and no amount of
+	 * looking at where it died says which register it was.
+	 *
+	 * So the host checks itself after every single crossing against a
+	 * snapshot taken before the first one, and stops at the first
+	 * divergence. That turns "it died somewhere" into "step 4481 changed
+	 * IDTR", which is an answer.
+	 */
+	int		   host_corrupt_field;	/* co_host_field_t, 0 = clean */
+	unsigned long	   host_corrupt_step;
+	unsigned long long host_corrupt_expected;
+	unsigned long long host_corrupt_actual;
 } co_arch_boot_result_t;
+
+/*
+ * The pieces of host CPU state a crossing could plausibly damage: everything
+ * the switch saves and restores, plus the ones it does not and therefore might
+ * be assuming wrongly. Reported by number so the driver need not format
+ * strings; the daemon names them.
+ */
+typedef enum {
+	CO_HOST_FIELD_NONE = 0,
+	CO_HOST_FIELD_CR0,
+	CO_HOST_FIELD_CR4,
+	CO_HOST_FIELD_CR3,
+	CO_HOST_FIELD_GDT_BASE,
+	CO_HOST_FIELD_GDT_LIMIT,
+	CO_HOST_FIELD_IDT_BASE,
+	CO_HOST_FIELD_IDT_LIMIT,
+	CO_HOST_FIELD_TR,
+	CO_HOST_FIELD_FS_BASE,
+	CO_HOST_FIELD_GS_BASE,
+	CO_HOST_FIELD_KERNEL_GS_BASE,
+	CO_HOST_FIELD_LSTAR,
+	CO_HOST_FIELD_STAR,
+	CO_HOST_FIELD_SFMASK,
+	CO_HOST_FIELD_EFER,
+	CO_HOST_FIELD_CS,
+	CO_HOST_FIELD_SS,
+	CO_HOST_FIELD_MAX
+} co_host_field_t;
 
 struct co_arch_guest_space;
 extern co_rc_t co_arch_boot_loaded(co_manager_t* manager,

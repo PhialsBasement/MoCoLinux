@@ -306,6 +306,17 @@ int co_vsnprintf(char *str, long nmax, const char *format, va_list ap)
         case STATE_PREFIX:
             switch (*pfmt)
             {
+                /*
+                 * A second 'l'. Without this the prefix stays 'l' and %llx
+                 * reads an `unsigned long int`, which is 32 bits on LLP64 --
+                 * so every 64-bit value the driver logged came out truncated,
+                 * and a log that quietly halves addresses is worse than none.
+                 * 'q' is the marker, matching the BSD quad convention, and is
+                 * not a prefix the caller can write.
+                 */
+                case 'l':
+                    prefix = 'q';
+                    break;
                 CHECK_TYPE
             }
 
@@ -455,8 +466,14 @@ static int pvsnfmt_str(char **pinsertion, long *nmax, const char fmt, int flags,
 static int pvsnfmt_int(char **pinsertion, long *nmax, char fmt, int flags,
                 int width, int precision, char prefix, va_list *ap)
 {
-    long int number = 0;
-    unsigned long int unumber = 0;
+    /*
+     * long long, not long. On LLP64 `long` is 32 bits, so holding the value
+     * here in a `long` truncates it again even after %ll reads the right
+     * number of bytes from the argument list. Widening the read without
+     * widening the accumulator would look like a fix and change nothing.
+     */
+    long long int number = 0;
+    unsigned long long int unumber = 0;
     char numbersigned = 1;
     char iszero = 0; /* bool */
     int base = 0;
@@ -498,6 +515,25 @@ static int pvsnfmt_int(char **pinsertion, long *nmax, char fmt, int flags,
                 break;
              case 'p':
                 unumber = (unsigned long) va_arg(*ap, void *);
+                numbersigned = 0;
+        }
+        break;
+    case 'q':                          /* %ll -- see STATE_PREFIX */
+        switch (fmt)
+        {
+            case 'd':
+            case 'i':
+                number = va_arg(*ap, signed long long int);
+                break;
+            case 'u':
+            case 'o':
+            case 'x':
+            case 'X':
+                unumber = va_arg(*ap, unsigned long long int);
+                numbersigned = 0;
+                break;
+             case 'p':
+                unumber = (unsigned long long) va_arg(*ap, void *);
                 numbersigned = 0;
         }
         break;

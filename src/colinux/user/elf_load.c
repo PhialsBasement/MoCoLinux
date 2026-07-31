@@ -373,7 +373,8 @@ static void co_e820_entry(unsigned char* p, unsigned long long addr,
 	for (i = 0; i < 4; i++)  p[16 + i] = (unsigned char)(type >> (8 * i));
 }
 
-co_rc_t co_elf_load_into_guest(const char* filename, int enter)
+co_rc_t co_elf_load_into_guest(const char* filename, int enter,
+			       unsigned long max_switches)
 {
 	co_elf_data_t* pl;
 	co_manager_handle_t handle;
@@ -774,9 +775,12 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 		 * from it, and an unbounded guest takes the host with it.
 		 */
 		b.step         = 1;
-		b.max_switches = 200000;
+		b.max_switches = max_switches ? max_switches : 200000;
 
 		co_terminal_print("\n  booting:\n");
+		co_terminal_print("    stopping after %d world switches%s\n",
+				  b.max_switches,
+				  max_switches ? "  (--max-switches)" : "");
 		for (i = 0; want[i]; i++)
 			co_terminal_print("    %-24s 0x%016llx\n", want[i], addr[i]);
 
@@ -827,6 +831,27 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 		co_terminal_print("  %llu bytes%s\n", b.console_written,
 				  (b.console_written > b.console_capacity) ? "  TRUNCATED" : "");
 		co_terminal_print("\n");
+
+		if (b.host_corrupt_field) {
+			static const char* const names[] = {
+				"none", "CR0", "CR4", "CR3", "GDT base", "GDT limit",
+				"IDT base", "IDT limit", "TR", "FS_BASE", "GS_BASE",
+				"KERNEL_GS_BASE", "LSTAR", "STAR", "SFMASK", "EFER",
+				"CS", "SS"
+			};
+			int f = b.host_corrupt_field;
+
+			co_terminal_print("  THE HOST DID NOT COME BACK INTACT.\n");
+			co_terminal_print("    %s changed across the crossing after %lu steps\n",
+					  (f > 0 && f < (int)(sizeof(names)/sizeof(names[0])))
+						? names[f] : "?",
+					  b.host_corrupt_step);
+			co_terminal_print("      was 0x%016llx\n", b.host_corrupt_expected);
+			co_terminal_print("      now 0x%016llx\n", b.host_corrupt_actual);
+			co_terminal_print("    Stopped here on purpose. Windows is running on\n");
+			co_terminal_print("    that value from now on, so this is the last\n");
+			co_terminal_print("    moment it can still be reported.\n\n");
+		}
 
 		if (b.faulted) {
 			co_terminal_print("  stopped on an exception the guest took:\n");
