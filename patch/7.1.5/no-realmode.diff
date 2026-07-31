@@ -1,0 +1,61 @@
+No real-mode trampoline for a cooperative guest.
+
+reserve_real_mode() allocates a page below 1 MB for the code an AP executes on
+its way from real mode into long mode, and for the stub the machine returns
+through when resuming from ACPI sleep. A cooperative guest has neither. There
+are no APs to start -- the host owns the processors and hands over one thread
+at a time -- and there is no firmware underneath to sleep into.
+
+It is also memory this guest cannot supply. Its physical memory is whatever
+contiguous blocks the host could spare, described at their true host physical
+addresses, and none of them is below 1 MB. So the allocation fails, and the
+kernel says so:
+
+    No sub-1M memory is available for the trampoline
+
+which is accurate and harmless on its own. What is not harmless is what comes
+later: init_real_mode() opens with
+
+    if (!real_mode_header)
+            panic("Real mode trampoline was not allocated");
+
+and it runs as an early_initcall, so a guest that gets that far dies there
+every time, with a panic that describes a facility it was never going to use.
+
+Both ops are pointed at x86_init_noop instead. That is what Xen PV does in
+xen_start_kernel() and what Hyper-V's VTL mode does in hv_vtl_init_platform(),
+for the same reason and by the same two assignments -- a guest with no real
+mode does not reserve a trampoline and does not initialise one.
+
+Done where the console is wired up, which is the top of setup_arch and the
+first point a cooperative guest is identifiable. The reserve call is roughly
+two hundred lines further down and the init call is an initcall away, so both
+are still ahead.
+
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -940,6 +940,24 @@
+ 	 */
+ 	co_colinux_console_init();
+ 
++	/*
++	 * A cooperative guest has no real mode to trampoline through.
++	 *
++	 * reserve_real_mode() wants a page below 1 MB for the code an AP runs
++	 * on its way into long mode and for the ACPI resume stub. There are no
++	 * APs here -- the host owns the processors -- and no firmware to sleep
++	 * into, and the guest's memory begins wherever the host had blocks to
++	 * spare, which is never below 1 MB. The allocation therefore fails, and
++	 * init_real_mode() panics on the null header it is left holding.
++	 *
++	 * Xen PV and Hyper-V VTL disable both ops exactly this way, for exactly
++	 * this reason.
++	 */
++	if (co_colinux_guest) {
++		x86_platform.realmode_reserve = x86_init_noop;
++		x86_platform.realmode_init    = x86_init_noop;
++	}
++
+ 	idt_setup_early_traps();
+ 	early_cpu_init();
+ 	jump_label_init();
