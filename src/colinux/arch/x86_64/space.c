@@ -268,6 +268,136 @@ co_rc_t co_arch_guest_lookup(co_manager_t* manager,
  * level is the level of the table being freed, so the recursion stops before
  * descending into what PT entries point at -- those pages are the caller's.
  */
+/*
+ * Collect every page-table page in the space, outermost first.
+ *
+ * Same one-entry-at-a-time walk as the teardown below and for the same reason:
+ * a 512-entry local is 4 KB and this recurses four deep, against a Windows x64
+ * kernel stack that is not much bigger than that.
+ */
+static void co_space_collect_tables(co_manager_t* manager, co_pfn_t pfn, int level,
+				    co_pfn_t* out, unsigned long* count,
+				    unsigned long limit)
+{
+	int i;
+
+	if (*count >= limit)
+		return;
+	out[(*count)++] = pfn;
+
+	if (level >= CO_SPACE_LEVELS - 1)
+		return;
+
+	for (i = 0; i < 512; i++) {
+		unsigned long long* table;
+		unsigned long long entry;
+		co_pfn_t child;
+
+		table = co_os_map(manager, pfn);
+		if (table == NULL)
+			return;
+
+		entry = table[i];
+		co_os_unmap(manager, table, pfn);
+
+		if (!(entry & _PAGE_PRESENT))
+			continue;
+		if (entry & _PAGE_PSE)
+			continue;	/* maps memory, not a table */
+
+		child = (co_pfn_t)((entry & CO_ARCH_PAGE_MASK & ~CO_ARCH_PAGE_NX)
+				   >> CO_ARCH_PAGE_SHIFT);
+		co_space_collect_tables(manager, child, level + 1, out, count, limit);
+	}
+}
+
+/*
+ * Give the space's own page tables addresses in its direct map.
+ *
+ * Linux reaches its page tables the same way it reaches anything else it knows
+ * the physical address of -- through __va(). early_ioremap_pmd() is the first
+ * to do it, with
+ *
+ *     pgd_t *base = __va(read_cr3_pa());
+ *
+ * and from there it walks down. Every one of those pages therefore has to be
+ * readable at DIRECT_MAP + its physical address.
+ *
+ * They are not, by default, and cannot be by accident: the tables come from the
+ * host's pool, so their physical addresses are wherever Windows had a page
+ * free -- around 2 GB on this machine -- while the guest has been told it has
+ * 128 MB. Nothing in the linear map built from that e820 covers them. The guest
+ * ran thirty-three million instructions and then took a page fault reading
+ * 0xffff88808054bff8, which is __va(CR3) + 0xff8: entry 511 of its own PML4.
+ *
+ * Mapping them creates more tables, which are themselves page-table pages that
+ * may need the same treatment, so this repeats until a pass adds nothing.
+ * It converges quickly -- the new tables cluster in the same few gigabytes of
+ * host physical address space, so they share the tables just created.
+ */
+co_rc_t co_arch_guest_map_own_tables(co_manager_t* manager,
+				     co_arch_guest_space_t* space,
+				     unsigned long long direct_map_base,
+				     unsigned long* mapped_out)
+{
+	enum { CO_SPACE_MAX_TABLES = 4096, CO_SPACE_MAX_PASSES = 8 };
+	co_pfn_t* list;
+	unsigned long total = 0;
+	int pass;
+	co_rc_t rc = CO_RC(OK);
+
+	if (space == NULL)
+		return CO_RC(INVALID_PARAMETER);
+
+	list = co_os_malloc(sizeof(co_pfn_t) * CO_SPACE_MAX_TABLES);
+	if (list == NULL)
+		return CO_RC(OUT_OF_MEMORY);
+
+	for (pass = 0; pass < CO_SPACE_MAX_PASSES; pass++) {
+		unsigned long count = 0, added = 0, i;
+
+		co_space_collect_tables(manager, space->pml4_pfn, 0, list, &count,
+					CO_SPACE_MAX_TABLES);
+
+		if (count >= CO_SPACE_MAX_TABLES) {
+			co_debug_error("space: more than %d page tables; "
+				       "cannot map them all into the direct map",
+				       (int)CO_SPACE_MAX_TABLES);
+			rc = CO_RC(ERROR);
+			break;
+		}
+
+		for (i = 0; i < count; i++) {
+			co_pa_t pa = ((co_pa_t)list[i]) << CO_ARCH_PAGE_SHIFT;
+			unsigned long long va = direct_map_base + pa;
+			co_pa_t found = 0;
+			int level = -1;
+
+			if (CO_OK(co_arch_guest_lookup(manager, space, va, &found, &level))
+			    && found == pa)
+				continue;
+
+			rc = co_arch_guest_map(manager, space, va, pa, _KERNPG_TABLE);
+			if (!CO_OK(rc))
+				goto out;
+
+			added++;
+			total++;
+		}
+
+		if (added == 0)
+			break;
+	}
+
+out:
+	co_os_free(list);
+
+	if (mapped_out)
+		*mapped_out = total;
+
+	return rc;
+}
+
 static void co_space_free_table(co_manager_t* manager, co_pfn_t pfn, int level,
 				unsigned long* freed)
 {

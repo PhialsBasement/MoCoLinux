@@ -390,6 +390,21 @@ co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_bytes,
 	co_debug("kload: %lld MB of guest RAM, %ld pages allocated for it",
 		 ram_bytes >> 20, kload_ram_pages);
 
+	/*
+	 * Not calling co_arch_guest_map_own_tables() here, deliberately.
+	 *
+	 * It maps each page-table page at DIRECT_MAP + its *host* physical
+	 * address, which collides with the guest's own linear map for any table
+	 * that happens to land below ram_bytes of host physical memory: the
+	 * table's mapping silently replaces a RAM page's, and teardown then
+	 * frees that page while the space destructor frees it again. A double
+	 * free of a page the host has since handed to someone else, which is
+	 * how the pool got corrupted.
+	 *
+	 * The deeper problem is that it would not be enough even without the
+	 * collision -- see the note on __va() in colinux/arch/space.h.
+	 */
+
 	return CO_RC(OK);
 }
 
