@@ -373,6 +373,111 @@ static void co_e820_entry(unsigned char* p, unsigned long long addr,
 	for (i = 0; i < 4; i++)  p[16 + i] = (unsigned char)(type >> (8 * i));
 }
 
+
+/*
+ * A pointer into the loaded image for a kernel virtual address.
+ *
+ * The section headers already say where each address lives in the file, so
+ * anything the guest can read at a link-time address can be read here too --
+ * before it has run, and after it has stopped.
+ */
+static const unsigned char* co_elf_at_va(co_elf_data_t* pl, unsigned long long va)
+{
+	co_elf_off_t i, n = co_get_section_count(pl);
+
+	for (i = 1; i < n; i++) {
+		co_elf_shdr_t* sh = co_get_section_header(pl, i);
+
+		if (!(sh->sh_flags & SHF_ALLOC) || sh->sh_type == SHT_NOBITS)
+			continue;
+		if (va < sh->sh_addr || va >= sh->sh_addr + sh->sh_size)
+			continue;
+
+		return pl->buffer + sh->sh_offset + (unsigned long)(va - sh->sh_addr);
+	}
+
+	return NULL;
+}
+
+/*
+ * Say what a WARN_ON was about.
+ *
+ * WARN_ON compiles to ud2 plus an entry in __bug_table, and on real hardware
+ * the kernel's own #UD handler is what turns that into a printed message. A
+ * cooperative guest runs on the host's IDT, so that handler never runs: the
+ * host steps over the instruction instead, and the text the kernel would have
+ * printed is never produced by anyone.
+ *
+ * But the table is in the image, so the message can be recovered here. Every
+ * field is a displacement relative to its own address, which is what makes the
+ * table position independent; on x86-64 the entry carries a format string and,
+ * with DEBUG_BUGVERBOSE, a file and line.
+ */
+static void co_report_bug_at(co_elf_data_t* pl, unsigned long long rip)
+{
+	co_elf_shdr_t* sec = co_get_section_by_name(pl, "__bug_table");
+	const unsigned char* base;
+	unsigned long long off;
+	static const int sizes[] = { 16, 12, 8 };
+	int si;
+
+	if (!sec || !sec->sh_size) {
+		co_terminal_print("      (no __bug_table in this image)\n");
+		return;
+	}
+
+	base = pl->buffer + sec->sh_offset;
+
+	/*
+	 * The entry size depends on config, and the config is not in front of
+	 * us. Take the first stride under which this table's own addresses all
+	 * land inside itself -- a wrong stride produces nonsense immediately.
+	 */
+	for (si = 0; si < (int)(sizeof(sizes)/sizeof(sizes[0])); si++) {
+		int stride = sizes[si];
+
+		if (sec->sh_size % stride)
+			continue;
+
+		for (off = 0; off + stride <= sec->sh_size; off += stride) {
+			const unsigned char* e = base + off;
+			int disp = *(const int*)e;
+			unsigned long long addr = sec->sh_addr + off + (long long)disp;
+
+			if (addr != rip)
+				continue;
+
+			co_terminal_print("      %s", "");
+			if (stride >= 16) {
+				int fdisp = *(const int*)(e + 8);
+				unsigned short line = *(const unsigned short*)(e + 12);
+				unsigned long long fva = sec->sh_addr + off + 8 + (long long)fdisp;
+				const unsigned char* fp = co_elf_at_va(pl, fva);
+
+				if (fp)
+					co_terminal_print("%s:%u", (const char*)fp, line);
+				else
+					co_terminal_print("file at 0x%llx line %u", fva, line);
+
+				{
+					int gdisp = *(const int*)(e + 4);
+					unsigned long long gva = sec->sh_addr + off + 4
+							       + (long long)gdisp;
+					const unsigned char* gp = co_elf_at_va(pl, gva);
+
+					if (gp && *gp)
+						co_terminal_print("  \"%s\"", (const char*)gp);
+				}
+			}
+			co_terminal_print("  flags 0x%x\n",
+					  *(const unsigned short*)(e + stride - 2));
+			return;
+		}
+	}
+
+	co_terminal_print("      (no __bug_table entry for this address)\n");
+}
+
 co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			       unsigned long max_switches, unsigned long batch)
 {
@@ -939,8 +1044,10 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			co_terminal_print("  %lu kernel warning%s stepped over, as the\n",
 					  b.warnings, (b.warnings == 1) ? "" : "s");
 			co_terminal_print("  kernel's own #UD handler would have:\n");
-			for (w = 0; w < n; w++)
+			for (w = 0; w < n; w++) {
 				co_terminal_print("    ud2 at 0x%016llx\n", b.warning_rip[w]);
+				co_report_bug_at(pl, b.warning_rip[w]);
+			}
 			co_terminal_print("\n");
 		}
 
