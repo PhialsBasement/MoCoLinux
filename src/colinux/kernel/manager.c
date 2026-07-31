@@ -725,6 +725,9 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->cr2		 = result.cr2;
 		params->fault_rdi	 = result.fault_rdi;
 		params->fault_rax	 = result.fault_rax;
+		params->warnings	 = result.warnings;
+		co_memcpy(params->warning_rip, result.warning_rip,
+			  sizeof(params->warning_rip));
 		params->preflight_checked = result.preflight_checked;
 		params->preflight_failed  = result.preflight_failed;
 		params->preflight_level	  = result.preflight_level;

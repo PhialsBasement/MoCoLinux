@@ -360,6 +360,8 @@ typedef struct {
 	unsigned long long cr2;
 	unsigned long long fault_rdi;	/* the guest's operand when it faulted */
 	unsigned long long fault_rax;
+	unsigned long	   warnings;	/* ud2s stepped over, as the kernel would */
+	unsigned long long warning_rip[8];
 	int		   preflight_checked;
 	int		   preflight_failed;
 	int		   preflight_level;
