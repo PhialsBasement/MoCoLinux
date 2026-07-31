@@ -39,6 +39,7 @@
 #include <colinux/kernel/manager.h>
 #include <colinux/os/kernel/alloc.h>
 #include <colinux/os/kernel/misc.h>
+#include <colinux/os/timer.h>
 #include <colinux/arch/switch.h>
 #include <colinux/arch/state.h>
 #include <colinux/arch/space.h>
@@ -1000,16 +1001,32 @@ asm(".text                                                          \n"
     "    and $-4096, %rax                                           \n"
     "    mov " CO_PP_CALL_TARGET "(%rax), %r10                      \n"
     /*
-     * Real IF stays clear in both modes. A free-running guest gives the CPU
-     * back explicitly at virtual-IRQ-enable, console and idle boundaries; the
-     * restored host IF then lets Windows take pending interrupts through its
-     * own IDT. Stepping uses TF as its additional instruction bound.
+     * Free-running: real IF goes ON here and stays on for the life of the
+     * guest. Hardware interrupts vector through the guest IDT into the stub,
+     * cross back to the host, and are replayed into Windows' live IDT -- so
+     * the host is never deaf for longer than one crossing, whatever the guest
+     * does. The guest's own cli/sti are virtual (asm/irqflags.h in the guest
+     * tree) and never touch the real flag; the one raw popfq on the guest's
+     * boot path (head_64.S, zero-EFLAGS before initial_code) is guarded to
+     * preserve IF for a cooperative guest.
+     *
+     * The previous policy -- IF clear, voluntary yields at virtual-sti,
+     * console and idle boundaries -- froze the machine the moment the guest
+     * ran free: early boot runs for hundreds of milliseconds between such
+     * boundaries, and a core deaf that long misses the clock and wedges every
+     * other core on TLB-shootdown IPIs.
+     *
+     * Stepping keeps IF clear and uses TF as its per-instruction bound, as
+     * before: interrupts are then delivered in host context between
+     * crossings, and the forwarding path stays out of the picture.
      */
     "    cmpq $0, " CO_PP_STEP "(%rax)                              \n"
-    "    je 5f                                                      \n"
+    "    je 4f                                                      \n"
     "    pushfq                                                     \n"
     "    orq $0x100, (%rsp)                                         \n"
     "    popfq                                                      \n"
+    "    jmp 5f                                                     \n"
+    "4:  sti                                                        \n"
     "5:  jmp *%r10                                                  \n"
     ".globl co_call_shim                                            \n"
     "co_call_shim:                                                  \n"
@@ -2762,7 +2779,8 @@ static void co_host_snapshot(co_host_snapshot_t* s)
 	 * covers, added after the first cooperative run completed cleanly --
 	 * every check above passing -- and the box froze anyway, minutes later.
 	 *
-	 * CR8 is IRQL on x64; the switch does not carry it. PAT is the memory
+	 * CR8 is IRQL on x64; the switch now carries it both directions, and
+	 * this snapshot is what proves that keeps being true. PAT is the memory
 	 * type table Linux's pat_init rewrites to its own layout, changing what
 	 * Windows' live PTEs mean out from under it. DR7 is written by the
 	 * kernel's hw_breakpoint init. Each is per-core, silent, and fatal on a
@@ -3040,6 +3058,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	/* Enter through the boot shim with real IF clear and virtual IF enabled. */
 	pp->params[20] = in->entry_va;
 	pp->params[29] = in->step ? 1 : 0;
+	pp->params[48] = 0;	/* virtual ticks banked while the host slept at IDLE */
 	pp->linuxvm_state.return_rip = (unsigned long long)(size_t)pp->code
 		+ (unsigned long)(&co_boot_shim - &co_switch_full);
 	pp->linuxvm_state.rsp = stack_va + CO_ARCH_PAGE_SIZE - 0x40;
@@ -3309,23 +3328,63 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 
 				if (op == CO_OPERATION_IDLE) {
 					out->idle_yields++;
-					if (out->idle_yields == 1)
+					if (out->idle_yields == 1) {
+						out->reached_idle = PTRUE;
 						co_debug("boot: first cooperative "
 							 "IDLE yield, after %ld "
 							 "switches", out->switches);
+					}
 
 					/*
-					 * With no virtual timer yet there is
-					 * nothing to hand the guest, so idle
-					 * yields ping-pong. A handful proves
-					 * the round trip survives repetition;
-					 * then the run is complete.
+					 * Sleep. This is the whole difference
+					 * between cooperative idle and the
+					 * freeze that ended every full run.
+					 *
+					 * Re-entering immediately ping-pongs
+					 * the crossing at full speed, and the
+					 * crossing runs under cli: the pinned
+					 * core spends nearly all of its time
+					 * with interrupts masked, Windows
+					 * loses its clock on that core, and
+					 * the machine freezes within a second
+					 * of the guest going idle -- exactly
+					 * when the boot finally works.
+					 *
+					 * coLinux's own monitor sleeps at IDLE
+					 * (monitor.c: iteration()) and wakes on
+					 * work. There is no message queue yet,
+					 * so the wake condition is time: one
+					 * host tick, with the host's flags
+					 * already restored above, so Windows
+					 * owns the core for the duration.
+					 *
+					 * Each tick slept is banked in
+					 * params[48] for the guest's virtual
+					 * clock to drain -- until the guest
+					 * learns to, the count is simply
+					 * unread, and jiffies not advancing is
+					 * the next piece of work, not a hazard.
 					 */
-					if (out->idle_yields >= 8) {
-						out->reached_idle = PTRUE;
+					co_os_msleep(10);
+					pp->params[48] += 1;
+
+					/*
+					 * Idle forever is correct cooperative
+					 * behaviour, but this loop still runs
+					 * inside an ioctl and has to give the
+					 * thread back while bring-up needs a
+					 * result to read. 500 slept yields is
+					 * five seconds of the host running
+					 * normally over an idle guest -- long
+					 * enough to prove the freeze is gone,
+					 * bounded enough to report.
+					 */
+					if (out->idle_yields >= 500) {
 						co_debug("boot: %ld cooperative "
-							 "idle yields -- boot "
-							 "complete", out->idle_yields);
+							 "idle yields, host alive "
+							 "throughout -- stopping "
+							 "the bring-up run",
+							 out->idle_yields);
 						break;
 					}
 					continue;
@@ -3576,8 +3635,20 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 						frame[0x98 / 8] |= 0x100ULL;	/* TF */
 						frame[0x98 / 8] &= ~0x200ULL;	/* IF */
 					} else {
+						/*
+						 * Free-running: clear TF only.
+						 * IF is left exactly as the
+						 * guest had it at the trap. A
+						 * free-running guest owns its
+						 * interrupt flag -- forcing it
+						 * off here silently disarmed
+						 * interrupt forwarding at the
+						 * first WARN after the kernel's
+						 * local_irq_enable(), removing
+						 * the one bound a free guest
+						 * has.
+						 */
 						frame[0x98 / 8] &= ~0x100ULL;	/* no TF */
-						frame[0x98 / 8] &= ~0x200ULL;	/* real IF stays off */
 					}
 
 					pp->linuxvm_state.return_rip = resume_rip;
@@ -3617,8 +3688,10 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 						frame[0x98 / 8] |= 0x100ULL;	/* TF */
 						frame[0x98 / 8] &= ~0x200ULL;	/* IF */
 					} else {
-						frame[0x98 / 8] &= ~0x100ULL;	/* no TF */
-						frame[0x98 / 8] &= ~0x200ULL;	/* real IF stays off */
+						/* Free-running: TF only; IF is
+						 * the guest's, as at the WARN
+						 * step-over above. */
+						frame[0x98 / 8] &= ~0x100ULL;
 					}
 
 					pp->linuxvm_state.return_rip = resume_rip;
