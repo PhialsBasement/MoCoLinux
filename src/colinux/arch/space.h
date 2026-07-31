@@ -62,6 +62,37 @@ extern co_rc_t co_arch_guest_lookup(co_manager_t* manager,
 				    co_pa_t* pa_out,
 				    int* level_out);
 
+/*
+ * Map the space's own page-table pages into its direct map.
+ *
+ * NOT CURRENTLY USED, and not a solution on its own -- see below. Kept because
+ * the walk it does is right and because the reason it is not enough is worth
+ * having written down next to it.
+ *
+ * The problem it was written for is real: Linux reaches its page tables through
+ * __va(). early_ioremap_pmd() starts from __va(read_cr3_pa()) and walks down,
+ * so the guest faulted reading __va(CR3)+0xff8 -- entry 511 of its own PML4 --
+ * after thirty-three million instructions.
+ *
+ * But mapping them at direct_map_base + their host physical address does two
+ * wrong things. It aliases: a table page that lands below ram_bytes of host
+ * physical memory takes the direct-map address of a guest RAM page, replacing
+ * that page's mapping and leaving it to be freed twice at teardown. And it does
+ * not actually work, because Linux does not merely need to reach the tables --
+ * it reads the entries and treats them as its own physical addresses, calling
+ * __va() on them to walk further. Those entries hold host physical addresses,
+ * because that is what the hardware requires.
+ *
+ * So the guest's idea of physical memory and the host's have to agree for every
+ * page Linux walks. That is the pseudo-physical/machine-frame translation
+ * problem, and it is solved by patching the guest's mm, the way coLinux and Xen
+ * both do -- not by adding mappings here.
+ */
+extern co_rc_t co_arch_guest_map_own_tables(co_manager_t* manager,
+					    co_arch_guest_space_t* space,
+					    unsigned long long direct_map_base,
+					    unsigned long* mapped_out);
+
 /* The value that would go into CR3. */
 extern co_pa_t co_arch_guest_space_root(co_arch_guest_space_t* space);
 
