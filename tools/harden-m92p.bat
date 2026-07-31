@@ -16,10 +16,10 @@ set PEER=192.168.137.1
 set ROOT=F:\xfer
 set PORT=5000
 
-rem  The account the box logs straight into. Leave LOGONPASS empty if it has
-rem  no password.
+rem  The account the box logs straight into. The password is asked for when this
+rem  runs rather than written here, so it never sits in a file, a repository or a
+rem  chat log -- only in the registry, where autologon needs it regardless.
 set LOGONUSER=Administrator
-set LOGONPASS=
 
 echo.
 echo === 1. reboot after a bugcheck instead of sitting on the blue screen ===
@@ -58,6 +58,19 @@ rem
 rem  A blank LOGONPASS is fine if the account has no password -- XP allows
 rem  autologon with an empty DefaultPassword, and LimitBlankPasswordUse only
 rem  restricts network logons, not the console one this uses.
+echo   The account needs a password for autologon to work. It goes into the
+echo   registry in clear text -- that is how AutoAdminLogon works, and it is the
+echo   price of the box coming back without anyone touching it.
+echo.
+set "LOGONPASS="
+set /p LOGONPASS=  Password for %LOGONUSER% (blank to skip autologon): 
+if "%LOGONPASS%"=="" (
+  echo.
+  echo   Skipped. Everything else is set, but the box will stop at the login
+  echo   prompt after a crash and stay unreachable. Re-run to finish.
+  goto verify
+)
+
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 1 /f
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d "%LOGONUSER%" /f
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /t REG_SZ /d "%LOGONPASS%" /f
@@ -65,6 +78,8 @@ reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoL
 rem  Winlogon decrements AutoLogonCount and stops autologging in when it hits
 rem  zero, so a stale one from anything else would make this work once.
 echo   autologon set for %LOGONUSER%
+
+:verify
 
 echo.
 echo === 6. start it now, so you can see it work ===
