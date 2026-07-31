@@ -301,6 +301,16 @@ typedef struct {
 	unsigned long long end_va;	/* in */
 	unsigned long	   ram_pages;	/* out: pages allocated for RAM */
 	unsigned long	   tables;	/* out */
+	/*
+	 * Where the guest's memory actually is.
+	 *
+	 * Guest physical N is host physical block_pa + N, because Linux calls
+	 * __va() on what it reads out of its own page tables and those entries
+	 * hold host physical addresses. So the daemon has to build the e820 and
+	 * phys_base from these rather than from 0.
+	 */
+	unsigned long long block_pa;	/* out: host physical base of the block */
+	unsigned long long usable_bytes;/* out: RAM below the reserved tables */
 } co_manager_ioctl_kram_t;
 
 /* interface for CO_MANAGER_IOCTL_KBOOT */

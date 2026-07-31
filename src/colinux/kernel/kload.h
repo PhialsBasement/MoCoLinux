@@ -12,6 +12,18 @@
 #include <colinux/kernel/manager.h>
 #include <colinux/arch/space.h>
 
+/*
+ * The guest's physical memory: one contiguous host allocation, with guest
+ * physical N at host physical base + N. See kload.c for why it cannot be
+ * scattered pages.
+ */
+#define CO_KLOAD_RAM_BYTES	(128ULL << 20)
+
+extern co_pa_t		  co_kload_block_pa(void);
+extern unsigned long long co_kload_usable_bytes(void);
+extern co_rc_t		  co_kload_table_frame(co_manager_t* manager, co_pfn_t* pfn_out);
+extern void*		  co_kload_frame_va(co_pfn_t pfn);
+
 extern co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 			      unsigned long long max_va);
 extern co_rc_t co_kload_chunk(co_manager_t* manager, unsigned long long va,

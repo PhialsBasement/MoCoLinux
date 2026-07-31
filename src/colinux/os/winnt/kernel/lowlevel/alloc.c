@@ -125,6 +125,22 @@ void co_os_free_exec_pages(void* ptr, unsigned int pages)
 	co_os_free_pages_by(CO_ALLOC_NONPAGED_POOL, ptr, pages);
 }
 
+void* co_os_alloc_contiguous_pages(unsigned int pages)
+{
+	if (pages == 0)
+		return NULL;
+
+	return co_os_alloc_pages_by(CO_ALLOC_CONTIGUOUS, pages);
+}
+
+void co_os_free_contiguous_pages(void* ptr, unsigned int pages)
+{
+	if (ptr == NULL)
+		return;
+
+	co_os_free_pages_by(CO_ALLOC_CONTIGUOUS, ptr, pages);
+}
+
 bool_t co_os_alloc_method(int index, const char** name)
 {
 	if (index < 0 || index >= CO_ALLOC_METHODS)
