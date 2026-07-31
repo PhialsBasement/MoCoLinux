@@ -954,6 +954,8 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		if (b.faulted) {
 			co_terminal_print("  stopped on an exception the guest took:\n");
 			co_terminal_print("    vector %llu at rip 0x%016llx\n", b.vector, b.fault_rip);
+			co_terminal_print("    rdi 0x%016llx  rax 0x%016llx\n",
+					  b.fault_rdi, b.fault_rax);
 			co_terminal_print("    error code 0x%llx", b.error_code);
 			if (b.vector == 14)
 				co_terminal_print("  cr2 0x%016llx  (%s, %s)",

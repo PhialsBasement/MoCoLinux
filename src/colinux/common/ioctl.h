@@ -357,6 +357,8 @@ typedef struct {
 	unsigned long long fault_rip;
 	unsigned long long error_code;
 	unsigned long long cr2;
+	unsigned long long fault_rdi;	/* the guest's operand when it faulted */
+	unsigned long long fault_rax;
 	int		   preflight_checked;
 	int		   preflight_failed;
 	int		   preflight_level;

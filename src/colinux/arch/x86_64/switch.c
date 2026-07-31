@@ -2944,6 +2944,21 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			out->cr2        = pp->params[18];
 
 			/*
+			 * The operand. The stub's frame is fifteen registers
+			 * pushed in a known order, so rdi is at 0x48 and rax
+			 * at 0x70 -- see the layout comment on the stub.
+			 */
+			{
+				const unsigned long long* f =
+					(const unsigned long long*)(size_t)pp->params[28];
+
+				if (f) {
+					out->fault_rdi = f[0x48 / 8];
+					out->fault_rax = f[0x70 / 8];
+				}
+			}
+
+			/*
 			 * #DB with stepping on is not a fault, it is the guest
 			 * having executed one instruction. Record where it was and
 			 * put it straight back. The trace is a ring of the last few

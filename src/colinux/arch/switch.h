@@ -165,6 +165,16 @@ typedef struct {
 	unsigned long long fault_rip;
 	unsigned long long error_code;
 	unsigned long long cr2;
+	/*
+	 * The guest's rdi and rax when it faulted.
+	 *
+	 * The stub already pushes all fifteen registers onto the IST stack, so
+	 * this costs a read. It is the difference between "the CPU refused a
+	 * CR4 write" and knowing which bit it refused -- and a fault whose
+	 * operand is invisible is a fault that gets guessed at.
+	 */
+	unsigned long long fault_rdi;
+	unsigned long long fault_rax;
 	int		   preflight_checked;
 	int		   preflight_failed;
 	int		   preflight_level;
