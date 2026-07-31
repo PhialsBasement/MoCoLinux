@@ -45,6 +45,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KLOAD_VERIFY,
 	CO_MANAGER_IOCTL_KLOAD_ENTER,
 	CO_MANAGER_IOCTL_KLOAD_END,
+	CO_MANAGER_IOCTL_KCALL,
 } co_manager_ioctl_t;
 
 /*
@@ -289,6 +290,26 @@ typedef struct {
 	unsigned long	   chunks;
 	unsigned long	   tables;
 } co_manager_ioctl_kload_verify_t;
+
+/* interface for CO_MANAGER_IOCTL_KCALL: mirrors co_arch_kcall_test_t */
+typedef struct {
+	co_rc_t		   rc;
+	int		   supported;
+	int		   succeeded;
+	unsigned long long memset_va;		/* in, then echoed back */
+	unsigned long long strlen_va;		/* in, then echoed back */
+	unsigned long long scratch_va;
+	unsigned long long memset_ret;
+	unsigned long long strlen_ret;
+	unsigned long long strlen_expected;
+	int		   pattern_ok;
+	int		   first_bad;
+	int		   first_bad_byte;
+	int		   faulted;
+	unsigned long long vector;
+	unsigned long long fault_rip;
+	unsigned long long cr2;
+} co_manager_ioctl_kcall_t;
 
 /* interface for CO_MANAGER_IOCTL_TEST_SPACE: mirrors co_arch_space_test_t */
 typedef struct {

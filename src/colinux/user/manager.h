@@ -48,6 +48,8 @@ extern co_rc_t co_manager_kload_verify(co_manager_handle_t handle,
 				       co_manager_ioctl_kload_verify_t* out);
 extern co_rc_t co_manager_kload_enter(co_manager_handle_t handle,
 				      co_manager_ioctl_test_switch_t* out);
+extern co_rc_t co_manager_kcall(co_manager_handle_t handle,
+				co_manager_ioctl_kcall_t* out);
 extern co_rc_t co_manager_kload_end(co_manager_handle_t handle);
 
 extern co_rc_t co_manager_test_space(co_manager_handle_t handle,

@@ -172,6 +172,14 @@ co_rc_t co_manager_kload_enter(co_manager_handle_t handle,
 				   out, sizeof(*out), out, sizeof(*out), &returned);
 }
 
+co_rc_t co_manager_kcall(co_manager_handle_t handle, co_manager_ioctl_kcall_t* out)
+{
+	unsigned long returned = 0;
+
+	return co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KCALL,
+				   out, sizeof(*out), out, sizeof(*out), &returned);
+}
+
 co_rc_t co_manager_kload_end(co_manager_handle_t handle)
 {
 	unsigned long returned = 0;

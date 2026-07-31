@@ -558,6 +558,43 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_KCALL: {
+		co_manager_ioctl_kcall_t* params = (typeof(params))(io_buffer);
+		co_arch_kcall_test_t result;
+		unsigned long long memset_va, strlen_va;
+		co_rc_t trc;
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		memset_va = params->memset_va;
+		strlen_va = params->strlen_va;
+		co_memset(params, 0, sizeof(*params));
+
+		trc = co_arch_test_kernel_code(manager, co_kload_space(),
+					       memset_va, strlen_va, &result);
+
+		params->rc		= trc;
+		params->supported	= result.supported;
+		params->succeeded	= result.succeeded;
+		params->memset_va	= result.memset_va;
+		params->strlen_va	= result.strlen_va;
+		params->scratch_va	= result.scratch_va;
+		params->memset_ret	= result.memset_ret;
+		params->strlen_ret	= result.strlen_ret;
+		params->strlen_expected = result.strlen_expected;
+		params->pattern_ok	= result.pattern_ok;
+		params->first_bad	= result.first_bad;
+		params->first_bad_byte	= result.first_bad_byte;
+		params->faulted		= result.faulted;
+		params->vector		= result.vector;
+		params->fault_rip	= result.fault_rip;
+		params->cr2		= result.cr2;
+
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_KLOAD_END: {
 		co_kload_free(manager);
 		*return_size = 0;
