@@ -2235,9 +2235,21 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			out->interrupts++;
 			co_forward_host_interrupt(pp, out->vector);
 
-			/* back in, exactly where it was */
+			/*
+			 * Back in, exactly where it was.
+			 *
+			 * The rsp handed to the switch is scratch -- co_guest_resume
+			 * replaces it immediately with the saved frame pointer -- but
+			 * the switch still pushes CS and the return RIP onto it before
+			 * the lretq, so it must not land inside the frame. The frame
+			 * occupies ist_top-0xb0 up to ist_top-0x08, so anything in
+			 * that span writes over saved registers: ist_top-0x40 would
+			 * have overwritten rbx and rcx on every single resume, and the
+			 * guest would have come back subtly wrong rather than
+			 * obviously broken.
+			 */
 			pp->linuxvm_state.return_rip = resume_rip;
-			pp->linuxvm_state.rsp        = ist_top - 0x40;
+			pp->linuxvm_state.rsp        = ist_top - 0x200;
 		}
 
 		if (out->switches >= in->max_switches)
