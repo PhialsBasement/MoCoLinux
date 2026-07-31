@@ -529,6 +529,132 @@ co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_bytes,
 	return CO_RC(OK);
 }
 
+/*
+ * Hand the guest its own page tables.
+ *
+ * Up to here the guest ran in an address space the host built. That is enough
+ * to execute code and reach memory, and it is not enough to be Linux: the
+ * kernel expects the tables it was linked with -- init_top_pgt, and the
+ * level3_kernel_pgt / level2_kernel_pgt / level2_fixmap_pgt chain under it --
+ * to be the live ones, and it walks and edits them directly. early_ioremap_init
+ * follows that chain down to install the fixmap, finds a zero where the host's
+ * space has its own arrangement instead, takes the zero as a table's physical
+ * address and writes to __va(0).
+ *
+ * Those tables are statically initialised with link-time addresses: an entry
+ * holds (target - __START_KERNEL_map), because at link time nobody knows where
+ * the image will be loaded. head_64.S's __startup_64 adds the load offset to
+ * every one of them before switching CR3, and this is that fixup -- the image
+ * is at phys_base, so phys_base is the delta.
+ *
+ * Then the host's own mappings are grafted in at top level: the direct map and
+ * the passage page exist only in the space the host built, and the guest cannot
+ * be switched to a table that does not contain the code performing the switch.
+ */
+static void kload_fixup_table(co_manager_t* manager, unsigned long long table_va,
+			      unsigned long long delta, int entries, const char* what)
+{
+	unsigned long long* t;
+	co_pa_t pa;
+	int i, fixed = 0;
+
+	pa = kload_block_pa + (table_va - CO_ARCH_KERNEL_MAP);
+	t  = (unsigned long long*)co_kload_frame_va((co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT));
+	if (t == NULL) {
+		co_debug_error("kload: %s is not inside the guest block", what);
+		return;
+	}
+
+	for (i = 0; i < entries; i++) {
+		if (!(t[i] & _PAGE_PRESENT))
+			continue;
+		t[i] += delta;
+		fixed++;
+	}
+
+	co_debug("kload: %s, %d entries relocated by 0x%llx", what, fixed, delta);
+}
+
+co_rc_t co_kload_adopt_kernel_tables(co_manager_t* manager,
+				     const unsigned long long* table_va,
+				     int table_count,
+				     unsigned long long* cr3_out)
+{
+	unsigned long long* kernel_pml4;
+	unsigned long long* ours;
+	co_pa_t pml4_pa;
+	int i, grafted = 0;
+
+	if (kload_space == NULL || kload_block == NULL || table_count < 1)
+		return CO_RC(ERROR);
+
+	/*
+	 * Relocate every static table first. init_top_pgt must be table_va[0]:
+	 * it is the one CR3 ends up holding, and the grafting below writes into
+	 * it after it has been fixed up.
+	 */
+	for (i = 0; i < table_count; i++)
+		kload_fixup_table(manager, table_va[i], kload_block_pa, 512,
+				  i == 0 ? "init_top_pgt" : "a static kernel table");
+
+	pml4_pa = kload_block_pa + (table_va[0] - CO_ARCH_KERNEL_MAP);
+	kernel_pml4 = (unsigned long long*)
+		co_kload_frame_va((co_pfn_t)(pml4_pa >> CO_ARCH_PAGE_SHIFT));
+	if (kernel_pml4 == NULL)
+		return CO_RC(ERROR);
+
+	ours = (unsigned long long*)co_kload_frame_va(
+			(co_pfn_t)(co_arch_guest_space_root(kload_space) >> CO_ARCH_PAGE_SHIFT));
+	if (ours == NULL)
+		return CO_RC(ERROR);
+
+	/*
+	 * The entry __startup_64 would have written.
+	 *
+	 * init_top_pgt is empty in the image in this kernel -- head_64.S builds
+	 * it at run time, out of early_top_pgt, and that is code the host skips.
+	 * The relocation pass above found nothing to relocate in it for exactly
+	 * that reason: zero entries present. So the one that matters is written
+	 * here, the kernel half of the address space, pointing at
+	 * level3_kernel_pgt, which does have its static contents and has just
+	 * been relocated.
+	 *
+	 * Without it CR3 held a blank top-level table with only the host's
+	 * grafted entries in it, and the first walk down to the fixmap found a
+	 * zero, took it for a table's physical address and wrote to __va(0).
+	 */
+	if (table_count > 1 &&
+	    !(kernel_pml4[CO_ARCH_PGD_INDEX(CO_ARCH_KERNEL_MAP)] & _PAGE_PRESENT)) {
+		co_pa_t l3 = kload_block_pa + (table_va[1] - CO_ARCH_KERNEL_MAP);
+
+		kernel_pml4[CO_ARCH_PGD_INDEX(CO_ARCH_KERNEL_MAP)] = l3 | _KERNPG_TABLE;
+		co_debug("kload: wired init_top_pgt[%d] -> level3_kernel_pgt at 0x%llx",
+			 (int)CO_ARCH_PGD_INDEX(CO_ARCH_KERNEL_MAP),
+			 (unsigned long long)l3);
+	}
+
+	/*
+	 * Anything the host mapped and the kernel's table has no opinion about.
+	 * That is the direct map and the passage page; the kernel's own entry
+	 * for its image is left exactly as linked, which is the entire point.
+	 */
+	for (i = 0; i < 512; i++) {
+		if (!(ours[i] & _PAGE_PRESENT))
+			continue;
+		if (kernel_pml4[i] & _PAGE_PRESENT)
+			continue;
+
+		kernel_pml4[i] = ours[i];
+		grafted++;
+	}
+
+	co_debug("kload: adopted the kernel's tables, cr3 0x%llx, %d host entries grafted",
+		 (unsigned long long)pml4_pa, grafted);
+
+	*cr3_out = pml4_pa;
+	return CO_RC(OK);
+}
+
 unsigned long co_kload_ram_pages(void)
 {
 	return kload_ram_pages;

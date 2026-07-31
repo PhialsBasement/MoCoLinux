@@ -137,6 +137,9 @@ typedef struct {
 	 * world switch per instruction.
 	 */
 	int		   batch;
+	/* the kernel's own page tables, init_top_pgt first; see kload.h */
+	unsigned long long kernel_tables[8];
+	int		   kernel_table_count;
 } co_arch_boot_t;
 
 typedef struct {

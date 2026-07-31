@@ -679,6 +679,9 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.guest_flag_va      = params->guest_flag_va;
 		in.step               = params->step;
 		in.batch              = params->batch;
+		in.kernel_table_count = params->kernel_table_count;
+		co_memcpy(in.kernel_tables, params->kernel_tables,
+			  sizeof(in.kernel_tables));
 		in.max_switches       = params->max_switches ? params->max_switches : 4096;
 
 		co_memset(params, 0, sizeof(*params));
