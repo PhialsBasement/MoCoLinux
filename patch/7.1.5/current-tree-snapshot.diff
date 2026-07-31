@@ -1,23 +1,24 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5 at the real-IF
-interrupt-forwarding checkpoint.  Generated against download/linux-7.1.5.tar.xz
-on 2026-08-01, after the first free-running boot the Windows host survived:
-199,896 hardware interrupts captured in the guest, crossed, and replayed into
-Windows' live IDT, host state verified intact after every crossing.
+Authoritative cumulative snapshot of ref/linux-7.1.5 at the virtual-time
+checkpoint.  Generated against download/linux-7.1.5.tar.xz on 2026-08-01, the
+day the kernel first booted to PID 1 on the M92p -- every initcall run, kernel
+threads scheduled, host wall time in the audit timestamps -- and panicked only
+for the root filesystem it does not have yet.
 
-The interrupt policy this snapshot carries, and the one it replaces:
+On top of the real-IF interrupt-forwarding checkpoint this adds virtual time:
 
-  - Real IF is ON for the guest's whole life.  The host enters the guest with
-    interrupts enabled; hardware interrupts vector through the guest IDT into
-    the passage-page stub, world-switch back to the host, and are replayed.
-    The guest's own cli/sti edit a virtual flag (asm/irqflags.h) and never
-    touch the hardware bit.  head_64.S's zero-EFLAGS popfq is guarded to
-    preserve IF for a cooperative guest.
+  - A cooperative clock_event_device ("cotimer", periodic-only, HZ=1000)
+    registered via x86_init.timers.timer_init.  Ticks are synthesised from the
+    host's monotonic clock, which the host stamps into passage-page params[49]
+    (100 ns units) before every re-entry; co_colinux_drain_time() converts the
+    elapsed time to N calls of the tick handler inside irq_enter/irq_exit,
+    clamped to one second, at the idle boundary (co_cpu_idle).
 
-  - The previous policy -- real IF clear, voluntary yields at virtual-sti and
-    console boundaries -- froze the machine the moment the guest ran free:
-    early boot runs for hundreds of milliseconds between boundaries, and a
-    core deaf that long misses the clock and wedges the other cores on their
-    TLB-shootdown IPIs.  native_irq_enable() no longer yields.
+  - x86_platform.get_wallclock reads the host's UTC time_t from params[50],
+    so timekeeping starts at the host's real date instead of 1970.
+
+  - calibrate_delay is skipped with lpj= on the command line (the daemon
+    passes lpj=1600000): virtual time is delivered at idle boundaries and the
+    calibration spin runs before the boot ever idles.
 
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
@@ -839,18 +840,20 @@ index 90a22e2..7cd11dd 100644
  	void *entry;
  
 diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
-index 4c718f8..efee9de 100644
+index 4c718f8..4f674b8 100644
 --- a/arch/x86/kernel/process.c
 +++ b/arch/x86/kernel/process.c
-@@ -54,6 +54,7 @@
+@@ -54,6 +54,9 @@
  #include <asm/mmu_context.h>
  #include <asm/msr.h>
  #include <asm/shstk.h>
 +#include <linux/console.h>	/* co_colinux_guest */
++#include <linux/clockchips.h>	/* the cooperative tick device */
++#include <linux/hardirq.h>	/* irq_enter/irq_exit around delivered ticks */
  
  #include "process.h"
  
-@@ -773,6 +774,72 @@ EXPORT_SYMBOL(default_idle);
+@@ -773,6 +776,172 @@ EXPORT_SYMBOL(default_idle);
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -877,6 +880,8 @@ index 4c718f8..efee9de 100644
 +#define CO_PP_HOST_STATE	0x740
 +#define CO_PP_LINUXVM_STATE	0x880
 +#define CO_PP_OPERATION		0x9c0
++#define CO_PP_HOST_MONO		0xb50	/* params[49]: host monotonic clock, 100 ns units */
++#define CO_PP_HOST_WALL		0xb58	/* params[50]: host wall clock, UTC time_t seconds */
 +
 +/* co_operation_t values, from include/linux/cooperative.h in the coLinux tree */
 +#define CO_OPERATION_IDLE	2
@@ -911,19 +916,117 @@ index 4c718f8..efee9de 100644
 +}
 +
 +/*
++ * Virtual time: the host's clock, delivered as ticks.
++ *
++ * The guest has no timer hardware -- nolapic, nohpet, no PIT it may touch --
++ * so nothing periodic ever fires on its own and jiffies would stand still
++ * forever (the first casualty being calibrate_delay, which spins on jiffies
++ * advancing). The host, meanwhile, has a perfectly good clock, and stamps its
++ * monotonic time into the passage page before every re-entry.
++ *
++ * This is coLinux's co_handle_jiffies one architecture over: a clock_event
++ * device whose events are synthesised from the host's clock at cooperative
++ * boundaries rather than raised by an interrupt line. The device is
++ * periodic-only, which keeps the tick core in periodic mode -- no oneshot, no
++ * NO_HZ engagement, one code path to trust during bring-up.
++ *
++ * Delivery happens at the idle boundary: co_cpu_idle drains the elapsed host
++ * time as N calls of the tick handler, each inside irq_enter/irq_exit exactly
++ * as a hardware tick would be. While the guest is busy computing, time is not
++ * delivered -- it catches up, clamped, at the next idle. That is the honest
++ * cooperative trade until interrupt-path delivery (the COPIC) exists.
++ */
++static int co_colinux_ce_state_noop(struct clock_event_device *evt)
++{
++	return 0;
++}
++
++static struct clock_event_device co_colinux_clockevent = {
++	.name			= "cotimer",
++	.features		= CLOCK_EVT_FEAT_PERIODIC,
++	.set_state_periodic	= co_colinux_ce_state_noop,
++	.set_state_shutdown	= co_colinux_ce_state_noop,
++	.rating			= 300,
++};
++
++void __init co_colinux_timer_init(void)
++{
++	co_colinux_clockevent.cpumask = cpumask_of(0);
++	clockevents_register_device(&co_colinux_clockevent);
++	pr_info("cotimer: cooperative tick device registered, HZ=%d\n", HZ);
++}
++
++void co_colinux_drain_time(void)
++{
++	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
++	const u64 per_tick = 10000000 / HZ;	/* 100 ns units */
++	static u64 last_mono;
++	u64 now;
++	unsigned int n;
++
++	if (!pp || !co_colinux_clockevent.event_handler)
++		return;
++
++	now = *(volatile u64 *)(pp + CO_PP_HOST_MONO);
++	if (!last_mono)
++		last_mono = now;
++	if (now <= last_mono)
++		return;
++
++	n = (now - last_mono) / per_tick;
++	if (!n)
++		return;
++
++	/*
++	 * Clamped, and the clamp forgets rather than owes. After a long busy
++	 * stretch or a host that slept, delivering the whole backlog would
++	 * spend seconds inside tick handlers to replay time nobody experienced;
++	 * wall-clock accuracy comes from the host's wall clock below, not from
++	 * counting every tick.
++	 */
++	if (n > HZ) {
++		n = HZ;
++		last_mono = now - (u64)n * per_tick;
++	}
++	last_mono += (u64)n * per_tick;
++
++	irq_enter();
++	while (n--)
++		co_colinux_clockevent.event_handler(&co_colinux_clockevent);
++	irq_exit();
++}
++
++/*
++ * The host's wall clock, read through the passage page. This is what
++ * timekeeping_init and the RTC path ask the platform for; without it the guest
++ * boots into 1970 and says 'Unable to read current time from RTC'.
++ */
++void co_colinux_get_wallclock(struct timespec64 *now)
++{
++	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
++
++	now->tv_sec  = pp ? *(volatile u64 *)(pp + CO_PP_HOST_WALL) : 0;
++	now->tv_nsec = 0;
++}
++
++/*
 + * The cooperative idle routine: hand the CPU back to the host and resume when
 + * it re-enters us. This is coLinux's co_idle_processor, one architecture over.
++ * The host sleeps a tick before re-entering, so the drain on the way back is
++ * what advances jiffies while the guest is idle -- which is what lets a
++ * sleeping boot task (schedule_timeout, msleep) ever wake again.
 + */
 +static void co_cpu_idle(void)
 +{
 +	co_colinux_switch(CO_OPERATION_IDLE);
++	co_colinux_drain_time();
 +	raw_local_irq_disable();
 +}
 +
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +1003,18 @@ out:
+@@ -936,6 +1105,18 @@ out:
  
  void __init select_idle_routine(void)
  {
@@ -943,7 +1046,7 @@ index 4c718f8..efee9de 100644
  		if (IS_ENABLED(CONFIG_SMP) && __max_threads_per_core > 1)
  			pr_warn_once("WARNING: polling idle and HT enabled, performance may degrade\n");
 diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
-index 46882ce..743795c 100644
+index 46882ce..528e41f 100644
 --- a/arch/x86/kernel/setup.c
 +++ b/arch/x86/kernel/setup.c
 @@ -55,6 +55,7 @@
@@ -954,7 +1057,7 @@ index 46882ce..743795c 100644
  #include <asm/unwind.h>
  #include <asm/vsyscall.h>
  
-@@ -933,6 +934,56 @@ void __init setup_arch(char **cmdline_p)
+@@ -933,6 +934,73 @@ void __init setup_arch(char **cmdline_p)
  	 */
  	olpc_ofw_detect();
  
@@ -1006,6 +1109,23 @@ index 46882ce..743795c 100644
 +	if (co_colinux_guest) {
 +		x86_platform.realmode_reserve = x86_init_noop;
 +		x86_platform.realmode_init    = x86_init_noop;
++
++		/*
++		 * Time is the host's, fed through the passage page.
++		 *
++		 * timer_init would otherwise be hpet_time_init: an HPET the
++		 * guest must not touch and a legacy IRQ0 it cannot have
++		 * ('Failed to register legacy timer interrupt'). The
++		 * cooperative tick device has no hardware behind it at all --
++		 * ticks are synthesised from the host clock at idle
++		 * boundaries (co_colinux_drain_time).
++		 *
++		 * get_wallclock is what timekeeping_init asks the platform
++		 * for; without it the guest boots into 1970 after 'Unable to
++		 * read current time from RTC'.
++		 */
++		x86_init.timers.timer_init = co_colinux_timer_init;
++		x86_platform.get_wallclock = co_colinux_get_wallclock;
 +	}
 +
  	idt_setup_early_traps();
@@ -1127,22 +1247,29 @@ index 467311b..24d4b74 100644
  	 * The init function returns an non zero value when
  	 * pci_legacy_init should be invoked.
 diff --git a/include/linux/console.h b/include/linux/console.h
-index 5520e44..8d75dc3 100644
+index 5520e44..08b07d0 100644
 --- a/include/linux/console.h
 +++ b/include/linux/console.h
-@@ -741,4 +741,15 @@ extern void console_init(void);
+@@ -741,4 +741,22 @@ extern void console_init(void);
  void dummycon_register_output_notifier(struct notifier_block *nb);
  void dummycon_unregister_output_notifier(struct notifier_block *nb);
  
 +/* Cooperative Linux: register the passage-page console at the top of setup_arch. */
++struct timespec64;
 +#ifdef CONFIG_EARLY_PRINTK
 +void co_colinux_console_init(void);
 +extern int co_colinux_guest;
 +void co_colinux_yield(void);
++void co_colinux_timer_init(void);
++void co_colinux_drain_time(void);
++void co_colinux_get_wallclock(struct timespec64 *now);
 +#else
 +static inline void co_colinux_console_init(void) { }
 +extern int co_colinux_guest;
 +void co_colinux_yield(void);
++void co_colinux_timer_init(void);
++void co_colinux_drain_time(void);
++void co_colinux_get_wallclock(struct timespec64 *now);
 +#endif
 +
  #endif /* _LINUX_CONSOLE_H */

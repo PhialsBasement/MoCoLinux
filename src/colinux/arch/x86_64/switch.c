@@ -39,6 +39,7 @@
 #include <colinux/kernel/manager.h>
 #include <colinux/os/kernel/alloc.h>
 #include <colinux/os/kernel/misc.h>
+#include <colinux/os/kernel/time.h>
 #include <colinux/os/timer.h>
 #include <colinux/arch/switch.h>
 #include <colinux/arch/state.h>
@@ -3210,6 +3211,21 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 * exact original flags are restored; pending hardware interrupts
 			 * then enter through Windows' own IDT before we re-enter the guest.
 			 */
+			/*
+			 * The host's clocks, stamped fresh before every entry.
+			 *
+			 * params[49] is the monotonic clock in 100 ns units;
+			 * the guest's cooperative tick device measures its
+			 * elapsed time against it and synthesises that many
+			 * ticks (co_colinux_drain_time in the guest tree).
+			 * params[50] is wall time for get_wallclock. Stamped
+			 * here rather than once, because a stale clock reads
+			 * as time standing still -- the exact failure virtual
+			 * time exists to end.
+			 */
+			pp->params[49] = co_os_monotonic_100ns();
+			pp->params[50] = co_os_get_time();
+
 			asm volatile("pushfq; popq %0; cli"
 				     : "=r"(host_flags) : : "memory", "cc");
 			co_host_snapshot(&host_was);

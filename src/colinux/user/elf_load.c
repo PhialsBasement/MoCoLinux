@@ -1160,12 +1160,21 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 * no-hardware paths early enough to avoid pointless native probes and
 		 * keep per-CPU PAT, MCE, microcode and watchdog state owned by Windows.
 		 */
+		/*
+		 * lpj= presets the delay-loop calibration. calibrate_delay()
+		 * otherwise spins waiting for jiffies to advance, and virtual
+		 * time is only delivered at idle boundaries -- which the boot
+		 * has not reached yet, so the spin never ends. The value is
+		 * loops per jiffy at HZ=1000 for the M92p's ~3.2 GHz core;
+		 * udelay lengths scale with it, and nothing here drives
+		 * hardware that cares about a few percent.
+		 */
 		memset(cmdline, 0, sizeof(cmdline));
 		strcpy(cmdline, "earlyprintk=colinux,keep console=earlycolinux"
 				" acpi=off noapic nolapic nohpet no_timer_check"
 				" noxsave noxsaveopt noxsaves disable_mtrr_trim"
 				" pci=off nopat io_delay=none mce=off dis_ucode_ldr"
-				" nowatchdog 8250.nr_uarts=0");
+				" nowatchdog 8250.nr_uarts=0 lpj=1600000");
 		rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_cl),
 					    cmdline, sizeof(cmdline), 0);
 		if (!CO_OK(rc)) {
