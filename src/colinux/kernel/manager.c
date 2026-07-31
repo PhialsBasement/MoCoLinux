@@ -147,6 +147,30 @@ void co_manager_unload(co_manager_t* manager)
 {
 	co_debug("unloaded from host kernel");
 
+	/*
+	 * The guest's memory, before anything it depends on goes away.
+	 *
+	 * Nothing else frees it here. The daemon calls KLOAD_END on its way
+	 * out, which covers a run that finishes -- but not one that is killed,
+	 * and reload-driver.sh kills the daemon by name every time it swaps the
+	 * driver. Windows does not reclaim MmAllocateContiguousMemory when a
+	 * driver unloads; that is the driver's job, and this driver was not
+	 * doing it. So every reload after a killed run stranded the guest's
+	 * whole memory -- 128 MB in four blocks -- until the machine rebooted.
+	 *
+	 * It does not announce itself as a leak, either. The symptom is that
+	 * contiguous allocation starts failing while the host still reports
+	 * gigabytes free, because what was lost is not the quantity, it is the
+	 * unbroken runs: each stranded block pins a region and the space
+	 * between them stops being large enough for the image.
+	 *
+	 * First, because co_kload_free() destroys an address space through the
+	 * arch layer and reads page tables through the manager, both of which
+	 * are torn down below.
+	 */
+	if (manager->state >= CO_MANAGER_STATE_INITIALIZED)
+		co_kload_free(manager);
+
 	if (manager->state >= CO_MANAGER_STATE_INITIALIZED) {
 		co_manager_free_reversed_pfns(manager);
 		co_os_mutex_destroy(manager->lock);
