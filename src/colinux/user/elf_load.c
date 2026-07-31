@@ -846,6 +846,33 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 */
 		b.batch        = batch ? batch : 256;
 
+		/*
+		 * The kernel's own page tables, init_top_pgt first. The host
+		 * relocates them to where the image really is and switches the
+		 * guest into them: the kernel walks and edits these directly,
+		 * and a space the host invented is not one it can work in.
+		 */
+		{
+			static const char* const tnames[] = {
+				"init_top_pgt", "level3_kernel_pgt",
+				"level2_kernel_pgt", "level2_fixmap_pgt",
+				"level1_fixmap_pgt", NULL
+			};
+			int t;
+
+			b.kernel_table_count = 0;
+			for (t = 0; tnames[t]; t++) {
+				co_elf_symbol_t* sym = co_get_symbol_by_name(pl, tnames[t]);
+
+				if (!sym) {
+					co_terminal_print("\n  %s not found\n", tnames[t]);
+					goto out_end;
+				}
+				b.kernel_tables[b.kernel_table_count++] =
+					co_elf_get_symbol_value(sym);
+			}
+		}
+
 		co_terminal_print("\n  booting:\n");
 		co_terminal_print("    stopping after %d world switches%s\n",
 				  b.max_switches,

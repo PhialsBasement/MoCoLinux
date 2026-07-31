@@ -328,6 +328,14 @@ typedef struct {
 	int		   max_switches;
 	int		   step;
 	int		   batch;
+	/*
+	 * The kernel's own statically linked page tables, init_top_pgt first.
+	 * The host relocates them to where the image really is and switches the
+	 * guest into them, because the kernel walks and edits these directly --
+	 * early_ioremap_init follows the chain down to install the fixmap.
+	 */
+	unsigned long long kernel_tables[8];
+	int		   kernel_table_count;
 	/* out */
 	unsigned long long guest_cr3;
 	unsigned long	   tables;

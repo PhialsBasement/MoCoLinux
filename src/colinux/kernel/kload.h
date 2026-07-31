@@ -24,6 +24,17 @@ extern unsigned long long co_kload_usable_bytes(void);
 extern co_rc_t		  co_kload_table_frame(co_manager_t* manager, co_pfn_t* pfn_out);
 extern void*		  co_kload_frame_va(co_pfn_t pfn);
 
+/*
+ * Relocate the kernel's statically linked page tables to where the image
+ * actually is, graft the host's own mappings into the top level, and return the
+ * CR3 that puts the guest into the address space it was built to expect.
+ * table_va[0] must be init_top_pgt.
+ */
+extern co_rc_t co_kload_adopt_kernel_tables(co_manager_t* manager,
+					    const unsigned long long* table_va,
+					    int table_count,
+					    unsigned long long* cr3_out);
+
 extern co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 			      unsigned long long max_va);
 extern co_rc_t co_kload_chunk(co_manager_t* manager, unsigned long long va,

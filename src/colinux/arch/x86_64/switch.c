@@ -42,6 +42,7 @@
 #include <colinux/arch/switch.h>
 #include <colinux/arch/state.h>
 #include <colinux/arch/space.h>
+#include <colinux/kernel/kload.h>
 
 #include "mmu.h"
 #include "utils.h"
@@ -1947,7 +1948,7 @@ co_rc_t co_arch_enter_loaded(co_manager_t* manager, co_arch_guest_space_t* space
 	co_arch_passage_page_t* pp;
 	co_switch_full_fn fn;
 	unsigned long long* sentinel;
-	unsigned long long stack_va = 0xffffffff90000000ULL;
+	unsigned long long stack_va = 0xffff908000000000ULL;
 	co_pfn_t stack_pfn = 0;
 	co_pa_t entry_pa = 0;
 	unsigned char* p;
@@ -2164,7 +2165,7 @@ co_rc_t co_arch_test_kernel_code(co_manager_t* manager, co_arch_guest_space_t* s
 	co_arch_passage_page_t* pp;
 	co_arch_switch_test_t setup = {0, };
 	co_switch_full_fn fn;
-	unsigned long long stack_va = 0xffffffff90000000ULL;
+	unsigned long long stack_va = 0xffff908000000000ULL;
 	co_pfn_t stack_pfn = 0, scratch_pfn = 0;
 	unsigned char* p;
 	int pages = sizeof(co_arch_passage_page_t) / CO_ARCH_PAGE_SIZE;
@@ -2624,7 +2625,19 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	co_arch_switch_test_t setup = {0, };
 	co_switch_full_fn fn;
 	struct co_console_ring* ring;
-	unsigned long long ring_va, stack_va = 0xffffffff90000000ULL;
+	/*
+	 * The guest's boot stack, in a PML4 slot of its own.
+	 *
+	 * It used to sit at 0xffffffff90000000, which shares the top-level slot
+	 * with the kernel image -- fine while the host owned the whole address
+	 * space, fatal once the guest is switched into the kernel's own tables:
+	 * that slot then belongs to level3_kernel_pgt, which maps the image and
+	 * nothing else, and the stack vanished under the first push.
+	 *
+	 * 0xffff908000000000 is in the 118 TB the host does not use, measured by
+	 * the PML4 sweep, and in a slot nothing else claims.
+	 */
+	unsigned long long ring_va, stack_va = 0xffff908000000000ULL;
 	co_pfn_t stack_pfn = 0;
 	int pages = sizeof(co_arch_passage_page_t) / CO_ARCH_PAGE_SIZE;
 	int page, n;
@@ -2695,6 +2708,28 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	}
 
 	pp->linuxvm_state.cr3 = co_arch_guest_space_root(space);
+
+	/*
+	 * Switch into the kernel's own address space, if it gave us one.
+	 *
+	 * The space the host built got the guest as far as running; it cannot
+	 * get it further, because the kernel walks and edits the tables it was
+	 * linked with and finds the host's arrangement instead. Adopting them
+	 * relocates those tables to where the image actually is and grafts the
+	 * host's mappings -- the direct map, and the passage page this very code
+	 * is executing from -- into the top level.
+	 */
+	if (in->kernel_table_count > 0) {
+		unsigned long long kcr3 = 0;
+
+		rc = co_kload_adopt_kernel_tables(manager, in->kernel_tables,
+						  in->kernel_table_count, &kcr3);
+		if (!CO_OK(rc)) {
+			co_debug_error("boot: could not adopt the kernel's page tables");
+			goto out_free_stack;
+		}
+		pp->linuxvm_state.cr3 = kcr3;
+	}
 	pp->params[19]        = (unsigned long long)(size_t)pp->code;
 
 	/*
