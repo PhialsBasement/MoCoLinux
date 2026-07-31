@@ -171,6 +171,9 @@ asm(".text                                          \n"
 #define CO_PP_CALL_ARG1		"0x978"
 #define CO_PP_CALL_ARG2		"0x980"
 #define CO_PP_CALL_RET		"0x988"
+#define CO_PP_CALL_ARG3		"0x990"
+#define CO_PP_CALL_ARG4		"0x998"
+#define CO_PP_CALL_ARG5		"0x9a0"
 #define CO_PP_CALL_TARGET_N	0x968
 #define CO_PP_CALL_RET_N	0x988
 
@@ -438,9 +441,23 @@ asm(".text                                                          \n"
     "    mov " CO_PP_CALL_ARG0 "(%rax), %rdi                        \n"
     "    mov " CO_PP_CALL_ARG1 "(%rax), %rsi                        \n"
     "    mov " CO_PP_CALL_ARG2 "(%rax), %rdx                        \n"
+    "    mov " CO_PP_CALL_ARG3 "(%rax), %rcx                        \n"
     "    mov " CO_PP_CALL_TARGET "(%rax), %r10                      \n"
     "    lea co_call_return(%rip), %r11                             \n"
     "    push %r11                  /* the callee's return address */\n"
+    /*
+     * r8 and r9 last, because rax is still the passage page pointer until now
+     * and r8 is where the fourth argument goes.
+     */
+    "    mov " CO_PP_CALL_ARG4 "(%rax), %r8                         \n"
+    "    mov " CO_PP_CALL_ARG5 "(%rax), %r9                         \n"
+    /*
+     * SysV requires al to hold the number of vector registers used when calling
+     * a variadic function. snprintf is variadic and reads it; leaving whatever
+     * happened to be in rax makes it save up to eight XMM registers to a stack
+     * area we never reserved.
+     */
+    "    xor %eax, %eax                                             \n"
     "    jmp *%r10                                                  \n"
     ".globl co_call_return                                          \n"
     "co_call_return:                                                \n"
@@ -1580,13 +1597,17 @@ static co_rc_t co_call_loaded_once(co_manager_t* manager, co_arch_passage_page_t
 				   co_switch_full_fn fn, unsigned long long stack_va,
 				   unsigned long long target,
 				   unsigned long long a0, unsigned long long a1,
-				   unsigned long long a2, unsigned long long* ret)
+				   unsigned long long a2, unsigned long long a3,
+				   unsigned long long a4, unsigned long long* ret)
 {
 	pp->params[20] = target;
 	pp->params[21] = a0;
 	pp->params[22] = a1;
 	pp->params[23] = a2;
 	pp->params[24] = 0;
+	pp->params[25] = a3;
+	pp->params[26] = a4;
+	pp->params[27] = 0;
 
 	/*
 	 * Both have to be reset before every call. The outbound switch overwrites
@@ -1616,6 +1637,7 @@ static co_rc_t co_call_loaded_once(co_manager_t* manager, co_arch_passage_page_t
 co_rc_t co_arch_test_kernel_code(co_manager_t* manager, co_arch_guest_space_t* space,
 				 unsigned long long memset_va,
 				 unsigned long long strlen_va,
+				 unsigned long long snprintf_va,
 				 co_arch_kcall_test_t* out)
 {
 	co_arch_passage_page_t* pp;
@@ -1682,7 +1704,7 @@ co_rc_t co_arch_test_kernel_code(co_manager_t* manager, co_arch_guest_space_t* s
 	out->memset_va = memset_va;
 	rc = co_call_loaded_once(manager, pp, fn, stack_va, memset_va,
 				 CO_TEST_SCRATCH, CO_TEST_PATTERN, CO_ARCH_PAGE_SIZE,
-				 &out->memset_ret);
+				 0, 0, &out->memset_ret);
 	if (!CO_OK(rc)) {
 		out->faulted   = (int)pp->params[4];
 		out->vector    = pp->params[16];
@@ -1714,7 +1736,7 @@ co_rc_t co_arch_test_kernel_code(co_manager_t* manager, co_arch_guest_space_t* s
 	/* --- strlen(scratch) --- */
 	out->strlen_va = strlen_va;
 	rc = co_call_loaded_once(manager, pp, fn, stack_va, strlen_va,
-				 CO_TEST_SCRATCH, 0, 0, &out->strlen_ret);
+				 CO_TEST_SCRATCH, 0, 0, 0, 0, &out->strlen_ret);
 	if (!CO_OK(rc)) {
 		out->faulted   = (int)pp->params[4];
 		out->vector    = pp->params[16];
@@ -1725,9 +1747,76 @@ co_rc_t co_arch_test_kernel_code(co_manager_t* manager, co_arch_guest_space_t* s
 
 	out->strlen_expected = sizeof(CO_TEST_STRING) - 1;
 
+	/*
+	 * --- snprintf, which is the point of the exercise ---
+	 *
+	 * memset and strlen are byte loops. vsnprintf is the kernel's whole
+	 * formatting engine: parsing, width and precision, integer conversion,
+	 * lookup tables. If it runs, most of the kernel's non-stateful code runs,
+	 * and printk is built directly on it -- so testing it on its own means
+	 * that when output later comes out wrong we already know the formatter
+	 * is not the reason.
+	 *
+	 * No %p. That path hashes pointers with a key a workqueue initialises,
+	 * and nothing here has initialised anything.
+	 */
+	if (snprintf_va) {
+		static const char fmt[] = "colinux: %s, %d-bit, ok";
+		static const char arg[] = "x86-64";
+		static const char want[] = "colinux: x86-64, 64-bit, ok";
+		unsigned long long fmt_va = CO_TEST_SCRATCH + 0x800;
+		unsigned long long arg_va = CO_TEST_SCRATCH + 0x900;
+		int n;
+
+		p = co_os_map(manager, scratch_pfn);
+		if (p == NULL) {
+			rc = CO_RC(ERROR);
+			goto out_free_scratch;
+		}
+		co_memset(p, 0, 0x400);
+		co_memcpy(p + 0x800, fmt, sizeof(fmt));
+		co_memcpy(p + 0x900, arg, sizeof(arg));
+		co_os_unmap(manager, p, scratch_pfn);
+
+		out->snprintf_va = snprintf_va;
+		rc = co_call_loaded_once(manager, pp, fn, stack_va, snprintf_va,
+					 CO_TEST_SCRATCH, 256, fmt_va,
+					 arg_va, 64, &out->snprintf_ret);
+		if (!CO_OK(rc)) {
+			out->faulted   = (int)pp->params[4];
+			out->vector    = pp->params[16];
+			out->fault_rip = pp->params[5];
+			out->cr2       = pp->params[18];
+			goto out_free_scratch;
+		}
+
+		/* Read what the kernel formatted, out of the guest's own memory. */
+		p = co_os_map(manager, scratch_pfn);
+		if (p == NULL) {
+			rc = CO_RC(ERROR);
+			goto out_free_scratch;
+		}
+		for (n = 0; n < (int)sizeof(out->text) - 1 && p[n]; n++)
+			out->text[n] = p[n];
+		out->text[n] = 0;
+		co_os_unmap(manager, p, scratch_pfn);
+
+		out->snprintf_expected = sizeof(want) - 1;
+		out->text_ok = PTRUE;
+		for (n = 0; n < (int)sizeof(want) - 1; n++) {
+			if (out->text[n] != want[n]) {
+				out->text_ok = PFALSE;
+				break;
+			}
+		}
+	}
+
 	out->succeeded = (out->pattern_ok &&
 			  out->memset_ret == CO_TEST_SCRATCH &&
-			  out->strlen_ret == out->strlen_expected) ? PTRUE : PFALSE;
+			  out->strlen_ret == out->strlen_expected &&
+			  (!snprintf_va || (out->text_ok &&
+					    out->snprintf_ret == out->snprintf_expected)))
+			 ? PTRUE : PFALSE;
 
 	rc = CO_RC(OK);
 

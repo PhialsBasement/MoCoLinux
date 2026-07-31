@@ -80,7 +80,12 @@ typedef struct {
 	unsigned long long memset_ret;
 	unsigned long long strlen_ret;
 	unsigned long long strlen_expected;
+	unsigned long long snprintf_va;
+	unsigned long long snprintf_ret;
+	unsigned long long snprintf_expected;
 	int		   pattern_ok;
+	int		   text_ok;
+	char		   text[128];
 	int		   first_bad;
 	int		   first_bad_byte;
 	int		   faulted;
@@ -94,6 +99,7 @@ extern co_rc_t co_arch_test_kernel_code(co_manager_t* manager,
 					struct co_arch_guest_space* space,
 					unsigned long long memset_va,
 					unsigned long long strlen_va,
+					unsigned long long snprintf_va,
 					co_arch_kcall_test_t* out);
 
 /* Enter an address space that already holds a loaded kernel image. */
