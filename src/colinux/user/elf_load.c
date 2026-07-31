@@ -709,8 +709,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		m.text_va   = co_elf_get_symbol_value(s_text);
 		m.end_va    = co_elf_get_symbol_value(s_end);
 
-		co_terminal_print("\n  giving the guest %llu MB of RAM and a linear map at\n",
-				  ram >> 20);
+		co_terminal_print("\n  giving the guest RAM and a linear map at\n");
 		co_terminal_print("  PAGE_OFFSET, with the image visible at both its link\n");
 		co_terminal_print("  addresses and its physical ones\n");
 
@@ -755,7 +754,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		bp[0x1e8] = 2;					/* e820_entries */
 		co_e820_entry(bp + 0x2d0 +  0, m.block_pa, m.usable_bytes, 1);
 		co_e820_entry(bp + 0x2d0 + 20, m.block_pa + m.usable_bytes,
-			      ram - m.usable_bytes, 2);	/* reserved: page tables */
+			      m.block_bytes - m.usable_bytes, 2);
 
 		rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_bp),
 					    bp, sizeof(bp), 0);
@@ -802,9 +801,13 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			co_terminal_print("    phys_base = 0x%llx\n", m.block_pa);
 		}
 
-		co_terminal_print("    e820: 0x%llx-0x%llx usable, 0x%llx-0x%llx reserved\n",
+		co_terminal_print("    e820: 0x%llx-0x%llx usable (%llu MB),"
+				  " 0x%llx-0x%llx reserved (%llu MB)\n",
 				  m.block_pa, m.block_pa + m.usable_bytes,
-				  m.block_pa + m.usable_bytes, m.block_pa + ram);
+				  m.usable_bytes >> 20,
+				  m.block_pa + m.usable_bytes,
+				  m.block_pa + m.block_bytes,
+				  (m.block_bytes - m.usable_bytes) >> 20);
 		co_terminal_print("    cmdline: %s\n", cmdline);
 
 		b.entry_va           = addr[0];
