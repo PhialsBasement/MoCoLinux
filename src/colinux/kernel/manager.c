@@ -646,6 +646,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.early_console_va   = params->early_console_va;
 		in.colinux_console_va = params->colinux_console_va;
 		in.ring_symbol_va     = params->ring_symbol_va;
+		in.guest_flag_va      = params->guest_flag_va;
+		in.step               = params->step;
 		in.max_switches       = params->max_switches ? params->max_switches : 4096;
 
 		co_memset(params, 0, sizeof(*params));
@@ -667,6 +669,9 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->unforwardable	 = result.unforwardable;
 		params->switches	 = result.switches;
 		params->interrupts	 = result.interrupts;
+		params->steps		 = result.steps;
+		params->trace_next	 = result.trace_next;
+		co_memcpy(params->trace, result.trace, sizeof(params->trace));
 		params->vector		 = result.vector;
 		params->fault_rip	 = result.fault_rip;
 		params->error_code	 = result.error_code;

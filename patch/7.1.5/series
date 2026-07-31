@@ -1,2 +1,3 @@
 early-console.diff
+keep-host-idt.diff
 head64-entry.diff

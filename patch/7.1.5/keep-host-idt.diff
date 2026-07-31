@@ -1,0 +1,83 @@
+Keep the host's interrupt table while bringing a guest up.
+
+The host installs an IDT whose every vector lands on a stub that records what
+happened and hands control back, on an IST stack so even a destroyed stack
+pointer is survivable. The kernel replacing it during early boot removes the
+only thing able to report a fault, at exactly the point where faults are
+expected -- and a fault whose handler is not ready is a double fault, then a
+triple fault, which resets the machine the guest is a process inside.
+
+Gated on co_colinux_guest, which the host sets before the guest runs, so a
+kernel booted on real hardware is unaffected.
+
+A guest that actually works will want its own traps eventually. That decision
+belongs after the kernel can survive taking one.
+
+--- a/arch/x86/kernel/idt.c
++++ b/arch/x86/kernel/idt.c
+@@ -3,6 +3,7 @@
+  * Interrupt descriptor table related code
+  */
+ #include <linux/interrupt.h>
++#include <linux/console.h>	/* co_colinux_guest */
+ 
+ #include <asm/cpu_entry_area.h>
+ #include <asm/set_memory.h>
+@@ -222,8 +223,27 @@
+  * before cpu_init() is invoked and sets up TSS. The IST variants are
+  * installed after that.
+  */
++/*
++ * Cooperative Linux keeps the host's interrupt table.
++ *
++ * The host installs an IDT whose every vector lands on a stub that records what
++ * happened and hands control back, on an IST stack so that even a destroyed
++ * stack pointer is survivable. Replacing it with the kernel's own during early
++ * boot removes the only thing able to report a fault, at exactly the point
++ * where faults are expected -- and a fault whose handler is not ready is a
++ * double fault, and then a triple fault, which resets the machine the guest is
++ * a process inside.
++ *
++ * So while bringing a guest up, these are left alone. The kernel runs on the
++ * host's stubs, every exception is reported, and nothing can escalate. A guest
++ * that is actually working will want its own traps eventually; that is a later
++ * decision, and it belongs after the kernel can survive taking one.
++ */
+ void __init idt_setup_early_traps(void)
+ {
++	if (co_colinux_guest)
++		return;
++
+ 	idt_setup_from_table(idt_table, early_idts, ARRAY_SIZE(early_idts),
+ 			     true);
+ 	load_idt(&idt_descr);
+@@ -234,6 +254,9 @@
+  */
+ void __init idt_setup_traps(void)
+ {
++	if (co_colinux_guest)
++		return;
++
+ 	idt_setup_from_table(idt_table, def_idts, ARRAY_SIZE(def_idts), true);
+ 
+ 	if (ia32_enabled())
+@@ -263,6 +286,9 @@
+  */
+ void __init idt_setup_early_pf(void)
+ {
++	if (co_colinux_guest)
++		return;
++
+ 	idt_setup_from_table(idt_table, early_pf_idts,
+ 			     ARRAY_SIZE(early_pf_idts), true);
+ }
+@@ -293,6 +319,9 @@
+  */
+ void __init idt_setup_apic_and_irq_gates(void)
+ {
++	if (co_colinux_guest)
++		return;
++
+ 	int i = FIRST_EXTERNAL_VECTOR;
+ 	void *entry;
+ 
