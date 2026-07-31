@@ -187,6 +187,21 @@ asm(".text                                          \n"
  */
 #define CO_PP_GUEST_FRAME	"0x9a8"
 #define CO_PP_GUEST_FRAME_N	0x9a8
+
+/*
+ * params[29]: run the guest one instruction at a time.
+ *
+ * Only three things can take control away from a guest running with interrupts
+ * disabled -- an exception, an NMI, or the trap flag. start_kernel disables
+ * interrupts almost immediately and leaves them off through the whole of
+ * setup_arch, so the interrupt path bounds nothing during exactly the stretch
+ * that matters. TF does: the CPU raises #DB after every instruction whether or
+ * not IF is set, the guest's own IDT sends that to a stub, and the host gets
+ * control back. Slow, and unhangeable, which is the trade worth making while
+ * finding out where a kernel dies.
+ */
+#define CO_PP_STEP		"0x9b0"
+#define CO_PP_STEP_N		0x9b0
 #define CO_PP_CALL_TARGET_N	0x968
 #define CO_PP_CALL_RET_N	0x988
 
@@ -522,7 +537,16 @@ asm(".text                                                          \n"
     "    and $-4096, %rax                                           \n"
     "    mov " CO_PP_CALL_TARGET "(%rax), %r10                      \n"
     "    sti                                                        \n"
-    "    jmp *%r10                                                  \n"
+    "    cmpq $0, " CO_PP_STEP "(%rax)                              \n"
+    "    je 4f                                                      \n"
+    /*
+     * Set TF last. Every instruction after this one traps, so anything between
+     * here and the jump would cost a world switch for nothing.
+     */
+    "    pushfq                                                     \n"
+    "    orq $0x100, (%rsp)                                         \n"
+    "    popfq                                                      \n"
+    "4:  jmp *%r10                                                  \n"
     ".globl co_call_shim                                            \n"
     "co_call_shim:                                                  \n"
     "    lea 0(%rip), %rax                                          \n"
@@ -779,7 +803,8 @@ typedef char co_assert_fault_slots
 	  CO_PP_SWITCH_ENTRY_N - __builtin_offsetof(co_arch_passage_page_t, params) == 0x98 &&
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 20 * 8 == CO_PP_CALL_TARGET_N &&
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 24 * 8 == CO_PP_CALL_RET_N &&
-	  __builtin_offsetof(co_arch_passage_page_t, params) + 28 * 8 == CO_PP_GUEST_FRAME_N)
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 28 * 8 == CO_PP_GUEST_FRAME_N &&
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 29 * 8 == CO_PP_STEP_N)
 	 ? 1 : -1];
 
 /* The blob reaches gdt.base by literal offset; keep it honest. */
@@ -2165,7 +2190,9 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	    !CO_OK(co_write_guest_u64(manager, space, in->early_console_va,
 				      in->colinux_console_va)) ||
 	    !CO_OK(co_write_guest_u64(manager, space, in->initial_code_va,
-				      in->start_kernel_va))) {
+				      in->start_kernel_va)) ||
+	    (in->guest_flag_va &&
+	     !CO_OK(co_write_guest_u64(manager, space, in->guest_flag_va, 1)))) {
 		co_debug_error("could not write the boot globals");
 		rc = CO_RC(ERROR);
 		goto out_free_stack;
@@ -2179,6 +2206,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	 * and point it at the kernel's entry.
 	 */
 	pp->params[20] = in->entry_va;
+	pp->params[29] = in->step ? 1 : 0;
 	pp->linuxvm_state.return_rip = (unsigned long long)(size_t)pp->code
 		+ (unsigned long)(&co_boot_shim - &co_switch_full);
 	pp->linuxvm_state.rsp = stack_va + CO_ARCH_PAGE_SIZE - 0x40;
@@ -2241,6 +2269,24 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			out->fault_rip  = pp->params[5];
 			out->error_code = pp->params[17];
 			out->cr2        = pp->params[18];
+
+			/*
+			 * #DB with stepping on is not a fault, it is the guest
+			 * having executed one instruction. Record where it was and
+			 * put it straight back. The trace is a ring of the last few
+			 * addresses, which is what tells you where a kernel stopped
+			 * when the answer is "it stopped" rather than "it faulted".
+			 */
+			if (in->step && out->vector == 1) {
+				out->steps++;
+				out->trace[out->trace_next & (CO_BOOT_TRACE - 1)] =
+					out->fault_rip;
+				out->trace_next++;
+
+				pp->linuxvm_state.return_rip = resume_rip;
+				pp->linuxvm_state.rsp        = ist_top - 0x200;
+				continue;
+			}
 
 			if (out->vector < 32) {
 				out->faulted = PTRUE;

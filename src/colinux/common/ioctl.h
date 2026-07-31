@@ -314,7 +314,9 @@ typedef struct {
 	unsigned long long early_console_va;
 	unsigned long long colinux_console_va;
 	unsigned long long ring_symbol_va;
+	unsigned long long guest_flag_va;
 	int		   max_switches;
+	int		   step;
 	/* out */
 	unsigned long long guest_cr3;
 	unsigned long	   tables;
@@ -328,6 +330,9 @@ typedef struct {
 	int		   unforwardable;
 	unsigned long	   switches;
 	unsigned long	   interrupts;
+	unsigned long	   steps;
+	unsigned long	   trace_next;
+	unsigned long long trace[16];
 	unsigned long long vector;
 	unsigned long long fault_rip;
 	unsigned long long error_code;

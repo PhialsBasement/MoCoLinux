@@ -671,8 +671,9 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 		static const char* want[] = { "co_arch_start_kernel", "initial_code",
 					      "start_kernel", "early_console",
 					      "early_colinux_console",
-					      "co_colinux_console_ring", NULL };
-		unsigned long long addr[6];
+					      "co_colinux_console_ring",
+					      "co_colinux_guest", NULL };
+		unsigned long long addr[7];
 		int i;
 
 		for (i = 0; want[i]; i++) {
@@ -766,12 +767,18 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 		b.early_console_va   = addr[3];
 		b.colinux_console_va = addr[4];
 		b.ring_symbol_va     = addr[5];
+		b.guest_flag_va      = addr[6];
+		/*
+		 * Stepped, always, for now. The guest runs with interrupts disabled
+		 * through all of setup_arch, so nothing else can take control back
+		 * from it, and an unbounded guest takes the host with it.
+		 */
+		b.step         = 1;
+		b.max_switches = 200000;
 
 		co_terminal_print("\n  booting:\n");
 		for (i = 0; want[i]; i++)
 			co_terminal_print("    %-24s 0x%016llx\n", want[i], addr[i]);
-
-		b.max_switches = 4096;
 
 		co_terminal_print("\n  entering co_arch_start_kernel with interrupts enabled,\n");
 		co_terminal_print("  initial_code pointed at start_kernel, the early console\n");
@@ -790,9 +797,19 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 
 		co_terminal_print("  guest cr3 0x%016llx, %lu table pages, preflight %d ok\n",
 				  b.guest_cr3, b.tables, b.preflight_checked);
-		co_terminal_print("  %lu world switches, %lu host interrupts forwarded%s\n",
-				  b.switches, b.interrupts,
-				  b.hit_limit ? "  (hit the switch limit)" : "");
+		co_terminal_print("  %lu world switches, %lu instructions stepped, %lu interrupts%s\n",
+				  b.switches, b.steps, b.interrupts,
+				  b.hit_limit ? "  (hit the limit)" : "");
+		if (b.steps) {
+			unsigned long i, n = (b.trace_next < 16) ? b.trace_next : 16;
+
+			co_terminal_print("\n  last instruction addresses:\n");
+			for (i = 0; i < n; i++) {
+				unsigned long idx = (b.trace_next - n + i) & 15;
+
+				co_terminal_print("    %2lu  0x%016llx\n", i, b.trace[idx]);
+			}
+		}
 		co_terminal_print("\n");
 		co_terminal_print("  ---------------- what the kernel printed ----------------\n");
 		if (b.console_written == 0)

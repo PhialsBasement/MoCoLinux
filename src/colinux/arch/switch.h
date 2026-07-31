@@ -118,6 +118,8 @@ extern co_rc_t co_arch_test_kernel_code(co_manager_t* manager,
  */
 extern bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long vector);
 
+#define CO_BOOT_TRACE 16	/* power of two: the loop masks with it */
+
 /* Booting the loaded kernel: enter co_arch_start_kernel and see how far it gets. */
 typedef struct {
 	unsigned long long entry_va;
@@ -126,7 +128,9 @@ typedef struct {
 	unsigned long long early_console_va;
 	unsigned long long colinux_console_va;
 	unsigned long long ring_symbol_va;
+	unsigned long long guest_flag_va;
 	int		   max_switches;
+	int		   step;
 } co_arch_boot_t;
 
 typedef struct {
@@ -144,6 +148,9 @@ typedef struct {
 	int		   unforwardable;
 	unsigned long	   switches;
 	unsigned long	   interrupts;
+	unsigned long	   steps;
+	unsigned long	   trace_next;
+	unsigned long long trace[CO_BOOT_TRACE];
 	unsigned long long vector;
 	unsigned long long fault_rip;
 	unsigned long long error_code;
