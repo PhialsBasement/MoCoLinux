@@ -131,6 +131,12 @@ typedef struct {
 	unsigned long long guest_flag_va;
 	int		   max_switches;
 	int		   step;
+	/*
+	 * Instructions the guest's own trap stub may step through before it
+	 * has to hand the processor back. 0 keeps the old behaviour of one
+	 * world switch per instruction.
+	 */
+	int		   batch;
 } co_arch_boot_t;
 
 typedef struct {

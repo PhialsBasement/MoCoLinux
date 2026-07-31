@@ -317,6 +317,7 @@ typedef struct {
 	unsigned long long guest_flag_va;
 	int		   max_switches;
 	int		   step;
+	int		   batch;
 	/* out */
 	unsigned long long guest_cr3;
 	unsigned long	   tables;

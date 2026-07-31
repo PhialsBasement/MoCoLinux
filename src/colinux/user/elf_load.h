@@ -43,7 +43,8 @@ extern co_rc_t co_elf_dump(const char *filename);
  * to stop first and report, which is the only diagnostic that survives a reset.
  */
 extern co_rc_t co_elf_load_into_guest(const char *filename, int enter,
-				      unsigned long max_switches);
+				      unsigned long max_switches,
+				      unsigned long batch);
 extern co_elf_symbol_t *co_get_symbol_by_name(co_elf_data_t *pl, const char *name);
 extern void *co_elf_get_symbol_data(co_elf_data_t *pl, co_elf_symbol_t *symbol);
 extern co_elf_addr_t co_elf_get_symbol_value(co_elf_symbol_t *symbol);

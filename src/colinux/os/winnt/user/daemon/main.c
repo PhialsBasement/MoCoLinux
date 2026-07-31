@@ -91,6 +91,27 @@ static BOOL WINAPI co_winnt_daemon_ctrl_handler(DWORD dwCtrlType)
 	return FALSE;
 }
 
+/*
+ * A positive decimal count from the command line, or false.
+ *
+ * Two options want one and neither wants a partial answer: a mistyped digit
+ * silently becoming a smaller number would change what a run means without
+ * saying so.
+ */
+static bool_t co_parse_count(const char* s, unsigned long* out)
+{
+	unsigned long v = 0;
+
+	while (*s >= '0' && *s <= '9')
+		v = v * 10 + (unsigned long)(*s++ - '0');
+
+	if (*s || !v)
+		return PFALSE;
+
+	*out = v;
+	return PTRUE;
+}
+
 co_rc_t co_winnt_daemon_main(co_start_parameters_t* start_parameters)
 {
 	co_rc_t rc;
@@ -236,32 +257,34 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 	}
 
 	if (winnt_parameters.boot_kernel) {
-		unsigned long limit = 0;
+		unsigned long limit = 0, batch = 0;
 
-		if (winnt_parameters.max_switches) {
-			const char* p = winnt_parameters.max_switches_arg;
-
-			while (*p >= '0' && *p <= '9')
-				limit = limit * 10 + (unsigned long)(*p++ - '0');
-			if (*p || !limit) {
-				co_terminal_print("--max-switches wants a positive decimal count\n");
-				return CO_RC(INVALID_PARAMETER);
-			}
+		if (winnt_parameters.max_switches &&
+		    !co_parse_count(winnt_parameters.max_switches_arg, &limit)) {
+			co_terminal_print("--max-switches wants a positive decimal count\n");
+			return CO_RC(INVALID_PARAMETER);
 		}
 
-		return co_elf_load_into_guest(winnt_parameters.boot_kernel_arg, 3, limit);
+		if (winnt_parameters.batch &&
+		    !co_parse_count(winnt_parameters.batch_arg, &batch)) {
+			co_terminal_print("--batch wants a positive decimal count\n");
+			return CO_RC(INVALID_PARAMETER);
+		}
+
+		return co_elf_load_into_guest(winnt_parameters.boot_kernel_arg, 3,
+					      limit, batch);
 	}
 
 	if (winnt_parameters.call_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0);
+		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0, 0);
 	}
 
 	if (winnt_parameters.enter_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0);
+		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0, 0);
 	}
 
 	if (winnt_parameters.load_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0);
+		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0);
 	}
 
 	if (winnt_parameters.dump_vmlinux) {

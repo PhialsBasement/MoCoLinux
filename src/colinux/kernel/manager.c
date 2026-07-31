@@ -59,7 +59,23 @@ co_rc_t co_manager_load(co_manager_t *manager)
 	co_memset(manager, 0, sizeof(*manager));
 
 	co_debug_startup();
-	co_debug("loaded to host kernel");
+	/*
+	 * Which build of the driver is actually resident.
+	 *
+	 * Uploading a new linux.sys and reinstalling the service does not
+	 * guarantee the new image is the one running: while any handle is still
+	 * open, `sc delete` only marks the service for deletion and the loaded
+	 * image stays where it is, so the next install quietly reuses it. That
+	 * produced an hour of nonsense -- a daemon and a driver built minutes
+	 * apart, disagreeing about the layout of the struct they pass to each
+	 * other, so every field the daemon printed was read from the wrong
+	 * offset and the guest's CR3 came back as 0x5d.
+	 *
+	 * This line is the first thing in the log after a load. If it does not
+	 * match the build that was just deployed, nothing else in the log is
+	 * about the code that was just written.
+	 */
+	co_debug("loaded to host kernel, built " __DATE__ " " __TIME__);
 
 	co_list_init(&manager->opens);
 	co_list_init(&manager->monitors);
@@ -660,6 +676,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.ring_symbol_va     = params->ring_symbol_va;
 		in.guest_flag_va      = params->guest_flag_va;
 		in.step               = params->step;
+		in.batch              = params->batch;
 		in.max_switches       = params->max_switches ? params->max_switches : 4096;
 
 		co_memset(params, 0, sizeof(*params));

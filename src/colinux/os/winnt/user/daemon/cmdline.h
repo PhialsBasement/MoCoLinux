@@ -37,6 +37,14 @@ typedef struct co_winnt_parameters {
 	 */
 	bool_t max_switches;
 	char   max_switches_arg[0x20];
+	/*
+	 * Instructions the guest steps per crossing. The default is chosen to
+	 * make stepping cheap; lowering it to 1 restores one world switch per
+	 * instruction, which is the right thing when the question is "which
+	 * instruction" rather than "how far".
+	 */
+	bool_t batch;
+	char   batch_arg[0x20];
 	bool_t call_kernel;
 	char   call_kernel_arg[0x100];
 	bool_t enter_kernel;
