@@ -227,6 +227,44 @@ asm(".text                                          \n"
  */
 #define CO_PP_STEP		"0x9b0"
 #define CO_PP_STEP_N		0x9b0
+
+/*
+ * How many more debug traps the stub may handle by itself before it has to give
+ * the host its turn back. params[30].
+ *
+ * Single-stepping cost one world switch per instruction: two CR3 writes and the
+ * TLB flushes that go with them, fxsave and fxrstor, fourteen MSR operations,
+ * three descriptor table loads -- 3.6us measured, to execute one instruction.
+ * A kernel is not usefully described as running at 280,000 instructions per
+ * second.
+ *
+ * None of that is needed to continue stepping. The trap already lands in the
+ * guest's own address space, on the guest's IST stack, in code the guest maps:
+ * everything required to re-arm the trap flag and go straight back is right
+ * there. So the stub does exactly that, and crosses to the host only when this
+ * counter runs out.
+ *
+ * The counter is what keeps it safe. It is the bound on how long a guest that
+ * cannot be interrupted may run before the host is heard from again, which is
+ * the same guarantee stepping gave -- just amortised. Anything that is not a
+ * debug trap still crosses immediately, so a fault is reported as promptly as
+ * before.
+ */
+#define CO_PP_BATCH		"0x9b8"
+#define CO_PP_BATCH_N		0x9b8
+
+/*
+ * A ring of the last sixteen addresses the guest stepped through, written by
+ * the stub, params[31..46], with the write index in params[47].
+ *
+ * The host used to record this itself, once per crossing. With the crossings
+ * gone it would otherwise see one address in every few thousand, and "where was
+ * it when it stopped" is the question this whole apparatus exists to answer.
+ */
+#define CO_PP_TRACE_N		0x9c0
+#define CO_PP_TRACE		"0x9c0"
+#define CO_PP_TRACE_IDX		"0xa40"
+#define CO_PP_TRACE_IDX_N	0xa40
 #define CO_PP_CALL_TARGET_N	0x968
 #define CO_PP_CALL_RET_N	0x988
 
@@ -608,6 +646,58 @@ asm(".text                                                          \n"
     "    push %r15                                                  \n"
     "    lea 0(%rip), %rax                                          \n"
     "    and $-4096, %rax                                           \n"
+    /*
+     * A debug trap with budget left never leaves the guest.
+     *
+     * Record where it was, put the trap flag back on and interrupts back off in
+     * the frame about to be returned through, and iretq. About twenty
+     * instructions, all of them in the guest's own address space, instead of a
+     * round trip through the host.
+     *
+     * Only #DB is treated this way. Everything else -- a fault, or an interrupt
+     * that got through -- falls into the crossing below and is reported at once,
+     * so nothing is hidden by batching; only stepping is made affordable.
+     *
+     * rax holds the passage page, rdx is free (saved above), and the frame is
+     * at a known offset from rsp because this stub pushed it.
+     */
+    "    cmpq $1, 0x78(%rsp)                                        \n"
+    "    jne 9f                                                     \n"
+    "    cmpq $0, " CO_PP_BATCH "(%rax)                             \n"
+    "    je 9f                                                      \n"
+    "    decq " CO_PP_BATCH "(%rax)                                 \n"
+    /* trace[idx++ & 15] = the address that just executed */
+    "    mov " CO_PP_TRACE_IDX "(%rax), %rdx                        \n"
+    "    mov %rdx, %rcx                                             \n"
+    "    inc %rdx                                                   \n"
+    "    mov %rdx, " CO_PP_TRACE_IDX "(%rax)                        \n"
+    "    and $15, %rcx                                              \n"
+    "    mov 0x88(%rsp), %rdx                                       \n"
+    "    mov %rdx, " CO_PP_TRACE "(%rax,%rcx,8)                     \n"
+    /*
+     * TF on and IF off for the next instruction, for the same reasons the host
+     * did it: the guest may clear either, and neither may be left to it.
+     */
+    "    orq $0x100, 0x98(%rsp)                                     \n"
+    "    andq $-513, 0x98(%rsp)     /* ~0x200: IF */                \n"
+    "    pop %r15                                                   \n"
+    "    pop %r14                                                   \n"
+    "    pop %r13                                                   \n"
+    "    pop %r12                                                   \n"
+    "    pop %r11                                                   \n"
+    "    pop %r10                                                   \n"
+    "    pop %r9                                                    \n"
+    "    pop %r8                                                    \n"
+    "    pop %rbp                                                   \n"
+    "    pop %rdi                                                   \n"
+    "    pop %rsi                                                   \n"
+    "    pop %rdx                                                   \n"
+    "    pop %rcx                                                   \n"
+    "    pop %rbx                                                   \n"
+    "    pop %rax                                                   \n"
+    "    add $0x10, %rsp            /* vector and error code */     \n"
+    "    iretq                                                      \n"
+    "9:                                                             \n"
     "    mov %rsp, " CO_PP_GUEST_FRAME "(%rax)                      \n"
     "    movq $1, " CO_PP_FAULTED "(%rax)                           \n"
     "    mov 0x78(%rsp), %rdx                                       \n"
@@ -1057,8 +1147,19 @@ typedef char co_assert_fault_slots
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 20 * 8 == CO_PP_CALL_TARGET_N &&
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 24 * 8 == CO_PP_CALL_RET_N &&
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 28 * 8 == CO_PP_GUEST_FRAME_N &&
-	  __builtin_offsetof(co_arch_passage_page_t, params) + 29 * 8 == CO_PP_STEP_N)
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 29 * 8 == CO_PP_STEP_N &&
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 30 * 8 == CO_PP_BATCH_N &&
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 31 * 8 == CO_PP_TRACE_N &&
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 47 * 8 == CO_PP_TRACE_IDX_N)
 	 ? 1 : -1];
+
+/*
+ * The trace ring the stub writes must not run off the end of the page it lives
+ * in -- it is addressed from the stub as a literal offset, with no bound beyond
+ * this one.
+ */
+typedef char co_assert_trace_fits
+	[(CO_PP_TRACE_IDX_N + 8 <= 0x1000) ? 1 : -1];
 
 /* The blob reaches gdt.base by literal offset; keep it honest. */
 typedef char co_assert_gdt_base_offset
@@ -2638,6 +2739,17 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	 * host by the time the instruction after it runs, so whatever the machine
 	 * does next, the log says what it was about to do.
 	 */
+	/*
+	 * Which driver build this run came from.
+	 *
+	 * The load-time stamp cannot be relied on: the driver is loaded before
+	 * the debug daemon raises the facility levels, so that record is
+	 * discarded at source. This one is emitted with the levels already up,
+	 * on every run, so a log can always be tied to the code that produced
+	 * it. A stale resident image reading a freshly built daemon's ioctl
+	 * struct at the wrong offsets is not a failure that announces itself.
+	 */
+	co_debug("boot: driver built " __DATE__ " " __TIME__);
 	co_debug("boot: passage page 0x%llx, guest cr3 0x%llx, %ld tables",
 		 (unsigned long long)(size_t)pp, out->guest_cr3, out->tables);
 	co_debug("boot: entry 0x%llx, stack 0x%llx, ring 0x%llx",
@@ -2673,7 +2785,30 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		co_host_snapshot(&host_was);
 
 		for (i = 0; i < in->max_switches; i++) {
+			unsigned long long batch;
+
 			pp->params[4] = 0;		/* faulted */
+
+			/*
+			 * How many instructions the guest may step through on
+			 * its own before it has to come back.
+			 *
+			 * This is the whole speed of the thing. At one world
+			 * switch per instruction it ran at 280,000
+			 * instructions a second; the stub handles a debug trap
+			 * in about twenty instructions without leaving the
+			 * guest, so a batch of this size turns one crossing
+			 * into thousands of executed instructions.
+			 *
+			 * Sized against the thing it is protecting: this is
+			 * how long a guest that cannot be interrupted may hold
+			 * the processor. A few thousand stepped instructions
+			 * is well under a millisecond, which is far less than
+			 * the host would lose to a single page fault.
+			 */
+			batch = (in->step && in->batch > 0)
+				? (unsigned long long)in->batch : 0;
+			pp->params[30] = batch;
 
 			/*
 			 * A progress mark every 64 steps, and the address the
@@ -2700,6 +2835,15 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			fn(&pp->host_state, &pp->linuxvm_state, NULL, 0);
 
 			out->switches++;
+
+			/*
+			 * Everything the stub stepped through without asking.
+			 * The counter it decremented is the only record of it,
+			 * and it has to be collected before the next crossing
+			 * overwrites it.
+			 */
+			if (batch)
+				out->steps += batch - pp->params[30];
 
 			/*
 			 * Before anything else, and before any of the state
@@ -2773,28 +2917,28 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 */
 			if (in->step && out->vector == 1) {
 				out->steps++;
-				out->trace[out->trace_next & (CO_BOOT_TRACE - 1)] =
-					out->fault_rip;
-				out->trace_next++;
 
 				/*
-				 * Every step on a short run, every 64th on a
-				 * long one.
+				 * One line per crossing, not per instruction.
 				 *
-				 * Every 64 is enough to say roughly where a
-				 * runaway happened and cheap enough for a full
-				 * boot, but it is not enough to name the
-				 * instruction: the last record can point at an
-				 * `add` in the middle of a string loop, which
-				 * cannot possibly be what lost control. Once a
-				 * failure has been bracketed, re-running it
-				 * with a short budget logs every instruction,
-				 * and then the last record is the answer
-				 * rather than a hint.
+				 * With the stub stepping thousands of
+				 * instructions between crossings there is no
+				 * longer any question of logging each one, and
+				 * no need: the address here is where the guest
+				 * had got to when its budget ran out, which is
+				 * a progress mark of exactly the right
+				 * granularity. The fine-grained record lives
+				 * in the stub's own ring, collected below.
 				 */
-				if (in->max_switches <= 8192 || out->steps < 8 ||
-				    (out->steps & 0x3f) == 0)
-					co_debug("boot: step %ld at 0x%llx",
+				/*
+				 * Throttled. One record per crossing was fine
+				 * at a hundred crossings and is thousands of
+				 * packets at a realistic budget -- and an
+				 * instrument that scales with the run is an
+				 * instrument that becomes a suspect.
+				 */
+				if (out->switches < 8 || (out->switches & 0x3f) == 0)
+					co_debug("boot: %ld steps, at 0x%llx",
 						 out->steps, out->fault_rip);
 
 				/*
@@ -2893,6 +3037,20 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 
 		if (out->switches >= in->max_switches)
 			out->hit_limit = PTRUE;
+
+		/*
+		 * The stub's ring, which is where the fine-grained trace lives
+		 * now. It records every instruction it stepped, so these are the
+		 * last sixteen the guest executed rather than the last sixteen
+		 * the host happened to see.
+		 */
+		{
+			int t;
+
+			out->trace_next = pp->params[47];
+			for (t = 0; t < CO_BOOT_TRACE; t++)
+				out->trace[t] = pp->params[31 + t];
+		}
 	}
 
 	co_debug("boot: loop ended -- %ld switches, %ld steps, %ld interrupts, "

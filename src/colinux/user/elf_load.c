@@ -374,7 +374,7 @@ static void co_e820_entry(unsigned char* p, unsigned long long addr,
 }
 
 co_rc_t co_elf_load_into_guest(const char* filename, int enter,
-			       unsigned long max_switches)
+			       unsigned long max_switches, unsigned long batch)
 {
 	co_elf_data_t* pl;
 	co_manager_handle_t handle;
@@ -776,11 +776,37 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 */
 		b.step         = 1;
 		b.max_switches = max_switches ? max_switches : 200000;
+		/*
+		 * Instructions per crossing, chosen as a length of time rather
+		 * than a round number.
+		 *
+		 * The guest steps this many before handing the processor back,
+		 * which is what makes stepping affordable: one world switch per
+		 * instruction measured 3.6us and nearly all of it was the
+		 * switch, against about 500ns for a trap handled in the guest.
+		 *
+		 * But the guest runs with interrupts disabled, so the batch is
+		 * also how long the host is deaf on this processor -- and the
+		 * thread is pinned, so it is the same processor every time. At
+		 * 4096 that is two milliseconds per crossing. A hundred
+		 * crossings of it is survivable and four thousand is not: the
+		 * machine stopped responding and needed the power button, with
+		 * the run's own log showing it never completed a single
+		 * crossing.
+		 *
+		 * 256 is about 130us, which is the same order as the latency a
+		 * disk interrupt already imposes, and it costs almost nothing:
+		 * the crossing is 3.6us against 128us of stepping, so 97% of
+		 * the batching win is kept.
+		 */
+		b.batch        = batch ? batch : 256;
 
 		co_terminal_print("\n  booting:\n");
 		co_terminal_print("    stopping after %d world switches%s\n",
 				  b.max_switches,
 				  max_switches ? "  (--max-switches)" : "");
+		co_terminal_print("    %d instructions stepped per crossing%s\n",
+				  b.batch, batch ? "  (--batch)" : "");
 		for (i = 0; want[i]; i++)
 			co_terminal_print("    %-24s 0x%016llx\n", want[i], addr[i]);
 
