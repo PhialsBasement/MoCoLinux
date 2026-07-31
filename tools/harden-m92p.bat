@@ -32,12 +32,13 @@ bootcfg /timeout 3 >nul 2>&1
 
 echo.
 echo === 3. write the launcher ===
-rem  python, not pythonw: it should have a console so you can see it and stop it.
-rem  It stays in the foreground of its own window, exactly like running it by hand.
+rem  py, because that is what is on this box -- there is no python.exe or
+rem  pythonw.exe on PATH. Also the right choice regardless: it keeps a console,
+rem  so the agent is visible and killable exactly as when run by hand.
 > "%~dp0run-agent.bat" echo @echo off
 >>"%~dp0run-agent.bat" echo title xp agent
 >>"%~dp0run-agent.bat" echo cd /d "%~dp0"
->>"%~dp0run-agent.bat" echo python "%~dp0xp_agent.py" --run --root "%ROOT%" --port %PORT% --peer %PEER%
+>>"%~dp0run-agent.bat" echo py "%~dp0xp_agent.py" --run --root "%ROOT%" --port %PORT% --peer %PEER%
 >>"%~dp0run-agent.bat" echo echo.
 >>"%~dp0run-agent.bat" echo echo agent exited -- window kept open on purpose
 >>"%~dp0run-agent.bat" echo pause
