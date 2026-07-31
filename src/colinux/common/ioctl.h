@@ -311,6 +311,7 @@ typedef struct {
 	 */
 	unsigned long long block_pa;	/* out: host physical base of the block */
 	unsigned long long usable_bytes;/* out: RAM below the reserved tables */
+	unsigned long long block_bytes;	/* out: what was actually allocated */
 } co_manager_ioctl_kram_t;
 
 /* interface for CO_MANAGER_IOCTL_KBOOT */

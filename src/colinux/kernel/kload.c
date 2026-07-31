@@ -116,6 +116,11 @@ unsigned long long co_kload_usable_bytes(void)
 	return kload_block_bytes - CO_KLOAD_TABLE_BYTES;
 }
 
+unsigned long long co_kload_block_bytes(void)
+{
+	return kload_block_bytes;
+}
+
 /*
  * A frame from the block, by guest physical offset. Zeroed, because a page
  * table with a stale bit in it is a present entry pointing anywhere.

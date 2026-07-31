@@ -21,6 +21,7 @@
 
 extern co_pa_t		  co_kload_block_pa(void);
 extern unsigned long long co_kload_usable_bytes(void);
+extern unsigned long long co_kload_block_bytes(void);
 extern co_rc_t		  co_kload_table_frame(co_manager_t* manager, co_pfn_t* pfn_out);
 extern void*		  co_kload_frame_va(co_pfn_t pfn);
 
