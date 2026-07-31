@@ -534,6 +534,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 		co_manager_ioctl_kcall_t k = {0, };
 		co_elf_symbol_t* ms = co_get_symbol_by_name(pl, "memset");
 		co_elf_symbol_t* sl = co_get_symbol_by_name(pl, "strlen");
+		co_elf_symbol_t* sp = co_get_symbol_by_name(pl, "snprintf");
 
 		if (!ms || !sl) {
 			co_terminal_print("\n  memset or strlen not found in the image\n");
@@ -542,10 +543,13 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 
 		k.memset_va = co_elf_get_symbol_value(ms);
 		k.strlen_va = co_elf_get_symbol_value(sl);
+		k.snprintf_va = sp ? co_elf_get_symbol_value(sp) : 0;
 
 		co_terminal_print("\n  calling code the kernel compiled:\n");
-		co_terminal_print("    memset  0x%016llx\n", k.memset_va);
-		co_terminal_print("    strlen  0x%016llx\n", k.strlen_va);
+		co_terminal_print("    memset    0x%016llx\n", k.memset_va);
+		co_terminal_print("    strlen    0x%016llx\n", k.strlen_va);
+		if (k.snprintf_va)
+			co_terminal_print("    snprintf  0x%016llx\n", k.snprintf_va);
 		co_terminal_print("\n");
 
 		rc = co_manager_kcall(handle, &k);
@@ -577,12 +581,25 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 		co_terminal_print("    returned      %llu   (expected %llu)   %s\n",
 				  k.strlen_ret, k.strlen_expected,
 				  (k.strlen_ret == k.strlen_expected) ? "MATCH" : "WRONG");
+		if (k.snprintf_va) {
+			co_terminal_print("\n  snprintf(buf, 256, \"colinux: %%s, %%d-bit, ok\", \"x86-64\", 64)\n");
+			co_terminal_print("    returned      %llu   (expected %llu)   %s\n",
+					  k.snprintf_ret, k.snprintf_expected,
+					  (k.snprintf_ret == k.snprintf_expected) ? "MATCH" : "WRONG");
+			co_terminal_print("\n");
+			co_terminal_print("    the kernel formatted this, and we read it out of guest memory:\n");
+			co_terminal_print("      >> %s\n", k.text);
+			co_terminal_print("    %s\n", k.text_ok ? "exactly as expected"
+							     : "NOT what was expected");
+		}
+
 		co_terminal_print("\n");
 
 		if (k.succeeded)
-			co_terminal_print("  RAN LINUX'S OWN COMPILED CODE. Two functions out of the\n"
-					  "  loaded image executed in the guest address space: one\n"
-					  "  verified by the bytes it wrote, one by the value it returned.\n");
+			co_terminal_print("  RAN LINUX'S OWN COMPILED CODE. Three functions out of the\n"
+					  "  loaded image executed in the guest address space: one verified\n"
+					  "  by the bytes it wrote, one by the value it returned, and the\n"
+					  "  kernel's whole formatting engine by the text it produced.\n");
 		else
 			co_terminal_print("  the calls returned but did not do what they should have\n");
 

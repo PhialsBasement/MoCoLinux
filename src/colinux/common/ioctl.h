@@ -302,7 +302,12 @@ typedef struct {
 	unsigned long long memset_ret;
 	unsigned long long strlen_ret;
 	unsigned long long strlen_expected;
+	unsigned long long snprintf_va;		/* in, then echoed back */
+	unsigned long long snprintf_ret;
+	unsigned long long snprintf_expected;
 	int		   pattern_ok;
+	int		   text_ok;
+	char		   text[128];
 	int		   first_bad;
 	int		   first_bad_byte;
 	int		   faulted;
