@@ -537,13 +537,33 @@ co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_bytes,
 	kload_end_phys  = end_phys;
 
 	/*
-	 * The direct map: one identity-offset range over the whole block.
+	 * The direct map, over the reserved region only -- not over RAM.
 	 *
-	 * __va(pa) is PAGE_OFFSET + pa, and pa is now a host physical address
-	 * inside the block, so this is the mapping that makes __va() mean
-	 * something -- for RAM, for the image, and for the page tables in the
-	 * reserved region at the top, which is why it covers the block rather
-	 * than just the usable part.
+	 * Mapping the whole block was the obvious thing and it is wrong, because
+	 * the guest builds this map too. init_mem_mapping() walks the e820's RAM
+	 * ranges and installs 2 MB pages for each; finding a host-built entry
+	 * already there and disagreeing with it, set_pmd_safe warns --
+	 * arch/x86/mm/init_64.c:90, which the kernel's bug table names for us --
+	 * and then overwrites it anyway. Two owners of one map, and the loser is
+	 * whichever ran first.
+	 *
+	 * Leaving the guest to own it outright was tried and is worse. On real
+	 * hardware the direct map does not exist until init_mem_mapping builds
+	 * it, and early faults are fixed up on demand by early_make_pgtable --
+	 * but that handler lives in an IDT this guest does not use. Its CR3 is
+	 * init_top_pgt, which is part of the kernel image and therefore in
+	 * ordinary RAM, so the very first __va(read_cr3_pa()) needs the RAM half
+	 * of this map. Removing it put the guest back five million instructions,
+	 * at exactly the fault this map was added to fix.
+	 *
+	 * So the map stays, and the conflict has to be settled the other way:
+	 * by geometry. init_mem_mapping installs 2 MB pages, this installs 4 KB
+	 * ones, and set_pmd_safe warns because the entries differ in kind rather
+	 * than in what they address. Building this map with 2 MB pages -- which
+	 * the block's alignment already allows -- would make the kernel's write
+	 * agree with what it finds. That is the next change; it needs the space
+	 * builder to install a PMD with _PAGE_PSE rather than always descending
+	 * to a PT.
 	 */
 	for (phys = 0; phys < kload_block_bytes; phys += CO_ARCH_PAGE_SIZE) {
 		co_pa_t pa = kload_block_pa + phys;
