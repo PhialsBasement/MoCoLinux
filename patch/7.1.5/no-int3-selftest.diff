@@ -1,0 +1,66 @@
+Skip the #BP self-test, which tests a handler this guest does not install.
+
+int3_selftest() registers a die notifier, executes an int3, and requires the
+notifier to have seen it:
+
+    BUG_ON(register_die_notifier(&int3_exception_nb));
+    int3_selftest_asm(&val);
+    BUG_ON(val != 0x1234);
+
+A cooperative guest runs on the host's IDT on purpose -- see the note on
+idt_setup_early_traps in keep-host-idt.diff -- so do_int3() is never installed
+and no notifier can run. The int3 goes to the host's stub instead, which is
+exactly what the design intends and exactly what this test is written to
+detect the absence of.
+
+It stopped the boot at 97,340,568 instructions, reported as vector 3 at
+int3_selftest_asm+0x1, which is the int3 itself.
+
+Skipping the self-test is not the same as skipping what it tests. Nothing here
+patches an int3 into anything. The test exists to prove the #BP path is
+reachable before text_poke_bp() begins depending on it, and text_poke_bp() is
+machinery for patching live code while other processors may be executing it --
+an smp_call_function affair. This guest is pinned to one processor and stepped,
+and the alternatives it applies are applied before anything else runs.
+
+Placed at the call rather than inside the function so that the reason lives
+where the decision is, and so a kernel booted on real hardware still runs the
+test unmodified.
+
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -6,6 +6,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/memory.h>
+ #include <linux/execmem.h>
++#include <linux/console.h>	/* co_colinux_guest */
+
+ #include <asm/text-patching.h>
+ #include <asm/insn.h>
+@@ -2383,7 +2384,25 @@
+ {
+ 	u64 ibt;
+
+-	int3_selftest();
++	/*
++	 * int3_selftest() checks that the kernel's own #BP handler works, by
++	 * executing an int3 and requiring a die notifier to have seen it.
++	 *
++	 * A cooperative guest does not have that handler. It runs on the
++	 * host's IDT deliberately -- see the note on idt_setup_early_traps --
++	 * so the int3 goes to the host's stub, no notifier runs, and the
++	 * BUG_ON(val != 0x1234) immediately after would fire on a facility
++	 * this guest has no use for and has not installed.
++	 *
++	 * Skipping a self-test is not the same as skipping the thing it
++	 * tests. Nothing here patches an int3 into anything; the test exists
++	 * to prove the handler is reachable before text_poke_bp() starts
++	 * relying on it, and text_poke_bp() is a smp_call_function affair for
++	 * patching live code on other processors, which this guest, pinned to
++	 * one and running stepped, does not do.
++	 */
++	if (!co_colinux_guest)
++		int3_selftest();
+
+ 	/*
+ 	 * The patching is not fully atomic, so try to avoid local

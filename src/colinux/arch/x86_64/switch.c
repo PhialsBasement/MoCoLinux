@@ -47,6 +47,10 @@
 #include "mmu.h"
 #include "utils.h"
 #include "defs.h"
+#include "extable.h"
+
+/* x86-64 extension to the original co_operation_t wire values. */
+#define CO_OPERATION_YIELD 16
 
 /*
  * Position independent by construction: no RIP-relative operand, no absolute
@@ -113,33 +117,33 @@ asm(".text                                          \n"
  * handler is assembly that has to find them without any register it can trust.
  * Asserted against the real structure below, so they cannot drift.
  */
-#define CO_PP_HOST_STATE	"0x640"
-#define CO_PP_LINUXVM_STATE	"0x780"
-#define CO_PP_FAULTED		"0x8e8"
-#define CO_PP_FAULT_RIP		"0x8f0"
+#define CO_PP_HOST_STATE	"0x740"
+#define CO_PP_LINUXVM_STATE	"0x880"
+#define CO_PP_FAULTED		"0x9e8"
+#define CO_PP_FAULT_RIP		"0x9f0"
 
-#define CO_PP_HOST_STATE_N	0x640
-#define CO_PP_LINUXVM_STATE_N	0x780
-#define CO_PP_FAULTED_N		0x8e8
-#define CO_PP_FAULT_RIP_N	0x8f0
+#define CO_PP_HOST_STATE_N	0x740
+#define CO_PP_LINUXVM_STATE_N	0x880
+#define CO_PP_FAULTED_N		0x9e8
+#define CO_PP_FAULT_RIP_N	0x9f0
 
 /* params[6] and params[7]; params[8..15] are reserved for the guest GDT. */
-#define CO_PP_COUNTER		"0x8f8"
-#define CO_PP_REGSUM		"0x900"
-#define CO_PP_COUNTER_N		0x8f8
-#define CO_PP_REGSUM_N		0x900
+#define CO_PP_COUNTER		"0x9f8"
+#define CO_PP_REGSUM		"0xa00"
+#define CO_PP_COUNTER_N		0x9f8
+#define CO_PP_REGSUM_N		0xa00
 
 /*
  * What a fault leaves behind, at params[16..18]. Placed above the GDT's eight
  * reserved slots so a TSS descriptor can be added there without moving these --
  * the stubs reach them by literal offset and cannot be recompiled per layout.
  */
-#define CO_PP_VECTOR		"0x948"
-#define CO_PP_ERRCODE		"0x950"
-#define CO_PP_CR2		"0x958"
-#define CO_PP_VECTOR_N		0x948
-#define CO_PP_ERRCODE_N		0x950
-#define CO_PP_CR2_N		0x958
+#define CO_PP_VECTOR		"0xa48"
+#define CO_PP_ERRCODE		"0xa50"
+#define CO_PP_CR2		"0xa58"
+#define CO_PP_VECTOR_N		0xa48
+#define CO_PP_ERRCODE_N		0xa50
+#define CO_PP_CR2_N		0xa58
 
 /*
  * The 256 vector stubs get a page of their own in host_temp, right after the
@@ -193,14 +197,14 @@ asm(".text                                          \n"
  * a return address, and jumps; the callee returns into that address like any
  * other caller, and the trampoline there switches back.
  */
-#define CO_PP_CALL_TARGET	"0x968"
-#define CO_PP_CALL_ARG0		"0x970"
-#define CO_PP_CALL_ARG1		"0x978"
-#define CO_PP_CALL_ARG2		"0x980"
-#define CO_PP_CALL_RET		"0x988"
-#define CO_PP_CALL_ARG3		"0x990"
-#define CO_PP_CALL_ARG4		"0x998"
-#define CO_PP_CALL_ARG5		"0x9a0"
+#define CO_PP_CALL_TARGET	"0xa68"
+#define CO_PP_CALL_ARG0		"0xa70"
+#define CO_PP_CALL_ARG1		"0xa78"
+#define CO_PP_CALL_ARG2		"0xa80"
+#define CO_PP_CALL_RET		"0xa88"
+#define CO_PP_CALL_ARG3		"0xa90"
+#define CO_PP_CALL_ARG4		"0xa98"
+#define CO_PP_CALL_ARG5		"0xaa0"
 
 /*
  * params[28]: where the interrupted guest's register frame was left.
@@ -211,8 +215,8 @@ asm(".text                                          \n"
  * full set onto the IST stack, records rsp here, and the resume path pops them
  * and returns with iretq into the exact instruction that was interrupted.
  */
-#define CO_PP_GUEST_FRAME	"0x9a8"
-#define CO_PP_GUEST_FRAME_N	0x9a8
+#define CO_PP_GUEST_FRAME	"0xaa8"
+#define CO_PP_GUEST_FRAME_N	0xaa8
 
 /*
  * params[29]: run the guest one instruction at a time.
@@ -226,8 +230,8 @@ asm(".text                                          \n"
  * control back. Slow, and unhangeable, which is the trade worth making while
  * finding out where a kernel dies.
  */
-#define CO_PP_STEP		"0x9b0"
-#define CO_PP_STEP_N		0x9b0
+#define CO_PP_STEP		"0xab0"
+#define CO_PP_STEP_N		0xab0
 
 /*
  * How many more debug traps the stub may handle by itself before it has to give
@@ -251,8 +255,8 @@ asm(".text                                          \n"
  * debug trap still crosses immediately, so a fault is reported as promptly as
  * before.
  */
-#define CO_PP_BATCH		"0x9b8"
-#define CO_PP_BATCH_N		0x9b8
+#define CO_PP_BATCH		"0xab8"
+#define CO_PP_BATCH_N		0xab8
 
 /*
  * A ring of the last sixteen addresses the guest stepped through, written by
@@ -262,12 +266,12 @@ asm(".text                                          \n"
  * gone it would otherwise see one address in every few thousand, and "where was
  * it when it stopped" is the question this whole apparatus exists to answer.
  */
-#define CO_PP_TRACE_N		0x9c0
-#define CO_PP_TRACE		"0x9c0"
-#define CO_PP_TRACE_IDX		"0xa40"
-#define CO_PP_TRACE_IDX_N	0xa40
-#define CO_PP_CALL_TARGET_N	0x968
-#define CO_PP_CALL_RET_N	0x988
+#define CO_PP_TRACE_N		0xac0
+#define CO_PP_TRACE		"0xac0"
+#define CO_PP_TRACE_IDX		"0xb40"
+#define CO_PP_TRACE_IDX_N	0xb40
+#define CO_PP_CALL_TARGET_N	0xa68
+#define CO_PP_CALL_RET_N	0xa88
 
 /*
  * gdt.base, which is two bytes into the ten-byte descriptor (limit first).
@@ -300,6 +304,8 @@ asm(".text                                                          \n"
     "    mov %rsp, " CO_ARCH_STATE_STACK_RSP "(%rcx)                \n"
     "    mov %cs, %eax                                              \n"
     "    mov %rax, " CO_ARCH_STATE_STACK_CS "(%rcx)                 \n"
+    "    mov %ss, %eax                                              \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_SS "(%rcx)                 \n"
     /*
      * The GDT has to travel with the address space. lretq does not merely set
      * CS:RIP, it loads a segment descriptor -- so it reads the GDT. Leaving GDTR
@@ -334,6 +340,8 @@ asm(".text                                                          \n"
      * reset. The IDT travels with the address space, just like the GDT.
      */
     "    sidt " CO_ARCH_STATE_STACK_IDT "(%rcx)                     \n"
+    "    sldt " CO_ARCH_STATE_STACK_LDT "(%rcx)                     \n"
+    "    str " CO_ARCH_STATE_STACK_TR "(%rcx)                       \n"
     /*
      * And the segment-base and syscall MSRs, saved here rather than assumed.
      *
@@ -377,6 +385,20 @@ asm(".text                                                          \n"
     CO_SAVE_MSR("0xc0000082", CO_ARCH_STATE_LSTAR)
     CO_SAVE_MSR("0xc0000083", CO_ARCH_STATE_CSTAR)
     CO_SAVE_MSR("0xc0000084", CO_ARCH_STATE_SFMASK)
+    CO_SAVE_MSR("0xc0000080", CO_ARCH_STATE_STACK_EFER)
+    CO_SAVE_MSR(MSR_IA32_SYSENTER_CS, CO_ARCH_STATE_SYSENTER_CS)
+    CO_SAVE_MSR(MSR_IA32_SYSENTER_ESP, CO_ARCH_STATE_SYSENTER_ESP)
+    CO_SAVE_MSR(MSR_IA32_SYSENTER_EIP, CO_ARCH_STATE_SYSENTER_EIP)
+    /* XGETBV exists only while this side has CR4.OSXSAVE set. */
+    "    mov %cr4, %rax                                             \n"
+    "    bt $18, %rax                                               \n"
+    "    jnc 9f                                                     \n"
+    "    xor %ecx, %ecx                                             \n"
+    "    xgetbv                                                     \n"
+    "    shl $32, %rdx                                              \n"
+    "    or %rdx, %rax                                              \n"
+    "    mov %rax, " CO_ARCH_STATE_XCR0 "(%r11)                     \n"
+    "9:                                                             \n"
 #undef CO_SAVE_MSR
     "    pop %rdx                                                   \n"
     "    pop %rcx                                                   \n"
@@ -411,23 +433,75 @@ asm(".text                                                          \n"
      * Doing it after leaves the FPU sequence running under exactly the CR0 it
      * has always run under.
      */
+    /*
+     * CR2 and CR3 are live state, not setup constants. In particular, putting
+     * back the CR3 captured when the passage page was allocated can resume
+     * Windows in a page table belonging to an earlier thread. That faults
+     * before the C-side checker is reachable, so it presents as an immediate
+     * host freeze with no final diagnostic record.
+     */
+    "    mov %cr2, %rax                                             \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_CR2 "(%rcx)                \n"
+    "    mov %cr3, %rax                                             \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_CR3 "(%rcx)                \n"
+    "    mov %cr8, %rax                                             \n"
+    "    mov %rax, " CO_ARCH_STATE_CR8 "(%rcx)                       \n"
     "    mov %cr4, %rax                                             \n"
     "    mov %rax, " CO_ARCH_STATE_STACK_CR4 "(%rcx)                \n"
     "    btr $7, %rax                                               \n"
     "    mov %rax, %cr4                                             \n"
     "    mov %cr0, %rax                                             \n"
     "    mov %rax, " CO_ARCH_STATE_STACK_CR0 "(%rcx)                \n"
+    /*
+     * The leaving side's data segment selectors, saved because the entering
+     * side's are restored -- anything restored per crossing must be saved per
+     * crossing, which is the rule the MSRs above are here to obey.
+     *
+     * Read before the CR3 write purely so this sits beside the rest of the
+     * save; the state block is in the passage page and is mapped either way.
+     */
+    "    xor %eax, %eax                                             \n"
+    "    mov %ds, %ax                                               \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_DS "(%rcx)                 \n"
+    "    mov %es, %ax                                               \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_ES "(%rcx)                 \n"
+    "    mov %fs, %ax                                               \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_FS "(%rcx)                 \n"
+    "    mov %gs, %ax                                               \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_GS "(%rcx)                 \n"
+    /*
+     * Debug registers are per-CPU state too. Save all of them, then disarm
+     * breakpoints while the passage code runs so one side's watchpoint cannot
+     * fire against the other side's address space. DR7 is restored last below.
+     */
+    "    mov %dr0, %rax                                             \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_DR0 "(%rcx)                \n"
+    "    mov %dr1, %rax                                             \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_DR1 "(%rcx)                \n"
+    "    mov %dr2, %rax                                             \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_DR2 "(%rcx)                \n"
+    "    mov %dr3, %rax                                             \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_DR3 "(%rcx)                \n"
+    "    mov %dr6, %rax                                             \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_DR6 "(%rcx)                \n"
+    "    mov %dr7, %rax                                             \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_DR7 "(%rcx)                \n"
+    "    mov $0x400, %eax                                           \n"
+    "    mov %rax, %dr7                                             \n"
     /* --- the crossing --- */
     "    mov " CO_ARCH_STATE_STACK_CR3 "(%rdx), %rax                \n"
     "    mov %rax, %cr3                                             \n"
     "    mov " CO_ARCH_STATE_STACK_CR4 "(%rdx), %rax                \n"
     "    mov %rax, %cr4                                             \n"
+    "    mov " CO_ARCH_STATE_CR8 "(%rdx), %rax                       \n"
+    "    mov %rax, %cr8                                             \n"
     /*
      * Now in the other address space, so its GDT is reachable. This must come
      * after the CR3 write and before the lretq that reads it.
      */
     "    lgdt " CO_ARCH_STATE_STACK_GDT "(%rdx)                     \n"
     "    lidt " CO_ARCH_STATE_STACK_IDT "(%rdx)                     \n"
+    "    lldt " CO_ARCH_STATE_STACK_LDT "(%rdx)                     \n"
     /*
      * And SS, which the switch used to leave alone.
      *
@@ -443,6 +517,46 @@ asm(".text                                                          \n"
      */
     "    mov " CO_ARCH_STATE_STACK_SS "(%rdx), %eax                  \n"
     "    mov %ax, %ss                                               \n"
+    /*
+     * And the data segment selectors, for the same reason SS needed doing.
+     *
+     * These looked ignorable for longer than the others because in long mode
+     * DS and ES carry no base and no limit, and FS and GS get their bases from
+     * MSRs the switch already carries. So nothing appeared to depend on the
+     * selector -- and nothing did, while no guest ever wrote one.
+     *
+     * __switch_to writes all of them. __loadsegment_ds/es/fs are built to fault
+     * and recover:
+     *
+     *     1: movl %k0,%%es
+     *        _ASM_EXTABLE_TYPE_REG(1b, 1b, EX_TYPE_ZERO_REG, %k0)
+     *
+     * -- if the selector is refused, zero the register and run the instruction
+     * again, which loads the null selector and always succeeds. So a guest
+     * reaching its first task switch deliberately ends up with ds, es and fs
+     * null, and with the selectors not travelling, Windows was handed them.
+     *
+     * It did not fault at the crossing. It died later in its own dispatcher at
+     * SYNCH_LEVEL, on bugcheck 0xA, reading a pointer through state it no
+     * longer had -- the same shape as the stale GS_BASE that took a day to
+     * corner. Two minidumps name it exactly: the crash before this bug was
+     * reachable has ds 002b es 002b fs 0053 gs 002b, and the one after has all
+     * four zero.
+     *
+     * Before the wrmsr block below, and that ordering is the substance of it:
+     * writing %fs or %gs in long mode loads the base from the descriptor --
+     * zero for a flat one -- so restoring the MSRs first would have them
+     * silently undone. co_arch_restore_state() in state.c says the same thing
+     * about the same two registers.
+     */
+    "    mov " CO_ARCH_STATE_STACK_DS "(%rdx), %eax                  \n"
+    "    mov %ax, %ds                                               \n"
+    "    mov " CO_ARCH_STATE_STACK_ES "(%rdx), %eax                  \n"
+    "    mov %ax, %es                                               \n"
+    "    mov " CO_ARCH_STATE_STACK_FS "(%rdx), %eax                  \n"
+    "    mov %ax, %fs                                               \n"
+    "    mov " CO_ARCH_STATE_STACK_GS "(%rdx), %eax                  \n"
+    "    mov %ax, %gs                                               \n"
     /*
      * And the task register, so the entering side has a TSS -- which is what
      * makes IST work, and IST is what lets a fault be handled when the current
@@ -526,6 +640,38 @@ asm(".text                                                          \n"
     "    mov %rax, %rdx                                             \n"
     "    shr $32, %rdx                                              \n"
     "    wrmsr                                                      \n"
+    /* LMA is read-only; preserve it by omitting it from the WRMSR value. */
+    "    mov $0xc0000080, %ecx      /* EFER */                      \n"
+    "    mov " CO_ARCH_STATE_STACK_EFER "(%r11), %rax               \n"
+    "    btr $10, %rax                                              \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    "    mov $" MSR_IA32_SYSENTER_CS ", %ecx /* SYSENTER_CS */      \n"
+    "    mov " CO_ARCH_STATE_SYSENTER_CS "(%r11), %rax              \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    "    mov $" MSR_IA32_SYSENTER_ESP ", %ecx /* SYSENTER_ESP */    \n"
+    "    mov " CO_ARCH_STATE_SYSENTER_ESP "(%r11), %rax             \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    "    mov $" MSR_IA32_SYSENTER_EIP ", %ecx /* SYSENTER_EIP */    \n"
+    "    mov " CO_ARCH_STATE_SYSENTER_EIP "(%r11), %rax             \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    /* XSETBV is legal only when the entering side enables OSXSAVE. */
+    "    mov %cr4, %rax                                             \n"
+    "    bt $18, %rax                                               \n"
+    "    jnc 9f                                                     \n"
+    "    mov " CO_ARCH_STATE_XCR0 "(%r11), %rax                     \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    xor %ecx, %ecx                                             \n"
+    "    xsetbv                                                     \n"
+    "9:                                                             \n"
     "    pop %rdx                                                   \n"
     "    pop %rcx                                                   \n"
     /* and the entering side's extended state, the mirror of the save above */
@@ -547,8 +693,23 @@ asm(".text                                                          \n"
      */
     "    mov " CO_ARCH_STATE_STACK_CR0 "(%rdx), %rax                \n"
     "    mov %rax, %cr0                                             \n"
+    "    mov " CO_ARCH_STATE_STACK_CR2 "(%rdx), %rax                \n"
+    "    mov %rax, %cr2                                             \n"
     "    push " CO_ARCH_STATE_STACK_CS "(%rdx)                      \n"
     "    push " CO_ARCH_STATE_STACK_RETURN_RIP "(%rdx)              \n"
+    /* DR7 last: it arms the address registers. */
+    "    mov " CO_ARCH_STATE_STACK_DR0 "(%rdx), %rax                \n"
+    "    mov %rax, %dr0                                             \n"
+    "    mov " CO_ARCH_STATE_STACK_DR1 "(%rdx), %rax                \n"
+    "    mov %rax, %dr1                                             \n"
+    "    mov " CO_ARCH_STATE_STACK_DR2 "(%rdx), %rax                \n"
+    "    mov %rax, %dr2                                             \n"
+    "    mov " CO_ARCH_STATE_STACK_DR3 "(%rdx), %rax                \n"
+    "    mov %rax, %dr3                                             \n"
+    "    mov " CO_ARCH_STATE_STACK_DR6 "(%rdx), %rax                \n"
+    "    mov %rax, %dr6                                             \n"
+    "    mov " CO_ARCH_STATE_STACK_DR7 "(%rdx), %rax                \n"
+    "    mov %rax, %dr7                                             \n"
     "    lretq                                                      \n"
     /* the other side switching back lands here, on our own stack again */
     "1:  popfq                                                      \n"
@@ -839,39 +1000,14 @@ asm(".text                                                          \n"
     "    and $-4096, %rax                                           \n"
     "    mov " CO_PP_CALL_TARGET "(%rax), %r10                      \n"
     /*
-     * A stepped guest runs with interrupts disabled, deliberately.
-     *
-     * This used to `sti` here, on the reasoning that a guest which cannot be
-     * interrupted cannot be taken away from -- but stepping is the bound, and a
-     * far better one. What `sti` bought instead was that host interrupts got
-     * delivered while the guest was current, so they vectored through the
-     * *guest's* IDT into a stub, and the host's handler then had to be called
-     * by hand from the monitor loop off a synthesised frame, at whatever IRQL
-     * the ioctl happened to be at rather than the device's. Windows' dispatch
-     * ends by lowering IRQL and draining DPCs; doing that from the middle of a
-     * driver ioctl on a hand-built frame is not something the host survives
-     * reliably. Every run that forwarded even one interrupt died; every run
-     * that forwarded none was clean.
-     *
-     * With IF clear the interrupt simply stays pending. The world switch back
-     * restores the host's flags, so it is delivered a few instructions later in
-     * host context, through the host's own IDT, by Windows' own dispatch, at
-     * the right IRQL -- which is to say, correctly, and with no code of ours
-     * involved. The cost is interrupt latency of about one step.
-     *
-     * The monitor loop clears IF in the guest's frame before every resume, the
-     * same way it sets TF, so this holds for the whole run and not just the
-     * first instruction.
+     * Real IF stays clear in both modes. A free-running guest gives the CPU
+     * back explicitly at virtual-IRQ-enable, console and idle boundaries; the
+     * restored host IF then lets Windows take pending interrupts through its
+     * own IDT. Stepping uses TF as its additional instruction bound.
      */
     "    cmpq $0, " CO_PP_STEP "(%rax)                              \n"
-    "    jne 4f                                                     \n"
-    "    sti                                                        \n"
-    "    jmp 5f                                                     \n"
-    /*
-     * Set TF last. Every instruction after this one traps, so anything between
-     * here and the jump would cost a world switch for nothing.
-     */
-    "4:  pushfq                                                     \n"
+    "    je 5f                                                      \n"
+    "    pushfq                                                     \n"
     "    orq $0x100, (%rsp)                                         \n"
     "    popfq                                                      \n"
     "5:  jmp *%r10                                                  \n"
@@ -954,7 +1090,7 @@ asm(".text                                                          \n"
     "co_extern_guest_fault_code_end:                                \n");
 
 /* params[19]: where the guest finds the switch. Reached as 0x98(%r8). */
-#define CO_PP_SWITCH_ENTRY_N	0x960
+#define CO_PP_SWITCH_ENTRY_N	0xa60
 
 
 extern char co_switch_guest_fault;
@@ -1425,8 +1561,41 @@ static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 		 * Null, deliberately. Long mode allows it at CPL 0, and it means the
 		 * guest never carries a selector that has to be valid in a GDT with
 		 * four entries in it.
+		 *
+		 * ds/es/fs/gs for the same reason, and this became load-bearing the
+		 * moment the switch started restoring them. linuxvm_state is copied
+		 * from host_state just above, so without this the guest would enter
+		 * with Windows' 0x2b/0x53 -- selectors that index past the end of the
+		 * four-entry guest GDT. The switch's mov %ax,%ds then #GPs while CR3 is
+		 * the guest's, RSP is still the host's (unmapped over there) and TR is
+		 * not loaded yet, so the fault cannot be delivered and neither can the
+		 * double fault: triple fault, instant reset. Which is exactly what a
+		 * host inheriting the guest's zeroed segments used to do in reverse.
 		 */
 		pp->linuxvm_state.ss        = 0;
+		pp->linuxvm_state.ds        = 0;
+		pp->linuxvm_state.es        = 0;
+		pp->linuxvm_state.fs        = 0;
+		pp->linuxvm_state.gs        = 0;
+		pp->linuxvm_state.ldt       = 0;
+
+		/*
+		 * These are CPU context, not useful defaults for a second OS. In
+		 * particular, inheriting an armed Windows hardware breakpoint makes it
+		 * fire against an unrelated guest virtual address. Linux will program
+		 * its own SYSENTER state during CPU setup; until then, leave it inert.
+		 */
+		pp->linuxvm_state.cr2         = 0;
+		pp->linuxvm_state.dr0         = 0;
+		pp->linuxvm_state.dr1         = 0;
+		pp->linuxvm_state.dr2         = 0;
+		pp->linuxvm_state.dr3         = 0;
+		pp->linuxvm_state.dr6         = 0xffff0ff0ULL;
+		pp->linuxvm_state.dr7         = 0x400;
+		pp->linuxvm_state.sysenter_cs = 0;
+		pp->linuxvm_state.sysenter_esp = 0;
+		pp->linuxvm_state.sysenter_eip = 0;
+		pp->linuxvm_state.cr8          = 0;
 
 		out->guest_gdt = (unsigned long long)(size_t)guest_gdt;
 		out->guest_tss = (unsigned long long)(size_t)tss;
@@ -2463,11 +2632,15 @@ out_free_pp:
  */
 typedef struct {
 	unsigned long	   cpu;
-	unsigned long long cr0, cr4, cr3;
+	unsigned long long cr0, cr2, cr4, cr3;
 	unsigned long long gdt_base, idt_base;
 	unsigned long long fs_base, gs_base, kernel_gs_base;
-	unsigned long long lstar, star, sfmask, efer;
-	unsigned short	   gdt_limit, idt_limit, tr, cs, ss;
+	unsigned long long lstar, star, cstar, sfmask, efer;
+	unsigned long long sysenter_cs, sysenter_esp, sysenter_eip;
+	unsigned long long dr0, dr1, dr2, dr3, dr6;
+	unsigned long long cr8, pat, dr7, rflags, xcr0;
+	unsigned short	   gdt_limit, idt_limit, ldt, tr, cs, ss;
+	unsigned short	   ds, es, fs, gs;
 } co_host_snapshot_t;
 
 static unsigned long long co_rdmsr(unsigned int msr)
@@ -2479,34 +2652,130 @@ static unsigned long long co_rdmsr(unsigned int msr)
 	return ((unsigned long long)hi << 32) | lo;
 }
 
+static void co_wrmsr(unsigned int msr, unsigned long long value)
+{
+	asm volatile("wrmsr" : : "c"(msr), "a"((unsigned int)value),
+		     "d"((unsigned int)(value >> 32)));
+}
+
+/*
+ * Put back the pieces of host state that can be put back.
+ *
+ * The self-check's job is to name what moved; this is the companion that keeps
+ * the box alive to hear the answer. PAT, CR8 and DR7 are plain values with no
+ * side effects on write, so restoring the snapshot is always safe -- and a
+ * no-op when nothing moved. The descriptor tables and MSRs the switch itself
+ * carries are deliberately not touched here: if those come back wrong the
+ * crossing machinery is broken and no repair from this side is trustworthy.
+ */
+static void co_host_repair(const co_host_snapshot_t* want,
+			   co_host_field_t bad)
+{
+	unsigned int lo, hi;
+
+	co_wrmsr(0x277, want->pat);
+	asm volatile("mov %0, %%cr8" : : "r"(want->cr8));
+	asm volatile("mov %0, %%cr2" : : "r"(want->cr2));
+	if (want->cr4 & (1ULL << 18)) {
+		lo = (unsigned int)want->xcr0;
+		hi = (unsigned int)(want->xcr0 >> 32);
+		asm volatile("xsetbv" : : "a"(lo), "d"(hi), "c"(0));
+	}
+
+	co_wrmsr(0xc0000083, want->cstar);
+	co_wrmsr(0x174, want->sysenter_cs);
+	co_wrmsr(0x175, want->sysenter_esp);
+	co_wrmsr(0x176, want->sysenter_eip);
+
+	/* Disarm first, restore the address/status registers, then arm last. */
+	asm volatile("mov %0, %%dr7" : : "r"(0x400ULL));
+	asm volatile("mov %0, %%dr0" : : "r"(want->dr0));
+	asm volatile("mov %0, %%dr1" : : "r"(want->dr1));
+	asm volatile("mov %0, %%dr2" : : "r"(want->dr2));
+	asm volatile("mov %0, %%dr3" : : "r"(want->dr3));
+	asm volatile("mov %0, %%dr6" : : "r"(want->dr6));
+	asm volatile("mov %0, %%dr7" : : "r"(want->dr7));
+
+	/* LLDT depends on the GDT, so only do it when that is the named mismatch. */
+	if (bad == CO_HOST_FIELD_LDT) {
+		unsigned short ldt = want->ldt;
+		asm volatile("lldt %0" : : "m"(ldt));
+	}
+}
+
 static void co_host_snapshot(co_host_snapshot_t* s)
 {
 	struct { unsigned short limit; unsigned long long base; } __attribute__((packed)) dt;
 	unsigned long long v;
+	unsigned int lo, hi;
 	unsigned short w;
 
 	s->cpu = co_os_current_cpu();
 
 	asm volatile("mov %%cr0, %0" : "=r"(v)); s->cr0 = v;
+	asm volatile("mov %%cr2, %0" : "=r"(v)); s->cr2 = v;
 	asm volatile("mov %%cr4, %0" : "=r"(v)); s->cr4 = v;
+	s->xcr0 = 0;
+	if (s->cr4 & (1ULL << 18)) {
+		asm volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+		s->xcr0 = ((unsigned long long)hi << 32) | lo;
+	}
 	asm volatile("mov %%cr3, %0" : "=r"(v)); s->cr3 = v;
+	asm volatile("pushfq; popq %0" : "=r"(v) : : "memory");
+	/* Ignore arithmetic flags, which ordinary C code changes constantly. */
+	s->rflags = v & 0x00000000001e7700ULL; /* TF IF DF IOPL NT VM AC VIF VIP */
 
 	asm volatile("sgdt %0" : "=m"(dt));
 	s->gdt_base = dt.base; s->gdt_limit = dt.limit;
 	asm volatile("sidt %0" : "=m"(dt));
 	s->idt_base = dt.base; s->idt_limit = dt.limit;
 
+	asm volatile("sldt %0"   : "=r"(w)); s->ldt = w;
 	asm volatile("str %0"    : "=r"(w)); s->tr = w;
 	asm volatile("mov %%cs, %0" : "=r"(w)); s->cs = w;
 	asm volatile("mov %%ss, %0" : "=r"(w)); s->ss = w;
+	/*
+	 * The data segment selectors, now that the switch restores them. They
+	 * are not covered above by cs/ss, and a wrong one is exactly the
+	 * delayed freeze this check exists to catch: Windows runs on a bad ds
+	 * or gs for a while and dies somewhere unrelated.
+	 */
+	asm volatile("mov %%ds, %0" : "=r"(w)); s->ds = w;
+	asm volatile("mov %%es, %0" : "=r"(w)); s->es = w;
+	asm volatile("mov %%fs, %0" : "=r"(w)); s->fs = w;
+	asm volatile("mov %%gs, %0" : "=r"(w)); s->gs = w;
 
 	s->fs_base	  = co_rdmsr(0xc0000100);
 	s->gs_base	  = co_rdmsr(0xc0000101);
 	s->kernel_gs_base = co_rdmsr(0xc0000102);
 	s->star		  = co_rdmsr(0xc0000081);
 	s->lstar	  = co_rdmsr(0xc0000082);
+	s->cstar	  = co_rdmsr(0xc0000083);
 	s->sfmask	  = co_rdmsr(0xc0000084);
 	s->efer		  = co_rdmsr(0xc0000080);
+	s->sysenter_cs  = co_rdmsr(0x174);
+	s->sysenter_esp = co_rdmsr(0x175);
+	s->sysenter_eip = co_rdmsr(0x176);
+
+	/*
+	 * State a free-running boot can plausibly write that nothing above
+	 * covers, added after the first cooperative run completed cleanly --
+	 * every check above passing -- and the box froze anyway, minutes later.
+	 *
+	 * CR8 is IRQL on x64; the switch does not carry it. PAT is the memory
+	 * type table Linux's pat_init rewrites to its own layout, changing what
+	 * Windows' live PTEs mean out from under it. DR7 is written by the
+	 * kernel's hw_breakpoint init. Each is per-core, silent, and fatal on a
+	 * delay -- exactly the profile of what this snapshot exists to name.
+	 */
+	asm volatile("mov %%cr8, %0" : "=r"(v)); s->cr8 = v;
+	s->pat = co_rdmsr(0x277);
+	asm volatile("mov %%dr0, %0" : "=r"(v)); s->dr0 = v;
+	asm volatile("mov %%dr1, %0" : "=r"(v)); s->dr1 = v;
+	asm volatile("mov %%dr2, %0" : "=r"(v)); s->dr2 = v;
+	asm volatile("mov %%dr3, %0" : "=r"(v)); s->dr3 = v;
+	asm volatile("mov %%dr6, %0" : "=r"(v)); s->dr6 = v;
+	asm volatile("mov %%dr7, %0" : "=r"(v)); s->dr7 = v;
 }
 
 /*
@@ -2557,63 +2826,91 @@ static co_host_field_t co_host_verify(const co_host_snapshot_t* want,
 	CO_CHECK(efer,		 CO_HOST_FIELD_EFER);
 	CO_CHECK(cs,		 CO_HOST_FIELD_CS);
 	CO_CHECK(ss,		 CO_HOST_FIELD_SS);
+	CO_CHECK(ds,		 CO_HOST_FIELD_DS);
+	CO_CHECK(es,		 CO_HOST_FIELD_ES);
+	CO_CHECK(fs,		 CO_HOST_FIELD_FS);
+	CO_CHECK(gs,		 CO_HOST_FIELD_GS);
+	CO_CHECK(cr8,		 CO_HOST_FIELD_CR8);
+	CO_CHECK(pat,		 CO_HOST_FIELD_PAT);
+	CO_CHECK(dr7,		 CO_HOST_FIELD_DR7);
+	CO_CHECK(rflags,	 CO_HOST_FIELD_RFLAGS);
+	CO_CHECK(cr2,		 CO_HOST_FIELD_CR2);
+	CO_CHECK(ldt,		 CO_HOST_FIELD_LDT);
+	CO_CHECK(cstar,		 CO_HOST_FIELD_CSTAR);
+	CO_CHECK(sysenter_cs,	 CO_HOST_FIELD_SYSENTER_CS);
+	CO_CHECK(sysenter_esp,	 CO_HOST_FIELD_SYSENTER_ESP);
+	CO_CHECK(sysenter_eip,	 CO_HOST_FIELD_SYSENTER_EIP);
+	CO_CHECK(dr0,		 CO_HOST_FIELD_DR0);
+	CO_CHECK(dr1,		 CO_HOST_FIELD_DR1);
+	CO_CHECK(dr2,		 CO_HOST_FIELD_DR2);
+	CO_CHECK(dr3,		 CO_HOST_FIELD_DR3);
+	CO_CHECK(dr6,		 CO_HOST_FIELD_DR6);
+	CO_CHECK(xcr0,		 CO_HOST_FIELD_XCR0);
 
 #undef CO_CHECK
 
 	return CO_HOST_FIELD_NONE;
 }
 
+/*
+ * One three-byte replay stub for each external vector:
+ *
+ *     int $vector
+ *     ret
+ *
+ * The external interrupt was accepted while the guest address space was
+ * current, so the local APIC already has the vector in its in-service state.
+ * Once the world switch restores the host IDT/TSS/CR8, executing the same
+ * vector with INT makes the processor enter Windows through its real gate.
+ * The processor builds the architecture-defined frame, performs any host IST
+ * switch, and IRETQ unwinds it. Windows' handler services and EOIs the original
+ * hardware interrupt; RET then brings us back to the monitor.
+ *
+ * This is deliberately outside co_switch_full..co_switch_full_end: it executes
+ * only in the host mapping and must not consume passage-page code space.
+ */
+asm(".text                                                        \n"
+    ".balign 16                                                   \n"
+    ".globl co_host_interrupt_replay_stubs                        \n"
+    "co_host_interrupt_replay_stubs:                              \n"
+    ".set co_replay_vector, 32                                    \n"
+    ".rept 224                                                    \n"
+    "    .byte 0xcd, co_replay_vector /* int $vector */           \n"
+    "    ret                                                       \n"
+    "    .set co_replay_vector, co_replay_vector + 1              \n"
+    ".endr                                                        \n");
+
+extern char co_host_interrupt_replay_stubs;
+
 bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long vector)
 {
-	struct co_x86_64_gate* idt = (struct co_x86_64_gate*)host_idt;
 	struct co_x86_64_gate* gate;
-	unsigned long long offset;
-	void* func;
+	void* stub;
 
-	if (idt == NULL || vector > 255)
+	/* host_idt is restored live by the switch; retain checks as tripwires. */
+	if (host_idt == NULL || vector < 32 || vector > 255)
+		return PFALSE;
+	gate = &((struct co_x86_64_gate*)host_idt)[vector];
+	if (!(gate->flags & 0x8000))
 		return PFALSE;
 
-	gate = &idt[vector];
-
-	if (!(gate->flags & 0x8000))		/* not present */
-		return PFALSE;
+	stub = (void*)((unsigned char*)&co_host_interrupt_replay_stubs
+		       + (vector - 32) * 3);
 
 	/*
-	 * Refuse gates that ask for an IST stack.
-	 *
-	 * A non-zero IST index means the hardware path would have switched to a
-	 * dedicated stack out of the TSS before entering the handler, and this
-	 * synthesised entry does not. Windows uses IST for NMI, machine check and
-	 * double fault -- precisely the handlers where running on the wrong stack
-	 * turns a recoverable event into an unrecoverable one. Report rather than
-	 * call: losing an NMI is bad, corrupting whatever is under the current
-	 * stack pointer while handling one is worse.
+	 * Keep nested interrupts out between the captured interrupt and its
+	 * Windows dispatch. INT ignores IF, enters through the host's real IDT,
+	 * and returns with IF still clear; restore the caller's exact flags only
+	 * after the replay stub has returned on the normal host stack.
 	 */
-	if (gate->flags & 0x7)
-		return PFALSE;
-
-	offset = (unsigned long long)gate->offset_low
-	       | ((unsigned long long)gate->offset_mid  << 16)
-	       | ((unsigned long long)gate->offset_high << 32);
-
-	/* (size_t): unsigned long is four bytes here and every ISR is above 4 GB. */
-	func = (void*)(size_t)offset;
-
 	asm volatile(
-	    "    movq %%rsp, %%r11"		"\n"
-	    "    andq $-16, %%rsp"		"\n"	/* as hardware aligns it */
-	    "    movl %%ss, %%eax"		"\n"
-	    "    pushq %%rax"			"\n"	/* SS     */
-	    "    pushq %%r11"			"\n"	/* RSP    */
-	    "    pushfq"			"\n"	/* RFLAGS */
-	    "    movl %%cs, %%eax"		"\n"
-	    "    pushq %%rax"			"\n"	/* CS     */
-	    "    leaq 1f(%%rip), %%rax"		"\n"
-	    "    pushq %%rax"			"\n"	/* RIP    */
+	    "    pushfq"			"\n"
+	    "    popq %%r11"			"\n"
 	    "    cli"				"\n"
-	    "    jmp *%0"			"\n"
-	    "1:"				"\n"
-	    : : "r"(func) : "rax", "r11", "memory", "cc");
+	    "    call *%0"			"\n"
+	    "    pushq %%r11"			"\n"
+	    "    popfq"				"\n"
+	    : : "r"(stub) : "r11", "memory", "cc");
 
 	return PTRUE;
 }
@@ -2701,7 +2998,15 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	    !CO_OK(co_write_guest_u64(manager, space, in->initial_code_va,
 				      in->start_kernel_va)) ||
 	    (in->guest_flag_va &&
-	     !CO_OK(co_write_guest_u64(manager, space, in->guest_flag_va, 1)))) {
+	     !CO_OK(co_write_guest_u64(manager, space, in->guest_flag_va, 1))) ||
+	    /*
+	     * Where the guest finds the world switch, so it can call it: the
+	     * passage page has the same address in both spaces, and the guest's
+	     * cooperative yield (co_idle_processor) calls pp->code directly.
+	     */
+	    (in->passage_symbol_va &&
+	     !CO_OK(co_write_guest_u64(manager, space, in->passage_symbol_va,
+				       (unsigned long long)(size_t)pp)))) {
 		co_debug_error("could not write the boot globals");
 		rc = CO_RC(ERROR);
 		goto out_free_stack;
@@ -2732,10 +3037,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	}
 	pp->params[19]        = (unsigned long long)(size_t)pp->code;
 
-	/*
-	 * Enter through the boot shim so the guest runs with interrupts enabled,
-	 * and point it at the kernel's entry.
-	 */
+	/* Enter through the boot shim with real IF clear and virtual IF enabled. */
 	pp->params[20] = in->entry_va;
 	pp->params[29] = in->step ? 1 : 0;
 	pp->linuxvm_state.return_rip = (unsigned long long)(size_t)pp->code
@@ -2784,6 +3086,24 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	 * it. A stale resident image reading a freshly built daemon's ioctl
 	 * struct at the wrong offsets is not a failure that announces itself.
 	 */
+	/*
+	 * The guest's exception table, before it runs.
+	 *
+	 * Not fatal if it is missing: a run without it behaves exactly as every
+	 * run did before, stopping at the first fault the kernel meant to
+	 * recover from. Saying so is the point -- a boot that dies at
+	 * __switch_to with no note here would send the next reader after the
+	 * segment load rather than after the table.
+	 */
+	if (in->ex_table_start && in->ex_table_stop) {
+		if (!CO_OK(co_arch_extable_load(manager, in->ex_table_start,
+						in->ex_table_stop)))
+			co_debug_error("boot: no exception table -- recoverable "
+				       "faults will stop the run");
+	} else {
+		co_debug("boot: no exception table given");
+	}
+
 	co_debug("boot: driver built " __DATE__ " " __TIME__);
 	co_debug("boot: passage page 0x%llx, guest cr3 0x%llx, %ld tables",
 		 (unsigned long long)(size_t)pp, out->guest_cr3, out->tables);
@@ -2813,16 +3133,12 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		co_host_snapshot_t host_was;
 		int i;
 
-		/*
-		 * What the host looks like before any of this happens. Every
-		 * crossing has to hand it back exactly.
-		 */
-		co_host_snapshot(&host_was);
-
 		for (i = 0; i < in->max_switches; i++) {
 			unsigned long long batch;
+			unsigned long long host_flags;
 
 			pp->params[4] = 0;		/* faulted */
+			pp->operation = CO_OPERATION_EMPTY;	/* set by voluntary yields */
 
 			/*
 			 * How many instructions the guest may step through on
@@ -2867,6 +3183,17 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			/* nothing here: the guest's address is only known after
 			 * the switch returns, and is logged there */
 
+			/*
+			 * Isolate the crossing from host interrupt delivery. The guest
+			 * returns voluntarily with the saved host IF still clear, which
+			 * lets us verify the switch before any legitimate Windows ISR can
+			 * alter per-CPU scratch state such as CR2. After verification the
+			 * exact original flags are restored; pending hardware interrupts
+			 * then enter through Windows' own IDT before we re-enter the guest.
+			 */
+			asm volatile("pushfq; popq %0; cli"
+				     : "=r"(host_flags) : : "memory", "cc");
+			co_host_snapshot(&host_was);
 			fn(&pp->host_state, &pp->linuxvm_state, NULL, 0);
 
 			out->switches++;
@@ -2896,8 +3223,11 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				if (bad != CO_HOST_FIELD_NONE) {
 					co_host_snapshot_t now;
 
-					out->host_corrupt_field = (int)bad;
-					out->host_corrupt_step  = out->steps;
+					/* the first divergence is the record */
+					if (!out->host_corrupt_field) {
+						out->host_corrupt_field = (int)bad;
+						out->host_corrupt_step  = out->steps;
+					}
 
 					/*
 					 * The whole snapshot, not just the first
@@ -2916,6 +3246,33 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 						 out->steps, (int)bad,
 						 out->host_corrupt_expected,
 						 out->host_corrupt_actual);
+					/*
+					 * Reported first, then repaired: PAT,
+					 * CR8 and DR7 go back to the snapshot
+					 * so Windows is not left running on
+					 * the guest's values while the report
+					 * travels home.
+					 */
+					co_host_repair(&host_was, bad);
+					asm volatile("pushq %0; popfq" : : "r"(host_flags)
+						     : "memory", "cc");
+
+					/*
+					 * Those three are plain values with no
+					 * machinery behind them, so a repaired
+					 * run is a healthy run and continues --
+					 * that is how the culprit gets named
+					 * AND the box survives to deliver the
+					 * report. Anything else means the
+					 * switch itself failed to carry state
+					 * it owns, and nothing after that is
+					 * trustworthy.
+					 */
+					if (bad == CO_HOST_FIELD_CR8 ||
+					    bad == CO_HOST_FIELD_PAT ||
+					    bad == CO_HOST_FIELD_DR7)
+						goto host_repaired;
+
 					co_debug("boot:   cpu   %ld -> %ld",
 						 host_was.cpu, now.cpu);
 					co_debug("boot:   cr3   0x%llx -> 0x%llx",
@@ -2930,11 +3287,70 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 						 host_was.gs_base, now.gs_base);
 					break;
 				}
+
+				asm volatile("pushq %0; popfq" : : "r"(host_flags)
+					     : "memory", "cc");
 			}
+	host_repaired:
 
 			if (!pp->params[4]) {
-				/* came back on its own -- nothing here does that yet */
+				/*
+				 * A voluntary crossing: the guest called the
+				 * switch itself, and pp->operation says why.
+				 * This is the cooperative protocol -- no fault,
+				 * no stub, the guest's own resume point saved
+				 * by the switch, so re-entering needs no frame
+				 * surgery at all: the same fn() call restores
+				 * it exactly where its yield left off.
+				 */
+				unsigned long long op = pp->operation;
+
+				pp->operation = 0;
+
+				if (op == CO_OPERATION_IDLE) {
+					out->idle_yields++;
+					if (out->idle_yields == 1)
+						co_debug("boot: first cooperative "
+							 "IDLE yield, after %ld "
+							 "switches", out->switches);
+
+					/*
+					 * With no virtual timer yet there is
+					 * nothing to hand the guest, so idle
+					 * yields ping-pong. A handful proves
+					 * the round trip survives repetition;
+					 * then the run is complete.
+					 */
+					if (out->idle_yields >= 8) {
+						out->reached_idle = PTRUE;
+						co_debug("boot: %ld cooperative "
+							 "idle yields -- boot "
+							 "complete", out->idle_yields);
+						break;
+					}
+					continue;
+				}
+
+				if (op == CO_OPERATION_YIELD) {
+					out->run_yields++;
+					if (out->run_yields == 1)
+						co_debug("boot: first cooperative run yield "
+							 "after %ld switches", out->switches);
+					continue;
+				}
+
+				if (op == CO_OPERATION_TERMINATE) {
+					out->terminated = PTRUE;
+					out->terminate_reason = pp->params[0];
+					co_debug("boot: guest terminated, reason "
+						 "%lld", pp->params[0]);
+					break;
+				}
+
 				out->returned_voluntarily = PTRUE;
+				out->stop_operation = op;
+				co_debug("boot: unhandled operation %lld -- "
+					 "stopping", op);
 				break;
 			}
 
@@ -2953,8 +3369,17 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 					(const unsigned long long*)(size_t)pp->params[28];
 
 				if (f) {
+					int r;
+
 					out->fault_rdi = f[0x48 / 8];
 					out->fault_rax = f[0x70 / 8];
+					/*
+					 * The whole frame, so the last step before a
+					 * stop -- fault or budget -- carries its
+					 * registers out. Fifteen GPRs at f[0..14].
+					 */
+					for (r = 0; r < 15; r++)
+						out->stop_regs[r] = f[r];
 				}
 			}
 
@@ -3061,29 +3486,77 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 * would be worse than stopping: the kernel said
 			 * something was wrong and nobody heard it.
 			 *
-			 * But only if the instruction actually is ud2. #UD is
-			 * raised by any instruction the CPU refuses, and the
-			 * first counterexample already happened: xsetbv with
-			 * CR4.OSXSAVE clear raises #UD, and xsetbv is three
-			 * bytes. Advancing a fixed two put RIP mid-instruction,
-			 * where the trailing byte decoded as something else and
-			 * faulted -- so a clean "the CPU refused xsetbv, here"
-			 * was laundered into a page fault at a garbage address
-			 * two instructions later. Read the bytes and step over
-			 * nothing but 0f 0b; anything else reports as what it
-			 * is, a real #UD at a named address.
+			 * But only if the instruction actually is a warning trap,
+			 * and there are two encodings of one. #UD is raised by
+			 * anything the CPU refuses, and the counterexamples came
+			 * quickly: xsetbv with CR4.OSXSAVE clear is three bytes,
+			 * so a fixed advance of two put RIP mid-instruction and
+			 * the tail faulted as garbage a step later.
+			 *
+			 *   ud2       0f 0b               WARN_ON and BUG, two bytes
+			 *   warninsn  67 48 0f b9 3a      WARN's static call, five
+			 *
+			 * The second is not obvious. WARN() is a static call to
+			 * __WARN_trap, and arch_static_call_transform() has a
+			 * special case for that target: rather than patch the site
+			 * to a call, it writes `warninsn`, a UD1 the kernel's #UD
+			 * handler recognises and reports through the same bug table
+			 * -- rdi already holds the bug_entry, loaded right before.
+			 * So it is a warning exactly like ud2, five bytes wide, and
+			 * do_one_initcall's first WARN reaches it.
+			 *
+			 * Read enough to tell them apart and step over the right
+			 * length. Anything else reports as what it is, a real #UD
+			 * at a named address.
 			 */
-			if (out->vector == 6 && in->step) {
+			if (out->vector == 6) {
 				unsigned long long* frame =
 					(unsigned long long*)(size_t)pp->params[28];
-				unsigned char op[2] = { 0, 0 };
+				static const unsigned char ud2[]      = { 0x0f, 0x0b };
+				static const unsigned char warninsn[] =
+					{ 0x67, 0x48, 0x0f, 0xb9, 0x3a };
+				unsigned char op[5] = { 0, 0, 0, 0, 0 };
+				int warn_len = 0;
+				int is_halt = 0;
 
-				if (!CO_OK(co_kload_read(manager, out->fault_rip, op, 2)) ||
-				    op[0] != 0x0f || op[1] != 0x0b) {
-					co_debug_error("boot: #UD at 0x%llx is %02x %02x,"
-						       " not ud2 -- the CPU refused an"
+				if (CO_OK(co_kload_read(manager, out->fault_rip, op, sizeof(op)))) {
+					/*
+					 * ud2; ud2 is the cooperative halt, not a
+					 * warning. native_halt and native_safe_halt
+					 * emit it under co_colinux_guest, and nothing
+					 * in the image is two ud2 in a row otherwise
+					 * -- a single ud2 is always a WARN or BUG,
+					 * followed by recovery code. The guest that
+					 * reaches this has finished booting and is
+					 * idle, waiting for a timer tick the host does
+					 * not deliver yet. Stop and say so, rather
+					 * than step over it into a spin.
+					 */
+					if (op[0] == ud2[0] && op[1] == ud2[1] &&
+					    op[2] == ud2[0] && op[3] == ud2[1])
+						is_halt = 1;
+					else if (op[0] == ud2[0] && op[1] == ud2[1])
+						warn_len = 2;
+					else if (op[0] == warninsn[0] && op[1] == warninsn[1] &&
+						 op[2] == warninsn[2] && op[3] == warninsn[3] &&
+						 op[4] == warninsn[4])
+						warn_len = 5;
+				}
+
+				if (is_halt) {
+					out->reached_idle = PTRUE;
+					co_debug("boot: guest halted at 0x%llx -- reached idle, "
+						 "boot complete, after %ld switches",
+						 out->fault_rip, out->switches);
+					break;
+				}
+
+				if (warn_len == 0) {
+					co_debug_error("boot: #UD at 0x%llx is"
+						       " %02x %02x %02x %02x %02x, not a"
+						       " warning trap -- the CPU refused an"
 						       " instruction", out->fault_rip,
-						       op[0], op[1]);
+						       op[0], op[1], op[2], op[3], op[4]);
 					out->faulted = PTRUE;
 					break;
 				}
@@ -3094,12 +3567,18 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 							out->fault_rip;
 					out->warnings++;
 
-					co_debug("boot: warning at 0x%llx, stepping over it",
+					co_debug("boot: warning (%d-byte) at 0x%llx,"
+						 " stepping over it", warn_len,
 						 out->fault_rip);
 
-					frame[0x88 / 8] += 2;		/* past the ud2 */
-					frame[0x98 / 8] |= 0x100ULL;	/* TF */
-					frame[0x98 / 8] &= ~0x200ULL;	/* IF */
+					frame[0x88 / 8] += warn_len;	/* past the trap */
+					if (in->step) {
+						frame[0x98 / 8] |= 0x100ULL;	/* TF */
+						frame[0x98 / 8] &= ~0x200ULL;	/* IF */
+					} else {
+						frame[0x98 / 8] &= ~0x100ULL;	/* no TF */
+						frame[0x98 / 8] &= ~0x200ULL;	/* real IF stays off */
+					}
 
 					pp->linuxvm_state.return_rip = resume_rip;
 					pp->linuxvm_state.rsp        = ist_top - 0x200;
@@ -3107,14 +3586,62 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				}
 			}
 
+			/*
+			 * A fault the kernel meant to take.
+			 *
+			 * Linux provokes faults deliberately -- a segment load
+			 * with a value that may be stale, an rdmsr of a
+			 * register this processor may not have, any copy to a
+			 * user address -- and pairs each with an entry in
+			 * __ex_table saying where to resume and what to leave
+			 * in a register. Its own #GP and #PF handlers apply
+			 * those entries; a cooperative guest has no such
+			 * handlers, so the host applies them instead.
+			 *
+			 * Tried after the ud2 check above, because a WARN is
+			 * also a deliberate fault and has its own table.
+			 */
 			if (out->vector < 32) {
+				unsigned long long* frame =
+					(unsigned long long*)(size_t)pp->params[28];
+				int extype = 0;
+
+				if (co_arch_extable_fixup(frame, out->vector, &extype)) {
+					if (out->fixups < 8) {
+						out->fixup_rip[out->fixups]  = out->fault_rip;
+						out->fixup_type[out->fixups] = extype;
+					}
+					out->fixups++;
+
+					if (in->step) {
+						frame[0x98 / 8] |= 0x100ULL;	/* TF */
+						frame[0x98 / 8] &= ~0x200ULL;	/* IF */
+					} else {
+						frame[0x98 / 8] &= ~0x100ULL;	/* no TF */
+						frame[0x98 / 8] &= ~0x200ULL;	/* real IF stays off */
+					}
+
+					pp->linuxvm_state.return_rip = resume_rip;
+					pp->linuxvm_state.rsp        = ist_top - 0x200;
+					continue;
+				}
+
 				out->faulted = PTRUE;
+				out->fault_extype = extype;
 				co_debug("boot: guest exception vector %lld at rip 0x%llx, "
 					 "err 0x%llx, cr2 0x%llx, after %ld switches",
 					 out->vector, out->fault_rip, out->error_code,
 					 out->cr2, out->switches);
+				if (extype)
+					co_debug_error("boot: it has an exception table entry "
+						       "of type %d, which the host does not "
+						       "implement", extype);
 				break;
 			}
+
+			if (out->interrupts == 0)
+				co_debug("boot: replaying first host interrupt vector %lld "
+					 "through the live Windows IDT", out->vector);
 
 			if (!co_arch_forward_host_interrupt(pp->host_state.idt.table,
 							    out->vector)) {
@@ -3164,8 +3691,8 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	}
 
 	co_debug("boot: loop ended -- %ld switches, %ld steps, %ld interrupts, "
-		 "%lld bytes printed", out->switches, out->steps, out->interrupts,
-		 ring->written);
+		 "%ld fixups, %lld bytes printed", out->switches, out->steps,
+		 out->interrupts, out->fixups, ring->written);
 
 	out->console_written  = ring->written;
 	out->console_capacity = ring->capacity;
@@ -3176,6 +3703,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	rc = CO_RC(OK);
 
 out_free_stack:
+	co_arch_extable_free();
 	if (stack_pfn)
 		co_os_put_page(manager, stack_pfn);
 out_free_pp:

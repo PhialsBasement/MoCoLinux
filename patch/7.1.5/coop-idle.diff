@@ -1,0 +1,104 @@
+Cooperative idle: yield to the host instead of halting.
+
+This is the first piece of the cooperative monitor loop, modelled on coLinux
+i386 (colinux/patch/base-2.6.33.diff: co_idle_processor in kernel/cooperative.c,
+and the co_switch mechanism in asm/cooperative_internal.h).
+
+A cooperative guest does not halt at idle. It hands the CPU back to the host by
+calling the passage-page world switch itself, with operation = CO_OPERATION_IDLE,
+and resumes where it left off when the host re-enters it. Between yields it runs
+free, at native speed -- no single-stepping.
+
+The switch blob uses the Microsoft x64 calling convention because it is built
+inside the Windows driver, whereas the guest uses SysV. The wrapper therefore
+pins the leaving and entering state pointers to rcx and rdx explicitly.
+
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -54,6 +54,7 @@
+ #include <asm/mmu_context.h>
+ #include <asm/msr.h>
+ #include <asm/shstk.h>
++#include <linux/console.h>	/* co_colinux_guest */
+ 
+ #include "process.h"
+ 
+@@ -773,6 +774,59 @@
+ 
+ DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
+ 
++/*
++ * Cooperative idle, for coLinux.
++ *
++ * The passage page, at the address the host primes here before the guest runs,
++ * carries the world switch blob and both saved-state blocks. Yielding is a call
++ * into that blob with rcx = the guest state (leaving) and rdx = the host state
++ * (entering) -- the Microsoft x64 convention the blob is built with, since it is
++ * assembled inside the Windows-built driver. The call returns when the host
++ * switches back in.
++ */
++unsigned long long co_colinux_passage_page;
++EXPORT_SYMBOL(co_colinux_passage_page);
++
++/*
++ * Offsets into co_arch_passage_page_t. These mirror the host's CO_PP_* and the
++ * shared struct in the coLinux tree's asm/cooperative.h; the host asserts them
++ * against __builtin_offsetof, so a drift is a build error there rather than a
++ * silent wrong pointer here. code sits after the seven debug-register slots.
++ */
++#define CO_PP_CODE		0x38
++#define CO_PP_HOST_STATE	0x740
++#define CO_PP_LINUXVM_STATE	0x880
++#define CO_PP_OPERATION		0x9c0
++
++/* co_operation_t values, from include/linux/cooperative.h in the coLinux tree */
++#define CO_OPERATION_IDLE	2
++
++static void co_colinux_switch(unsigned long long operation)
++{
++	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
++	register void *leaving  asm("rcx") = pp + CO_PP_LINUXVM_STATE;
++	register void *entering asm("rdx") = pp + CO_PP_HOST_STATE;
++	void *code = pp + CO_PP_CODE;
++
++	*(volatile unsigned long long *)(pp + CO_PP_OPERATION) = operation;
++
++	asm volatile(
++		"call *%[code]\n"
++		: "+r"(leaving), "+r"(entering)
++		: [code] "r"(code)
++		: "rax", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory", "cc");
++}
++
++/*
++ * The cooperative idle routine: hand the CPU back to the host and resume when
++ * it re-enters us. This is coLinux's co_idle_processor, one architecture over.
++ */
++static void co_cpu_idle(void)
++{
++	co_colinux_switch(CO_OPERATION_IDLE);
++	raw_local_irq_disable();
++}
++
+ static bool x86_idle_set(void)
+ {
+ 	return !!static_call_query(x86_idle);
+@@ -936,6 +990,18 @@
+ 
+ void __init select_idle_routine(void)
+ {
++	/*
++	 * A cooperative guest yields at idle rather than halting. Everything
++	 * below chooses between mwait and hlt on real hardware; neither is
++	 * right here -- both take the core, which is exactly what a
++	 * cooperative guest must not do.
++	 */
++	if (co_colinux_guest) {
++		pr_info("using cooperative idle (coLinux)\n");
++		static_call_update(x86_idle, co_cpu_idle);
++		return;
++	}
++
+ 	if (boot_option_idle_override == IDLE_POLL) {
+ 		if (IS_ENABLED(CONFIG_SMP) && __max_threads_per_core > 1)
+ 			pr_warn_once("WARNING: polling idle and HT enabled, performance may degrade\n");

@@ -1,0 +1,217 @@
+Keep a cooperative guest away from Windows-owned physical hardware.
+
+The first free-running boot completed and returned from its ioctl, but froze
+Windows immediately afterwards.  Its console log gives the mechanism rather
+than merely a symptom: native PCI probing enumerated the host's real Ivy Bridge
+chipset, NVIDIA GPU and Intel SATA controller, then ata_piix bound to
+00:1f.2 and programmed it.  Cooperative Linux shares the processor; it does
+not virtualize the physical I/O-port or MMIO namespaces, so that controller was
+the one Windows was actively using.
+
+This is the isolation boundary used by the original coLinux port, adapted to a
+runtime-detected x86-64 guest:
+
+  * physical port reads report an absent device and writes are discarded;
+  * string port I/O is covered too, not just inb/outb;
+  * ioremap refuses physical MMIO;
+  * native PCI initialization never probes the host bus; and
+  * PAT remains at the host's value, because IA32_PAT is per CPU rather than
+    per address space and changing it changes the meaning of Windows' PTEs.
+
+Synthetic coLinux devices use passage-page operations and do not need any of
+these native paths.
+
+--- a/arch/x86/include/asm/io.h
++++ b/arch/x86/include/asm/io.h
+@@ -44,6 +44,52 @@
+ #include <asm/shared/io.h>
+ #include <asm/special_insns.h>
+ 
++/*
++ * A cooperative guest shares the real processor with Windows; it does not
++ * own the processor's I/O-port namespace.  Native PCI probing through CF8/CFC
++ * was enough to discover the host's Intel SATA controller, after which
++ * ata_piix programmed that live controller and froze the host.
++ *
++ * Keep the native helpers available for a normal boot, but turn every port
++ * read into the value of an absent device and every port write into a no-op
++ * while the cooperative guest is current.  Synthetic coLinux devices use the
++ * passage page and do not depend on physical port I/O.
++ */
++extern int co_colinux_guest;
++
++#define CO_COLINUX_BUILDIO(bwl, type)                                    \
++static __always_inline void co_colinux_out##bwl(type value, u16 port)     \
++{                                                                         \
++	if (unlikely(co_colinux_guest))                                     \
++		return;                                                       \
++	__out##bwl(value, port);                                             \
++}                                                                         \
++                                                                          \
++static __always_inline type co_colinux_in##bwl(u16 port)                  \
++{                                                                         \
++	if (unlikely(co_colinux_guest))                                     \
++		return (type)~0U;                                             \
++	return __in##bwl(port);                                              \
++}
++
++CO_COLINUX_BUILDIO(b, u8)
++CO_COLINUX_BUILDIO(w, u16)
++CO_COLINUX_BUILDIO(l, u32)
++#undef CO_COLINUX_BUILDIO
++
++#undef inb
++#undef inw
++#undef inl
++#undef outb
++#undef outw
++#undef outl
++#define inb co_colinux_inb
++#define inw co_colinux_inw
++#define inl co_colinux_inl
++#define outb co_colinux_outb
++#define outw co_colinux_outw
++#define outl co_colinux_outl
++
+ #define build_mmio_read(name, size, type, reg, barrier) \
+ static inline type name(const volatile void __iomem *addr) \
+ { type ret; asm volatile("mov" size " %1,%0":reg (ret) \
+@@ -249,6 +295,9 @@
+ 
+ static inline void slow_down_io(void)
+ {
++	if (unlikely(co_colinux_guest))
++		return;
++
+ 	if (!call_io_delay())
+ 		return;
+ 
+@@ -271,6 +320,9 @@
+ 									\
+ static inline void outs##bwl(u16 port, const void *addr, unsigned long count) \
+ {									\
++	if (unlikely(co_colinux_guest))                                  \
++		return;                                                    \
++	                                                                    \
+ 	if (cc_platform_has(CC_ATTR_GUEST_UNROLL_STRING_IO)) {		\
+ 		type *value = (type *)addr;				\
+ 		while (count) {						\
+@@ -287,6 +339,11 @@
+ 									\
+ static inline void ins##bwl(u16 port, void *addr, unsigned long count)	\
+ {									\
++	if (unlikely(co_colinux_guest)) {                                \
++		memset(addr, 0xff, count * sizeof(type));                  \
++		return;                                                    \
++	}                                                                   \
++	                                                                    \
+ 	if (cc_platform_has(CC_ATTR_GUEST_UNROLL_STRING_IO)) {		\
+ 		type *value = (type *)addr;				\
+ 		while (count) {						\
+--- a/arch/x86/mm/ioremap.c
++++ b/arch/x86/mm/ioremap.c
+@@ -31,6 +31,8 @@
+ 
+ #include "physaddr.h"
+ 
++extern int co_colinux_guest;
++
+ /*
+  * Descriptor controlling ioremap() behavior.
+  */
+@@ -195,6 +197,18 @@
+ 	int retval;
+ 	void __iomem *ret_addr;
+ 
++	/*
++	 * There is no physical MMIO namespace owned by a cooperative guest.
++	 * Mapping a PCI BAR here maps the actual Windows device, not a virtual
++	 * one; the first free-running boot did exactly that for the host SATA
++	 * controller.  Synthetic devices are passage-page devices and never
++	 * arrive here.
++	 */
++	if (unlikely(co_colinux_guest)) {
++		pr_err_once("ioremap: physical MMIO is unavailable to a coLinux guest\n");
++		return NULL;
++	}
++
+ 	/* Don't allow wraparound or zero size */
+ 	last_addr = phys_addr + size - 1;
+ 	if (!size || last_addr < phys_addr)
+--- a/arch/x86/mm/pat/memtype.c
++++ b/arch/x86/mm/pat/memtype.c
+@@ -225,6 +225,10 @@
+ 
+ void pat_cpu_init(void)
+ {
++	/* The cooperative guest must leave the host's per-CPU PAT untouched. */
++	if (co_colinux_guest)
++		return;
++
+ 	if (!boot_cpu_has(X86_FEATURE_PAT)) {
+ 		/*
+ 		 * If this happens we are on a secondary CPU, but switched to
+@@ -251,6 +255,15 @@
+ {
+ 	struct cpuinfo_x86 *c = &boot_cpu_data;
+ 
++	/*
++	 * IA32_PAT is per logical processor, not per address space.  Replacing
++	 * it changes the meaning of cache bits in Windows' live PTEs too.  Use
++	 * the host's existing table and initialize Linux's translation tables
++	 * from it, exactly as the disabled/Xen-PV path below already does.
++	 */
++	if (co_colinux_guest)
++		pat_disable("PAT writes disabled for a coLinux guest.");
++
+ 	if (!IS_ENABLED(CONFIG_X86_PAT))
+ 		pr_info_once("x86/PAT: PAT support disabled because CONFIG_X86_PAT is disabled in the kernel.\n");
+ 
+--- a/arch/x86/pci/init.c
++++ b/arch/x86/pci/init.c
+@@ -5,12 +5,24 @@
+ #include <asm/x86_init.h>
+ #include <asm/irqdomain.h>
+ 
++extern int co_colinux_guest;
++
+ /* arch_initcall has too random ordering, so call the initializers
+    in the right sequence from here. */
+ static __init int pci_arch_init(void)
+ {
+ 	int type, pcbios = 1;
+ 
++	/*
++	 * Native PCI config space is the host's real bus.  A cooperative guest
++	 * may enumerate only the synthetic bus supplied by the monitor; until
++	 * that backend is installed, it has no PCI bus at all.
++	 */
++	if (co_colinux_guest) {
++		pr_info("PCI: physical bus disabled for coLinux guest\n");
++		return 0;
++	}
++
+ 	type = pci_direct_probe();
+ 
+ 	if (!(pci_probe & PCI_PROBE_NOEARLY))
+--- a/arch/x86/pci/legacy.c
++++ b/arch/x86/pci/legacy.c
+@@ -8,6 +8,8 @@
+ #include <asm/jailhouse_para.h>
+ #include <asm/pci_x86.h>
+ 
++extern int co_colinux_guest;
++
+ /*
+  * Discover remaining PCI buses in case there are peer host bridges.
+  * We use the number of last PCI bus provided by the PCI BIOS.
+@@ -57,6 +59,9 @@
+ 
+ static int __init pci_subsys_init(void)
+ {
++	if (co_colinux_guest)
++		return 0;
++
+ 	/*
+ 	 * The init function returns an non zero value when
+ 	 * pci_legacy_init should be invoked.

@@ -188,7 +188,9 @@ Index: linux-2.6.33-source/arch/x86/include/asm/cooperative.h
 +	unsigned long long xcr0;
 +	#define CO_ARCH_STATE_XCR0_N	0x130
 +	#define CO_ARCH_STATE_XCR0	CO_STRINGIFY(CO_ARCH_STATE_XCR0_N)
-+	unsigned long long pad2;
++	unsigned long long cr8;
++	#define CO_ARCH_STATE_CR8_N	0x138
++	#define CO_ARCH_STATE_CR8	CO_STRINGIFY(CO_ARCH_STATE_CR8_N)
 +} __attribute__((packed)) co_arch_state_stack_t;
 +
 +/* Generated offsets, checked against the struct they describe. */
@@ -232,6 +234,7 @@ Index: linux-2.6.33-source/arch/x86/include/asm/cooperative.h
 +CO_ASSERT_STATE_OFFSET(sysenter_esp, CO_ARCH_STATE_SYSENTER_ESP_N);
 +CO_ASSERT_STATE_OFFSET(sysenter_eip, CO_ARCH_STATE_SYSENTER_EIP_N);
 +CO_ASSERT_STATE_OFFSET(xcr0, CO_ARCH_STATE_XCR0_N);
++CO_ASSERT_STATE_OFFSET(cr8, CO_ARCH_STATE_CR8_N);
 +
 +/* The passage page relies on both of these; see the layout rules above. */
 +typedef char co_assert_state_stack_size
@@ -279,14 +282,14 @@ Index: linux-2.6.33-source/arch/x86/include/asm/cooperative.h
 +					 * extra MSR save/restore pairs do not fit
 +					 * in 608 bytes.
 +					 */
-+					unsigned char code[0x600];
++					unsigned char code[0x700];
 +				} __attribute__((packed));
-+				unsigned char pad[0x640];
++				unsigned char pad[0x740];
 +			} __attribute__((packed));
 +
 +			/*
 +			 * Both state blocks land on 16-byte boundaries: pad is
-+			 * 0x640 and sizeof(co_arch_state_stack_t) is 0x140.
++			 * 0x740 and sizeof(co_arch_state_stack_t) is 0x140.
 +			 */
 +			co_arch_state_stack_t host_state;
 +			co_arch_state_stack_t linuxvm_state;

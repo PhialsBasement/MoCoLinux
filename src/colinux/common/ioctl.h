@@ -360,6 +360,16 @@ typedef struct {
 	 */
 	unsigned long long kernel_tables[8];
 	int		   kernel_table_count;
+	/*
+	 * The guest's __ex_table. Linux faults on purpose -- segment loads,
+	 * rdmsr_safe, every user copy -- and its own #GP and #PF handlers
+	 * consult this table to recover. Those handlers do not run in a
+	 * cooperative guest, so the host applies the entries instead.
+	 */
+	unsigned long long ex_table_start;
+	unsigned long long ex_table_stop;
+	/* where the guest keeps co_colinux_passage_page, for cooperative yields */
+	unsigned long long passage_symbol_va;
 	/* out */
 	unsigned long long guest_cr3;
 	unsigned long	   tables;
@@ -383,8 +393,23 @@ typedef struct {
 	unsigned long long cr2;
 	unsigned long long fault_rdi;	/* the guest's operand when it faulted */
 	unsigned long long fault_rax;
+	/* the whole register frame at the stop: [0] r15 .. [14] rax */
+	unsigned long long stop_regs[15];
 	unsigned long	   warnings;	/* ud2s stepped over, as the kernel would */
 	unsigned long long warning_rip[8];
+	/* faults recovered from the guest's own __ex_table, as its handlers would */
+	unsigned long	   fixups;
+	unsigned long long fixup_rip[8];
+	int		   fixup_type[8];
+	int		   fault_extype;	/* set if the fatal fault had an entry */
+	int		   ex_entries;		/* how many the host loaded */
+	int		   reached_idle;	/* guest halted -- booted through to idle */
+	/* the cooperative protocol: voluntary crossings, by kind */
+	unsigned long	   run_yields;
+	unsigned long	   idle_yields;
+	int		   terminated;
+	unsigned long long terminate_reason;
+	unsigned long long stop_operation;
 	int		   preflight_checked;
 	int		   preflight_failed;
 	int		   preflight_level;

@@ -1,50 +1,73 @@
-Never let a cooperative guest halt.
+Never let a cooperative guest halt -- and catch the idle halt too.
 
 The guest is code running inside a host process, on a CPU the host owns. HLT
 with interrupts disabled waits for an NMI or a reset, so a guest that reaches
 it takes that core away permanently: the host cannot preempt it, the other
 cores notice, and the machine bugchecks.
 
-Every panic path ends in a halt loop, so without this the failure that most
-wants reporting is precisely the one that takes the host down instead of
-saying anything.
+There are two halts, and the first version of this patch caught only one.
+native_halt() is the emergency halt every panic path ends in. native_safe_halt()
+is the idle halt -- default_idle() reaches it through raw_safe_halt(), and a
+booted guest waits there. A guest that boots successfully and then idles would,
+without this, execute a real `sti; hlt` and hang the host exactly as a
+panicking one would. So both trap.
 
-ud2 raises #UD, which reaches the host's stub through the guest IDT and returns
-control with the fault recorded. The i386 port does the same thing by calling
-co_terminate from head_32.S's hlt_loop; this is the same idea placed at the one
-function every halt goes through.
+The trap is `ud2; ud2`, two in a row, and the doubling is load bearing. A
+single ud2 is how WARN and BUG trap, and the host steps over a warning to keep
+the boot going. It must not step over a halt. No WARN or BUG is ever followed
+by a second ud2 -- there are zero `0f 0b 0f 0b` sequences in the whole image --
+so the pair is a signature the host tells apart from a warning with certainty:
+it stops on it and reports the guest reached idle.
 
-Single-stepping cannot cover this case. The trap flag raises #DB after an
-instruction completes, and HLT does not complete.
+Single-stepping cannot cover this case on its own. The trap flag raises #DB
+after an instruction completes, and HLT does not complete; and the default idle
+uses MWAIT, which a stepped guest does not pause on at all. idle=halt on the
+command line routes idle through native_safe_halt so the trap is reached.
 
 --- a/arch/x86/include/asm/irqflags.h
 +++ b/arch/x86/include/asm/irqflags.h
-@@ -48,8 +48,28 @@
- 	asm volatile("sti; hlt": : :"memory");
+@@ -45,8 +45,31 @@ static __always_inline void native_irq_enable(void)
+ 	asm volatile("sti": : :"memory");
  }
- 
-+/*
-+ * Cooperative Linux must never actually halt.
-+ *
-+ * The guest is code running inside a host process, on a CPU the host owns. HLT
-+ * with interrupts disabled waits for an NMI or a reset, so a guest that reaches
-+ * it takes that core away permanently -- the host cannot preempt it, the other
-+ * cores notice, and the machine bugchecks. Every panic path ends in exactly
-+ * this, so the failure that most wants reporting is the one that would take the
-+ * host down instead.
-+ *
-+ * ud2 raises #UD, which reaches the host's stub through the guest IDT and
-+ * returns control with the fault recorded. The i386 port does the same thing by
-+ * calling co_terminate from head_32.S's hlt_loop; this is the same idea at the
-+ * single place every halt goes through.
-+ */
+
 +extern int co_colinux_guest;
 +
+ static __always_inline void native_safe_halt(void)
+ {
++	/*
++	 * The idle halt, and the one the original no-halt patch missed.
++	 *
++	 * native_halt() below is the emergency halt every panic path ends in.
++	 * This is the other one: default_idle() reaches it through
++	 * raw_safe_halt(), so it is where a booted, idle guest waits. A guest
++	 * that reaches idle and really executes `sti; hlt` takes its core away
++	 * exactly as a panicking one would -- the boot succeeding is not a
++	 * reason to let it hang the host.
++	 *
++	 * Two ud2 rather than one. A single ud2 is how WARN and BUG trap, and
++	 * the host steps over a warning; the host must not step over a halt. No
++	 * WARN is ever followed by a second ud2, so `ud2; ud2` is a signature
++	 * the host can tell apart from a warning with certainty, and it stops
++	 * on it and reports the guest reached idle.
++	 */
++	if (co_colinux_guest)
++		asm volatile("ud2; ud2");
++
+ 	x86_idle_clear_cpu_buffers();
+ 	asm volatile("sti; hlt": : :"memory");
+ }
+@@ -63,8 +86,11 @@ static __always_inline void native_halt(void)
+  */
+-extern int co_colinux_guest;
+-
  static __always_inline void native_halt(void)
  {
-+	if (co_colinux_guest)
-+		asm volatile("ud2");
-+
++	/* ud2; ud2 -- the cooperative-halt signature, told apart from the
++	 * single ud2 of a WARN. See native_safe_halt above. */
+ 	if (co_colinux_guest)
+-		asm volatile("ud2");
++		asm volatile("ud2; ud2");
+
  	x86_idle_clear_cpu_buffers();
  	asm volatile("hlt": : :"memory");
  }

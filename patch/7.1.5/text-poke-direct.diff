@@ -1,0 +1,62 @@
+Write kernel text directly under coLinux, without the poking mm.
+
+__text_poke() patches live kernel text through a temporary mm: it maps the
+target page at a user address, switches CR3 into that mm, writes through the
+alias, and switches back. The alias exists because kernel text is read-only, so
+it cannot be written at its own address.
+
+Neither half of that holds for a cooperative guest. The image is mapped by the
+host with _PAGE_RW and mark_rodata_ro()'s protection was never applied, so the
+text is writable where it lives. And the switch cannot happen anyway:
+use_temporary_mm() changes mm by writing CR3, and native_write_cr3() is a no-op
+for a cooperative guest, because the host owns the address space and a guest
+CR3 load would throw it away. So the mm switch does nothing, the guest stays on
+its own tables, and the memcpy writes to the poking address -- which is mapped
+only in the temporary mm and faults here.
+
+That was the #PF at text_poke_memcpy+0xa, writing 0x00002aaaaaaabc0a (the
+user-space poking address) with the guest still on init_mm, at 146 million
+instructions in.
+
+So when co_colinux_guest, write to addr directly and keep the memcmp that
+verifies it. Same bytes the alias would have reached, none of the machinery
+that cannot run.
+
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -2578,6 +2578,35 @@
+ 	 */
+ 	BUG_ON(!after_bootmem);
+ 
++	/*
++	 * A cooperative guest writes straight to the target.
++	 *
++	 * The whole apparatus below -- a temporary mm with the page aliased at a
++	 * user address, a CR3 switch into it, the write, a CR3 switch back --
++	 * exists for one reason: kernel text is mapped read-only, so it has to
++	 * be reached through a second, writable mapping. Under coLinux the image
++	 * is mapped by the host with _PAGE_RW and mark_rodata_ro()'s protection
++	 * was never applied, so the text is already writable at its own address.
++	 *
++	 * And the mechanism cannot run here regardless: use_temporary_mm()
++	 * switches mm by writing CR3, which native_write_cr3() suppresses for a
++	 * cooperative guest -- the host owns the address space and a guest CR3
++	 * load would discard it. So the switch is a no-op, the guest stays on
++	 * its own tables, and the memcpy lands on the poking address, which is
++	 * unmapped there. That is the #PF at text_poke_memcpy this replaces.
++	 *
++	 * Writing to addr directly reaches the same bytes the alias would have,
++	 * with the same verification kept.
++	 */
++	if (co_colinux_guest) {
++		local_irq_save(flags);
++		func(addr, src, len);
++		if (func == text_poke_memcpy)
++			BUG_ON(memcmp(addr, src, len));
++		local_irq_restore(flags);
++		return addr;
++	}
++
+ 	if (!core_kernel_text((unsigned long)addr)) {
+ 		pages[0] = vmalloc_to_page(addr);
+ 		if (cross_page_boundary)
