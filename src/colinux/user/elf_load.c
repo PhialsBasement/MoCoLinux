@@ -789,6 +789,13 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 			co_terminal_print("  kboot failed (rc %x / %x)\n", (int)rc, (int)b.rc);
 			goto out_end;
 		}
+		if (b.vmx_present) {
+			co_terminal_print("  REFUSED: CR4.VMXE is set -- something else has VMX\n");
+			co_terminal_print("  claimed on this machine (Hyper-V role, VirtualBox, a VM).\n");
+			co_terminal_print("  Clearing CR4.PGE under another hypervisor is a double\n");
+			co_terminal_print("  fault. Disable it and retry.\n");
+			goto out_end;
+		}
 		if (b.preflight_failed) {
 			co_terminal_print("  PREFLIGHT REFUSED at 0x%016llx (level %d)\n",
 					  b.preflight_va, b.preflight_level);

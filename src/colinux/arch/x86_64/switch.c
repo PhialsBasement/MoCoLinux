@@ -157,6 +157,31 @@ asm(".text                                          \n"
  */
 #define CO_PP_TSS_PAGE		 4
 #define CO_PP_CONSOLE_PAGE	 5	/* the early console's ring buffer */
+#define CO_PP_FPU_PAGE		 6	/* two 512-byte FXSAVE areas */
+
+/*
+ * Extended state, saved on every crossing.
+ *
+ * The i386 port does not do this, and reading its code I concluded the omission
+ * was deliberate delegation to the guest. It was deliberate, but the reason does
+ * not carry over: coLinux's changelog shows years of FPU corruption -- crashes
+ * in xor_block_pIII_sse and raid6_sse -- ending in a lazy scheme that saves only
+ * when the guest actually touches the FPU. That is sound exactly while "the
+ * guest never used the FPU" can be true. On x86-64 it never is: the ABI passes
+ * floats in XMM and the compiler emits SSE for ordinary memcpy, so the first
+ * crossing already has live XMM state on both sides.
+ *
+ * Corruption here does not crash. It returns wrong numbers to whatever host
+ * thread was interrupted, which is the worst failure mode available.
+ *
+ * FXSAVE rather than XSAVE, and that is a property of this host rather than a
+ * shortcut: the measured CR4 is 0x6f8, which has OSFXSR but not OSXSAVE, so
+ * nothing on the machine can use AVX and the 512-byte x87+SSE area is the whole
+ * of the extended state. A host with OSXSAVE set needs XSAVE against XCR0 --
+ * which the state block already carries, for this reason.
+ */
+#define CO_PP_FPU_HOST		"0xe000"	/* host_temp page 6 + 0x000 */
+#define CO_PP_FPU_GUEST		"0xe200"	/* host_temp page 6 + 0x200 */
 #define CO_PP_STUB_SIZE		16		/* uniform, so stub N is base + N*16 */
 /*
  * params[20..24]: calling a function that the loaded kernel compiled.
@@ -243,6 +268,22 @@ asm(".text                                                          \n"
      * an unmapped page, and the page-fault handler is unmapped too: double fault,
      * triple fault, instant reset with no bugcheck. Learned the hard way.
      */
+    /*
+     * The leaving side's extended state, into the area belonging to whichever
+     * side that is. The state pointer is inside the passage page, so masking it
+     * gives the page base; the two blocks sit at fixed offsets, so comparing the
+     * low bits says which one this is.
+     */
+    "    mov %rcx, %rax                                             \n"
+    "    and $-4096, %rax                                           \n"
+    "    mov %rcx, %r11                                             \n"
+    "    and $0xfff, %r11d                                          \n"
+    "    cmp $" CO_PP_HOST_STATE ", %r11d                           \n"
+    "    je 5f                                                      \n"
+    "    lea " CO_PP_FPU_GUEST "(%rax), %rax                        \n"
+    "    jmp 6f                                                     \n"
+    "5:  lea " CO_PP_FPU_HOST "(%rax), %rax                         \n"
+    "6:  fxsave64 (%rax)                                            \n"
     "    sgdt " CO_ARCH_STATE_STACK_GDT "(%rcx)                     \n"
     /*
      * And the IDT with it, for exactly the same reason one step removed. IDTR is
@@ -356,6 +397,17 @@ asm(".text                                                          \n"
     "    wrmsr                                                      \n"
     "    pop %rdx                                                   \n"
     "    pop %rcx                                                   \n"
+    /* and the entering side's extended state, the mirror of the save above */
+    "    mov %rdx, %rax                                             \n"
+    "    and $-4096, %rax                                           \n"
+    "    mov %rdx, %r11                                             \n"
+    "    and $0xfff, %r11d                                          \n"
+    "    cmp $" CO_PP_HOST_STATE ", %r11d                           \n"
+    "    je 7f                                                      \n"
+    "    lea " CO_PP_FPU_GUEST "(%rax), %rax                        \n"
+    "    jmp 8f                                                     \n"
+    "7:  lea " CO_PP_FPU_HOST "(%rax), %rax                         \n"
+    "8:  fxrstor64 (%rax)                                           \n"
     "    push " CO_ARCH_STATE_STACK_CS "(%rdx)                      \n"
     "    push " CO_ARCH_STATE_STACK_RETURN_RIP "(%rdx)              \n"
     "    lretq                                                      \n"
@@ -576,6 +628,17 @@ asm(".text                                                          \n"
     "    pop %rsi                                                   \n"
     "    pop %rdx                                                   \n"
     "    pop %rcx                                                   \n"
+    /* and the entering side's extended state, the mirror of the save above */
+    "    mov %rdx, %rax                                             \n"
+    "    and $-4096, %rax                                           \n"
+    "    mov %rdx, %r11                                             \n"
+    "    and $0xfff, %r11d                                          \n"
+    "    cmp $" CO_PP_HOST_STATE ", %r11d                           \n"
+    "    je 7f                                                      \n"
+    "    lea " CO_PP_FPU_GUEST "(%rax), %rax                        \n"
+    "    jmp 8f                                                     \n"
+    "7:  lea " CO_PP_FPU_HOST "(%rax), %rax                         \n"
+    "8:  fxrstor64 (%rax)                                           \n"
     "    pop %rbx                                                   \n"
     "    pop %rax                                                   \n"
     "    add $16, %rsp              /* vector and error code */     \n"
@@ -873,7 +936,13 @@ typedef char co_assert_gdt_base_offset
 /* The stubs need a page to themselves, after the IDT's. */
 typedef char co_assert_stubs_fit_host_temp
 	[(sizeof(((co_arch_passage_page_t*)0)->host_temp)
-	  >= (CO_PP_TSS_PAGE + 1) * 0x1000) ? 1 : -1];
+	  >= (CO_PP_FPU_PAGE + 1) * 0x1000) ? 1 : -1];
+
+/* The two FXSAVE areas must be 16-byte aligned and inside that page. */
+typedef char co_assert_fpu_areas
+	[((0xe000 == __builtin_offsetof(co_arch_passage_page_t, host_temp)
+		    + CO_PP_FPU_PAGE * 0x1000) &&
+	  (0xe000 % 16) == 0 && (0xe200 % 16) == 0) ? 1 : -1];
 typedef char co_assert_stub_table_is_a_page
 	[((256 * CO_PP_STUB_SIZE) == 0x1000) ? 1 : -1];
 
@@ -2216,6 +2285,24 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 
 	if (space == NULL || !in->entry_va || !in->initial_code_va || !in->start_kernel_va)
 		return CO_RC(ERROR);
+
+	/*
+	 * Refuse if anything else has VMX claimed.
+	 *
+	 * The switch clears CR4.PGE on every crossing. Under another hypervisor
+	 * the machine is in VMX non-root mode, where CR4 writes are the other
+	 * hypervisor's to interpret -- coLinux's own history records this as
+	 * STOP 0x7F, UNEXPECTED_KERNEL_MODE_TRAP, which is a double fault and
+	 * takes the host with it. Aborting the guest is the only sane answer, and
+	 * it is what the i386 port learned to do.
+	 */
+	if (co_get_cr4() & CO_ARCH_X86_CR4_VMXE) {
+		co_debug_error("CR4.VMXE is set: something else has VMX claimed. "
+			       "Clearing CR4.PGE under another hypervisor is a "
+			       "double fault, so refusing to run a guest.");
+		out->vmx_present = PTRUE;
+		return CO_RC(ERROR);
+	}
 
 	pp = co_setup_guest_page(&setup,
 		(unsigned long)(&co_switch_guest_entry - &co_switch_full));
