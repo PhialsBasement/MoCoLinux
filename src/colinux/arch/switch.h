@@ -86,6 +86,11 @@ typedef struct {
 	int		   pattern_ok;
 	int		   text_ok;
 	char		   text[128];
+	unsigned long long console_ring_va;
+	unsigned long long console_written;
+	unsigned long long console_capacity;
+	int		   console_ok;
+	char		   console_text[160];
 	int		   first_bad;
 	int		   first_bad_byte;
 	int		   faulted;
@@ -100,6 +105,10 @@ extern co_rc_t co_arch_test_kernel_code(co_manager_t* manager,
 					unsigned long long memset_va,
 					unsigned long long strlen_va,
 					unsigned long long snprintf_va,
+					unsigned long long early_printk_va,
+					unsigned long long early_console_va,
+					unsigned long long colinux_console_va,
+					unsigned long long ring_symbol_va,
 					co_arch_kcall_test_t* out);
 
 /* Enter an address space that already holds a loaded kernel image. */

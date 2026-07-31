@@ -562,6 +562,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		co_manager_ioctl_kcall_t* params = (typeof(params))(io_buffer);
 		co_arch_kcall_test_t result;
 		unsigned long long memset_va, strlen_va, snprintf_va;
+		unsigned long long epk_va, ec_va, cc_va, ring_va;
 		co_rc_t trc;
 
 		if (in_size < sizeof(*params) || out_size < sizeof(*params))
@@ -570,10 +571,15 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		memset_va = params->memset_va;
 		strlen_va = params->strlen_va;
 		snprintf_va = params->snprintf_va;
+		epk_va  = params->early_printk_va;
+		ec_va   = params->early_console_va;
+		cc_va   = params->colinux_console_va;
+		ring_va = params->ring_symbol_va;
 		co_memset(params, 0, sizeof(*params));
 
 		trc = co_arch_test_kernel_code(manager, co_kload_space(),
-					       memset_va, strlen_va, snprintf_va, &result);
+					       memset_va, strlen_va, snprintf_va,
+					       epk_va, ec_va, cc_va, ring_va, &result);
 
 		params->rc		= trc;
 		params->supported	= result.supported;
@@ -589,6 +595,11 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->snprintf_expected = result.snprintf_expected;
 		params->pattern_ok	= result.pattern_ok;
 		params->text_ok		= result.text_ok;
+		params->console_ring_va   = result.console_ring_va;
+		params->console_written   = result.console_written;
+		params->console_capacity  = result.console_capacity;
+		params->console_ok	  = result.console_ok;
+		co_memcpy(params->console_text, result.console_text, sizeof(params->console_text));
 		co_memcpy(params->text, result.text, sizeof(params->text));
 		params->first_bad	= result.first_bad;
 		params->first_bad_byte	= result.first_bad_byte;

@@ -308,6 +308,15 @@ typedef struct {
 	int		   pattern_ok;
 	int		   text_ok;
 	char		   text[128];
+	unsigned long long early_printk_va;	/* in */
+	unsigned long long early_console_va;	/* in */
+	unsigned long long colinux_console_va;	/* in */
+	unsigned long long ring_symbol_va;	/* in */
+	unsigned long long console_ring_va;
+	unsigned long long console_written;
+	unsigned long long console_capacity;
+	int		   console_ok;
+	char		   console_text[160];
 	int		   first_bad;
 	int		   first_bad_byte;
 	int		   faulted;
