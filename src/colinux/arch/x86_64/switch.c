@@ -156,6 +156,7 @@ asm(".text                                          \n"
  * is cheap; finding that corruption from a triple fault is not.
  */
 #define CO_PP_TSS_PAGE		 4
+#define CO_PP_CONSOLE_PAGE	 5	/* the early console's ring buffer */
 #define CO_PP_STUB_SIZE		16		/* uniform, so stub N is base + N*16 */
 /*
  * params[20..24]: calling a function that the loaded kernel compiled.
@@ -1589,6 +1590,40 @@ out_free_pp:
  * default instruction stream is what executes -- still code the kernel's own
  * assembler emitted, just not the ERMS variant a booted kernel would select.
  */
+/*
+ * The ring the patched kernel's early console writes into. Its layout is fixed
+ * by the kernel side (patch/7.1.5/early-console.diff) and must match exactly:
+ * two 64-bit counters followed by the text.
+ */
+struct co_console_ring {
+	unsigned long long written;
+	unsigned long long capacity;
+	char		   text[];
+};
+
+/* Write one 64-bit value into the guest, through the guest's own tables. */
+static co_rc_t co_write_guest_u64(co_manager_t* manager, co_arch_guest_space_t* space,
+				  unsigned long long va, unsigned long long value)
+{
+	co_pa_t pa = 0;
+	int level = -1;
+	unsigned char* p;
+
+	if (!CO_OK(co_arch_guest_lookup(manager, space, va, &pa, &level)) || !pa) {
+		co_debug_error("poke: 0x%llx is not mapped (level %d)", va, level);
+		return CO_RC(NOT_FOUND);
+	}
+
+	p = co_os_map(manager, (co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT));
+	if (p == NULL)
+		return CO_RC(ERROR);
+
+	*(unsigned long long*)(p + (va & ~CO_ARCH_PAGE_MASK)) = value;
+	co_os_unmap(manager, p, (co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT));
+
+	return CO_RC(OK);
+}
+
 #define CO_TEST_SCRATCH		0xffffffff91000000ULL
 #define CO_TEST_PATTERN		0x5a
 #define CO_TEST_STRING		"hello from a cooperative guest"
@@ -1638,6 +1673,10 @@ co_rc_t co_arch_test_kernel_code(co_manager_t* manager, co_arch_guest_space_t* s
 				 unsigned long long memset_va,
 				 unsigned long long strlen_va,
 				 unsigned long long snprintf_va,
+				 unsigned long long early_printk_va,
+				 unsigned long long early_console_va,
+				 unsigned long long colinux_console_va,
+				 unsigned long long ring_symbol_va,
 				 co_arch_kcall_test_t* out)
 {
 	co_arch_passage_page_t* pp;
@@ -1809,6 +1848,69 @@ co_rc_t co_arch_test_kernel_code(co_manager_t* manager, co_arch_guest_space_t* s
 				break;
 			}
 		}
+	}
+
+	/*
+	 * --- the patched kernel's own early console ---
+	 *
+	 * Two globals are poked before anything runs: co_colinux_console_ring, so
+	 * the console knows where to write, and early_console, so early_printk has
+	 * a console at all. The second is the trick a real machine cannot use --
+	 * it would have to reach setup_early_printk() during setup_arch() first,
+	 * and everything before that point is silent.
+	 *
+	 * Then early_printk() is called exactly as kernel code calls it.
+	 */
+	if (early_printk_va && early_console_va && colinux_console_va && ring_symbol_va) {
+		unsigned char* host_temp = (unsigned char*)&pp->host_temp;
+		struct co_console_ring* ring = (struct co_console_ring*)
+			(host_temp + CO_PP_CONSOLE_PAGE * CO_ARCH_PAGE_SIZE);
+		unsigned long long ring_va = (unsigned long long)(size_t)ring;
+		static const char cfmt[] = "colinux: early console alive, %s, %d-bit\n";
+		static const char carg[] = "x86-64";
+		unsigned long long fmt_va = CO_TEST_SCRATCH + 0xa00;
+		unsigned long long arg_va = CO_TEST_SCRATCH + 0xb00;
+		unsigned long long ignored = 0;
+		int n;
+
+		co_memset(ring, 0, CO_ARCH_PAGE_SIZE);
+		ring->capacity = CO_ARCH_PAGE_SIZE - sizeof(*ring);
+
+		p = co_os_map(manager, scratch_pfn);
+		if (p == NULL) {
+			rc = CO_RC(ERROR);
+			goto out_free_scratch;
+		}
+		co_memcpy(p + 0xa00, cfmt, sizeof(cfmt));
+		co_memcpy(p + 0xb00, carg, sizeof(carg));
+		co_os_unmap(manager, p, scratch_pfn);
+
+		if (!CO_OK(co_write_guest_u64(manager, space, ring_symbol_va, ring_va)) ||
+		    !CO_OK(co_write_guest_u64(manager, space, early_console_va,
+					      colinux_console_va))) {
+			co_debug_error("could not poke the console globals");
+			rc = CO_RC(ERROR);
+			goto out_free_scratch;
+		}
+
+		out->console_ring_va = ring_va;
+
+		rc = co_call_loaded_once(manager, pp, fn, stack_va, early_printk_va,
+					 fmt_va, arg_va, 64, 0, 0, &ignored);
+		if (!CO_OK(rc)) {
+			out->faulted   = (int)pp->params[4];
+			out->vector    = pp->params[16];
+			out->fault_rip = pp->params[5];
+			out->cr2       = pp->params[18];
+			goto out_free_scratch;
+		}
+
+		out->console_written  = ring->written;
+		out->console_capacity = ring->capacity;
+		for (n = 0; n < (int)sizeof(out->console_text) - 1 && n < (int)ring->written; n++)
+			out->console_text[n] = ring->text[n];
+		out->console_text[n] = 0;
+		out->console_ok = (ring->written > 0) ? PTRUE : PFALSE;
 	}
 
 	out->succeeded = (out->pattern_ok &&

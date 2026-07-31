@@ -532,9 +532,14 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 		 * line of kernel initialisation has.
 		 */
 		co_manager_ioctl_kcall_t k = {0, };
+		bool_t have_console;
 		co_elf_symbol_t* ms = co_get_symbol_by_name(pl, "memset");
 		co_elf_symbol_t* sl = co_get_symbol_by_name(pl, "strlen");
 		co_elf_symbol_t* sp = co_get_symbol_by_name(pl, "snprintf");
+		co_elf_symbol_t* ep = co_get_symbol_by_name(pl, "early_printk");
+		co_elf_symbol_t* ec = co_get_symbol_by_name(pl, "early_console");
+		co_elf_symbol_t* cc = co_get_symbol_by_name(pl, "early_colinux_console");
+		co_elf_symbol_t* cr = co_get_symbol_by_name(pl, "co_colinux_console_ring");
 
 		if (!ms || !sl) {
 			co_terminal_print("\n  memset or strlen not found in the image\n");
@@ -550,6 +555,21 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 		co_terminal_print("    strlen    0x%016llx\n", k.strlen_va);
 		if (k.snprintf_va)
 			co_terminal_print("    snprintf  0x%016llx\n", k.snprintf_va);
+
+		have_console = (ep && ec && cc && cr) ? PTRUE : PFALSE;
+		if (have_console) {
+			k.early_printk_va    = co_elf_get_symbol_value(ep);
+			k.early_console_va   = co_elf_get_symbol_value(ec);
+			k.colinux_console_va = co_elf_get_symbol_value(cc);
+			k.ring_symbol_va     = co_elf_get_symbol_value(cr);
+			co_terminal_print("\n  the patched early console:\n");
+			co_terminal_print("    early_printk             0x%016llx\n", k.early_printk_va);
+			co_terminal_print("    early_console (global)   0x%016llx\n", k.early_console_va);
+			co_terminal_print("    early_colinux_console    0x%016llx\n", k.colinux_console_va);
+			co_terminal_print("    co_colinux_console_ring  0x%016llx\n", k.ring_symbol_va);
+		} else {
+			co_terminal_print("\n  (image has no cooperative console -- unpatched kernel)\n");
+		}
 		co_terminal_print("\n");
 
 		rc = co_manager_kcall(handle, &k);
@@ -591,6 +611,24 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 			co_terminal_print("      >> %s\n", k.text);
 			co_terminal_print("    %s\n", k.text_ok ? "exactly as expected"
 							     : "NOT what was expected");
+		}
+
+		/*
+		 * Gate on the local flag, not on k.early_printk_va: that field
+		 * travels inwards and the driver clears the struct before filling
+		 * in results, so it reads back as zero.
+		 */
+		if (have_console) {
+			co_terminal_print("\n  early_printk(\"colinux: early console alive, %%s, %%d-bit\\n\", \"x86-64\", 64)\n");
+			co_terminal_print("    ring at       0x%016llx  (in the passage page)\n", k.console_ring_va);
+			co_terminal_print("    bytes written %llu of %llu capacity%s\n",
+					  k.console_written, k.console_capacity,
+					  (k.console_written > k.console_capacity) ? "  TRUNCATED" : "");
+			co_terminal_print("\n");
+			co_terminal_print("    what the kernel printed:\n");
+			co_terminal_print("      >> %s", k.console_text);
+			if (!k.console_ok)
+				co_terminal_print("      (nothing -- the console did not write)\n");
 		}
 
 		co_terminal_print("\n");
