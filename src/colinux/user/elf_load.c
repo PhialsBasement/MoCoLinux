@@ -834,7 +834,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 
 		if (b.host_corrupt_field) {
 			static const char* const names[] = {
-				"none", "CR0", "CR4", "CR3", "GDT base", "GDT limit",
+				"none", "processor number", "CR0", "CR4", "CR3", "GDT base", "GDT limit",
 				"IDT base", "IDT limit", "TR", "FS_BASE", "GS_BASE",
 				"KERNEL_GS_BASE", "LSTAR", "STAR", "SFMASK", "EFER",
 				"CS", "SS"

@@ -296,6 +296,52 @@ asm(".text                                                          \n"
      */
     "    sidt " CO_ARCH_STATE_STACK_IDT "(%rcx)                     \n"
     /*
+     * And the segment-base and syscall MSRs, saved here rather than assumed.
+     *
+     * The entering side's copies of these are written back further down, and
+     * for a long time that was the whole story: they were captured once, by
+     * co_arch_save_state() when the passage page was set up, and every crossing
+     * afterwards wrote those same values into the host.
+     *
+     * That is only correct if the host's never change, and the host is Windows.
+     * GS_BASE holds the KPCR -- the per-processor block -- and KERNEL_GS_BASE
+     * its counterpart; the scheduler updates them, and they differ per
+     * processor. So the first time anything moved, every subsequent crossing
+     * restored a stale pointer to per-CPU data, and the host carried on with
+     * someone else's KPCR. Nothing faults at that moment. It dies later,
+     * somewhere unrelated, differently each time -- which is exactly the shape
+     * of the failures that took a day to corner.
+     *
+     * The descriptor tables were always done properly, two instructions above:
+     * sgdt/sidt read the live registers on every crossing. These now do the
+     * same. The rule is that anything restored per crossing must be saved per
+     * crossing.
+     *
+     * rdmsr returns edx:eax zero-extended into rdx:rax and takes the register
+     * number in ecx, all three of which are in use here -- rcx and rdx carry
+     * the state pointers -- so both are saved across the sequence. r11 holds
+     * the leaving state while they are on the stack.
+     */
+    "    push %rcx                                                  \n"
+    "    push %rdx                                                  \n"
+    "    mov %rcx, %r11                                             \n"
+#define CO_SAVE_MSR(number, offset)					\
+    "    mov $" number ", %ecx                                      \n"	\
+    "    rdmsr                                                      \n"	\
+    "    shl $32, %rdx                                              \n"	\
+    "    or %rdx, %rax                                              \n"	\
+    "    mov %rax, " offset "(%r11)                                 \n"
+    CO_SAVE_MSR("0xc0000100", CO_ARCH_STATE_FS_BASE)
+    CO_SAVE_MSR("0xc0000101", CO_ARCH_STATE_GS_BASE)
+    CO_SAVE_MSR("0xc0000102", CO_ARCH_STATE_KERNEL_GS_BASE)
+    CO_SAVE_MSR("0xc0000081", CO_ARCH_STATE_STAR)
+    CO_SAVE_MSR("0xc0000082", CO_ARCH_STATE_LSTAR)
+    CO_SAVE_MSR("0xc0000083", CO_ARCH_STATE_CSTAR)
+    CO_SAVE_MSR("0xc0000084", CO_ARCH_STATE_SFMASK)
+#undef CO_SAVE_MSR
+    "    pop %rdx                                                   \n"
+    "    pop %rcx                                                   \n"
+    /*
      * CR4 and CR0 belong to whichever side is running, and until now they did
      * not travel: CR4 was read once, stashed in r10 across the CR3 write purely
      * to drop global TLB entries, and put back unchanged. That is correct only
@@ -2314,6 +2360,7 @@ out_free_pp:
  * believed to travel safely with the address space.
  */
 typedef struct {
+	unsigned long	   cpu;
 	unsigned long long cr0, cr4, cr3;
 	unsigned long long gdt_base, idt_base;
 	unsigned long long fs_base, gs_base, kernel_gs_base;
@@ -2335,6 +2382,8 @@ static void co_host_snapshot(co_host_snapshot_t* s)
 	struct { unsigned short limit; unsigned long long base; } __attribute__((packed)) dt;
 	unsigned long long v;
 	unsigned short w;
+
+	s->cpu = co_os_current_cpu();
 
 	asm volatile("mov %%cr0, %0" : "=r"(v)); s->cr0 = v;
 	asm volatile("mov %%cr4, %0" : "=r"(v)); s->cr4 = v;
@@ -2383,6 +2432,12 @@ static co_host_field_t co_host_verify(const co_host_snapshot_t* want,
 
 	co_host_snapshot(&now);
 
+	/*
+	 * The processor first. Everything below it is per CPU, so if this one
+	 * has moved then the rest are being compared against a different
+	 * machine's registers and their verdicts mean nothing.
+	 */
+	CO_CHECK(cpu,		 CO_HOST_FIELD_CPU);
 	CO_CHECK(cr0,		 CO_HOST_FIELD_CR0);
 	CO_CHECK(cr4,		 CO_HOST_FIELD_CR4);
 	CO_CHECK(cr3,		 CO_HOST_FIELD_CR3);
@@ -2660,14 +2715,40 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 						       &out->host_corrupt_actual);
 
 				if (bad != CO_HOST_FIELD_NONE) {
+					co_host_snapshot_t now;
+
 					out->host_corrupt_field = (int)bad;
 					out->host_corrupt_step  = out->steps;
+
+					/*
+					 * The whole snapshot, not just the first
+					 * field that differed. Reporting one
+					 * field by number invites reading the
+					 * number wrong -- and a value that looks
+					 * like the wrong kind of address for the
+					 * register it is attributed to is the
+					 * only clue that the numbering and the
+					 * name table have drifted apart.
+					 */
+					co_host_snapshot(&now);
 					co_debug("boot: HOST STATE DAMAGED after "
 						 "%ld steps: field %d, was 0x%llx, "
 						 "now 0x%llx",
 						 out->steps, (int)bad,
 						 out->host_corrupt_expected,
 						 out->host_corrupt_actual);
+					co_debug("boot:   cpu   %ld -> %ld",
+						 host_was.cpu, now.cpu);
+					co_debug("boot:   cr3   0x%llx -> 0x%llx",
+						 host_was.cr3, now.cr3);
+					co_debug("boot:   cr4   0x%llx -> 0x%llx",
+						 host_was.cr4, now.cr4);
+					co_debug("boot:   gdt   0x%llx -> 0x%llx",
+						 host_was.gdt_base, now.gdt_base);
+					co_debug("boot:   idt   0x%llx -> 0x%llx",
+						 host_was.idt_base, now.idt_base);
+					co_debug("boot:   gsbase 0x%llx -> 0x%llx",
+						 host_was.gs_base, now.gs_base);
 					break;
 				}
 			}

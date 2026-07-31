@@ -191,6 +191,7 @@ typedef struct {
  */
 typedef enum {
 	CO_HOST_FIELD_NONE = 0,
+	CO_HOST_FIELD_CPU,
 	CO_HOST_FIELD_CR0,
 	CO_HOST_FIELD_CR4,
 	CO_HOST_FIELD_CR3,

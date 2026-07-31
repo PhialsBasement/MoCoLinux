@@ -163,3 +163,45 @@ co_id_t co_os_current_id(void)
 {
 	return (co_id_t)(PsGetCurrentProcessId());
 }
+
+/*
+ * Pin this thread to the processor it is on. See colinux/os/kernel/misc.h for
+ * why the world switch cannot survive without it.
+ *
+ * KeSetSystemAffinityThread takes effect at the next reschedule, so the
+ * processor number is read afterwards rather than before: what matters is
+ * where the thread ends up, not where it was when it asked. Nesting is not
+ * supported and not needed -- the one caller wraps the whole ioctl.
+ *
+ * Affinity rather than raising IRQL. Running the monitor loop at
+ * DISPATCH_LEVEL would also stop the thread moving, but the loop can run for
+ * hundreds of thousands of world switches, and starving every DPC on the
+ * machine for that long is its own way of killing the host. Device interrupts
+ * still need to be taken between steps -- that is now how the host gets them
+ * at all.
+ */
+void co_os_pin_cpu(void)
+{
+	KAFFINITY here;
+
+	here = (KAFFINITY)1 << KeGetCurrentProcessorNumber();
+	KeSetSystemAffinityThread(here);
+
+	/*
+	 * If the scheduler had already decided to move us, the mask above was
+	 * computed for the wrong processor. Re-read and re-pin; the second one
+	 * cannot be wrong, because affinity is now a single bit.
+	 */
+	here = (KAFFINITY)1 << KeGetCurrentProcessorNumber();
+	KeSetSystemAffinityThread(here);
+}
+
+void co_os_unpin_cpu(void)
+{
+	KeRevertToUserAffinityThread();
+}
+
+unsigned long co_os_current_cpu(void)
+{
+	return (unsigned long)KeGetCurrentProcessorNumber();
+}
