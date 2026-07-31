@@ -3060,10 +3060,33 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 * Every one is recorded. A warning stepped over silently
 			 * would be worse than stopping: the kernel said
 			 * something was wrong and nobody heard it.
+			 *
+			 * But only if the instruction actually is ud2. #UD is
+			 * raised by any instruction the CPU refuses, and the
+			 * first counterexample already happened: xsetbv with
+			 * CR4.OSXSAVE clear raises #UD, and xsetbv is three
+			 * bytes. Advancing a fixed two put RIP mid-instruction,
+			 * where the trailing byte decoded as something else and
+			 * faulted -- so a clean "the CPU refused xsetbv, here"
+			 * was laundered into a page fault at a garbage address
+			 * two instructions later. Read the bytes and step over
+			 * nothing but 0f 0b; anything else reports as what it
+			 * is, a real #UD at a named address.
 			 */
 			if (out->vector == 6 && in->step) {
 				unsigned long long* frame =
 					(unsigned long long*)(size_t)pp->params[28];
+				unsigned char op[2] = { 0, 0 };
+
+				if (!CO_OK(co_kload_read(manager, out->fault_rip, op, 2)) ||
+				    op[0] != 0x0f || op[1] != 0x0b) {
+					co_debug_error("boot: #UD at 0x%llx is %02x %02x,"
+						       " not ud2 -- the CPU refused an"
+						       " instruction", out->fault_rip,
+						       op[0], op[1]);
+					out->faulted = PTRUE;
+					break;
+				}
 
 				if (frame) {
 					if (out->warnings < 8)
