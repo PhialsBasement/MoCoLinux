@@ -9,7 +9,7 @@
  * The passage page and code are responsible for switching between the two
  * operating systems.
  *
- * The switch itself is NOT implemented here yet. This file carries the passage
+ * The switch itself lives in switch.c, not here. This file carries the passage
  * page's allocation and teardown so that the driver builds and loads, and
  * co_host_switch_wrapper() refuses to switch rather than attempting it. That is
  * milestone M2 in doc/porting-x86_64: prove that an unsigned 64-bit driver loads
@@ -154,13 +154,19 @@ co_rc_t co_monitor_arch_passage_page_init(co_monitor_t *cmon)
 	co_passage_page_dump_state("linux", &pp->linuxvm_state);
 
 	/*
-	 * Deliberately not building the temporary address spaces, the guest entry
-	 * state or the passage code itself. There is no switch to run yet, and
-	 * half-initialising the page would only make the eventual bring-up harder to
-	 * reason about. co_host_switch_wrapper() refuses, so this is never relied on.
+	 * The switch itself exists and works -- arch/x86_64/switch.c, exercised by
+	 * the --test-* and --boot-kernel paths, which build their own passage pages
+	 * directly. What is missing is the wiring between it and *this* entry point,
+	 * the one the monitor uses: a monitor instance, pseudo-physical memory, and
+	 * a guest kernel that speaks the passage-page protocol.
+	 *
+	 * So this still does not build the guest entry state, and the wrapper below
+	 * still refuses. Half-initialising the page would be worse than not
+	 * initialising it.
 	 */
-	co_debug_error("x86-64 world switch is not implemented; "
-		       "this driver can load and answer ioctls but cannot run a guest");
+	co_debug_error("x86-64 monitor path is not wired to the switch yet; "
+		       "the driver can load, answer ioctls, and run the switch tests, "
+		       "but co_monitor cannot run a guest");
 
 	return CO_RC_OK;
 }
@@ -169,9 +175,10 @@ void co_host_switch_wrapper(co_monitor_t *cmon)
 {
 	/*
 	 * Refuse, loudly and every time. This is the one place that would otherwise
-	 * hand control to a passage page containing nothing but zeroes.
+	 * hand control to a passage page containing nothing but zeroes -- the switch
+	 * works, but nothing has initialised *this* page for it.
 	 */
-	co_debug_error("refusing to switch: x86-64 passage code not implemented");
+	co_debug_error("refusing to switch: the monitor's passage page is not built");
 
 	co_passage_page->operation = CO_OPERATION_TERMINATE;
 	co_passage_page->params[0] = CO_TERMINATE_INVALID_OPERATION;
