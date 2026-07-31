@@ -933,6 +933,17 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 				  (b.console_written > b.console_capacity) ? "  TRUNCATED" : "");
 		co_terminal_print("\n");
 
+		if (b.warnings) {
+			unsigned long w, n = (b.warnings < 8) ? b.warnings : 8;
+
+			co_terminal_print("  %lu kernel warning%s stepped over, as the\n",
+					  b.warnings, (b.warnings == 1) ? "" : "s");
+			co_terminal_print("  kernel's own #UD handler would have:\n");
+			for (w = 0; w < n; w++)
+				co_terminal_print("    ud2 at 0x%016llx\n", b.warning_rip[w]);
+			co_terminal_print("\n");
+		}
+
 		if (b.host_corrupt_field) {
 			static const char* const names[] = {
 				"none", "processor number", "CR0", "CR4", "CR3", "GDT base", "GDT limit",

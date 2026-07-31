@@ -175,6 +175,15 @@ typedef struct {
 	 */
 	unsigned long long fault_rdi;
 	unsigned long long fault_rax;
+	/*
+	 * WARN_ON and friends compile to ud2 with an entry in __bug_table. On
+	 * real hardware the kernel's own #UD handler finds that entry, prints
+	 * the warning and steps over the instruction. A cooperative guest keeps
+	 * the host's IDT, so that handler never runs and the host has to do it
+	 * -- otherwise a warning, which is a log line, stops the run.
+	 */
+	unsigned long	   warnings;
+	unsigned long long warning_rip[8];
 	int		   preflight_checked;
 	int		   preflight_failed;
 	int		   preflight_level;

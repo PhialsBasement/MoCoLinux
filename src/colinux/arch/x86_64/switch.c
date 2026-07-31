@@ -3047,6 +3047,43 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				continue;
 			}
 
+			/*
+			 * A warning is not a fault. WARN_ON and its relatives
+			 * compile to ud2 with an entry in __bug_table, and the
+			 * kernel's own #UD handler prints the warning and steps
+			 * over the instruction -- two bytes -- and carries on.
+			 * That handler is not installed here, because the guest
+			 * runs on the host's IDT, so the host does the stepping
+			 * over. Without it the first WARN_ON in the boot ends
+			 * the run, which is the wrong answer to a log line.
+			 *
+			 * Every one is recorded. A warning stepped over silently
+			 * would be worse than stopping: the kernel said
+			 * something was wrong and nobody heard it.
+			 */
+			if (out->vector == 6 && in->step) {
+				unsigned long long* frame =
+					(unsigned long long*)(size_t)pp->params[28];
+
+				if (frame) {
+					if (out->warnings < 8)
+						out->warning_rip[out->warnings] =
+							out->fault_rip;
+					out->warnings++;
+
+					co_debug("boot: warning at 0x%llx, stepping over it",
+						 out->fault_rip);
+
+					frame[0x88 / 8] += 2;		/* past the ud2 */
+					frame[0x98 / 8] |= 0x100ULL;	/* TF */
+					frame[0x98 / 8] &= ~0x200ULL;	/* IF */
+
+					pp->linuxvm_state.return_rip = resume_rip;
+					pp->linuxvm_state.rsp        = ist_top - 0x200;
+					continue;
+				}
+			}
+
 			if (out->vector < 32) {
 				out->faulted = PTRUE;
 				co_debug("boot: guest exception vector %lld at rip 0x%llx, "
