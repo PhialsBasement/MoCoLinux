@@ -20,7 +20,12 @@ static co_terminal_print_hook_func_t terminal_print_hook;
 
 static void co_terminal_printv(const char *format, va_list ap)
 {
-	char buf[0x100];
+	/*
+	 * 4 KB, not 256 bytes: this prints kernel log records and the boot
+	 * console's accumulated text, and a report that silently truncates is
+	 * a report that lies by omission.
+	 */
+	char buf[0x1000];
 	int len;
 
 	vsnprintf(buf, sizeof(buf), format, ap);

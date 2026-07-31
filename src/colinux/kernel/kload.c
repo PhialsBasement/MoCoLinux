@@ -513,6 +513,49 @@ co_rc_t co_kload_chunk(co_manager_t* manager, unsigned long long va,
 }
 
 /*
+ * Read guest memory through the guest's own page tables.
+ *
+ * The reader for post-mortem structure decoding: the daemon points this at the
+ * printk ringbuffer's descriptors and text and gets back exactly the bytes the
+ * guest would have read, because it is the same walk over the same frames. A
+ * hole in the range is reported as NOT_FOUND rather than skipped -- a decoder
+ * fed silently zeroed gaps produces plausible garbage, which is worse than an
+ * error.
+ */
+co_rc_t co_kload_read(co_manager_t* manager, unsigned long long va,
+		      unsigned char* buf, unsigned long size)
+{
+	if (kload_space == NULL)
+		return CO_RC(ERROR);
+
+	while (size) {
+		unsigned long offset = (unsigned long)(va & ~CO_ARCH_PAGE_MASK);
+		unsigned long part   = CO_ARCH_PAGE_SIZE - offset;
+		co_pa_t pa = 0;
+		int level = -1;
+		unsigned char* p;
+
+		if (part > size)
+			part = size;
+
+		if (!CO_OK(co_arch_guest_lookup(manager, kload_space, va, &pa, &level)) || !pa)
+			return CO_RC(NOT_FOUND);
+
+		p = co_kload_frame_va((co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT));
+		if (p == NULL)
+			return CO_RC(ERROR);
+
+		co_memcpy(buf, p + offset, part);
+
+		buf  += part;
+		va   += part;
+		size -= part;
+	}
+
+	return CO_RC(OK);
+}
+
+/*
  * A checksum of what is actually in guest memory, read back through the guest's
  * own page tables.
  *

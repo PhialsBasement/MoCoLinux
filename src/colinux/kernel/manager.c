@@ -533,6 +533,20 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_KREAD: {
+		co_manager_ioctl_kread_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+		if (out_size < sizeof(*params) + params->size)
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_kload_read(manager, params->va, params->data,
+					   params->size);
+		*return_size = sizeof(*params) + params->size;
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_KLOAD_ENTER: {
 		co_manager_ioctl_test_switch_t* params = (typeof(params))(io_buffer);
 		co_arch_switch_test_t result;

@@ -46,6 +46,8 @@ extern co_rc_t co_manager_kload_chunk(co_manager_handle_t handle, unsigned long 
 				      const void* data, unsigned long size, int zero);
 extern co_rc_t co_manager_kload_verify(co_manager_handle_t handle,
 				       co_manager_ioctl_kload_verify_t* out);
+extern co_rc_t co_manager_kread(co_manager_handle_t handle, unsigned long long va,
+				void* data, unsigned long size);
 extern co_rc_t co_manager_kload_enter(co_manager_handle_t handle,
 				      co_manager_ioctl_test_switch_t* out);
 extern co_rc_t co_manager_kcall(co_manager_handle_t handle,
