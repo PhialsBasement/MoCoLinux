@@ -154,6 +154,33 @@ co_rc_t co_manager_kload_chunk(co_manager_handle_t handle, unsigned long long va
 	return rc;
 }
 
+co_rc_t co_manager_kread(co_manager_handle_t handle, unsigned long long va,
+			 void* data, unsigned long size)
+{
+	co_manager_ioctl_kread_t* params;
+	unsigned long returned = 0;
+	unsigned long total = sizeof(*params) + size;
+	co_rc_t rc;
+
+	params = co_os_malloc(total);
+	if (!params)
+		return CO_RC(OUT_OF_MEMORY);
+
+	co_memset(params, 0, sizeof(*params));
+	params->va   = va;
+	params->size = size;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KREAD,
+				 params, sizeof(*params), params, total, &returned);
+	if (CO_OK(rc))
+		rc = params->rc;
+	if (CO_OK(rc))
+		co_memcpy(data, params->data, size);
+
+	co_os_free(params);
+	return rc;
+}
+
 co_rc_t co_manager_kload_verify(co_manager_handle_t handle,
 				co_manager_ioctl_kload_verify_t* out)
 {

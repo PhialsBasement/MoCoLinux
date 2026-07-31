@@ -375,6 +375,173 @@ static void co_e820_entry(unsigned char* p, unsigned long long addr,
 
 
 /*
+ * Dump the kernel's own log, read out of guest memory after a run.
+ *
+ * printk() does not write to consoles. It appends records to a ringbuffer --
+ * kernel/printk/printk_ringbuffer.c -- and consoles drain that buffer later,
+ * if any ever register and get the chance. Every boot so far has died before
+ * that, which is why the runs were silent: the kernel was never quiet, nobody
+ * was reading. The buffer is guest memory and the guest's tables are ours to
+ * walk, so read it the way a crash dump reader would.
+ *
+ * Layout facts, taken from the 7.1.5 tree this kernel is built from and used
+ * as offsets rather than shared structs, because this is a Win64 program
+ * parsing an LP64 kernel's memory -- the compilers must not be allowed to
+ * disagree about what a long is:
+ *
+ *   prb                        pointer to the live printk_ringbuffer
+ *   printk_ringbuffer          desc_ring at +0, text_data_ring at +48
+ *   desc_ring                  count_bits +0, descs +8, infos +16,
+ *                              head_id +24, tail_id +32
+ *   text_data_ring             size_bits +0, data +8
+ *   prb_desc (24 bytes)        state_var +0, blk_lpos.begin +8, .next +16
+ *   printk_info (88 bytes)     seq +0, ts_nsec +8, text_len +16
+ *   state_var                  descriptor id | state << 62; committed = 1,
+ *                              finalized = 2
+ *   data block                 8-byte id, then the record text
+ *   lpos                       low bit set means dataless; 0x3 both sides is
+ *                              an empty line. A block whose begin and next
+ *                              fall in different wraps of the ring starts at
+ *                              index 0, not at begin's index.
+ */
+static void co_dump_kernel_log(co_manager_handle_t handle, co_elf_data_t* pl)
+{
+	co_elf_symbol_t* s_prb = co_get_symbol_by_name(pl, "prb");
+	unsigned long long rb_va = 0, descs_va, infos_va, data_va;
+	unsigned char rb[80];
+	unsigned int count_bits, size_bits;
+	unsigned long long desc_count, data_size;
+	unsigned long long head_id, tail_id, id;
+	unsigned long long shown = 0, missed = 0;
+	co_rc_t rc;
+
+	if (s_prb)
+		if (!CO_OK(co_manager_kread(handle, co_elf_get_symbol_value(s_prb),
+					    &rb_va, 8)))
+			rb_va = 0;
+	if (!rb_va) {
+		co_elf_symbol_t* s_static = co_get_symbol_by_name(pl, "printk_rb_static");
+
+		if (!s_static) {
+			co_terminal_print("  (no prb / printk_rb_static symbol -- log unreadable)\n");
+			return;
+		}
+		rb_va = co_elf_get_symbol_value(s_static);
+	}
+
+	rc = co_manager_kread(handle, rb_va, rb, sizeof(rb));
+	if (!CO_OK(rc)) {
+		co_terminal_print("  (printk_ringbuffer at 0x%llx unreadable, rc %x)\n",
+				  rb_va, (int)rc);
+		return;
+	}
+
+	memcpy(&count_bits, rb + 0,  4);
+	memcpy(&descs_va,   rb + 8,  8);
+	memcpy(&infos_va,   rb + 16, 8);
+	memcpy(&head_id,    rb + 24, 8);
+	memcpy(&tail_id,    rb + 32, 8);
+	memcpy(&size_bits,  rb + 48, 4);
+	memcpy(&data_va,    rb + 56, 8);
+
+	if (count_bits < 4 || count_bits > 20 || size_bits < 8 || size_bits > 26) {
+		co_terminal_print("  (ringbuffer geometry is nonsense: %u desc bits,"
+				  " %u data bits -- wrong offsets or trampled memory)\n",
+				  count_bits, size_bits);
+		return;
+	}
+
+	desc_count = 1ULL << count_bits;
+	data_size  = 1ULL << size_bits;
+
+	for (id = tail_id; (long long)(head_id - id) >= 0; id++) {
+		unsigned char desc[24], info[24];
+		unsigned long long sv, begin, next, seq, ts;
+		unsigned int state;
+		unsigned short text_len;
+		unsigned long long text_va, text_avail;
+		char text[1024];
+
+		if (id - tail_id > desc_count + 64) {
+			co_terminal_print("  (stopping: walked more ids than exist"
+					  " -- corrupt head/tail)\n");
+			break;
+		}
+
+		if (!CO_OK(co_manager_kread(handle,
+					    descs_va + (id & (desc_count - 1)) * 24,
+					    desc, sizeof(desc)))) {
+			missed++;
+			continue;
+		}
+		memcpy(&sv,    desc + 0,  8);
+		memcpy(&begin, desc + 8,  8);
+		memcpy(&next,  desc + 16, 8);
+
+		state = (unsigned int)(sv >> 62) & 3;
+		if ((sv & ~(3ULL << 62)) != id)
+			continue;		/* recycled or never used */
+		if (state != 1 && state != 2)
+			continue;		/* not committed/finalized */
+
+		if (!CO_OK(co_manager_kread(handle,
+					    infos_va + (id & (desc_count - 1)) * 88,
+					    info, sizeof(info)))) {
+			missed++;
+			continue;
+		}
+		memcpy(&seq,      info + 0,  8);
+		memcpy(&ts,       info + 8,  8);
+		memcpy(&text_len, info + 16, 2);
+
+		if ((begin & 1) && (next & 1)) {
+			if (begin == 0x3 && next == 0x3)
+				co_terminal_print("  [%5llu.%06llu]\n",
+						  ts / 1000000000ULL,
+						  (ts % 1000000000ULL) / 1000);
+			continue;
+		}
+
+		/* A block never straddles the wrap; a wrapping one sits at 0. */
+		if ((begin >> size_bits) == (next >> size_bits)) {
+			text_va    = data_va + (begin & (data_size - 1)) + 8;
+			text_avail = (next & (data_size - 1))
+				     - (begin & (data_size - 1)) - 8;
+		} else if (((begin + data_size) >> size_bits) == (next >> size_bits)) {
+			text_va    = data_va + 8;
+			text_avail = (next & (data_size - 1)) - 8;
+		} else {
+			missed++;
+			continue;
+		}
+
+		if (text_avail > text_len)
+			text_avail = text_len;
+		if (text_avail > sizeof(text) - 1)
+			text_avail = sizeof(text) - 1;
+
+		if (!CO_OK(co_manager_kread(handle, text_va, text,
+					    (unsigned long)text_avail))) {
+			missed++;
+			continue;
+		}
+		text[text_avail] = 0;
+
+		co_terminal_print("  [%5llu.%06llu] %s%s\n",
+				  ts / 1000000000ULL,
+				  (ts % 1000000000ULL) / 1000,
+				  text,
+				  (text_len > text_avail) ? "  (truncated)" : "");
+		shown++;
+	}
+
+	co_terminal_print("\n  %llu records", shown);
+	if (missed)
+		co_terminal_print(", %llu unreadable or torn", missed);
+	co_terminal_print("  (descriptor ids %llu..%llu)\n", tail_id, head_id);
+}
+
+/*
  * A pointer into the loaded image for a kernel virtual address.
  *
  * The section headers already say where each address lives in the file, so
@@ -1130,6 +1297,16 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		} else if (b.returned_voluntarily) {
 			co_terminal_print("  the guest switched back on its own\n");
 		}
+
+		/*
+		 * What the kernel wrote to printk, whether or not any console
+		 * ever drained it. This is the run's own narration, read out of
+		 * the ringbuffer post mortem -- the guest is stopped, its
+		 * memory is still mapped, and KLOAD_END has not run yet.
+		 */
+		co_terminal_print("\n  ------------------ the kernel's own log ------------------\n");
+		co_dump_kernel_log(handle, pl);
+		co_terminal_print("  -----------------------------------------------------------\n");
 
 		goto out_end;
 	}

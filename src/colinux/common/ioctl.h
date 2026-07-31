@@ -48,6 +48,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KCALL,
 	CO_MANAGER_IOCTL_KBOOT,
 	CO_MANAGER_IOCTL_KRAM,
+	CO_MANAGER_IOCTL_KREAD,
 } co_manager_ioctl_t;
 
 /*
@@ -293,10 +294,24 @@ typedef struct {
 	unsigned long	   tables;
 } co_manager_ioctl_kload_verify_t;
 
-/* interface for CO_MANAGER_IOCTL_KRAM: give the guest physical memory */
+/*
+ * interface for CO_MANAGER_IOCTL_KREAD: read guest memory through the guest's
+ * own page tables. What the daemon reads is what the guest would have read --
+ * the same walk, the same frames -- which is what makes post-mortem structure
+ * decoding (the printk ring, for one) trustworthy.
+ */
 typedef struct {
 	co_rc_t		   rc;
-	unsigned long long ram_bytes;	/* in */
+	unsigned long long va;
+	unsigned long	   size;
+	unsigned char	   data[0];
+} co_manager_ioctl_kread_t;
+
+/* interface for CO_MANAGER_IOCTL_KRAM: give the guest physical memory */
+#define CO_KRAM_MAX_RANGES 16
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long ram_bytes;	/* in: total RAM target */
 	unsigned long long text_va;	/* in */
 	unsigned long long end_va;	/* in */
 	unsigned long	   ram_pages;	/* out: pages allocated for RAM */
