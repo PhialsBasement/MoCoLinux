@@ -312,6 +312,21 @@ asm(".text                                                          \n"
     "    lgdt " CO_ARCH_STATE_STACK_GDT "(%rdx)                     \n"
     "    lidt " CO_ARCH_STATE_STACK_IDT "(%rdx)                     \n"
     /*
+     * And SS, which the switch used to leave alone.
+     *
+     * In long mode SS carries no base or limit, so it looks ignorable -- but
+     * the CPU still pushes it when delivering an interrupt, and iretq still
+     * reloads it. A guest entered without one keeps the host's SS, and the host
+     * selector means something entirely different in the guest's GDT: 0x18 here
+     * is the upper half of the TSS descriptor, so the first iretq out of a
+     * single-step raised #GP with error code 0x18, naming the selector exactly.
+     *
+     * The guest is given a null SS, which long mode permits at CPL 0, so there
+     * is no descriptor to get wrong. The host gets back the selector it had.
+     */
+    "    mov " CO_ARCH_STATE_STACK_SS "(%rdx), %eax                  \n"
+    "    mov %ax, %ss                                               \n"
+    /*
      * And the task register, so the entering side has a TSS -- which is what
      * makes IST work, and IST is what lets a fault be handled when the current
      * stack is the thing that is broken. Without it a bad RSP is a double fault
@@ -628,17 +643,6 @@ asm(".text                                                          \n"
     "    pop %rsi                                                   \n"
     "    pop %rdx                                                   \n"
     "    pop %rcx                                                   \n"
-    /* and the entering side's extended state, the mirror of the save above */
-    "    mov %rdx, %rax                                             \n"
-    "    and $-4096, %rax                                           \n"
-    "    mov %rdx, %r11                                             \n"
-    "    and $0xfff, %r11d                                          \n"
-    "    cmp $" CO_PP_HOST_STATE ", %r11d                           \n"
-    "    je 7f                                                      \n"
-    "    lea " CO_PP_FPU_GUEST "(%rax), %rax                        \n"
-    "    jmp 8f                                                     \n"
-    "7:  lea " CO_PP_FPU_HOST "(%rax), %rax                         \n"
-    "8:  fxrstor64 (%rax)                                           \n"
     "    pop %rbx                                                   \n"
     "    pop %rax                                                   \n"
     "    add $16, %rsp              /* vector and error code */     \n"
@@ -776,53 +780,69 @@ typedef void (*co_switch_probe_fn)(unsigned long long host_cr3,
  */
 static bool_t co_build_guest_tables(co_arch_passage_page_t* pp, unsigned long long va)
 {
-	co_pa_t first_pa, pt_pa, pd_pa, pdpt_pa;
 	unsigned long long last_va = va + sizeof(*pp) - 1;
+	co_pa_t pd_pa, pdpt_pa;
+	int pages = (int)(sizeof(*pp) / CO_ARCH_PAGE_SIZE);
+	int page;
 
 	/*
-	 * One PT is installed, at one PD slot, so all 15 pages have to fall inside the
-	 * same 2 MB region. NonPagedPool has no reason to honour that, and when it does
-	 * not, CO_ARCH_PTE_INDEX wraps and the tail pages are quietly mapped nowhere --
-	 * which the guest only discovers by faulting on an unmapped stack or IDT. Refuse
-	 * instead, so a bad allocation is a failed test and not a reset.
+	 * The allocation is fifteen pages, so it spans at most two 2 MB regions and
+	 * needs at most two page tables. guest_temp carries pt[2] for exactly that.
+	 *
+	 * An earlier version installed one PT and refused any allocation that
+	 * straddled a 2 MB boundary. The refusal was right -- the alternative was
+	 * CO_ARCH_PTE_INDEX wrapping and the tail pages being mapped nowhere -- but
+	 * refusing turned out to fire on roughly one run in five, because
+	 * NonPagedPool has no reason to keep a 60 KB allocation inside one region.
+	 * That is a limitation to remove, not a hazard to guard against.
+	 *
+	 * Anything beyond two regions, or crossing a 1 GB or 512 GB boundary, is
+	 * still refused: it cannot happen for fifteen pages, and silently handling
+	 * a case that cannot arise is how the next size change breaks quietly.
 	 */
-	if (CO_ARCH_PMD_INDEX(va)  != CO_ARCH_PMD_INDEX(last_va) ||
-	    CO_ARCH_PUD_INDEX(va)  != CO_ARCH_PUD_INDEX(last_va) ||
-	    CO_ARCH_PGD_INDEX(va)  != CO_ARCH_PGD_INDEX(last_va)) {
-		co_debug_error("passage page 0x%llx..0x%llx straddles a 2MB boundary",
+	if (CO_ARCH_PUD_INDEX(va) != CO_ARCH_PUD_INDEX(last_va) ||
+	    CO_ARCH_PGD_INDEX(va) != CO_ARCH_PGD_INDEX(last_va)) {
+		co_debug_error("passage page 0x%llx..0x%llx crosses a 1GB boundary",
+			       va, last_va);
+		return PFALSE;
+	}
+
+	if (CO_ARCH_PMD_INDEX(last_va) - CO_ARCH_PMD_INDEX(va) > 1) {
+		co_debug_error("passage page 0x%llx..0x%llx spans more than two 2MB regions",
 			       va, last_va);
 		return PFALSE;
 	}
 
 	co_memset(&pp->guest_temp, 0, sizeof(pp->guest_temp));
 
-	first_pa = co_os_virt_to_phys(&pp->first_page);
-	pt_pa    = co_os_virt_to_phys(&pp->guest_temp.pt[0]);
-	pd_pa    = co_os_virt_to_phys(&pp->guest_temp.pd[0]);
-	pdpt_pa  = co_os_virt_to_phys(&pp->guest_temp.pdpt[0]);
+	pd_pa   = co_os_virt_to_phys(&pp->guest_temp.pd[0]);
+	pdpt_pa = co_os_virt_to_phys(&pp->guest_temp.pdpt[0]);
 
 	/*
-	 * Map every page of the passage page, not just the first. The guest needs a
-	 * stack to be far-returned onto and to push from, and the only memory it can
-	 * touch is what this table maps. NonPagedPool is not physically contiguous,
-	 * so each page is looked up individually.
+	 * Each page goes into the table for its own 2 MB region: pt[0] for the
+	 * region the allocation starts in, pt[1] for the next one if it reaches
+	 * that far. NonPagedPool is not physically contiguous, so every page is
+	 * looked up individually.
 	 */
-	{
-		int page;
+	for (page = 0; page < pages; page++) {
+		unsigned char* p = (unsigned char*)pp + page * CO_ARCH_PAGE_SIZE;
+		unsigned long long page_va = va + page * CO_ARCH_PAGE_SIZE;
+		int which = (CO_ARCH_PMD_INDEX(page_va) == CO_ARCH_PMD_INDEX(va)) ? 0 : 1;
 
-		for (page = 0; page < (int)(sizeof(*pp) / CO_ARCH_PAGE_SIZE); page++) {
-			unsigned char* p = (unsigned char*)pp + page * CO_ARCH_PAGE_SIZE;
-			unsigned long long page_va = va + page * CO_ARCH_PAGE_SIZE;
-
-			pp->guest_temp.pt[0][CO_ARCH_PTE_INDEX(page_va)] =
-				co_os_virt_to_phys(p) | _KERNPG_TABLE;
-		}
+		pp->guest_temp.pt[which][CO_ARCH_PTE_INDEX(page_va)] =
+			co_os_virt_to_phys(p) | _KERNPG_TABLE;
 	}
 
-	pp->guest_temp.pt[0][CO_ARCH_PTE_INDEX(va)]   = first_pa | _KERNPG_TABLE;
-	pp->guest_temp.pd[0][CO_ARCH_PMD_INDEX(va)]   = pt_pa    | _KERNPG_TABLE;
-	pp->guest_temp.pdpt[0][CO_ARCH_PUD_INDEX(va)] = pd_pa    | _KERNPG_TABLE;
-	pp->guest_temp.pml4[CO_ARCH_PGD_INDEX(va)]    = pdpt_pa  | _KERNPG_TABLE;
+	/* One PD entry per region actually used. */
+	pp->guest_temp.pd[0][CO_ARCH_PMD_INDEX(va)] =
+		co_os_virt_to_phys(&pp->guest_temp.pt[0]) | _KERNPG_TABLE;
+
+	if (CO_ARCH_PMD_INDEX(last_va) != CO_ARCH_PMD_INDEX(va))
+		pp->guest_temp.pd[0][CO_ARCH_PMD_INDEX(last_va)] =
+			co_os_virt_to_phys(&pp->guest_temp.pt[1]) | _KERNPG_TABLE;
+
+	pp->guest_temp.pdpt[0][CO_ARCH_PUD_INDEX(va)] = pd_pa   | _KERNPG_TABLE;
+	pp->guest_temp.pml4[CO_ARCH_PGD_INDEX(va)]    = pdpt_pa | _KERNPG_TABLE;
 
 	return PTRUE;
 }
@@ -1188,6 +1208,12 @@ static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 		pp->linuxvm_state.gdt.limit = (4 * 8) - 1;
 		pp->linuxvm_state.cs        = 0x08;
 		pp->linuxvm_state.tr        = 0x10;
+		/*
+		 * Null, deliberately. Long mode allows it at CPL 0, and it means the
+		 * guest never carries a selector that has to be valid in a GDT with
+		 * four entries in it.
+		 */
+		pp->linuxvm_state.ss        = 0;
 
 		out->guest_gdt = (unsigned long long)(size_t)guest_gdt;
 		out->guest_tss = (unsigned long long)(size_t)tss;
