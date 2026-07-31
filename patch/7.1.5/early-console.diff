@@ -82,9 +82,37 @@
 +{
 +	if (!co_colinux_console_ring)
 +		return;
-+	if (early_console)
++
++	/*
++	 * Not "if (early_console) return", which is the obvious guard and is
++	 * wrong here for the one reason that is easy to miss: the host sets
++	 * early_console itself, before the guest executes anything, so that
++	 * early_printk() works from the first instruction rather than from
++	 * wherever setup_early_printk() happens to run.
++	 *
++	 * That pointer being set is therefore not evidence that a console was
++	 * registered -- it is evidence of the opposite. Both registration paths
++	 * test it and both bailed on it: this one, and setup_early_printk(),
++	 * which opens with the same check. So nothing ever called
++	 * register_console(), and printk() only writes to registered consoles.
++	 * The kernel produced eighty-six records and the ring received none of
++	 * them, which read as a broken console and was a console that was never
++	 * connected.
++	 *
++	 * So: proceed if the pointer is unset or is already ours, and stand
++	 * aside only for a console someone else chose.
++	 */
++	if (early_console && early_console != &early_colinux_console)
 +		return;
 +
++	/*
++	 * CON_PRINTBUFFER means registration replays the ringbuffer from the
++	 * beginning, so everything printed before this point arrives too. The
++	 * ring is one page and the boot says far more than that, so it holds
++	 * the earliest output and reports the rest as truncated -- which is the
++	 * right half to keep, since the earliest output is where a boot that
++	 * goes wrong starts going wrong.
++	 */
 +	early_console_register(&early_colinux_console, 1);
 +}
 +
