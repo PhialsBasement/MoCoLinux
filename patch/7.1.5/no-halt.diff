@@ -1,0 +1,50 @@
+Never let a cooperative guest halt.
+
+The guest is code running inside a host process, on a CPU the host owns. HLT
+with interrupts disabled waits for an NMI or a reset, so a guest that reaches
+it takes that core away permanently: the host cannot preempt it, the other
+cores notice, and the machine bugchecks.
+
+Every panic path ends in a halt loop, so without this the failure that most
+wants reporting is precisely the one that takes the host down instead of
+saying anything.
+
+ud2 raises #UD, which reaches the host's stub through the guest IDT and returns
+control with the fault recorded. The i386 port does the same thing by calling
+co_terminate from head_32.S's hlt_loop; this is the same idea placed at the one
+function every halt goes through.
+
+Single-stepping cannot cover this case. The trap flag raises #DB after an
+instruction completes, and HLT does not complete.
+
+--- a/arch/x86/include/asm/irqflags.h
++++ b/arch/x86/include/asm/irqflags.h
+@@ -48,8 +48,28 @@
+ 	asm volatile("sti; hlt": : :"memory");
+ }
+ 
++/*
++ * Cooperative Linux must never actually halt.
++ *
++ * The guest is code running inside a host process, on a CPU the host owns. HLT
++ * with interrupts disabled waits for an NMI or a reset, so a guest that reaches
++ * it takes that core away permanently -- the host cannot preempt it, the other
++ * cores notice, and the machine bugchecks. Every panic path ends in exactly
++ * this, so the failure that most wants reporting is the one that would take the
++ * host down instead.
++ *
++ * ud2 raises #UD, which reaches the host's stub through the guest IDT and
++ * returns control with the fault recorded. The i386 port does the same thing by
++ * calling co_terminate from head_32.S's hlt_loop; this is the same idea at the
++ * single place every halt goes through.
++ */
++extern int co_colinux_guest;
++
+ static __always_inline void native_halt(void)
+ {
++	if (co_colinux_guest)
++		asm volatile("ud2");
++
+ 	x86_idle_clear_cpu_buffers();
+ 	asm volatile("hlt": : :"memory");
+ }
