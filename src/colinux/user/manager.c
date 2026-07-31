@@ -9,6 +9,8 @@
  */
 
 #include <colinux/os/user/misc.h>
+#include <colinux/os/alloc.h>
+#include <colinux/common/libc.h>
 
 #include "manager.h"
 
@@ -107,6 +109,75 @@ co_rc_t co_manager_save_state(co_manager_handle_t handle,
 
 	return co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_SAVE_STATE,
 				   out, sizeof(*out), out, sizeof(*out), &returned);
+}
+
+co_rc_t co_manager_kload_begin(co_manager_handle_t handle,
+			       unsigned long long min_va, unsigned long long max_va)
+{
+	co_manager_ioctl_kload_begin_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	params.min_va = min_va;
+	params.max_va = max_va;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KLOAD_BEGIN,
+				 &params, sizeof(params), &params, sizeof(params), &returned);
+	return CO_OK(rc) ? params.rc : rc;
+}
+
+co_rc_t co_manager_kload_chunk(co_manager_handle_t handle, unsigned long long va,
+			       const void* data, unsigned long size, int zero)
+{
+	co_manager_ioctl_kload_chunk_t* params;
+	unsigned long returned = 0;
+	unsigned long total = sizeof(*params) + (zero ? 0 : size);
+	co_rc_t rc;
+
+	params = co_os_malloc(total);
+	if (!params)
+		return CO_RC(OUT_OF_MEMORY);
+
+	co_memset(params, 0, sizeof(*params));
+	params->va   = va;
+	params->size = size;
+	params->zero = zero;
+	if (!zero)
+		co_memcpy(params->data, data, size);
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KLOAD_CHUNK,
+				 params, total, params, sizeof(*params), &returned);
+	if (CO_OK(rc))
+		rc = params->rc;
+
+	co_os_free(params);
+	return rc;
+}
+
+co_rc_t co_manager_kload_verify(co_manager_handle_t handle,
+				co_manager_ioctl_kload_verify_t* out)
+{
+	unsigned long returned = 0;
+
+	return co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KLOAD_VERIFY,
+				   out, sizeof(*out), out, sizeof(*out), &returned);
+}
+
+co_rc_t co_manager_kload_enter(co_manager_handle_t handle,
+			       co_manager_ioctl_test_switch_t* out)
+{
+	unsigned long returned = 0;
+
+	return co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KLOAD_ENTER,
+				   out, sizeof(*out), out, sizeof(*out), &returned);
+}
+
+co_rc_t co_manager_kload_end(co_manager_handle_t handle)
+{
+	unsigned long returned = 0;
+
+	return co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KLOAD_END,
+				   NULL, 0, NULL, 0, &returned);
 }
 
 co_rc_t co_manager_test_space(co_manager_handle_t handle,

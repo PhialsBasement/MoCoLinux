@@ -235,6 +235,14 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		return co_winnt_probe_passage();
 	}
 
+	if (winnt_parameters.enter_kernel) {
+		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, PTRUE);
+	}
+
+	if (winnt_parameters.load_kernel) {
+		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, PFALSE);
+	}
+
 	if (winnt_parameters.dump_vmlinux) {
 		return co_elf_dump(winnt_parameters.dump_vmlinux_arg);
 	}

@@ -66,6 +66,13 @@ extern co_rc_t co_arch_test_extern_guest(co_manager_t* manager,
 					 co_arch_switch_test_t* out,
 					 bool_t provoke_fault);
 
+/* Enter an address space that already holds a loaded kernel image. */
+struct co_arch_guest_space;
+extern co_rc_t co_arch_enter_loaded(co_manager_t* manager,
+				    struct co_arch_guest_space* space,
+				    unsigned long long entry_va,
+				    co_arch_switch_test_t* out);
+
 /* Enter the guest N times and require it to continue from where it stopped. */
 extern co_rc_t co_arch_test_resume(co_manager_t* manager, co_arch_switch_test_t* out,
 				   int iterations);

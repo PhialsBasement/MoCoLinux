@@ -40,6 +40,11 @@ typedef enum {
 	CO_MANAGER_IOCTL_TEST_BADSTACK,
 	CO_MANAGER_IOCTL_TEST_GUEST,
 	CO_MANAGER_IOCTL_TEST_GUESTFAULT,
+	CO_MANAGER_IOCTL_KLOAD_BEGIN,
+	CO_MANAGER_IOCTL_KLOAD_CHUNK,
+	CO_MANAGER_IOCTL_KLOAD_VERIFY,
+	CO_MANAGER_IOCTL_KLOAD_ENTER,
+	CO_MANAGER_IOCTL_KLOAD_END,
 } co_manager_ioctl_t;
 
 /*
@@ -259,6 +264,31 @@ typedef struct {
 	int		   preflight_level;
 	unsigned long long preflight_va;
 } co_manager_ioctl_test_switch_t;
+
+/* interface for the CO_MANAGER_IOCTL_KLOAD_* family */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long min_va;
+	unsigned long long max_va;
+} co_manager_ioctl_kload_begin_t;
+
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long va;
+	unsigned long	   size;
+	int		   zero;	/* allocate the pages but write nothing */
+	unsigned char	   data[0];
+} co_manager_ioctl_kload_chunk_t;
+
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long va;
+	unsigned long	   size;
+	unsigned long long checksum;
+	unsigned long	   pages;
+	unsigned long	   chunks;
+	unsigned long	   tables;
+} co_manager_ioctl_kload_verify_t;
 
 /* interface for CO_MANAGER_IOCTL_TEST_SPACE: mirrors co_arch_space_test_t */
 typedef struct {

@@ -23,6 +23,10 @@ typedef struct co_winnt_parameters {
 	bool_t probe_va;
 	bool_t probe_passage;
 	bool_t probe_sweep;
+	bool_t load_kernel;
+	char   load_kernel_arg[0x100];
+	bool_t enter_kernel;
+	char   enter_kernel_arg[0x100];
 	bool_t dump_vmlinux;
 	char   dump_vmlinux_arg[0x100];
 	bool_t save_state;

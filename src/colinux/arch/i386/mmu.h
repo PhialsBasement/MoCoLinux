@@ -48,6 +48,15 @@ typedef unsigned long co_pfn_t;
 #define CO_ARCH_PAGE_SHIFT      12
 #define CO_ARCH_PAGE_SIZE       (1 << CO_ARCH_PAGE_SHIFT)
 #define CO_ARCH_PAGE_MASK       (~(CO_ARCH_PAGE_SIZE-1))
+
+/*
+ * On x86-64 an address is canonical only if bits 48..63 copy bit 47, and code
+ * shared between the two ports checks that before using an address. A 32-bit
+ * address space has no such hole -- every value is a valid address -- so this is
+ * unconditionally true here rather than absent, which would make the shared code
+ * arch-specific for no reason.
+ */
+#define CO_ARCH_VA_CANONICAL(va) (1)
 #define CO_ARCH_KERNEL_OFFSET   0xc0000000
 
 #endif
