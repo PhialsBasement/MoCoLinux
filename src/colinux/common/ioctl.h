@@ -46,6 +46,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KLOAD_ENTER,
 	CO_MANAGER_IOCTL_KLOAD_END,
 	CO_MANAGER_IOCTL_KCALL,
+	CO_MANAGER_IOCTL_KBOOT,
 } co_manager_ioctl_t;
 
 /*
@@ -290,6 +291,40 @@ typedef struct {
 	unsigned long	   chunks;
 	unsigned long	   tables;
 } co_manager_ioctl_kload_verify_t;
+
+/* interface for CO_MANAGER_IOCTL_KBOOT */
+typedef struct {
+	co_rc_t		   rc;
+	int		   supported;
+	/* in */
+	unsigned long long entry_va;
+	unsigned long long initial_code_va;
+	unsigned long long start_kernel_va;
+	unsigned long long early_console_va;
+	unsigned long long colinux_console_va;
+	unsigned long long ring_symbol_va;
+	int		   max_switches;
+	/* out */
+	unsigned long long guest_cr3;
+	unsigned long	   tables;
+	unsigned long long console_ring_va;
+	unsigned long long console_written;
+	unsigned long long console_capacity;
+	char		   console_text[2048];
+	int		   faulted;
+	int		   returned_voluntarily;
+	int		   hit_limit;
+	unsigned long	   switches;
+	unsigned long	   interrupts;
+	unsigned long long vector;
+	unsigned long long fault_rip;
+	unsigned long long error_code;
+	unsigned long long cr2;
+	int		   preflight_checked;
+	int		   preflight_failed;
+	int		   preflight_level;
+	unsigned long long preflight_va;
+} co_manager_ioctl_kboot_t;
 
 /* interface for CO_MANAGER_IOCTL_KCALL: mirrors co_arch_kcall_test_t */
 typedef struct {

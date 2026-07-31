@@ -235,6 +235,10 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		return co_winnt_probe_passage();
 	}
 
+	if (winnt_parameters.boot_kernel) {
+		return co_elf_load_into_guest(winnt_parameters.boot_kernel_arg, 3);
+	}
+
 	if (winnt_parameters.call_kernel) {
 		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2);
 	}

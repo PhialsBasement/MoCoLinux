@@ -175,6 +175,18 @@ asm(".text                                          \n"
 #define CO_PP_CALL_ARG3		"0x990"
 #define CO_PP_CALL_ARG4		"0x998"
 #define CO_PP_CALL_ARG5		"0x9a0"
+
+/*
+ * params[28]: where the interrupted guest's register frame was left.
+ *
+ * A guest that is going to be resumed cannot have its registers thrown away,
+ * and until the guest kernel has coLinux's own interrupt entry hooks -- which
+ * would do SAVE_ALL themselves -- the stub has to preserve them. It pushes the
+ * full set onto the IST stack, records rsp here, and the resume path pops them
+ * and returns with iretq into the exact instruction that was interrupted.
+ */
+#define CO_PP_GUEST_FRAME	"0x9a8"
+#define CO_PP_GUEST_FRAME_N	0x9a8
 #define CO_PP_CALL_TARGET_N	0x968
 #define CO_PP_CALL_RET_N	0x988
 
@@ -341,14 +353,42 @@ asm(".text                                                          \n"
      */
     ".globl co_switch_guest_fault                                   \n"
     "co_switch_guest_fault:                                         \n"
+    /*
+     * Save everything before touching anything. The guest may be resumed, and
+     * an interrupt arrives at an arbitrary instruction, so every register is
+     * live. Fifteen pushes: rsp itself is already in the interrupt frame.
+     *
+     * Frame from rsp after this, which the offsets below depend on:
+     *   0x00 r15  0x08 r14  0x10 r13  0x18 r12  0x20 r11  0x28 r10
+     *   0x30 r9   0x38 r8   0x40 rbp  0x48 rdi  0x50 rsi  0x58 rdx
+     *   0x60 rcx  0x68 rbx  0x70 rax
+     *   0x78 vector  0x80 error code   (pushed by the stub)
+     *   0x88 RIP  0x90 CS  0x98 RFLAGS  0xa0 RSP  0xa8 SS   (pushed by the CPU)
+     */
+    "    push %rax                                                  \n"
+    "    push %rbx                                                  \n"
+    "    push %rcx                                                  \n"
+    "    push %rdx                                                  \n"
+    "    push %rsi                                                  \n"
+    "    push %rdi                                                  \n"
+    "    push %rbp                                                  \n"
+    "    push %r8                                                   \n"
+    "    push %r9                                                   \n"
+    "    push %r10                                                  \n"
+    "    push %r11                                                  \n"
+    "    push %r12                                                  \n"
+    "    push %r13                                                  \n"
+    "    push %r14                                                  \n"
+    "    push %r15                                                  \n"
     "    lea 0(%rip), %rax                                          \n"
     "    and $-4096, %rax                                           \n"
+    "    mov %rsp, " CO_PP_GUEST_FRAME "(%rax)                      \n"
     "    movq $1, " CO_PP_FAULTED "(%rax)                           \n"
-    "    mov 0(%rsp), %rdx                                          \n"
+    "    mov 0x78(%rsp), %rdx                                       \n"
     "    mov %rdx, " CO_PP_VECTOR "(%rax)                           \n"
-    "    mov 8(%rsp), %rdx                                          \n"
+    "    mov 0x80(%rsp), %rdx                                       \n"
     "    mov %rdx, " CO_PP_ERRCODE "(%rax)                          \n"
-    "    mov 16(%rsp), %rdx                                         \n"
+    "    mov 0x88(%rsp), %rdx                                       \n"
     "    mov %rdx, " CO_PP_FAULT_RIP "(%rax)                        \n"
     /* CR2 is only meaningful for #PF, but it costs nothing and is the whole
      * diagnosis when it is: the address that could not be translated. */
@@ -435,6 +475,54 @@ asm(".text                                                          \n"
      * caller-saved in SysV and the callee may have used it. It recovers the
      * passage page from its own RIP instead, exactly as the fault handler does.
      */
+    /*
+     * Put an interrupted guest back exactly where it was.
+     *
+     * The host sets return_rip here after handing the interrupt to Windows. rsp
+     * on arrival is irrelevant -- it is replaced immediately by the frame the
+     * stub recorded -- and the iretq restores RIP, CS, RFLAGS, RSP and SS
+     * together, so the guest resumes at the interrupted instruction with its
+     * interrupt flag as it was.
+     */
+    ".globl co_guest_resume                                         \n"
+    "co_guest_resume:                                               \n"
+    "    lea 0(%rip), %rax                                          \n"
+    "    and $-4096, %rax                                           \n"
+    "    mov " CO_PP_GUEST_FRAME "(%rax), %rsp                      \n"
+    "    pop %r15                                                   \n"
+    "    pop %r14                                                   \n"
+    "    pop %r13                                                   \n"
+    "    pop %r12                                                   \n"
+    "    pop %r11                                                   \n"
+    "    pop %r10                                                   \n"
+    "    pop %r9                                                    \n"
+    "    pop %r8                                                    \n"
+    "    pop %rbp                                                   \n"
+    "    pop %rdi                                                   \n"
+    "    pop %rsi                                                   \n"
+    "    pop %rdx                                                   \n"
+    "    pop %rcx                                                   \n"
+    "    pop %rbx                                                   \n"
+    "    pop %rax                                                   \n"
+    "    add $16, %rsp              /* vector and error code */     \n"
+    "    iretq                                                      \n"
+    /*
+     * Entry for booting: enable interrupts, then jump to the kernel.
+     *
+     * The switch reaches the guest by lretq, which does not restore RFLAGS, so
+     * a guest entered any other way runs with IF clear. That is fine for code
+     * that returns in microseconds and fatal for code that does not: a Windows
+     * thread spinning with interrupts off cannot be preempted, and the other
+     * cores eventually trip the clock watchdog and bugcheck the machine. A
+     * kernel booting is the first guest that runs long enough to matter.
+     */
+    ".globl co_boot_shim                                            \n"
+    "co_boot_shim:                                                  \n"
+    "    lea 0(%rip), %rax                                          \n"
+    "    and $-4096, %rax                                           \n"
+    "    mov " CO_PP_CALL_TARGET "(%rax), %r10                      \n"
+    "    sti                                                        \n"
+    "    jmp *%r10                                                  \n"
     ".globl co_call_shim                                            \n"
     "co_call_shim:                                                  \n"
     "    lea 0(%rip), %rax                                          \n"
@@ -473,6 +561,8 @@ asm(".text                                                          \n"
     "co_switch_full_end:                                            \n");
 
 extern char co_call_shim;
+extern char co_guest_resume;
+extern char co_boot_shim;
 
 /*
  * The guest for R4, which does not live in the passage page.
@@ -688,7 +778,8 @@ typedef char co_assert_fault_slots
 	  /* the extern guest reads it as 0x98(%r8), r8 being &params[0] */
 	  CO_PP_SWITCH_ENTRY_N - __builtin_offsetof(co_arch_passage_page_t, params) == 0x98 &&
 	  __builtin_offsetof(co_arch_passage_page_t, params) + 20 * 8 == CO_PP_CALL_TARGET_N &&
-	  __builtin_offsetof(co_arch_passage_page_t, params) + 24 * 8 == CO_PP_CALL_RET_N)
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 24 * 8 == CO_PP_CALL_RET_N &&
+	  __builtin_offsetof(co_arch_passage_page_t, params) + 28 * 8 == CO_PP_GUEST_FRAME_N)
 	 ? 1 : -1];
 
 /* The blob reaches gdt.base by literal offset; keep it honest. */
@@ -1925,6 +2016,242 @@ co_rc_t co_arch_test_kernel_code(co_manager_t* manager, co_arch_guest_space_t* s
 out_free_scratch:
 	if (scratch_pfn)
 		co_os_put_page(manager, scratch_pfn);
+out_free_stack:
+	if (stack_pfn)
+		co_os_put_page(manager, stack_pfn);
+out_free_pp:
+	co_os_free_exec_pages(pp, pages);
+
+	return rc;
+}
+
+/*
+ * Boot the loaded kernel: enter co_arch_start_kernel and see how far it gets.
+ *
+ * Three globals are written before anything runs, all of them things the host
+ * can do and a real machine cannot:
+ *
+ *   co_colinux_console_ring  where the early console writes
+ *   early_console            so early_printk has a console from instruction one
+ *   initial_code             start_kernel rather than x86_64_start_kernel
+ *
+ * The last is the same substitution the i386 port makes. x86_64_start_kernel
+ * calls reset_early_page_tables() and assigns init_top_pgt[511], which would
+ * discard the address space we are running in, and idt_setup_early_handler(),
+ * which would replace the fault stubs during the window they are most needed.
+ * What it does that we want -- clearing .bss -- is already true, because every
+ * page kload allocates is zeroed and .bss arrives as zeroing chunks.
+ *
+ * This is expected to stop somewhere. The point is that it can now say where:
+ * whatever it printed before dying is in the ring, and if it faults the stubs
+ * report the vector, RIP and CR2.
+ */
+/*
+ * Hand an interrupt that arrived in the guest to the host that owns it.
+ *
+ * The interrupt really was delivered by hardware -- it vectored through the
+ * guest's IDT into our stub -- so the APIC's in-service bit is set and Windows'
+ * own handler has to run, both to do the work and to send EOI. Swallowing it
+ * instead leaves that priority level masked and everything at or below it stops
+ * being delivered, which wedges the machine as thoroughly as a hang.
+ *
+ * The frame is synthesised the way hardware would build it. iretq pops five
+ * quadwords whether or not the privilege level changed, so SS and RSP have to
+ * be there and not just flags, CS and RIP.
+ */
+static void co_forward_host_interrupt(co_arch_passage_page_t* pp, unsigned long long vector)
+{
+	struct co_x86_64_gate* idt =
+		(struct co_x86_64_gate*)pp->host_state.idt.table;
+	struct co_x86_64_gate* gate;
+	unsigned long long offset;
+	void* func;
+
+	if (idt == NULL || vector > 255)
+		return;
+
+	gate = &idt[vector];
+
+	offset = (unsigned long long)gate->offset_low
+	       | ((unsigned long long)gate->offset_mid  << 16)
+	       | ((unsigned long long)gate->offset_high << 32);
+
+	if (!(gate->flags & 0x8000))		/* not present */
+		return;
+
+	/* (size_t): unsigned long is four bytes here and every ISR is above 4 GB. */
+	func = (void*)(size_t)offset;
+
+	asm volatile(
+	    "    movq %%rsp, %%r11"		"\n"
+	    "    andq $-16, %%rsp"		"\n"	/* as hardware aligns it */
+	    "    movl %%ss, %%eax"		"\n"
+	    "    pushq %%rax"			"\n"	/* SS     */
+	    "    pushq %%r11"			"\n"	/* RSP    */
+	    "    pushfq"			"\n"	/* RFLAGS */
+	    "    movl %%cs, %%eax"		"\n"
+	    "    pushq %%rax"			"\n"	/* CS     */
+	    "    leaq 1f(%%rip), %%rax"		"\n"
+	    "    pushq %%rax"			"\n"	/* RIP    */
+	    "    cli"				"\n"
+	    "    jmp *%0"			"\n"
+	    "1:"				"\n"
+	    : : "r"(func) : "rax", "r11", "memory", "cc");
+}
+
+co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
+			    co_arch_boot_t* in, co_arch_boot_result_t* out)
+{
+	co_arch_passage_page_t* pp;
+	co_arch_switch_test_t setup = {0, };
+	co_switch_full_fn fn;
+	struct co_console_ring* ring;
+	unsigned long long ring_va, stack_va = 0xffffffff90000000ULL;
+	co_pfn_t stack_pfn = 0;
+	int pages = sizeof(co_arch_passage_page_t) / CO_ARCH_PAGE_SIZE;
+	int page, n;
+	co_rc_t rc;
+
+	co_memset(out, 0, sizeof(*out));
+	out->supported = PTRUE;
+
+	if (space == NULL || !in->entry_va || !in->initial_code_va || !in->start_kernel_va)
+		return CO_RC(ERROR);
+
+	pp = co_setup_guest_page(&setup,
+		(unsigned long)(&co_switch_guest_entry - &co_switch_full));
+	if (pp == NULL)
+		return CO_RC(ERROR);
+
+	for (page = 0; page < pages; page++) {
+		unsigned char* q = (unsigned char*)pp + page * CO_ARCH_PAGE_SIZE;
+
+		rc = co_arch_guest_map(manager, space, (unsigned long long)(size_t)q,
+				       co_os_virt_to_phys(q), _KERNPG_TABLE);
+		if (!CO_OK(rc))
+			goto out_free_pp;
+	}
+
+	rc = co_os_get_page(manager, &stack_pfn);
+	if (!CO_OK(rc))
+		goto out_free_pp;
+	rc = co_arch_guest_map(manager, space, stack_va,
+			       ((co_pa_t)stack_pfn) << CO_ARCH_PAGE_SHIFT, _KERNPG_TABLE);
+	if (!CO_OK(rc))
+		goto out_free_stack;
+
+	ring = (struct co_console_ring*)((unsigned char*)&pp->host_temp
+					 + CO_PP_CONSOLE_PAGE * CO_ARCH_PAGE_SIZE);
+	ring_va = (unsigned long long)(size_t)ring;
+	co_memset(ring, 0, CO_ARCH_PAGE_SIZE);
+	ring->capacity = CO_ARCH_PAGE_SIZE - sizeof(*ring);
+
+	if (!CO_OK(co_write_guest_u64(manager, space, in->ring_symbol_va, ring_va)) ||
+	    !CO_OK(co_write_guest_u64(manager, space, in->early_console_va,
+				      in->colinux_console_va)) ||
+	    !CO_OK(co_write_guest_u64(manager, space, in->initial_code_va,
+				      in->start_kernel_va))) {
+		co_debug_error("could not write the boot globals");
+		rc = CO_RC(ERROR);
+		goto out_free_stack;
+	}
+
+	pp->linuxvm_state.cr3 = co_arch_guest_space_root(space);
+	pp->params[19]        = (unsigned long long)(size_t)pp->code;
+
+	/*
+	 * Enter through the boot shim so the guest runs with interrupts enabled,
+	 * and point it at the kernel's entry.
+	 */
+	pp->params[20] = in->entry_va;
+	pp->linuxvm_state.return_rip = (unsigned long long)(size_t)pp->code
+		+ (unsigned long)(&co_boot_shim - &co_switch_full);
+	pp->linuxvm_state.rsp = stack_va + CO_ARCH_PAGE_SIZE - 0x40;
+
+	fn = (co_switch_full_fn)(void*)pp->code;
+
+	out->guest_cr3      = pp->linuxvm_state.cr3;
+	out->entry_va       = in->entry_va;
+	out->console_ring_va = ring_va;
+	out->tables         = co_arch_guest_space_tables(space);
+
+	if (!CO_OK(co_preflight_space(manager, space, "entry", in->entry_va, 0, &setup)) ||
+	    !CO_OK(co_preflight_space(manager, space, "stack", stack_va,
+				      ((co_pa_t)stack_pfn) << CO_ARCH_PAGE_SHIFT, &setup)) ||
+	    !CO_OK(co_preflight_space(manager, space, "start_kernel",
+				      in->start_kernel_va, 0, &setup)) ||
+	    !CO_OK(co_preflight_space(manager, space, "passage page",
+				      (unsigned long long)(size_t)pp,
+				      co_os_virt_to_phys(pp), &setup))) {
+		out->preflight_failed = PTRUE;
+		out->preflight_va     = setup.preflight_va;
+		out->preflight_level  = setup.preflight_level;
+		rc = CO_RC(ERROR);
+		goto out_free_stack;
+	}
+	out->preflight_checked = setup.preflight_checked;
+
+	/*
+	 * The monitor loop.
+	 *
+	 * The guest runs until something interrupts it. External vectors (32 and
+	 * above) are the host's -- forward them to Windows and put the guest back
+	 * exactly where it was. Anything below 32 is an exception the guest itself
+	 * took, which is news, so stop and report it.
+	 *
+	 * Bounded, because an unbounded loop here is the same bug as an unbounded
+	 * guest: this runs inside a driver ioctl and has to give the thread back.
+	 */
+	{
+		unsigned long long resume_rip = (unsigned long long)(size_t)pp->code
+			+ (unsigned long)(&co_guest_resume - &co_switch_full);
+		unsigned long long ist_top = (unsigned long long)(size_t)&pp->host_temp
+			+ (CO_PP_ISTSTACK_PAGE + 1) * CO_ARCH_PAGE_SIZE;
+		int i;
+
+		for (i = 0; i < in->max_switches; i++) {
+			pp->params[4] = 0;		/* faulted */
+
+			fn(&pp->host_state, &pp->linuxvm_state, NULL, 0);
+
+			out->switches++;
+
+			if (!pp->params[4]) {
+				/* came back on its own -- nothing here does that yet */
+				out->returned_voluntarily = PTRUE;
+				break;
+			}
+
+			out->vector     = pp->params[16];
+			out->fault_rip  = pp->params[5];
+			out->error_code = pp->params[17];
+			out->cr2        = pp->params[18];
+
+			if (out->vector < 32) {
+				out->faulted = PTRUE;
+				break;
+			}
+
+			out->interrupts++;
+			co_forward_host_interrupt(pp, out->vector);
+
+			/* back in, exactly where it was */
+			pp->linuxvm_state.return_rip = resume_rip;
+			pp->linuxvm_state.rsp        = ist_top - 0x40;
+		}
+
+		if (out->switches >= in->max_switches)
+			out->hit_limit = PTRUE;
+	}
+
+	out->console_written  = ring->written;
+	out->console_capacity = ring->capacity;
+	for (n = 0; n < (int)sizeof(out->console_text) - 1 && n < (int)ring->written; n++)
+		out->console_text[n] = ring->text[n];
+	out->console_text[n] = 0;
+
+	rc = CO_RC(OK);
+
 out_free_stack:
 	if (stack_pfn)
 		co_os_put_page(manager, stack_pfn);

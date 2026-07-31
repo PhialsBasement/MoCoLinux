@@ -66,3 +66,11 @@ co_rc_t co_arch_test_kernel_code(co_manager_t* manager, struct co_arch_guest_spa
 	out->supported = PFALSE;
 	return CO_RC(OK);
 }
+
+co_rc_t co_arch_boot_loaded(co_manager_t* manager, struct co_arch_guest_space* space,
+			    co_arch_boot_t* in, co_arch_boot_result_t* out)
+{
+	co_memset(out, 0, sizeof(*out));
+	out->supported = PFALSE;
+	return CO_RC(OK);
+}

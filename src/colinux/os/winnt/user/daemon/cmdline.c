@@ -52,6 +52,8 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("                                   whether it is executable. Porting aid.\n");
 	co_terminal_print("      --load-kernel FILE           Load a vmlinux into a guest address\n");
 	co_terminal_print("                                   space and verify it. Does not enter.\n");
+	co_terminal_print("      --boot-kernel FILE           Enter co_arch_start_kernel and report\n");
+	co_terminal_print("                                   what the kernel printed before stopping\n");
 	co_terminal_print("      --call-kernel FILE           Load a vmlinux, then call memset and\n");
 	co_terminal_print("                                   strlen out of it. Runs kernel code.\n");
 	co_terminal_print("      --enter-kernel FILE          The same, then transfer control into\n");
@@ -240,6 +242,15 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		&winnt_parameters->load_kernel,
 		winnt_parameters->load_kernel_arg,
 		sizeof(winnt_parameters->load_kernel_arg));
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--boot-kernel",
+		&winnt_parameters->boot_kernel,
+		winnt_parameters->boot_kernel_arg,
+		sizeof(winnt_parameters->boot_kernel_arg));
 
 	if (!CO_OK(rc))
 		return rc;

@@ -612,6 +612,54 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_KBOOT: {
+		co_manager_ioctl_kboot_t* params = (typeof(params))(io_buffer);
+		co_arch_boot_t in;
+		co_arch_boot_result_t result;
+		co_rc_t trc;
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		in.entry_va           = params->entry_va;
+		in.initial_code_va    = params->initial_code_va;
+		in.start_kernel_va    = params->start_kernel_va;
+		in.early_console_va   = params->early_console_va;
+		in.colinux_console_va = params->colinux_console_va;
+		in.ring_symbol_va     = params->ring_symbol_va;
+		in.max_switches       = params->max_switches ? params->max_switches : 4096;
+
+		co_memset(params, 0, sizeof(*params));
+
+		trc = co_arch_boot_loaded(manager, co_kload_space(), &in, &result);
+
+		params->rc		 = trc;
+		params->supported	 = result.supported;
+		params->entry_va	 = result.entry_va;
+		params->guest_cr3	 = result.guest_cr3;
+		params->tables		 = result.tables;
+		params->console_ring_va	 = result.console_ring_va;
+		params->console_written	 = result.console_written;
+		params->console_capacity = result.console_capacity;
+		co_memcpy(params->console_text, result.console_text, sizeof(params->console_text));
+		params->faulted		 = result.faulted;
+		params->returned_voluntarily = result.returned_voluntarily;
+		params->hit_limit	 = result.hit_limit;
+		params->switches	 = result.switches;
+		params->interrupts	 = result.interrupts;
+		params->vector		 = result.vector;
+		params->fault_rip	 = result.fault_rip;
+		params->error_code	 = result.error_code;
+		params->cr2		 = result.cr2;
+		params->preflight_checked = result.preflight_checked;
+		params->preflight_failed  = result.preflight_failed;
+		params->preflight_level	  = result.preflight_level;
+		params->preflight_va	  = result.preflight_va;
+
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_KLOAD_END: {
 		co_kload_free(manager);
 		*return_size = 0;
