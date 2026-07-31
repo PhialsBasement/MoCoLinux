@@ -1,0 +1,216 @@
+Making the x86-64 guest actually cooperative
+=============================================
+
+This is the plan for turning the current single-stepped bring-up into a real
+cooperative guest, modelled on what coLinux i386 does. It is written after
+reading the upstream source (colinux/patch/base-2.6.33.diff and
+colinux/src/colinux/kernel/monitor.c), not from guessing, and every mechanism
+below has a named counterpart there.
+
+
+0. Where we are, and why it is not cooperative
+----------------------------------------------
+
+The guest boots. It reaches do_idle at ~170M instructions, halts, and the host
+stops. Getting there costs ~90 seconds of one core pinned at 100% inside a
+driver ioctl, because every guest instruction is single-stepped: TF is set, the
+CPU traps after each instruction, and the host re-arms it. 170M traps is 170M
+world-switch-sized events.
+
+That is the opposite of cooperative in two ways:
+
+  * it takes total control of a core for the whole run, and
+  * at idle it terminates the guest rather than handing the CPU back and
+    resuming later when there is work.
+
+Single-stepping was the right scaffold for an unbootable guest -- it bounds a
+guest that would otherwise run away with interrupts off, and it turns every
+fault into a reportable stop. It has done its job. A booting guest does not
+need it, and cannot afford it.
+
+
+1. The coLinux cooperative model, from the source
+-------------------------------------------------
+
+The guest runs FREE, at native speed, with real interrupts enabled. It does not
+get stepped. It hands control back to the host by *calling the world switch
+itself* at a small number of cooperative points. Between those points it runs
+like any kernel.
+
+Three yield points, all of which call co_switch_wrapper() -- the guest half of
+the passage-page world switch:
+
+  a. Idle. arch/x86/kernel/process.c points pm_idle at co_idle_processor:
+
+         local_irq_disable();
+         co_passage_page->operation = CO_OPERATION_IDLE;
+         co_switch_wrapper();          /* hand the CPU to the host */
+         co_callback(NULL);            /* on re-entry, absorb what host sent */
+         local_irq_enable();
+
+     No hlt. The guest yields; the host runs its own world (Windows, other
+     work); it re-enters the guest when there is something to do, and the guest
+     drains it in co_callback.
+
+  b. A real host hardware interrupt arriving while the guest is current. Every
+     IDT vector is pointed at proxy_interrupt_handler (i8259_cooperative.c):
+
+         co_passage_page->operation = CO_OPERATION_FORWARD_INTERRUPT;
+         co_passage_page->params[0] = vector;
+         co_passage_page->host_state.flags &= ~(1 << 9);   /* IF off in host flags */
+         co_switch_wrapper();
+         co_callback(regs);
+
+     The interrupt is not handled in the guest. It is handed to the host, which
+     delivers it to Windows' own ISR -- see section 3 for the crucial detail of
+     *where* that happens.
+
+  c. Sending a message to the host: CO_OPERATION_MESSAGE_TO_MONITOR, for device
+     I/O and console output.
+
+Time is virtual. There is no guest timer hardware. The host tells the guest how
+many ticks have passed by putting a count in the passage page, and
+co_handle_jiffies delivers them by calling the guest's own timer IRQ that many
+times:
+
+         while (count-- > 0) { irq_enter(); __do_IRQ(TIMER_IRQ); irq_exit(); }
+
+Devices are virtual too. A virtual interrupt controller, COPIC
+(i8259_cooperative.c), replaces the 8259/APIC. Its "interrupts" are messages
+the host queues; the guest delivers each with __do_IRQ(device_irq). The
+per-device IRQ numbers (KEYBOARD_IRQ, NETWORK_IRQ, BLOCKDEV_IRQ, ...) are fixed.
+
+The whole conversation runs over the passage page plus an I/O area, with a
+small set of operations (from base-2.6.33.diff):
+
+    START IDLE TERMINATE MESSAGE_TO_MONITOR MESSAGE_FROM_MONITOR
+    FORWARD_INTERRUPT DEVICE GET_TIME GET_HIGH_PREC_TIME
+    DEBUG_LINE TRACE_POINT FREE_PAGES ALLOC_PAGES GETPP
+
+The host monitor loop (monitor.c: iteration()) is the mirror image: switch to
+the guest, and on the switch back dispatch on co_passage_page->operation --
+IDLE sleeps until a message arrives, FORWARD_INTERRUPT calls the host ISR,
+MESSAGE_TO_MONITOR routes a device message, and so on, then switch back in.
+
+
+2. What we have and what is missing
+-----------------------------------
+
+Have:
+  * The world switch itself (co_switch_full), bidirectional, proven.
+  * The passage page and guest address space.
+  * The guest kernel patched enough to boot to idle.
+  * Fault, warning, halt and exception-table handling for bring-up.
+
+Missing -- this is the cooperative core, and it is most of M4/M5:
+  * The passage-page message protocol: the operation dispatch, the I/O area,
+    the message queues. We have `params[]` used ad hoc for the boot test; there
+    is no operation loop.
+  * Cooperative idle: co_idle_processor and the host co_idle that sleeps and
+    wakes on a message. We have a double-ud2 halt that stops the run.
+  * Virtual time: co_handle_jiffies driven by a host tick count. We have
+    nothing; jiffies never advance, which is why the guest cannot leave idle.
+  * Proxy interrupt forwarding done coLinux's way, plus the x64 CR8 fix
+    (section 3).
+  * COPIC and the device IRQ mapping.
+  * The guest-side glue (co_switch_wrapper, co_callback, co_send_message) as
+    x86-64 rather than the i386 in base-2.6.33.diff.
+
+And the thing that goes away: single-stepping, TF re-arming, the batch, and the
+per-instruction IF clearing. The guest runs free.
+
+
+3. The x86-64 problem coLinux never had: CR8 / IRQL
+---------------------------------------------------
+
+Our earlier attempt to run with IF=1 and forward interrupts killed the host
+every time. The switch's own comment records it: "every run that forwarded even
+one interrupt died." That was read as "forwarding is fatal, keep IF=0." Reading
+the coLinux source shows the opposite -- coLinux forwards constantly and
+survives -- so the fatal part is specific to us, and there are two causes.
+
+First, *where* the host ISR is called. coLinux calls Windows' ISR only after a
+full cooperative world switch back to the host, in host context, on the host
+stack, under the host CR3/GDT/IDT, via call_intr() building a synthetic
+interrupt frame (interrupt.c). Our dormant path tried to call it from inside
+the monitor ioctl on a hand-built frame without having cleanly returned to host
+context. Same idea, wrong place.
+
+Second, and specific to 64-bit: CR8 is the task priority register, and on x64
+Windows CR8 *is* IRQL. A hardware interrupt raises it; the ISR lowers it on the
+way out. Our world switch carries CR0, CR3, CR4, the MSRs, the segment
+selectors, GDT, IDT and TR -- but not CR8. So an interrupt taken on the guest
+side, forwarded, and completed on the host side leaves the CPU's task priority
+inconsistent with what Windows believes IRQL to be, and the machine dies later,
+unrelated -- the exact signature we kept seeing. i386 has no CR8; IRQL there is
+the PIC mask and the HAL's software level, so coLinux never had to carry it.
+CR8 must travel across the switch, both directions, like CR3 does.
+
+The host self-check must grow a CR8 field too, so a future omission is caught at
+the crossing rather than as a delayed freeze.
+
+
+4. The build, in order, each piece testable on its own
+------------------------------------------------------
+
+Stage A -- the operation loop and cooperative idle (no interrupts yet)
+    Give the passage page a real operation field and an I/O area. Replace the
+    monitor's step loop with an operation loop: enter the guest, and on the
+    switch back dispatch on operation. Implement START, IDLE, TERMINATE,
+    MESSAGE_TO_MONITOR (printk only, to keep the console), and GETPP.
+
+    Patch the guest: co_switch_wrapper / co_callback / co_send_message as
+    x86-64; point pm_idle (select_idle_routine) at co_idle_processor. Drop the
+    double-ud2 halt.
+
+    The guest still runs free but with interrupts *masked at the source* -- keep
+    IF clear for this stage by not yet enabling the proxy path, so nothing
+    depends on CR8/forwarding. The bound is now the guest's own cooperative
+    yields (idle) plus faults, not stepping. This is where we find out whether
+    the boot has any genuinely unbounded non-yielding loop; the trace-eval one
+    we "fixed" was a stepping artifact and should be reverted and retested here,
+    because at native speed it is nothing.
+
+    Done when: the guest boots to idle in well under a second, yields
+    CO_OPERATION_IDLE, the host re-enters, and printk still reaches the console
+    over MESSAGE_TO_MONITOR.
+
+Stage B -- virtual time
+    Host keeps a tick count (from its own timer, or a coarse wall-clock read per
+    idle) and hands it to the guest on each re-entry. Implement co_handle_jiffies
+    and wire TIMER_IRQ. Now jiffies advance, the scheduler runs, and the guest
+    leaves idle on its own -- init runs.
+
+    Done when: the guest's uptime advances, and it proceeds past "reached idle"
+    into running the init process.
+
+Stage C -- CR8 across the switch, then proxy interrupt forwarding
+    Add CR8 to the state block, the switch save/restore (both directions), and
+    the host self-check. Only then bring up proxy_interrupt_handler: point the
+    guest IDT vectors at it, run the guest with real IF=1, and on
+    CO_OPERATION_FORWARD_INTERRUPT deliver the host ISR the coLinux way
+    (call_intr equivalent, after the switch back). Test with one forwarded
+    interrupt first, with the self-check watching CR8 and the segments, before
+    trusting it under load.
+
+    Done when: a run survives thousands of forwarded host interrupts with the
+    self-check clean every crossing.
+
+Stage D -- the COPIC and device messages
+    The virtual controller, the device IRQ map, MESSAGE_FROM_MONITOR delivering
+    queued device messages via __do_IRQ. This is what makes cobd (block) and
+    conet (net) and the cooperative console work -- i.e. a usable machine.
+
+
+5. What stays true throughout
+-----------------------------
+
+  * The host must come back from every crossing exactly as it left. The
+    self-check is the guarantor; it grows CR8 and the segments in this work, and
+    a run stops at the first divergence rather than freezing later.
+  * The guest is trusted. Cooperative Linux is not a hypervisor: a guest that
+    runs away without yielding can take the host, and that is accepted, the same
+    way it is accepted upstream. The bound is the guest's own cooperative
+    yields, not a hardware watchdog.
+  * Every stage is verified against the coLinux reference, which is a working
+    implementation of exactly this, one architecture over.

@@ -40,6 +40,7 @@
 void co_arch_save_state(co_arch_state_stack_t* state)
 {
 	unsigned short sel;
+	unsigned int lo, hi;
 
 	co_memset(state, 0, sizeof(*state));
 
@@ -59,6 +60,11 @@ void co_arch_save_state(co_arch_state_stack_t* state)
 	state->cr2 = co_get_cr2();
 	state->cr3 = co_get_cr3();
 	state->cr4 = co_get_cr4();
+	asm volatile("mov %%cr8, %0" : "=r"(state->cr8));
+	if (state->cr4 & (1ULL << 18)) {
+		asm volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+		state->xcr0 = ((unsigned long long)hi << 32) | lo;
+	}
 
 	/*
 	 * None of these exist in the i386 state. EFER carries long mode itself;
@@ -141,6 +147,7 @@ static void co_arch_clear_tss_busy(co_arch_state_stack_t* state)
 void co_arch_restore_state(co_arch_state_stack_t* state)
 {
 	unsigned long long flags;
+	unsigned int lo, hi;
 	unsigned short sel;
 
 	asm volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
@@ -149,8 +156,14 @@ void co_arch_restore_state(co_arch_state_stack_t* state)
 	 * consistent with CR4's paging-mode bits when it takes effect. */
 	asm volatile("mov %0, %%cr0" : : "r"(state->cr0) : "memory");
 	asm volatile("mov %0, %%cr4" : : "r"(state->cr4) : "memory");
+	if (state->cr4 & (1ULL << 18)) {
+		lo = (unsigned int)state->xcr0;
+		hi = (unsigned int)(state->xcr0 >> 32);
+		asm volatile("xsetbv" : : "a"(lo), "d"(hi), "c"(0));
+	}
 	asm volatile("mov %0, %%cr2" : : "r"(state->cr2));
 	asm volatile("mov %0, %%cr3" : : "r"(state->cr3) : "memory");
+	asm volatile("mov %0, %%cr8" : : "r"(state->cr8));
 
 	/* Descriptor tables. */
 	asm volatile("lgdt %0" : : "m"(state->gdt));
@@ -185,12 +198,16 @@ void co_arch_restore_state(co_arch_state_stack_t* state)
 	co_write_msr(CO_MSR_IA32_LSTAR,  state->lstar);
 	co_write_msr(CO_MSR_IA32_CSTAR,  state->cstar);
 	co_write_msr(CO_MSR_IA32_SFMASK, state->sfmask);
+	co_write_msr(0x174, state->sysenter_cs);
+	co_write_msr(0x175, state->sysenter_esp);
+	co_write_msr(0x176, state->sysenter_eip);
 
 	/* DR7 last: it is what actually arms the others. */
 	asm volatile("mov %0, %%dr0" : : "r"(state->dr0));
 	asm volatile("mov %0, %%dr1" : : "r"(state->dr1));
 	asm volatile("mov %0, %%dr2" : : "r"(state->dr2));
 	asm volatile("mov %0, %%dr3" : : "r"(state->dr3));
+	asm volatile("mov %0, %%dr6" : : "r"(state->dr6));
 	asm volatile("mov %0, %%dr7" : : "r"(state->dr7));
 
 	asm volatile("pushq %0; popfq" : : "r"(flags) : "memory", "cc");

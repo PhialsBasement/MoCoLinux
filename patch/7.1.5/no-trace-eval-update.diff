@@ -1,0 +1,59 @@
+Skip resolving trace-event enum maps, which single-stepping cannot afford.
+
+eval_map_work_func() rewrites every trace event's print-format string,
+replacing enum names with their numeric values so a tracefs reader sees
+numbers. It does this by scanning each of ~1700 events' format strings against
+each of ~1400 eval maps, in trace_event_update_all -> update_event_printk: on
+the order of a million string comparisons, each re-walking a format string.
+
+On real hardware that is a blip. A cooperative guest is single-stepped, one
+world switch per batch, and at that scale the scan is a wall the boot cannot
+get past -- it presents as a hang, hundreds of millions of instructions deep in
+trace_event_update_all's inner character loop with no new console output and
+the event/map iterators (verified from the guest registers: map index 1345 of
+1414, scan pointer in .rodata) grinding forward far too slowly to ever finish.
+
+The data is not corrupt -- the section bounds are right and the strings are
+real -- it is simply O(events x maps x length) where none of the three is
+small. And it is cosmetic: it changes how trace formats print in tracefs,
+which this guest does not use and does not reach.
+
+So skip it when co_colinux_guest. Guarded in eval_map_work_func() rather than
+at the queue_work() site, because there is a fallback path that calls the
+function directly when the workqueue cannot be allocated, and both want the
+same treatment.
+
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -15,6 +15,7 @@
+ #include <linux/ring_buffer.h>
+ #include <linux/utsname.h>
+ #include <linux/stacktrace.h>
++#include <linux/console.h>	/* co_colinux_guest */
+ #include <linux/writeback.h>
+ #include <linux/kallsyms.h>
+ #include <linux/security.h>
+@@ -9050,6 +9051,23 @@
+ {
+ 	int len;
+ 
++	/*
++	 * This resolves enum names to their values inside every trace event's
++	 * print-format string, so that a reader of tracefs sees numbers rather
++	 * than symbols. It does so by scanning each of ~1700 events' format
++	 * strings against each of ~1400 eval maps -- a million-plus string
++	 * comparisons, cosmetic and needed by nothing that boots.
++	 *
++	 * A cooperative guest is single-stepped, and at that scale the scan is
++	 * a wall a run cannot get past in any reasonable time -- it looks like
++	 * a hang, in trace_event_update_all, hundreds of millions of
++	 * instructions with no forward progress. Skipping it costs only the
++	 * enum-name resolution in tracefs output, which this guest has no user
++	 * for, and lets the boot continue to the next initcall.
++	 */
++	if (co_colinux_guest)
++		return;
++
+ 	len = __stop_ftrace_eval_maps - __start_ftrace_eval_maps;
+ 	trace_event_update_with_eval_map(NULL, __start_ftrace_eval_maps, len);
+ }

@@ -1,0 +1,69 @@
+Prime the CR4 shadow, so cr4_set_bits() computes from a real CR4.
+
+cr4_set_bits() and its relatives never read CR4. They compute from
+this_cpu_read(cpu_tlbstate.cr4), a shadow primed once by cr4_init_shadow()
+inside x86_64_start_kernel(). A cooperative guest does not run that function --
+it reloads CR3 and would discard the address space the host built for it -- so
+the shadow is whatever the per-CPU page happened to hold, and it reads back as
+all ones.
+
+Every cr4_set_bits() therefore computes an impossible CR4, with bits set above
+31 where the architecture defines none. The host refuses to write it, which is
+correct and is the guard that keeps a guest from handing Windows a nonsense
+control register. But the feature the caller was enabling quietly does not get
+enabled, and the instruction that needed it faults later with nothing to
+connect it back.
+
+That has now cost two walls, both looking like the CPU refusing a legal
+instruction for no reason:
+
+    xsetbv    at fpu__init_cpu_xstate+0x73, after CR4.OSXSAVE
+    rdfsbase  at __rdfsbase_inactive, after CR4.FSGSBASE
+
+One read of the live register fixes the class. It goes at the top of
+setup_arch, next to the console, because it has to precede the first
+cr4_set_bits() and the earliest of those is in FPU and CPU setup, a long way
+further on.
+
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -55,6 +55,7 @@
+ #include <asm/proto.h>
+ #include <asm/realmode.h>
+ #include <asm/thermal.h>
++#include <asm/tlbflush.h>	/* cr4_init_shadow */
+ #include <asm/unwind.h>
+ #include <asm/vsyscall.h>
+ 
+@@ -941,6 +942,31 @@
+ 	co_colinux_console_init();
+ 
+ 	/*
++	 * Prime the CR4 shadow, which nothing else here has done.
++	 *
++	 * cr4_set_bits() and its relatives do not read CR4. They compute from
++	 * this_cpu_read(cpu_tlbstate.cr4), a shadow copy primed by
++	 * cr4_init_shadow() out of x86_64_start_kernel() -- a function a
++	 * cooperative guest never runs, because it reloads CR3 and would throw
++	 * away the address space the host built. So the shadow holds whatever
++	 * that per-CPU page happened to contain, which is all ones, and every
++	 * cr4_set_bits() computes an impossible CR4 from it. The host refuses
++	 * to write one with bits set above 31, correctly, and the feature the
++	 * caller was enabling silently does not get enabled.
++	 *
++	 * The instruction that wanted it then raises #UD, some distance away
++	 * and with nothing to connect it back. That has now happened twice:
++	 * xsetbv after CR4.OSXSAVE, and rdfsbase after CR4.FSGSBASE. Both look
++	 * like the CPU refusing a legal instruction for no reason.
++	 *
++	 * One read of the live register fixes the whole class. It must happen
++	 * before the first cr4_set_bits(), and the earliest of those is in
++	 * FPU and CPU setup, well after this point.
++	 */
++	if (co_colinux_guest)
++		cr4_init_shadow();
++
++	/*
+ 	 * A cooperative guest has no real mode to trampoline through.
+ 	 *
+ 	 * reserve_real_mode() wants a page below 1 MB for the code an AP runs

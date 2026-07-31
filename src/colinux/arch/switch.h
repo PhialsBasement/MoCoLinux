@@ -140,6 +140,15 @@ typedef struct {
 	/* the kernel's own page tables, init_top_pgt first; see kload.h */
 	unsigned long long kernel_tables[8];
 	int		   kernel_table_count;
+	/* the guest's __ex_table, which the host applies on its behalf */
+	unsigned long long ex_table_start;
+	unsigned long long ex_table_stop;
+	/*
+	 * Where the guest keeps co_colinux_passage_page. The host writes the
+	 * passage page's address there before entry, and the guest yields
+	 * cooperatively by calling the switch blob through it.
+	 */
+	unsigned long long passage_symbol_va;
 } co_arch_boot_t;
 
 typedef struct {
@@ -176,6 +185,19 @@ typedef struct {
 	unsigned long long fault_rdi;
 	unsigned long long fault_rax;
 	/*
+	 * The whole register frame at the last stop, fault or limit.
+	 *
+	 * fault_rdi/rax name two registers, which is enough for a fault whose
+	 * operand is known. A hang is different: the run stops on the switch
+	 * budget somewhere inside a loop, and which loop is a question the
+	 * instruction pointer answers but why it does not exit is a question the
+	 * registers answer -- a list iterator that never reaches its sentinel, a
+	 * scan pointer that ran off the end of a string. In the stub's frame
+	 * order: [0] r15, then r14 r13 r12 r11 r10 r9 r8 rbp rdi rsi rdx rcx
+	 * rbx, [14] rax.
+	 */
+	unsigned long long stop_regs[15];
+	/*
 	 * WARN_ON and friends compile to ud2 with an entry in __bug_table. On
 	 * real hardware the kernel's own #UD handler finds that entry, prints
 	 * the warning and steps over the instruction. A cooperative guest keeps
@@ -184,6 +206,23 @@ typedef struct {
 	 */
 	unsigned long	   warnings;
 	unsigned long long warning_rip[8];
+	/* faults recovered from the guest's own __ex_table */
+	unsigned long	   fixups;
+	unsigned long long fixup_rip[8];
+	int		   fixup_type[8];
+	int		   fault_extype;	/* set if the fatal fault had an entry */
+	int		   reached_idle;	/* guest halted -- booted through to idle */
+	/*
+	 * The cooperative protocol. run_yields are active safe-point crossings;
+	 * idle_yields are CO_OPERATION_IDLE crossings. terminated and
+	 * terminate_reason report a guest-requested shutdown; stop_operation is
+	 * whatever unhandled operation ended the run.
+	 */
+	unsigned long	   run_yields;
+	unsigned long	   idle_yields;
+	int		   terminated;
+	unsigned long long terminate_reason;
+	unsigned long long stop_operation;
 	int		   preflight_checked;
 	int		   preflight_failed;
 	int		   preflight_level;
@@ -237,6 +276,26 @@ typedef enum {
 	CO_HOST_FIELD_EFER,
 	CO_HOST_FIELD_CS,
 	CO_HOST_FIELD_SS,
+	CO_HOST_FIELD_DS,
+	CO_HOST_FIELD_ES,
+	CO_HOST_FIELD_FS,
+	CO_HOST_FIELD_GS,
+	CO_HOST_FIELD_CR8,
+	CO_HOST_FIELD_PAT,
+	CO_HOST_FIELD_DR7,
+	CO_HOST_FIELD_RFLAGS,
+	CO_HOST_FIELD_CR2,
+	CO_HOST_FIELD_LDT,
+	CO_HOST_FIELD_CSTAR,
+	CO_HOST_FIELD_SYSENTER_CS,
+	CO_HOST_FIELD_SYSENTER_ESP,
+	CO_HOST_FIELD_SYSENTER_EIP,
+	CO_HOST_FIELD_DR0,
+	CO_HOST_FIELD_DR1,
+	CO_HOST_FIELD_DR2,
+	CO_HOST_FIELD_DR3,
+	CO_HOST_FIELD_DR6,
+	CO_HOST_FIELD_XCR0,
 	CO_HOST_FIELD_MAX
 } co_host_field_t;
 

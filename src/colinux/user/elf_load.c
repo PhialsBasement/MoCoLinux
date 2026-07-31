@@ -1144,10 +1144,28 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 * memory correctly; it is the guest's idea of which RAM is its
 		 * own that they say nothing useful about.
 		 */
+		/*
+		 * No idle= override: select_idle_routine sees co_colinux_guest
+		 * and installs the cooperative idle, which yields to the host
+		 * through the passage page instead of halting or mwaiting. The
+		 * ud2;ud2 traps in native_halt/native_safe_halt remain as a
+		 * backstop for any halt reached some other way.
+		 *
+		 * This guest must also never discover or initialize the physical
+		 * machine underneath Windows.  The first native-speed boot found the
+		 * host's PCI bus and ran ata_piix against its live SATA controller;
+		 * the ioctl returned cleanly, then Windows froze because its storage
+		 * controller had been reprogrammed.  The kernel has hard PIO/MMIO and
+		 * PCI guards as the security boundary.  These options also select the
+		 * no-hardware paths early enough to avoid pointless native probes and
+		 * keep per-CPU PAT, MCE, microcode and watchdog state owned by Windows.
+		 */
 		memset(cmdline, 0, sizeof(cmdline));
 		strcpy(cmdline, "earlyprintk=colinux,keep console=earlycolinux"
 				" acpi=off noapic nolapic nohpet no_timer_check"
-				" noxsave noxsaveopt noxsaves disable_mtrr_trim");
+				" noxsave noxsaveopt noxsaves disable_mtrr_trim"
+				" pci=off nopat io_delay=none mce=off dis_ucode_ldr"
+				" nowatchdog 8250.nr_uarts=0");
 		rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_cl),
 					    cmdline, sizeof(cmdline), 0);
 		if (!CO_OK(rc)) {
@@ -1209,11 +1227,16 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		b.ring_symbol_va     = addr[5];
 		b.guest_flag_va      = addr[6];
 		/*
-		 * Stepped, always, for now. The guest runs with interrupts disabled
-		 * through all of setup_arch, so nothing else can take control back
-		 * from it, and an unbounded guest takes the host with it.
+		 * Free-running. The guest runs at native speed and comes back on
+		 * its own cooperative yields, warnings and recoverable faults --
+		 * single-stepping was the bring-up scaffold, and what it bought
+		 * (a bound on a guest that never yields) the cooperative idle
+		 * now provides. Real IF stays clear the whole time (the guest's
+		 * interrupt flag is virtual), so the host is deaf only from
+		 * entry to the first crossing -- a boot's worth at native speed,
+		 * not 90 seconds of stepping. --batch N restores stepped mode.
 		 */
-		b.step         = 1;
+		b.step         = batch ? 1 : 0;
 		b.max_switches = max_switches ? max_switches : 200000;
 		/*
 		 * Instructions per crossing, chosen as a length of time rather
@@ -1238,7 +1261,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 * the crossing is 3.6us against 128us of stepping, so 97% of
 		 * the batching win is kept.
 		 */
-		b.batch        = batch ? batch : 256;
+		b.batch        = batch;
 
 		/*
 		 * The kernel's own page tables, init_top_pgt first. The host
@@ -1267,18 +1290,58 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			}
 		}
 
+		/*
+		 * The guest's exception table.
+		 *
+		 * Linux takes faults on purpose and recovers from them through
+		 * this table -- segment loads, rdmsr_safe, every user copy. Its
+		 * own handlers are not installed in a cooperative guest, so the
+		 * host reads the entries and does what they say.
+		 */
+		{
+			co_elf_symbol_t* s_exs = co_get_symbol_by_name(pl, "__start___ex_table");
+			co_elf_symbol_t* s_exe = co_get_symbol_by_name(pl, "__stop___ex_table");
+
+			if (s_exs && s_exe) {
+				b.ex_table_start = co_elf_get_symbol_value(s_exs);
+				b.ex_table_stop  = co_elf_get_symbol_value(s_exe);
+			} else {
+				co_terminal_print("\n  __ex_table symbols missing -- faults the\n"
+						  "  kernel means to recover from will stop the run\n");
+			}
+		}
+
+		/*
+		 * Where the guest keeps its pointer to the passage page. The
+		 * driver writes the page's address there before entry, and the
+		 * guest's cooperative idle calls the world switch through it.
+		 */
+		{
+			co_elf_symbol_t* s_pp = co_get_symbol_by_name(pl, "co_colinux_passage_page");
+
+			if (s_pp) {
+				b.passage_symbol_va = co_elf_get_symbol_value(s_pp);
+			} else {
+				co_terminal_print("\n  co_colinux_passage_page missing -- the guest\n"
+						  "  cannot yield cooperatively and idle will spin\n");
+			}
+		}
+
 		co_terminal_print("\n  booting:\n");
 		co_terminal_print("    stopping after %d world switches%s\n",
 				  b.max_switches,
 				  max_switches ? "  (--max-switches)" : "");
-		co_terminal_print("    %d instructions stepped per crossing%s\n",
-				  b.batch, batch ? "  (--batch)" : "");
+		if (b.step)
+			co_terminal_print("    stepped, %d instructions per crossing  (--batch)\n",
+					  b.batch);
+		else
+			co_terminal_print("    free-running: native speed, cooperative yields\n");
 		for (i = 0; want[i]; i++)
 			co_terminal_print("    %-24s 0x%016llx\n", want[i], addr[i]);
 
-		co_terminal_print("\n  entering co_arch_start_kernel with interrupts enabled,\n");
+		co_terminal_print("\n  entering co_arch_start_kernel with real IF held clear,\n");
 		co_terminal_print("  initial_code pointed at start_kernel, the early console\n");
-		co_terminal_print("  wired, and host interrupts forwarded back to Windows\n\n");
+		co_terminal_print("  wired, and cooperative safe points returning to Windows\n\n");
 
 		rc = co_manager_kboot(handle, &b);
 		if (!CO_OK(rc) || !CO_OK(b.rc)) {
@@ -1300,8 +1363,10 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 
 		co_terminal_print("  guest cr3 0x%016llx, %lu table pages, preflight %d ok\n",
 				  b.guest_cr3, b.tables, b.preflight_checked);
-		co_terminal_print("  %lu world switches, %lu instructions stepped, %lu interrupts%s\n",
-				  b.switches, b.steps, b.interrupts,
+		co_terminal_print("  %lu world switches, %lu run yields, %lu idle yields,\n",
+				  b.switches, b.run_yields, b.idle_yields);
+		co_terminal_print("  %lu instructions stepped, %lu captured interrupts%s\n",
+				  b.steps, b.interrupts,
 				  b.hit_limit ? "  (hit the limit)" : "");
 		if (b.steps) {
 			unsigned long i, n = (b.trace_next < 16) ? b.trace_next : 16;
@@ -1337,25 +1402,62 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			co_terminal_print("\n");
 		}
 
+		if (b.fixups) {
+			unsigned long f, n = (b.fixups < 8) ? b.fixups : 8;
+			static const char* const extype[] = {
+				"none", "default", "fault", "uaccess", "?", "clear fs",
+				"fpu restore", "bpf", "wrmsr", "rdmsr", "wrmsr safe",
+				"rdmsr safe", "wrmsr in mce", "rdmsr in mce",
+				"default mce safe", "fault mce safe", "pop reg",
+				"imm reg", "fault sgx", "ucopy len", "zeropad", "eretu"
+			};
+
+			co_terminal_print("  %lu fault%s recovered from the kernel's own\n",
+					  b.fixups, (b.fixups == 1) ? "" : "s");
+			co_terminal_print("  exception table, as its handlers would have:\n");
+			for (f = 0; f < n; f++) {
+				int t = b.fixup_type[f];
+
+				co_terminal_print("    0x%016llx  %s\n", b.fixup_rip[f],
+						  (t >= 0 && t < (int)(sizeof(extype)/sizeof(extype[0])))
+						  ? extype[t] : "?");
+			}
+			co_terminal_print("\n");
+		}
+
 		if (b.host_corrupt_field) {
 			static const char* const names[] = {
 				"none", "processor number", "CR0", "CR4", "CR3", "GDT base", "GDT limit",
 				"IDT base", "IDT limit", "TR", "FS_BASE", "GS_BASE",
 				"KERNEL_GS_BASE", "LSTAR", "STAR", "SFMASK", "EFER",
-				"CS", "SS"
+				"CS", "SS", "DS", "ES", "FS", "GS",
+				"CR8 (IRQL)", "PAT", "DR7", "RFLAGS control bits",
+				"CR2", "LDTR", "CSTAR", "SYSENTER_CS", "SYSENTER_ESP",
+				"SYSENTER_EIP", "DR0", "DR1", "DR2", "DR3", "DR6", "XCR0"
 			};
 			int f = b.host_corrupt_field;
+			int repaired = (f == 23 || f == 24 || f == 25); /* CR8, PAT, DR7 */
 
-			co_terminal_print("  THE HOST DID NOT COME BACK INTACT.\n");
+			if (repaired)
+				co_terminal_print("  THE GUEST WROTE HOST STATE THE SWITCH DOES NOT CARRY.\n");
+			else
+				co_terminal_print("  THE HOST DID NOT COME BACK INTACT.\n");
 			co_terminal_print("    %s changed across the crossing after %lu steps\n",
 					  (f > 0 && f < (int)(sizeof(names)/sizeof(names[0])))
 						? names[f] : "?",
 					  b.host_corrupt_step);
 			co_terminal_print("      was 0x%016llx\n", b.host_corrupt_expected);
 			co_terminal_print("      now 0x%016llx\n", b.host_corrupt_actual);
-			co_terminal_print("    Stopped here on purpose. Windows is running on\n");
-			co_terminal_print("    that value from now on, so this is the last\n");
-			co_terminal_print("    moment it can still be reported.\n\n");
+			if (repaired) {
+				co_terminal_print("    Restored to the host's value at the crossing and\n");
+				co_terminal_print("    the run continued. The guest must be patched to\n");
+				co_terminal_print("    stop writing it -- the repair is containment,\n");
+				co_terminal_print("    not a fix.\n\n");
+			} else {
+				co_terminal_print("    Stopped here on purpose. Windows is running on\n");
+				co_terminal_print("    that value from now on, so this is the last\n");
+				co_terminal_print("    moment it can still be reported.\n\n");
+			}
 		}
 
 		if (b.faulted) {
@@ -1370,9 +1472,54 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 						  (b.error_code & 1) ? "protection" : "not present",
 						  (b.error_code & 2) ? "write" : "read");
 			co_terminal_print("\n");
+			if (b.fault_extype)
+				co_terminal_print("    the kernel has an exception table entry\n"
+						  "    for this address, of type %d, which the host\n"
+						  "    does not implement -- so this is a fault the\n"
+						  "    kernel expected and would have recovered from\n",
+						  b.fault_extype);
+		} else if (b.reached_idle && b.idle_yields) {
+			co_terminal_print("\n");
+			co_terminal_print("  ========================================================\n");
+			co_terminal_print("  THE GUEST BOOTED AND YIELDED COOPERATIVELY.\n");
+			co_terminal_print("  %lu CO_OPERATION_IDLE round trips after %lu switches --\n",
+					  b.idle_yields, b.switches);
+			co_terminal_print("  start_kernel and every initcall ran free (no stepping),\n");
+			co_terminal_print("  the guest handed the CPU back at idle, and the host\n");
+			co_terminal_print("  re-entered it repeatedly. The cooperative loop works.\n");
+			co_terminal_print("  Virtual time (jiffies from the host) is the next piece.\n");
+			co_terminal_print("  ========================================================\n");
+		} else if (b.reached_idle) {
+			co_terminal_print("\n");
+			co_terminal_print("  ========================================================\n");
+			co_terminal_print("  THE GUEST BOOTED THROUGH TO IDLE (via halt trap).\n");
+			co_terminal_print("  It halted at 0x%016llx after %lu switches, %lu\n",
+					  b.fault_rip, b.switches, b.steps);
+			co_terminal_print("  instructions -- but through ud2, not a cooperative\n");
+			co_terminal_print("  yield: the cooperative idle did not take.\n");
+			co_terminal_print("  ========================================================\n");
+		} else if (b.terminated) {
+			co_terminal_print("  the guest terminated itself, reason %llu\n",
+					  b.terminate_reason);
+		} else if (b.returned_voluntarily && b.stop_operation) {
+			co_terminal_print("  the guest yielded operation %llu, which the host\n"
+					  "  does not handle yet\n", b.stop_operation);
 		} else if (b.hit_limit) {
+			static const char* const rn[15] = {
+				"r15","r14","r13","r12","r11","r10","r9","r8",
+				"rbp","rdi","rsi","rdx","rcx","rbx","rax"
+			};
+			int r;
+
 			co_terminal_print("  still running after %lu switches -- stopped it on purpose\n",
 					  b.switches);
+			co_terminal_print("  last instruction 0x%016llx, registers:\n",
+					  b.fault_rip);
+			for (r = 0; r < 15; r += 3)
+				co_terminal_print("    %-3s 0x%016llx   %-3s 0x%016llx   %-3s 0x%016llx\n",
+						  rn[r],   b.stop_regs[r],
+						  rn[r+1], b.stop_regs[r+1],
+						  rn[r+2], b.stop_regs[r+2]);
 		} else if (b.returned_voluntarily) {
 			co_terminal_print("  the guest switched back on its own\n");
 		}

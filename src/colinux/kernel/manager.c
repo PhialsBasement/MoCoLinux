@@ -732,6 +732,9 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.kernel_table_count = params->kernel_table_count;
 		co_memcpy(in.kernel_tables, params->kernel_tables,
 			  sizeof(in.kernel_tables));
+		in.ex_table_start = params->ex_table_start;
+		in.ex_table_stop  = params->ex_table_stop;
+		in.passage_symbol_va  = params->passage_symbol_va;
 		in.max_switches       = params->max_switches ? params->max_switches : 4096;
 
 		co_memset(params, 0, sizeof(*params));
@@ -777,6 +780,20 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->warnings	 = result.warnings;
 		co_memcpy(params->warning_rip, result.warning_rip,
 			  sizeof(params->warning_rip));
+		params->fixups		 = result.fixups;
+		params->fault_extype	 = result.fault_extype;
+		params->reached_idle	 = result.reached_idle;
+		params->run_yields	 = result.run_yields;
+		params->idle_yields	 = result.idle_yields;
+		params->terminated	 = result.terminated;
+		params->terminate_reason = result.terminate_reason;
+		params->stop_operation	 = result.stop_operation;
+		co_memcpy(params->stop_regs, result.stop_regs,
+			  sizeof(params->stop_regs));
+		co_memcpy(params->fixup_rip, result.fixup_rip,
+			  sizeof(params->fixup_rip));
+		co_memcpy(params->fixup_type, result.fixup_type,
+			  sizeof(params->fixup_type));
 		params->preflight_checked = result.preflight_checked;
 		params->preflight_failed  = result.preflight_failed;
 		params->preflight_level	  = result.preflight_level;

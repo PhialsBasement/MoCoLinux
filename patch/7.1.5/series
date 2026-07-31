@@ -3,3 +3,9 @@ keep-host-idt.diff
 no-halt.diff
 head64-entry.diff
 no-realmode.diff
+no-int3-selftest.diff
+cr4-shadow.diff
+text-poke-direct.diff
+no-trace-eval-update.diff
+coop-idle.diff
+hardware-isolation.diff

@@ -1,0 +1,1120 @@
+Authoritative cumulative snapshot of ref/linux-7.1.5 at the cooperative-yield
+bring-up checkpoint.  Generated against download/linux-7.1.5.tar.xz on
+2026-08-01 after the full free-running test still froze the Windows host.
+
+This file is intentionally not listed in series: it preserves the exact live
+guest source while the incremental patch set is still being repaired.
+
+diff --git a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
+index 00aeae8..d2cb2d1 100644
+--- a/arch/x86/include/asm/desc.h
++++ b/arch/x86/include/asm/desc.h
+@@ -205,13 +205,42 @@ static inline void native_set_ldt(const void *addr, unsigned int entries)
+ 	}
+ }
+ 
++/*
++ * While a cooperative guest is being brought up, the host owns the descriptor
++ * tables and the guest may not replace them.
++ *
++ * Guarding the individual callers was tried first and is not good enough:
++ * idt.c has four of them, head_64.S and head64.c have one each, and cpu_init()
++ * and the trap setup add more. Missing one is not a bug that reports itself.
++ * The host single-steps the guest with the trap flag, and the debug trap is
++ * delivered through the host's IDT -- so the instant the guest loads its own,
++ * the only bound on a guest running with interrupts disabled is gone. It does
++ * not fault, it does not stop: it runs away inside the host's ioctl and the
++ * machine has to be power-cycled. Twice, so far.
++ *
++ * Guarding lgdt/lidt/ltr themselves closes every path at once, including ones
++ * that do not exist yet. The tables the host installed stay loaded, they are
++ * mapped in the guest's address space, and the world switch carries GDTR and
++ * IDTR across every crossing in both directions.
++ *
++ * The guest will want its own tables eventually. That belongs after it can
++ * survive taking a fault, not before.
++ */
++extern int co_colinux_guest;
++
+ static inline void native_load_gdt(const struct desc_ptr *dtr)
+ {
++	if (co_colinux_guest)
++		return;
++
+ 	asm volatile("lgdt %0"::"m" (*dtr));
+ }
+ 
+ static __always_inline void native_load_idt(const struct desc_ptr *dtr)
+ {
++	if (co_colinux_guest)
++		return;
++
+ 	asm volatile("lidt %0"::"m" (*dtr));
+ }
+ 
+@@ -258,6 +287,17 @@ static inline void native_load_tr_desc(void)
+ 	bool restore = 0;
+ 	struct desc_struct *fixmap_gdt;
+ 
++	/*
++	 * The task register goes with the GDT that is actually loaded. The
++	 * host's TSS is what makes IST work, and IST is what lets a fault be
++	 * reported when the guest's own stack pointer is the thing that broke.
++	 * GDT_ENTRY_TSS indexes the kernel's table, which is not the one loaded
++	 * here, so this would load whatever happens to sit at that index in the
++	 * host's -- and then a fault has nowhere to land.
++	 */
++	if (co_colinux_guest)
++		return;
++
+ 	native_store_gdt(&gdt);
+ 	fixmap_gdt = get_cpu_gdt_ro(cpu);
+ 
+diff --git a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
+index 7f4847b..912c599 100644
+--- a/arch/x86/include/asm/io.h
++++ b/arch/x86/include/asm/io.h
+@@ -44,6 +44,52 @@
+ #include <asm/shared/io.h>
+ #include <asm/special_insns.h>
+ 
++/*
++ * A cooperative guest shares the real processor with Windows; it does not
++ * own the processor's I/O-port namespace.  Native PCI probing through CF8/CFC
++ * was enough to discover the host's Intel SATA controller, after which
++ * ata_piix programmed that live controller and froze the host.
++ *
++ * Keep the native helpers available for a normal boot, but turn every port
++ * read into the value of an absent device and every port write into a no-op
++ * while the cooperative guest is current.  Synthetic coLinux devices use the
++ * passage page and do not depend on physical port I/O.
++ */
++extern int co_colinux_guest;
++
++#define CO_COLINUX_BUILDIO(bwl, type)                                    \
++static __always_inline void co_colinux_out##bwl(type value, u16 port)     \
++{                                                                         \
++	if (unlikely(co_colinux_guest))                                     \
++		return;                                                       \
++	__out##bwl(value, port);                                             \
++}                                                                         \
++                                                                          \
++static __always_inline type co_colinux_in##bwl(u16 port)                  \
++{                                                                         \
++	if (unlikely(co_colinux_guest))                                     \
++		return (type)~0U;                                             \
++	return __in##bwl(port);                                              \
++}
++
++CO_COLINUX_BUILDIO(b, u8)
++CO_COLINUX_BUILDIO(w, u16)
++CO_COLINUX_BUILDIO(l, u32)
++#undef CO_COLINUX_BUILDIO
++
++#undef inb
++#undef inw
++#undef inl
++#undef outb
++#undef outw
++#undef outl
++#define inb co_colinux_inb
++#define inw co_colinux_inw
++#define inl co_colinux_inl
++#define outb co_colinux_outb
++#define outw co_colinux_outw
++#define outl co_colinux_outl
++
+ #define build_mmio_read(name, size, type, reg, barrier) \
+ static inline type name(const volatile void __iomem *addr) \
+ { type ret; asm volatile("mov" size " %1,%0":reg (ret) \
+@@ -249,6 +295,9 @@ extern void io_delay_init(void);
+ 
+ static inline void slow_down_io(void)
+ {
++	if (unlikely(co_colinux_guest))
++		return;
++
+ 	if (!call_io_delay())
+ 		return;
+ 
+@@ -271,6 +320,9 @@ static inline type in##bwl##_p(u16 port)				\
+ 									\
+ static inline void outs##bwl(u16 port, const void *addr, unsigned long count) \
+ {									\
++	if (unlikely(co_colinux_guest))                                  \
++		return;                                                    \
++	                                                                    \
+ 	if (cc_platform_has(CC_ATTR_GUEST_UNROLL_STRING_IO)) {		\
+ 		type *value = (type *)addr;				\
+ 		while (count) {						\
+@@ -287,6 +339,11 @@ static inline void outs##bwl(u16 port, const void *addr, unsigned long count) \
+ 									\
+ static inline void ins##bwl(u16 port, void *addr, unsigned long count)	\
+ {									\
++	if (unlikely(co_colinux_guest)) {                                \
++		memset(addr, 0xff, count * sizeof(type));                  \
++		return;                                                    \
++	}                                                                   \
++	                                                                    \
+ 	if (cc_platform_has(CC_ATTR_GUEST_UNROLL_STRING_IO)) {		\
+ 		type *value = (type *)addr;				\
+ 		while (count) {						\
+diff --git a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
+index 6f25de0..d8b00f3 100644
+--- a/arch/x86/include/asm/irqflags.h
++++ b/arch/x86/include/asm/irqflags.h
+@@ -12,6 +12,26 @@
+  * Interrupt control:
+  */
+ 
++extern int co_colinux_guest;
++
++/*
++ * The cooperative guest's interrupt flag is virtual.
++ *
++ * Linux gets a virtual IF: sti/cli/save_fl edit this bit rather than the real
++ * hardware flag. Real IF remains clear whenever the guest address space is
++ * current, so host hardware interrupts remain pending instead of entering a
++ * guest IDT and then being replayed unsafely from driver ioctl context.
++ *
++ * Enabling virtual interrupts is also a cooperative scheduling boundary. The
++ * guest switches back to the host, where the saved host IF is restored and any
++ * pending interrupt enters Windows through Windows' own IDT and stack. The host
++ * then re-enters the guest at the instruction after that voluntary switch.
++ *
++ * Holds X86_EFLAGS_IF or 0, so it substitutes directly into saved flags.
++ */
++extern unsigned long co_colinux_virtual_if;
++extern void co_colinux_yield(void);
++
+ /* Declaration required for gcc < 4.9 to prevent -Werror=missing-prototypes */
+ extern inline unsigned long native_save_fl(void);
+ extern __always_inline unsigned long native_save_fl(void)
+@@ -29,27 +49,83 @@ extern __always_inline unsigned long native_save_fl(void)
+ 		     : /* no input */
+ 		     : "memory");
+ 
++	if (co_colinux_guest)
++		flags = (flags & ~X86_EFLAGS_IF) | co_colinux_virtual_if;
++
+ 	return flags;
+ }
+ 
+ static __always_inline void native_irq_disable(void)
+ {
++	if (co_colinux_guest) {
++		co_colinux_virtual_if = 0;
++		asm volatile("": : :"memory");
++		return;
++	}
++
+ 	asm volatile("cli": : :"memory");
+ }
+ 
+ static __always_inline void native_irq_enable(void)
+ {
++	if (co_colinux_guest) {
++		/* Publish virtual IF before yielding so a future event sees it. */
++		co_colinux_virtual_if = X86_EFLAGS_IF;
++		asm volatile("" : : : "memory");
++		co_colinux_yield();
++		return;
++	}
++
+ 	asm volatile("sti": : :"memory");
+ }
+ 
+ static __always_inline void native_safe_halt(void)
+ {
++	/*
++	 * The idle halt, and the one the original no-halt patch missed.
++	 *
++	 * native_halt() below is the emergency halt every panic path ends in.
++	 * This is the other one: default_idle() reaches it through
++	 * raw_safe_halt(), so it is where a booted, idle guest waits. A guest
++	 * that reaches idle and really executes `sti; hlt` takes its core away
++	 * exactly as a panicking one would -- the boot succeeding is not a
++	 * reason to let it hang the host.
++	 *
++	 * Two ud2 rather than one. A single ud2 is how WARN and BUG trap, and
++	 * the host steps over a warning; the host must not step over a halt. No
++	 * WARN is ever followed by a second ud2, so `ud2; ud2` is a signature
++	 * the host can tell apart from a warning with certainty, and it stops
++	 * on it and reports the guest reached idle.
++	 */
++	if (co_colinux_guest)
++		asm volatile("ud2; ud2");
++
+ 	x86_idle_clear_cpu_buffers();
+ 	asm volatile("sti; hlt": : :"memory");
+ }
+ 
++/*
++ * Cooperative Linux must never actually halt.
++ *
++ * The guest is code running inside a host process, on a CPU the host owns. HLT
++ * with interrupts disabled waits for an NMI or a reset, so a guest that reaches
++ * it takes that core away permanently -- the host cannot preempt it, the other
++ * cores notice, and the machine bugchecks. Every panic path ends in exactly
++ * this, so the failure that most wants reporting is the one that would take the
++ * host down instead.
++ *
++ * ud2 raises #UD, which reaches the host's stub through the guest IDT and
++ * returns control with the fault recorded. The i386 port does the same thing by
++ * calling co_terminate from head_32.S's hlt_loop; this is the same idea at the
++ * single place every halt goes through.
++ */
+ static __always_inline void native_halt(void)
+ {
++	/* ud2; ud2 -- the cooperative-halt signature, told apart from the
++	 * single ud2 of a WARN. See native_safe_halt above. */
++	if (co_colinux_guest)
++		asm volatile("ud2; ud2");
++
+ 	x86_idle_clear_cpu_buffers();
+ 	asm volatile("hlt": : :"memory");
+ }
+diff --git a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
+index 46aa2c9..00a94e7 100644
+--- a/arch/x86/include/asm/special_insns.h
++++ b/arch/x86/include/asm/special_insns.h
+@@ -38,8 +38,34 @@ static __always_inline unsigned long __native_read_cr3(void)
+ 	return val;
+ }
+ 
++/*
++ * A cooperative guest does not own CR3 -- see the descriptor-table note in
++ * asm/desc.h, of which this is the third and least survivable case.
++ *
++ * The host built the guest's address space, mapped the kernel image at its
++ * link addresses, and put the passage page -- the code performing the world
++ * switch, and the stack it runs on -- at an address valid on both sides. A CR3
++ * write from inside the guest replaces all of that with a table describing a
++ * machine that was never there. The instruction after it is fetched from an
++ * address space that does not contain it; the page fault is delivered through
++ * an IDT that is no longer mapped; the double fault handler is not mapped
++ * either. Triple fault, immediate reset, no bugcheck and no dump on a host
++ * that is not a virtual machine but the actual computer.
++ *
++ * setup_arch() reaches one of these on every boot: init_mem_mapping() finishes
++ * by loading swapper_pg_dir.
++ *
++ * Skipping it also skips the TLB flushes written as a CR3 reload, which is
++ * harmless here: the mappings under the guest are the host's and do not
++ * change while it runs.
++ */
++extern int co_colinux_guest;
++
+ static __always_inline void native_write_cr3(unsigned long val)
+ {
++	if (co_colinux_guest)
++		return;
++
+ 	asm volatile("mov %0,%%cr3": : "r" (val) : "memory");
+ }
+ 
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 62936a3..1eccd6a 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -6,6 +6,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/memory.h>
+ #include <linux/execmem.h>
++#include <linux/console.h>	/* co_colinux_guest */
+ 
+ #include <asm/text-patching.h>
+ #include <asm/insn.h>
+@@ -2383,7 +2384,25 @@ void __init alternative_instructions(void)
+ {
+ 	u64 ibt;
+ 
+-	int3_selftest();
++	/*
++	 * int3_selftest() checks that the kernel's own #BP handler works, by
++	 * executing an int3 and requiring a die notifier to have seen it.
++	 *
++	 * A cooperative guest does not have that handler. It runs on the
++	 * host's IDT deliberately -- see the note on idt_setup_early_traps --
++	 * so the int3 goes to the host's stub, no notifier runs, and the
++	 * BUG_ON(val != 0x1234) immediately after would fire on a facility
++	 * this guest has no use for and has not installed.
++	 *
++	 * Skipping a self-test is not the same as skipping the thing it
++	 * tests. Nothing here patches an int3 into anything; the test exists
++	 * to prove the handler is reachable before text_poke_bp() starts
++	 * relying on it, and text_poke_bp() is a smp_call_function affair for
++	 * patching live code on other processors, which this guest, pinned to
++	 * one and running stepped, does not do.
++	 */
++	if (!co_colinux_guest)
++		int3_selftest();
+ 
+ 	/*
+ 	 * The patching is not fully atomic, so try to avoid local
+@@ -2559,6 +2578,35 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
+ 	 */
+ 	BUG_ON(!after_bootmem);
+ 
++	/*
++	 * A cooperative guest writes straight to the target.
++	 *
++	 * The whole apparatus below -- a temporary mm with the page aliased at a
++	 * user address, a CR3 switch into it, the write, a CR3 switch back --
++	 * exists for one reason: kernel text is mapped read-only, so it has to
++	 * be reached through a second, writable mapping. Under coLinux the image
++	 * is mapped by the host with _PAGE_RW and mark_rodata_ro()'s protection
++	 * was never applied, so the text is already writable at its own address.
++	 *
++	 * And the mechanism cannot run here regardless: use_temporary_mm()
++	 * switches mm by writing CR3, which native_write_cr3() suppresses for a
++	 * cooperative guest -- the host owns the address space and a guest CR3
++	 * load would discard it. So the switch is a no-op, the guest stays on
++	 * its own tables, and the memcpy lands on the poking address, which is
++	 * unmapped there. That is the #PF at text_poke_memcpy this replaces.
++	 *
++	 * Writing to addr directly reaches the same bytes the alias would have,
++	 * with the same verification kept.
++	 */
++	if (co_colinux_guest) {
++		local_irq_save(flags);
++		func(addr, src, len);
++		if (func == text_poke_memcpy)
++			BUG_ON(memcmp(addr, src, len));
++		local_irq_restore(flags);
++		return addr;
++	}
++
+ 	if (!core_kernel_text((unsigned long)addr)) {
+ 		pages[0] = vmalloc_to_page(addr);
+ 		if (cross_page_boundary)
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index a4268c4..a043725 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -6,6 +6,7 @@
+ #include <linux/linkage.h>
+ #include <linux/bitops.h>
+ #include <linux/kernel.h>
++#include <linux/console.h>	/* co_colinux_guest */
+ #include <linux/export.h>
+ #include <linux/kvm_types.h>
+ #include <linux/percpu.h>
+@@ -476,6 +477,36 @@ void __no_profile native_write_cr4(unsigned long val)
+ {
+ 	unsigned long bits_changed = 0;
+ 
++	/*
++	 * Refuse a value that would clear CR4.PAE while long mode is active.
++	 *
++	 * That is an immediate #GP, and the kernel gets there honestly. The
++	 * flush paths write back this_cpu_read(cpu_tlbstate.cr4), a shadow
++	 * primed by cr4_init_shadow() from x86_64_start_kernel(). A cooperative
++	 * guest is entered at start_kernel and never runs that function, so the
++	 * shadow is zero and the first __native_tlb_flush_global() writes zero
++	 * to CR4:
++	 *
++	 *     vector 13 at native_write_cr4, error code 0
++	 *
++	 * with the guest a few instructions into setup_arch and nothing wrong
++	 * with the value it believes it is preserving.
++	 *
++	 * The shadow does not read back as zero, it reads back as all ones --
++	 * 0xffffffffffffff7f reached this function, which is ~0 with PGE masked
++	 * out by __native_tlb_flush_global. So the test is not "is PAE set" but
++	 * "is this a CR4 at all": the register has no defined bits above 31, so
++	 * anything in the top half is not a value the kernel computed.
++	 *
++	 * Skipping it is right rather than merely convenient: that value is an
++	 * uninitialised variable, and the flush it belongs to has nothing to
++	 * preserve. Every real write goes through untouched, and the world
++	 * switch carries CR4 across every crossing, so the guest's settings
++	 * remain its own.
++	 */
++	if (co_colinux_guest && ((val >> 32) || !(val & X86_CR4_PAE)))
++		return;
++
+ set_register:
+ 	asm volatile("mov %0,%%cr4": "+r" (val) : : "memory");
+ 
+diff --git a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
+index cba7530..704430e 100644
+--- a/arch/x86/kernel/early_printk.c
++++ b/arch/x86/kernel/early_printk.c
+@@ -370,6 +370,139 @@ static struct console early_serial_console = {
+ 	.index =	-1,
+ };
+ 
++/*
++ * Cooperative Linux: an early console that writes into the passage page.
++ *
++ * There is no device here to talk to. The guest runs inside a host process's
++ * address space and its only channel out is memory both sides can see, so the
++ * console appends bytes to a ring in the passage page and the host drains it
++ * after the next world switch.
++ *
++ * co_colinux_console_ring is filled in by the host before the guest executes
++ * anything. That matters: it means output works from the very first
++ * instruction, rather than from whenever setup_early_printk() happens to run
++ * during setup_arch(). A real machine has to bootstrap its own console and is
++ * blind until it does; the host can simply write the pointer in beforehand,
++ * and being blind through early boot is exactly how a port like this gets
++ * stuck.
++ *
++ * written counts everything the guest tried to emit, including what did not
++ * fit. The host compares it against capacity to report truncation rather than
++ * silently showing a short log.
++ */
++struct co_console_ring {
++	volatile unsigned long long written;
++	volatile unsigned long long capacity;
++	volatile char text[];
++};
++
++struct co_console_ring *co_colinux_console_ring;
++EXPORT_SYMBOL(co_colinux_console_ring);
++
++/*
++ * Set by the host before the guest runs. Distinct from the console ring so that
++ * "is this a cooperative guest" is not inferred from "does it have somewhere to
++ * print", which are different questions that happen to coincide today.
++ */
++int co_colinux_guest;
++EXPORT_SYMBOL(co_colinux_guest);
++
++/*
++ * The guest's virtual interrupt flag -- see asm/irqflags.h. Real IF stays
++ * clear while the guest is current; sti/cli/save_fl edit this instead. Holds
++ * X86_EFLAGS_IF or 0 so it substitutes directly into saved flags.
++ */
++unsigned long co_colinux_virtual_if;
++EXPORT_SYMBOL(co_colinux_virtual_if);
++/*
++ * arch/x86/boot/startup is compiled with every symbol prefixed __pi_, so it can
++ * only reach what has been deliberately aliased. It gets here through the
++ * guards in asm/desc.h, which it includes for native_load_gdt/native_load_idt.
++ */
++SYM_PIC_ALIAS(co_colinux_guest);
++
++static void early_colinux_write(struct console *con, const char *s, unsigned n)
++{
++	struct co_console_ring *ring = co_colinux_console_ring;
++
++	if (!ring)
++		return;
++
++	while (n-- > 0) {
++		if (ring->written < ring->capacity)
++			ring->text[ring->written] = *s;
++		ring->written++;
++		s++;
++	}
++
++	/*
++	 * Early boot can run for a long time without toggling logical IRQs. Each
++	 * completed console record is nevertheless a safe cooperative boundary,
++	 * and keeps Windows responsive while initcalls run at native speed.
++	 */
++	co_colinux_yield();
++}
++
++static struct console early_colinux_console = {
++	.name =		"earlycolinux",
++	.write =	early_colinux_write,
++	.flags =	CON_PRINTBUFFER,
++	.index =	-1,
++};
++
++/*
++ * Register the cooperative console as early as setup_arch can manage.
++ *
++ * Waiting for parse_early_param() to act on earlyprintk= is too late. In
++ * setup_arch the order is idt_setup_early_traps() at the top, then
++ * e820__memory_setup(), then parse_early_param() -- so the stretch where a
++ * cooperative guest is most likely to die first is also the stretch with no
++ * console registered and, because the kernel has just replaced the host's
++ * interrupt stubs, nothing able to report a fault either.
++ *
++ * Self-gating: it does nothing unless the host has filled in the ring pointer,
++ * so a kernel booted normally on real hardware is unaffected.
++ */
++static void early_console_register(struct console *con, int keep_early);
++
++void co_colinux_console_init(void)
++{
++	if (!co_colinux_console_ring)
++		return;
++
++	/*
++	 * Not "if (early_console) return", which is the obvious guard and is
++	 * wrong here for the one reason that is easy to miss: the host sets
++	 * early_console itself, before the guest executes anything, so that
++	 * early_printk() works from the first instruction rather than from
++	 * wherever setup_early_printk() happens to run.
++	 *
++	 * That pointer being set is therefore not evidence that a console was
++	 * registered -- it is evidence of the opposite. Both registration paths
++	 * test it and both bailed on it: this one, and setup_early_printk(),
++	 * which opens with the same check. So nothing ever called
++	 * register_console(), and printk() only writes to registered consoles.
++	 * The kernel produced eighty-six records and the ring received none of
++	 * them, which read as a broken console and was a console that was never
++	 * connected.
++	 *
++	 * So: proceed if the pointer is unset or is already ours, and stand
++	 * aside only for a console someone else chose.
++	 */
++	if (early_console && early_console != &early_colinux_console)
++		return;
++
++	/*
++	 * CON_PRINTBUFFER means registration replays the ringbuffer from the
++	 * beginning, so everything printed before this point arrives too. The
++	 * ring is one page and the boot says far more than that, so it holds
++	 * the earliest output and reports the rest as truncated -- which is the
++	 * right half to keep, since the earliest output is where a boot that
++	 * goes wrong starts going wrong.
++	 */
++	early_console_register(&early_colinux_console, 1);
++}
++
+ static void early_console_register(struct console *con, int keep_early)
+ {
+ 	if (con->index != -1) {
+@@ -398,6 +531,10 @@ static int __init setup_early_printk(char *buf)
+ 	keep = (strstr(buf, "keep") != NULL);
+ 
+ 	while (*buf != '\0') {
++		if (!strncmp(buf, "colinux", 7)) {
++			buf += 7;
++			early_console_register(&early_colinux_console, keep);
++		}
+ 		if (!strncmp(buf, "mmio32", 6)) {
+ 			buf += 6;
+ 			early_mmio_serial_init(buf);
+diff --git a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+index fd28b53..c9393aa 100644
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@ -19,6 +19,7 @@
+ #include <linux/memblock.h>
+ #include <linux/cc_platform.h>
+ #include <linux/pgtable.h>
++#include <linux/console.h>	/* co_colinux_guest */
+ 
+ #include <asm/asm.h>
+ #include <asm/page_64.h>
+@@ -314,6 +315,26 @@ void early_setup_idt(void)
+ {
+ 	void *handler = NULL;
+ 
++	/*
++	 * The first IDT load a cooperative guest reaches, and the one that
++	 * matters most.
++	 *
++	 * idt.c has four of these and all four are already skipped, but none of
++	 * them runs this early: head_64.S calls here about twenty-five
++	 * instructions after the host hands control over, long before
++	 * start_kernel. Letting it through replaces the host's stubs with the
++	 * bringup table, and with them goes the debug trap the host is using to
++	 * single-step the guest -- which is the only bound on a guest running
++	 * with interrupts disabled. The guest then runs away inside the host's
++	 * ioctl and the machine stops responding entirely: no bugcheck, no
++	 * dump, no reset, power button.
++	 *
++	 * So the host's table stays. Every exception the early kernel takes is
++	 * still reported, and stepping still ends the guest's turn.
++	 */
++	if (co_colinux_guest)
++		return;
++
+ 	if (IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT)) {
+ 		setup_ghcb();
+ 		handler = vc_boot_ghcb;
+diff --git a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
+index 7ed5520..b91e534 100644
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@ -195,6 +195,33 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
+ 	 */
+ 	movq	%rax, %cr3
+ 
++/*
++ * Cooperative Linux enters here, and not at startup_64.
++ *
++ * Everything above this point exists to get from a bootloader's world into the
++ * kernel's: __startup_64 does the relocation fixups, builds early_top_pgt, and
++ * two `movq %rax, %cr3` install it and then init_top_pgt. A cooperative guest
++ * is already in the kernel's world when it arrives -- the host built its
++ * address space, mapped the image at its link addresses, and switched CR3 to it
++ * deliberately. Running that code would throw all of it away and install page
++ * tables describing an identity-mapped physical machine that was never there,
++ * and the instruction after the CR3 write would be fetched from an address
++ * space that does not contain it.
++ *
++ * From here down there is no CR3 write, so the rest runs unmodified: the CR4
++ * mask, the boot stack out of current_task, the kernel's own GDT, the data
++ * segments, EFER. The GDT load is not a problem -- the world switch saves the
++ * guest's GDTR on the way out and restores it on the way back in, so whichever
++ * table the guest adopts travels with it.
++ *
++ * initial_code is left alone here. The host points it at start_kernel before
++ * entry, because x86_64_start_kernel would call reset_early_page_tables() and
++ * assign init_top_pgt[511] -- CR3 hostility again -- and idt_setup_early_handler(),
++ * which would replace the fault stubs during the window they are most needed.
++ */
++SYM_INNER_LABEL(co_arch_start_kernel, SYM_L_GLOBAL)
++	ANNOTATE_NOENDBR
++
+ SYM_INNER_LABEL(common_startup_64, SYM_L_LOCAL)
+ 	UNWIND_HINT_END_OF_STACK
+ 	ANNOTATE_NOENDBR
+@@ -345,8 +372,33 @@ SYM_INNER_LABEL(common_startup_64, SYM_L_LOCAL)
+ 	movw	$(GDT_SIZE-1), (%rsp)
+ 	leaq	gdt_page(%rdx), %rax
+ 	movq	%rax, 2(%rsp)
++	/*
++	 * A cooperative guest keeps the host's GDT, for the same reason it keeps
++	 * the host's IDT -- and this one is not survivable if it is wrong.
++	 *
++	 * Selectors are indices into whichever table is loaded, so replacing the
++	 * table silently changes what every selector already in a register
++	 * means. The host enters the guest with CS = 0x08, which in its table is
++	 * a 64-bit code segment; in this one 0x08 is GDT_ENTRY_KERNEL32_CS, a
++	 * 32-bit segment. The world switch returns to the guest with `lretq` on
++	 * that selector, so the next entry would leave long mode and start
++	 * executing 64-bit instructions as 32-bit ones. Nothing survives that:
++	 * no fault is reportable because the fault handlers are reached through
++	 * the same broken table, so it is a triple fault and an immediate reset.
++	 *
++	 * The task register is the second reason. IST -- the only thing that
++	 * makes a fault deliverable when the guest's stack pointer is the
++	 * problem -- comes from the TSS the host put in its own GDT. This table
++	 * has a TSS entry that no one has filled in yet.
++	 *
++	 * The kernel loses nothing by keeping the host's table: the host built
++	 * it, maps it in the guest's address space, and the world switch carries
++	 * GDTR across every crossing in both directions.
++	 */
++	cmpl	$0, co_colinux_guest(%rip)
++	jne	1f
+ 	lgdt	(%rsp)
+-	addq	$16, %rsp
++1:	addq	$16, %rsp
+ 
+ 	/* set up data segments */
+ 	xorl %eax,%eax
+diff --git a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
+index 90a22e2..7cd11dd 100644
+--- a/arch/x86/kernel/idt.c
++++ b/arch/x86/kernel/idt.c
+@@ -3,6 +3,7 @@
+  * Interrupt descriptor table related code
+  */
+ #include <linux/interrupt.h>
++#include <linux/console.h>	/* co_colinux_guest */
+ 
+ #include <asm/cpu_entry_area.h>
+ #include <asm/set_memory.h>
+@@ -222,8 +223,27 @@ static __init void set_intr_gate(unsigned int n, const void *addr)
+  * before cpu_init() is invoked and sets up TSS. The IST variants are
+  * installed after that.
+  */
++/*
++ * Cooperative Linux keeps the host's interrupt table.
++ *
++ * The host installs an IDT whose every vector lands on a stub that records what
++ * happened and hands control back, on an IST stack so that even a destroyed
++ * stack pointer is survivable. Replacing it with the kernel's own during early
++ * boot removes the only thing able to report a fault, at exactly the point
++ * where faults are expected -- and a fault whose handler is not ready is a
++ * double fault, and then a triple fault, which resets the machine the guest is
++ * a process inside.
++ *
++ * So while bringing a guest up, these are left alone. The kernel runs on the
++ * host's stubs, every exception is reported, and nothing can escalate. A guest
++ * that is actually working will want its own traps eventually; that is a later
++ * decision, and it belongs after the kernel can survive taking one.
++ */
+ void __init idt_setup_early_traps(void)
+ {
++	if (co_colinux_guest)
++		return;
++
+ 	idt_setup_from_table(idt_table, early_idts, ARRAY_SIZE(early_idts),
+ 			     true);
+ 	load_idt(&idt_descr);
+@@ -234,6 +254,9 @@ void __init idt_setup_early_traps(void)
+  */
+ void __init idt_setup_traps(void)
+ {
++	if (co_colinux_guest)
++		return;
++
+ 	idt_setup_from_table(idt_table, def_idts, ARRAY_SIZE(def_idts), true);
+ 
+ 	if (ia32_enabled())
+@@ -263,6 +286,9 @@ static const __initconst struct idt_data early_pf_idts[] = {
+  */
+ void __init idt_setup_early_pf(void)
+ {
++	if (co_colinux_guest)
++		return;
++
+ 	idt_setup_from_table(idt_table, early_pf_idts,
+ 			     ARRAY_SIZE(early_pf_idts), true);
+ }
+@@ -293,6 +319,9 @@ static void __init idt_map_in_cea(void)
+  */
+ void __init idt_setup_apic_and_irq_gates(void)
+ {
++	if (co_colinux_guest)
++		return;
++
+ 	int i = FIRST_EXTERNAL_VECTOR;
+ 	void *entry;
+ 
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index 4c718f8..efee9de 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -54,6 +54,7 @@
+ #include <asm/mmu_context.h>
+ #include <asm/msr.h>
+ #include <asm/shstk.h>
++#include <linux/console.h>	/* co_colinux_guest */
+ 
+ #include "process.h"
+ 
+@@ -773,6 +774,72 @@ EXPORT_SYMBOL(default_idle);
+ 
+ DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
+ 
++/*
++ * Cooperative idle, for coLinux.
++ *
++ * The passage page, at the address the host primes here before the guest runs,
++ * carries the world switch blob and both saved-state blocks. Yielding is a call
++ * into that blob with rcx = the guest state (leaving) and rdx = the host state
++ * (entering) -- the Microsoft x64 convention the blob is built with, since it is
++ * assembled inside the Windows-built driver. The call returns when the host
++ * switches back in.
++ */
++unsigned long long co_colinux_passage_page;
++EXPORT_SYMBOL(co_colinux_passage_page);
++
++/*
++ * Offsets into co_arch_passage_page_t. These mirror the host's CO_PP_* and the
++ * shared struct in the coLinux tree's asm/cooperative.h; the host asserts them
++ * against __builtin_offsetof, so a drift is a build error there rather than a
++ * silent wrong pointer here. code sits after the seven debug-register slots.
++ */
++#define CO_PP_CODE		0x38
++#define CO_PP_HOST_STATE	0x740
++#define CO_PP_LINUXVM_STATE	0x880
++#define CO_PP_OPERATION		0x9c0
++
++/* co_operation_t values, from include/linux/cooperative.h in the coLinux tree */
++#define CO_OPERATION_IDLE	2
++#define CO_OPERATION_YIELD	16
++
++static __always_inline void co_colinux_switch(unsigned long long operation)
++{
++	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
++	register void *leaving  asm("rcx") = pp + CO_PP_LINUXVM_STATE;
++	register void *entering asm("rdx") = pp + CO_PP_HOST_STATE;
++	void *code = pp + CO_PP_CODE;
++
++	*(volatile unsigned long long *)(pp + CO_PP_OPERATION) = operation;
++
++	asm volatile(
++		"call *%[code]\n"
++		: "+r"(leaving), "+r"(entering)
++		: [code] "r"(code)
++		: "rax", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory", "cc");
++}
++
++/*
++ * Give the processor back at a safe guest boundary. This is intentionally a
++ * real out-of-line, non-instrumented function: native_irq_enable() calls it
++ * from throughout the kernel and tracing the boundary could recurse back into
++ * the same irqflag path.
++ */
++noinstr void co_colinux_yield(void)
++{
++	if (co_colinux_passage_page)
++		co_colinux_switch(CO_OPERATION_YIELD);
++}
++
++/*
++ * The cooperative idle routine: hand the CPU back to the host and resume when
++ * it re-enters us. This is coLinux's co_idle_processor, one architecture over.
++ */
++static void co_cpu_idle(void)
++{
++	co_colinux_switch(CO_OPERATION_IDLE);
++	raw_local_irq_disable();
++}
++
+ static bool x86_idle_set(void)
+ {
+ 	return !!static_call_query(x86_idle);
+@@ -936,6 +1003,18 @@ out:
+ 
+ void __init select_idle_routine(void)
+ {
++	/*
++	 * A cooperative guest yields at idle rather than halting. Everything
++	 * below chooses between mwait and hlt on real hardware; neither is
++	 * right here -- both take the core, which is exactly what a
++	 * cooperative guest must not do.
++	 */
++	if (co_colinux_guest) {
++		pr_info("using cooperative idle (coLinux)\n");
++		static_call_update(x86_idle, co_cpu_idle);
++		return;
++	}
++
+ 	if (boot_option_idle_override == IDLE_POLL) {
+ 		if (IS_ENABLED(CONFIG_SMP) && __max_threads_per_core > 1)
+ 			pr_warn_once("WARNING: polling idle and HT enabled, performance may degrade\n");
+diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+index 46882ce..743795c 100644
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -55,6 +55,7 @@
+ #include <asm/proto.h>
+ #include <asm/realmode.h>
+ #include <asm/thermal.h>
++#include <asm/tlbflush.h>	/* cr4_init_shadow */
+ #include <asm/unwind.h>
+ #include <asm/vsyscall.h>
+ 
+@@ -933,6 +934,56 @@ void __init setup_arch(char **cmdline_p)
+ 	 */
+ 	olpc_ofw_detect();
+ 
++	/*
++	 * Before anything that can fail. A cooperative guest has a console the
++	 * moment the host hands it a ring, and everything from here to
++	 * parse_early_param() is otherwise silent.
++	 */
++	co_colinux_console_init();
++
++	/*
++	 * Prime the CR4 shadow, which nothing else here has done.
++	 *
++	 * cr4_set_bits() and its relatives do not read CR4. They compute from
++	 * this_cpu_read(cpu_tlbstate.cr4), a shadow copy primed by
++	 * cr4_init_shadow() out of x86_64_start_kernel() -- a function a
++	 * cooperative guest never runs, because it reloads CR3 and would throw
++	 * away the address space the host built. So the shadow holds whatever
++	 * that per-CPU page happened to contain, which is all ones, and every
++	 * cr4_set_bits() computes an impossible CR4 from it. The host refuses
++	 * to write one with bits set above 31, correctly, and the feature the
++	 * caller was enabling silently does not get enabled.
++	 *
++	 * The instruction that wanted it then raises #UD, some distance away
++	 * and with nothing to connect it back. That has now happened twice:
++	 * xsetbv after CR4.OSXSAVE, and rdfsbase after CR4.FSGSBASE. Both look
++	 * like the CPU refusing a legal instruction for no reason.
++	 *
++	 * One read of the live register fixes the whole class. It must happen
++	 * before the first cr4_set_bits(), and the earliest of those is in
++	 * FPU and CPU setup, well after this point.
++	 */
++	if (co_colinux_guest)
++		cr4_init_shadow();
++
++	/*
++	 * A cooperative guest has no real mode to trampoline through.
++	 *
++	 * reserve_real_mode() wants a page below 1 MB for the code an AP runs
++	 * on its way into long mode and for the ACPI resume stub. There are no
++	 * APs here -- the host owns the processors -- and no firmware to sleep
++	 * into, and the guest's memory begins wherever the host had blocks to
++	 * spare, which is never below 1 MB. The allocation therefore fails, and
++	 * init_real_mode() panics on the null header it is left holding.
++	 *
++	 * Xen PV and Hyper-V VTL disable both ops exactly this way, for exactly
++	 * this reason.
++	 */
++	if (co_colinux_guest) {
++		x86_platform.realmode_reserve = x86_init_noop;
++		x86_platform.realmode_init    = x86_init_noop;
++	}
++
+ 	idt_setup_early_traps();
+ 	early_cpu_init();
+ 	jump_label_init();
+diff --git a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
+index 12c8180..6dd31c0 100644
+--- a/arch/x86/mm/ioremap.c
++++ b/arch/x86/mm/ioremap.c
+@@ -31,6 +31,8 @@
+ 
+ #include "physaddr.h"
+ 
++extern int co_colinux_guest;
++
+ /*
+  * Descriptor controlling ioremap() behavior.
+  */
+@@ -195,6 +197,18 @@ __ioremap_caller(resource_size_t phys_addr, unsigned long size,
+ 	int retval;
+ 	void __iomem *ret_addr;
+ 
++	/*
++	 * There is no physical MMIO namespace owned by a cooperative guest.
++	 * Mapping a PCI BAR here maps the actual Windows device, not a virtual
++	 * one; the first free-running boot did exactly that for the host SATA
++	 * controller.  Synthetic devices are passage-page devices and never
++	 * arrive here.
++	 */
++	if (unlikely(co_colinux_guest)) {
++		pr_err_once("ioremap: physical MMIO is unavailable to a coLinux guest\n");
++		return NULL;
++	}
++
+ 	/* Don't allow wraparound or zero size */
+ 	last_addr = phys_addr + size - 1;
+ 	if (!size || last_addr < phys_addr)
+diff --git a/arch/x86/mm/pat/memtype.c b/arch/x86/mm/pat/memtype.c
+index cf94fb5..150ca6a 100644
+--- a/arch/x86/mm/pat/memtype.c
++++ b/arch/x86/mm/pat/memtype.c
+@@ -225,6 +225,10 @@ static void __init init_cache_modes(u64 pat)
+ 
+ void pat_cpu_init(void)
+ {
++	/* The cooperative guest must leave the host's per-CPU PAT untouched. */
++	if (co_colinux_guest)
++		return;
++
+ 	if (!boot_cpu_has(X86_FEATURE_PAT)) {
+ 		/*
+ 		 * If this happens we are on a secondary CPU, but switched to
+@@ -251,6 +255,15 @@ void __init pat_bp_init(void)
+ {
+ 	struct cpuinfo_x86 *c = &boot_cpu_data;
+ 
++	/*
++	 * IA32_PAT is per logical processor, not per address space.  Replacing
++	 * it changes the meaning of cache bits in Windows' live PTEs too.  Use
++	 * the host's existing table and initialize Linux's translation tables
++	 * from it, exactly as the disabled/Xen-PV path below already does.
++	 */
++	if (co_colinux_guest)
++		pat_disable("PAT writes disabled for a coLinux guest.");
++
+ 	if (!IS_ENABLED(CONFIG_X86_PAT))
+ 		pr_info_once("x86/PAT: PAT support disabled because CONFIG_X86_PAT is disabled in the kernel.\n");
+ 
+diff --git a/arch/x86/pci/init.c b/arch/x86/pci/init.c
+index 0bb3b8b..927679f 100644
+--- a/arch/x86/pci/init.c
++++ b/arch/x86/pci/init.c
+@@ -5,12 +5,24 @@
+ #include <asm/x86_init.h>
+ #include <asm/irqdomain.h>
+ 
++extern int co_colinux_guest;
++
+ /* arch_initcall has too random ordering, so call the initializers
+    in the right sequence from here. */
+ static __init int pci_arch_init(void)
+ {
+ 	int type, pcbios = 1;
+ 
++	/*
++	 * Native PCI config space is the host's real bus.  A cooperative guest
++	 * may enumerate only the synthetic bus supplied by the monitor; until
++	 * that backend is installed, it has no PCI bus at all.
++	 */
++	if (co_colinux_guest) {
++		pr_info("PCI: physical bus disabled for coLinux guest\n");
++		return 0;
++	}
++
+ 	type = pci_direct_probe();
+ 
+ 	if (!(pci_probe & PCI_PROBE_NOEARLY))
+diff --git a/arch/x86/pci/legacy.c b/arch/x86/pci/legacy.c
+index 467311b..24d4b74 100644
+--- a/arch/x86/pci/legacy.c
++++ b/arch/x86/pci/legacy.c
+@@ -8,6 +8,8 @@
+ #include <asm/jailhouse_para.h>
+ #include <asm/pci_x86.h>
+ 
++extern int co_colinux_guest;
++
+ /*
+  * Discover remaining PCI buses in case there are peer host bridges.
+  * We use the number of last PCI bus provided by the PCI BIOS.
+@@ -57,6 +59,9 @@ EXPORT_SYMBOL_GPL(pcibios_scan_specific_bus);
+ 
+ static int __init pci_subsys_init(void)
+ {
++	if (co_colinux_guest)
++		return 0;
++
+ 	/*
+ 	 * The init function returns an non zero value when
+ 	 * pci_legacy_init should be invoked.
+diff --git a/include/linux/console.h b/include/linux/console.h
+index 5520e44..8d75dc3 100644
+--- a/include/linux/console.h
++++ b/include/linux/console.h
+@@ -741,4 +741,15 @@ extern void console_init(void);
+ void dummycon_register_output_notifier(struct notifier_block *nb);
+ void dummycon_unregister_output_notifier(struct notifier_block *nb);
+ 
++/* Cooperative Linux: register the passage-page console at the top of setup_arch. */
++#ifdef CONFIG_EARLY_PRINTK
++void co_colinux_console_init(void);
++extern int co_colinux_guest;
++void co_colinux_yield(void);
++#else
++static inline void co_colinux_console_init(void) { }
++extern int co_colinux_guest;
++void co_colinux_yield(void);
++#endif
++
+ #endif /* _LINUX_CONSOLE_H */
+diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
+index 4c3729c..0fc6e84 100644
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -15,6 +15,7 @@
+ #include <linux/ring_buffer.h>
+ #include <linux/utsname.h>
+ #include <linux/stacktrace.h>
++#include <linux/console.h>	/* co_colinux_guest */
+ #include <linux/writeback.h>
+ #include <linux/kallsyms.h>
+ #include <linux/security.h>
+@@ -9050,6 +9051,23 @@ static void __init eval_map_work_func(struct work_struct *work)
+ {
+ 	int len;
+ 
++	/*
++	 * This resolves enum names to their values inside every trace event's
++	 * print-format string, so that a reader of tracefs sees numbers rather
++	 * than symbols. It does so by scanning each of ~1700 events' format
++	 * strings against each of ~1400 eval maps -- a million-plus string
++	 * comparisons, cosmetic and needed by nothing that boots.
++	 *
++	 * A cooperative guest is single-stepped, and at that scale the scan is
++	 * a wall a run cannot get past in any reasonable time -- it looks like
++	 * a hang, in trace_event_update_all, hundreds of millions of
++	 * instructions with no forward progress. Skipping it costs only the
++	 * enum-name resolution in tracefs output, which this guest has no user
++	 * for, and lets the boot continue to the next initcall.
++	 */
++	if (co_colinux_guest)
++		return;
++
+ 	len = __stop_ftrace_eval_maps - __start_ftrace_eval_maps;
+ 	trace_event_update_with_eval_map(NULL, __start_ftrace_eval_maps, len);
+ }
