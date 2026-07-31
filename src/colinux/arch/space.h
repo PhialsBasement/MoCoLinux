@@ -93,6 +93,19 @@ extern co_rc_t co_arch_guest_map_own_tables(co_manager_t* manager,
 					    unsigned long long direct_map_base,
 					    unsigned long* mapped_out);
 
+/*
+ * Supply the frames for page tables, instead of the host's page allocator.
+ *
+ * A space that runs Linux needs its tables inside the guest's own physical
+ * memory, because Linux walks them through __va(). Frames from a source are
+ * that source's to free: the destructor will not free them.
+ *
+ * NULL restores the default.
+ */
+extern void co_arch_guest_space_set_frame_source(
+	co_rc_t (*source)(co_manager_t* manager, co_pfn_t* pfn_out),
+	void*   (*mapper)(co_pfn_t pfn));
+
 /* The value that would go into CR3. */
 extern co_pa_t co_arch_guest_space_root(co_arch_guest_space_t* space);
 

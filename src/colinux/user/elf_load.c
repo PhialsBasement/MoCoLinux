@@ -720,8 +720,11 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 					  (int)rc, (int)m.rc);
 			goto out_end;
 		}
-		co_terminal_print("    %lu pages allocated, %lu page-table pages total\n",
+		co_terminal_print("    %lu pages mapped, %lu page-table pages total\n",
 				  m.ram_pages, m.tables);
+		co_terminal_print("    guest physical 0 is host physical 0x%llx,"
+				  " %llu MB usable\n",
+				  m.block_pa, m.usable_bytes >> 20);
 
 		/*
 		 * boot_params, written straight into the guest at its symbol.
@@ -738,10 +741,21 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			goto out_end;
 		}
 
+		/*
+		 * The e820 describes where the memory really is.
+		 *
+		 * Guest physical N is host physical block_pa + N, so the guest's
+		 * RAM starts at block_pa, not at zero -- there is no low memory
+		 * and no hole, because there is no emulated machine underneath,
+		 * just one contiguous allocation. The reserved entry is the
+		 * region at the top holding the page tables the host built: the
+		 * guest must not allocate over its own address space.
+		 */
 		memset(bp, 0, sizeof(bp));
 		bp[0x1e8] = 2;					/* e820_entries */
-		co_e820_entry(bp + 0x2d0 +  0, 0x0000ULL,   0x9fc00ULL,        1);
-		co_e820_entry(bp + 0x2d0 + 20, 0x100000ULL, ram - 0x100000ULL, 1);
+		co_e820_entry(bp + 0x2d0 +  0, m.block_pa, m.usable_bytes, 1);
+		co_e820_entry(bp + 0x2d0 + 20, m.block_pa + m.usable_bytes,
+			      ram - m.usable_bytes, 2);	/* reserved: page tables */
 
 		rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_bp),
 					    bp, sizeof(bp), 0);
@@ -759,7 +773,38 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			goto out_end;
 		}
 
-		co_terminal_print("    e820: 0x0-0x9fc00 and 0x100000-0x%llx usable\n", ram);
+		/*
+		 * phys_base, which is how __pa() of a kernel address is computed:
+		 *
+		 *     __pa(x) = x - __START_KERNEL_map + phys_base
+		 *
+		 * The image was loaded at guest physical (link address -
+		 * __START_KERNEL_map), and guest physical is offset from host
+		 * physical by the block base, so phys_base is that base. Left at
+		 * zero the kernel would compute physical addresses for its own
+		 * text that are 128 MB below where it actually is.
+		 */
+		{
+			co_elf_symbol_t* s_pb = co_get_symbol_by_name(pl, "phys_base");
+
+			if (!s_pb) {
+				co_terminal_print("\n  phys_base not found\n");
+				goto out_end;
+			}
+
+			rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_pb),
+						    (unsigned char*)&m.block_pa,
+						    sizeof(m.block_pa), 0);
+			if (!CO_OK(rc)) {
+				co_terminal_print("  writing phys_base failed (rc %x)\n", (int)rc);
+				goto out_end;
+			}
+			co_terminal_print("    phys_base = 0x%llx\n", m.block_pa);
+		}
+
+		co_terminal_print("    e820: 0x%llx-0x%llx usable, 0x%llx-0x%llx reserved\n",
+				  m.block_pa, m.block_pa + m.usable_bytes,
+				  m.block_pa + m.usable_bytes, m.block_pa + ram);
 		co_terminal_print("    cmdline: %s\n", cmdline);
 
 		b.entry_va           = addr[0];

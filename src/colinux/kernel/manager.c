@@ -651,7 +651,9 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		co_memset(params, 0, sizeof(*params));
 
 		params->rc = co_kload_build_ram(manager, ram, text, end);
-		params->ram_pages = co_kload_ram_pages();
+		params->ram_pages    = co_kload_ram_pages();
+		params->block_pa     = co_kload_block_pa();
+		params->usable_bytes = co_kload_usable_bytes();
 		params->tables = co_kload_space()
 				 ? co_arch_guest_space_tables(co_kload_space()) : 0;
 

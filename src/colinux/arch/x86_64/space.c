@@ -54,17 +54,72 @@ static unsigned long co_space_index(unsigned long long va, int level)
 	}
 }
 
+/*
+ * Where page-table pages come from.
+ *
+ * Normally the host's page allocator, which is right for the switch tests: the
+ * tables describe a space, and nothing inside that space ever looks at them.
+ *
+ * A space that runs Linux is different. Linux reads its own page tables and
+ * calls __va() on the entries, so the tables have to be part of the guest's
+ * physical memory rather than scattered host pool pages. When a caller supplies
+ * a frame source, its frames are also its to free -- the destructor below
+ * leaves them alone, since freeing a page out of the middle of someone else's
+ * allocation is how a host loses its pool.
+ */
+static co_rc_t (*co_space_frame_source)(co_manager_t*, co_pfn_t*);
+static void*   (*co_space_frame_mapper)(co_pfn_t);
+
+void co_arch_guest_space_set_frame_source(co_rc_t (*source)(co_manager_t*, co_pfn_t*),
+					  void* (*mapper)(co_pfn_t))
+{
+	co_space_frame_source = source;
+	co_space_frame_mapper = mapper;
+}
+
+/*
+ * Reaching a page table.
+ *
+ * co_os_map() is MmMapIoSpace, which is for device memory. Used on ordinary RAM
+ * that already has a system mapping it creates a second one with a different
+ * cache attribute, which is architecturally undefined and which Driver Verifier
+ * stops the machine for. When the frames come from a caller that already holds
+ * a mapping of them, ask it for the address instead of making another.
+ */
+static void* co_space_map(co_manager_t* manager, co_pfn_t pfn)
+{
+	if (co_space_frame_mapper) {
+		void* p = co_space_frame_mapper(pfn);
+
+		if (p)
+			return p;
+	}
+
+	return co_os_map(manager, pfn);
+}
+
+static void co_space_unmap(co_manager_t* manager, void* p, co_pfn_t pfn)
+{
+	if (co_space_frame_mapper && co_space_frame_mapper(pfn))
+		return;
+
+	co_os_unmap(manager, p, pfn);
+}
+
 static co_rc_t co_space_new_table(co_manager_t* manager, co_pfn_t* pfn_out)
 {
 	unsigned long long* table;
 	co_pfn_t pfn;
 	co_rc_t rc;
 
+	if (co_space_frame_source)
+		return co_space_frame_source(manager, pfn_out);
+
 	rc = co_os_get_page(manager, &pfn);
 	if (!CO_OK(rc))
 		return rc;
 
-	table = co_os_map(manager, pfn);
+	table = co_space_map(manager, pfn);
 	if (table == NULL) {
 		co_os_put_page(manager, pfn);
 		return CO_RC(ERROR);
@@ -76,7 +131,7 @@ static co_rc_t co_space_new_table(co_manager_t* manager, co_pfn_t* pfn_out)
 	 * pointing at an arbitrary physical page.
 	 */
 	co_memset(table, 0, CO_ARCH_PAGE_SIZE);
-	co_os_unmap(manager, table, pfn);
+	co_space_unmap(manager, table, pfn);
 
 	*pfn_out = pfn;
 	return CO_RC(OK);
@@ -137,13 +192,13 @@ co_rc_t co_arch_guest_map(co_manager_t* manager,
 		co_pfn_t next;
 		co_rc_t rc;
 
-		table = co_os_map(manager, pfn);
+		table = co_space_map(manager, pfn);
 		if (table == NULL)
 			return CO_RC(ERROR);
 
 		if (level == CO_SPACE_LEVELS - 1) {
 			table[index] = (pa & CO_ARCH_PAGE_MASK) | flags;
-			co_os_unmap(manager, table, pfn);
+			co_space_unmap(manager, table, pfn);
 			return CO_RC(OK);
 		}
 
@@ -156,14 +211,14 @@ co_rc_t co_arch_guest_map(co_manager_t* manager,
 			 * hold a 4 KB mapping. Refuse rather than corrupt it.
 			 */
 			if (entry & _PAGE_PSE) {
-				co_os_unmap(manager, table, pfn);
+				co_space_unmap(manager, table, pfn);
 				co_debug_error("guest map: 0x%llx crosses a large page at level %d",
 					       va, level);
 				return CO_RC(ERROR);
 			}
 			next = (co_pfn_t)((entry & CO_ARCH_PAGE_MASK & ~CO_ARCH_PAGE_NX)
 					  >> CO_ARCH_PAGE_SHIFT);
-			co_os_unmap(manager, table, pfn);
+			co_space_unmap(manager, table, pfn);
 			pfn = next;
 			continue;
 		}
@@ -173,13 +228,13 @@ co_rc_t co_arch_guest_map(co_manager_t* manager,
 		 * co_os_map() may hold a single reusable window -- nesting two
 		 * live mappings is not something the host allocator promises.
 		 */
-		co_os_unmap(manager, table, pfn);
+		co_space_unmap(manager, table, pfn);
 
 		rc = co_space_new_table(manager, &next);
 		if (!CO_OK(rc))
 			return rc;
 
-		table = co_os_map(manager, pfn);
+		table = co_space_map(manager, pfn);
 		if (table == NULL) {
 			co_os_put_page(manager, next);
 			return CO_RC(ERROR);
@@ -193,7 +248,7 @@ co_rc_t co_arch_guest_map(co_manager_t* manager,
 		 */
 		entry = table[index];
 		if (entry & _PAGE_PRESENT) {
-			co_os_unmap(manager, table, pfn);
+			co_space_unmap(manager, table, pfn);
 			co_os_put_page(manager, next);
 			pfn = (co_pfn_t)((entry & CO_ARCH_PAGE_MASK & ~CO_ARCH_PAGE_NX)
 					 >> CO_ARCH_PAGE_SHIFT);
@@ -202,7 +257,7 @@ co_rc_t co_arch_guest_map(co_manager_t* manager,
 
 		table[index] = (((unsigned long long)next) << CO_ARCH_PAGE_SHIFT)
 			       | _KERNPG_TABLE;
-		co_os_unmap(manager, table, pfn);
+		co_space_unmap(manager, table, pfn);
 
 		space->tables++;
 		pfn = next;
@@ -231,12 +286,12 @@ co_rc_t co_arch_guest_lookup(co_manager_t* manager,
 		unsigned long long entry;
 		unsigned long index = co_space_index(va, level);
 
-		table = co_os_map(manager, pfn);
+		table = co_space_map(manager, pfn);
 		if (table == NULL)
 			return CO_RC(ERROR);
 
 		entry = table[index];
-		co_os_unmap(manager, table, pfn);
+		co_space_unmap(manager, table, pfn);
 
 		if (!(entry & _PAGE_PRESENT)) {
 			*level_out = level;
@@ -293,12 +348,12 @@ static void co_space_collect_tables(co_manager_t* manager, co_pfn_t pfn, int lev
 		unsigned long long entry;
 		co_pfn_t child;
 
-		table = co_os_map(manager, pfn);
+		table = co_space_map(manager, pfn);
 		if (table == NULL)
 			return;
 
 		entry = table[i];
-		co_os_unmap(manager, table, pfn);
+		co_space_unmap(manager, table, pfn);
 
 		if (!(entry & _PAGE_PRESENT))
 			continue;
@@ -417,12 +472,12 @@ static void co_space_free_table(co_manager_t* manager, co_pfn_t pfn, int level,
 			 * much larger than that. Teardown is not hot, so paying
 			 * 512 map/unmap pairs per table is the right trade.
 			 */
-			table = co_os_map(manager, pfn);
+			table = co_space_map(manager, pfn);
 			if (table == NULL)
 				break;
 
 			entry = table[i];
-			co_os_unmap(manager, table, pfn);
+			co_space_unmap(manager, table, pfn);
 
 			if (!(entry & _PAGE_PRESENT))
 				continue;
@@ -435,7 +490,8 @@ static void co_space_free_table(co_manager_t* manager, co_pfn_t pfn, int level,
 		}
 	}
 
-	co_os_put_page(manager, pfn);
+	if (!co_space_frame_source)
+		co_os_put_page(manager, pfn);
 	(*freed)++;
 }
 
