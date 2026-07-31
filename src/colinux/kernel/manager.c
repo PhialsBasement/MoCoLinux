@@ -450,10 +450,18 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 
 #if defined(__x86_64__) || defined(CONFIG_X86_64)
 		params->supported = PTRUE;
+		/*
+		 * GDTR, IDTR, TR and GS_BASE are per processor, so capturing
+		 * them on one and putting them back on another is meaningless
+		 * at best. Pinned even for the read-only case: a state dump
+		 * taken across a migration describes no processor that exists.
+		 */
+		co_os_pin_cpu();
 		if (params->restore)
 			co_arch_test_save_restore(&params->state);
 		else
 			co_arch_save_state(&params->state);
+		co_os_unpin_cpu();
 #else
 		params->supported = PFALSE;
 #endif
@@ -522,7 +530,9 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		entry_va = params->code_va;
 		co_memset(params, 0, sizeof(*params));
 
+		co_os_pin_cpu();
 		trc = co_arch_enter_loaded(manager, co_kload_space(), entry_va, &result);
+		co_os_unpin_cpu();
 
 		params->rc         = trc;
 		params->supported  = result.supported;
@@ -577,9 +587,11 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		ring_va = params->ring_symbol_va;
 		co_memset(params, 0, sizeof(*params));
 
+		co_os_pin_cpu();
 		trc = co_arch_test_kernel_code(manager, co_kload_space(),
 					       memset_va, strlen_va, snprintf_va,
 					       epk_va, ec_va, cc_va, ring_va, &result);
+		co_os_unpin_cpu();
 
 		params->rc		= trc;
 		params->supported	= result.supported;
@@ -652,7 +664,18 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 
 		co_memset(params, 0, sizeof(*params));
 
+		/*
+		 * Pinned for the whole call, not just the monitor loop.
+		 *
+		 * co_arch_boot_loaded captures the host's GDTR, IDTR, TR and
+		 * GS_BASE before it enters the guest and restores them on every
+		 * crossing back, and all of those are per processor. The capture
+		 * has to happen on the processor the switches will run on, so
+		 * the pin has to come first.
+		 */
+		co_os_pin_cpu();
 		trc = co_arch_boot_loaded(manager, co_kload_space(), &in, &result);
+		co_os_unpin_cpu();
 
 		params->rc		 = trc;
 		params->supported	 = result.supported;
@@ -766,6 +789,16 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			return CO_RC(OK);
 		}
 
+		/*
+		 * Every one of these crosses into a guest address space and
+		 * back, which means every one of them saves and restores per
+		 * processor state. They are short enough that a migration is
+		 * unlikely rather than impossible, which is exactly the kind of
+		 * bug that passes a hundred runs and then takes the machine
+		 * down once.
+		 */
+		co_os_pin_cpu();
+
 		if (ioctl == CO_MANAGER_IOCTL_TEST_ROUNDTRIP)
 			trc = co_arch_test_roundtrip(manager, &result, 0);
 		else if (ioctl == CO_MANAGER_IOCTL_TEST_FAULT)
@@ -782,6 +815,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			trc = co_arch_test_resume(manager, &result, req_iterations);
 		else
 			trc = co_arch_test_switch(manager, &result);
+
+		co_os_unpin_cpu();
 
 		params->rc         = trc;
 		params->supported  = result.supported;

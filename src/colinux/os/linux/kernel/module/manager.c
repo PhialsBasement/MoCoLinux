@@ -369,3 +369,25 @@ co_id_t co_os_current_id(void)
 {
 	return current->pid;
 }
+
+/*
+ * Pin this thread to the processor it is on -- see colinux/os/kernel/misc.h.
+ *
+ * Not implemented for the Linux host yet, and deliberately not faked: the
+ * x86-64 world switch is the code that needs this, it only runs on the Windows
+ * host so far, and a silent no-op here would be a per-CPU state bug waiting for
+ * whoever brings the Linux host up. set_cpus_allowed_ptr() is the equivalent
+ * when that happens.
+ */
+void co_os_pin_cpu(void)
+{
+}
+
+void co_os_unpin_cpu(void)
+{
+}
+
+unsigned long co_os_current_cpu(void)
+{
+	return (unsigned long)smp_processor_id();
+}
