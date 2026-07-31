@@ -1,6 +1,23 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5 at the cooperative-yield
-bring-up checkpoint.  Generated against download/linux-7.1.5.tar.xz on
-2026-08-01 after the full free-running test still froze the Windows host.
+Authoritative cumulative snapshot of ref/linux-7.1.5 at the real-IF
+interrupt-forwarding checkpoint.  Generated against download/linux-7.1.5.tar.xz
+on 2026-08-01, after the first free-running boot the Windows host survived:
+199,896 hardware interrupts captured in the guest, crossed, and replayed into
+Windows' live IDT, host state verified intact after every crossing.
+
+The interrupt policy this snapshot carries, and the one it replaces:
+
+  - Real IF is ON for the guest's whole life.  The host enters the guest with
+    interrupts enabled; hardware interrupts vector through the guest IDT into
+    the passage-page stub, world-switch back to the host, and are replayed.
+    The guest's own cli/sti edit a virtual flag (asm/irqflags.h) and never
+    touch the hardware bit.  head_64.S's zero-EFLAGS popfq is guarded to
+    preserve IF for a cooperative guest.
+
+  - The previous policy -- real IF clear, voluntary yields at virtual-sti and
+    console boundaries -- froze the machine the moment the guest ran free:
+    early boot runs for hundreds of milliseconds between boundaries, and a
+    core deaf that long misses the clock and wedges the other cores on their
+    TLB-shootdown IPIs.  native_irq_enable() no longer yields.
 
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
@@ -160,10 +177,10 @@ index 7f4847b..912c599 100644
  		type *value = (type *)addr;				\
  		while (count) {						\
 diff --git a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
-index 6f25de0..d8b00f3 100644
+index 6f25de0..539a05d 100644
 --- a/arch/x86/include/asm/irqflags.h
 +++ b/arch/x86/include/asm/irqflags.h
-@@ -12,6 +12,26 @@
+@@ -12,6 +12,37 @@
   * Interrupt control:
   */
  
@@ -173,14 +190,25 @@ index 6f25de0..d8b00f3 100644
 + * The cooperative guest's interrupt flag is virtual.
 + *
 + * Linux gets a virtual IF: sti/cli/save_fl edit this bit rather than the real
-+ * hardware flag. Real IF remains clear whenever the guest address space is
-+ * current, so host hardware interrupts remain pending instead of entering a
-+ * guest IDT and then being replayed unsafely from driver ioctl context.
++ * hardware flag. Real IF stays SET the whole time the guest address space is
++ * current -- the host enters the guest with interrupts enabled and nothing in
++ * the guest may clear them.
 + *
-+ * Enabling virtual interrupts is also a cooperative scheduling boundary. The
-+ * guest switches back to the host, where the saved host IF is restored and any
-+ * pending interrupt enters Windows through Windows' own IDT and stack. The host
-+ * then re-enters the guest at the instruction after that voluntary switch.
++ * That is what keeps the host alive underneath a free-running guest. A real
++ * hardware interrupt vectors through the guest IDT into the passage-page stub,
++ * which performs a full world switch back to the host; the host, restored to
++ * its own context, replays the vector into Windows' live IDT and re-enters the
++ * guest at the interrupted instruction. So the host is never deaf for longer
++ * than one crossing, no matter what the guest is doing -- including the long
++ * stretches of early boot that run under a virtual cli with no cooperative
++ * boundary in sight. The previous policy (real IF clear, yield only at
++ * virtual-sti boundaries) froze the machine exactly there: the pinned core
++ * stopped answering the clock and every other core's TLB-shootdown IPIs
++ * within milliseconds of the guest running free.
++ *
++ * The virtual flag is still what Linux reads back: irqs_disabled() and
++ * saved-flags tests see the guest's own logical state, not the hardware bit
++ * the host owns.
 + *
 + * Holds X86_EFLAGS_IF or 0, so it substitutes directly into saved flags.
 + */
@@ -190,7 +218,7 @@ index 6f25de0..d8b00f3 100644
  /* Declaration required for gcc < 4.9 to prevent -Werror=missing-prototypes */
  extern inline unsigned long native_save_fl(void);
  extern __always_inline unsigned long native_save_fl(void)
-@@ -29,27 +49,83 @@ extern __always_inline unsigned long native_save_fl(void)
+@@ -29,27 +60,90 @@ extern __always_inline unsigned long native_save_fl(void)
  		     : /* no input */
  		     : "memory");
  
@@ -214,10 +242,17 @@ index 6f25de0..d8b00f3 100644
  static __always_inline void native_irq_enable(void)
  {
 +	if (co_colinux_guest) {
-+		/* Publish virtual IF before yielding so a future event sees it. */
++		/*
++		 * The virtual bit only. Real IF is already set -- the host
++		 * entered the guest that way and hardware interrupts bound the
++		 * guest via the stub crossing -- so there is nothing to yield
++		 * for here. The yield this used to make was also the only
++		 * bound the guest had, which meant every stretch that never
++		 * toggled virtual IF ran unbounded with real interrupts off:
++		 * that was the host-freeze, and real-IF-on is its fix.
++		 */
 +		co_colinux_virtual_if = X86_EFLAGS_IF;
 +		asm volatile("" : : : "memory");
-+		co_colinux_yield();
 +		return;
 +	}
 +
@@ -632,7 +667,7 @@ index fd28b53..c9393aa 100644
  		setup_ghcb();
  		handler = vc_boot_ghcb;
 diff --git a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
-index 7ed5520..b91e534 100644
+index 7ed5520..65805ce 100644
 --- a/arch/x86/kernel/head_64.S
 +++ b/arch/x86/kernel/head_64.S
 @@ -195,6 +195,33 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
@@ -704,6 +739,35 @@ index 7ed5520..b91e534 100644
  
  	/* set up data segments */
  	xorl %eax,%eax
+@@ -405,9 +457,27 @@ SYM_INNER_LABEL(common_startup_64, SYM_L_LOCAL)
+ 	/* Make changes effective */
+ 	movq	%rax, %cr0
+ 
+-	/* zero EFLAGS after setting rsp */
++	/*
++	 * Zero EFLAGS after setting rsp -- except IF, for a cooperative guest.
++	 *
++	 * The cooperative guest is entered with real interrupts enabled and
++	 * must keep them that way: a hardware interrupt is the only bound the
++	 * host has on a free-running guest, delivered through the guest IDT
++	 * stub as a world switch. This popfq was clearing IF microseconds
++	 * after entry, which deafened the pinned core for the whole of early
++	 * boot -- the clock stopped and every other core wedged on its TLB
++	 * shootdown IPIs. Linux's own view of its interrupt state is the
++	 * virtual flag in asm/irqflags.h, not this bit.
++	 */
++	cmpl	$0, co_colinux_guest(%rip)
++	je	.Lzero_eflags
++	pushq	$X86_EFLAGS_IF
++	popfq
++	jmp	.Leflags_done
++.Lzero_eflags:
+ 	pushq $0
+ 	popfq
++.Leflags_done:
+ 
+ 	/* Pass the boot_params pointer as first argument */
+ 	movq	%r15, %rdi
 diff --git a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
 index 90a22e2..7cd11dd 100644
 --- a/arch/x86/kernel/idt.c
