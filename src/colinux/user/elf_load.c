@@ -359,6 +359,20 @@ co_rc_t co_elf_dump(const char *filename)
  */
 #define CO_KLOAD_CHUNK	0x8000
 
+/* How much physical memory the guest is told it has. */
+#define CO_GUEST_RAM	(128ULL << 20)
+
+/* One e820 entry: 8-byte address, 8-byte size, 4-byte type, packed to 20. */
+static void co_e820_entry(unsigned char* p, unsigned long long addr,
+			  unsigned long long size, unsigned int type)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)  p[i]      = (unsigned char)(addr >> (8 * i));
+	for (i = 0; i < 8; i++)  p[8 + i]  = (unsigned char)(size >> (8 * i));
+	for (i = 0; i < 4; i++)  p[16 + i] = (unsigned char)(type >> (8 * i));
+}
+
 co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 {
 	co_elf_data_t* pl;
@@ -646,6 +660,14 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 
 	if (enter == 3) {
 		co_manager_ioctl_kboot_t b = {0, };
+		co_manager_ioctl_kram_t  m = {0, };
+		unsigned char bp[4096];
+		char cmdline[256];
+		co_elf_symbol_t* s_bp;
+		co_elf_symbol_t* s_cl;
+		co_elf_symbol_t* s_text;
+		co_elf_symbol_t* s_end;
+		unsigned long long ram = CO_GUEST_RAM;
 		static const char* want[] = { "co_arch_start_kernel", "initial_code",
 					      "start_kernel", "early_console",
 					      "early_colinux_console",
@@ -663,6 +685,80 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter)
 			}
 			addr[i] = co_elf_get_symbol_value(sym);
 		}
+
+		/*
+		 * Physical memory, and a linear map of it.
+		 *
+		 * setup_arch reads an e820 map, hands the ranges to memblock, and
+		 * from then on turns physical addresses back into virtual ones with
+		 * __va(). Without RAM behind those addresses and a map at
+		 * PAGE_OFFSET, the first allocation the kernel dereferences faults
+		 * -- and by then it has replaced our stubs, so the fault is
+		 * unreportable. This is what was missing when it took the host down.
+		 */
+		s_text = co_get_symbol_by_name(pl, "_text");
+		s_end  = co_get_symbol_by_name(pl, "_end");
+		if (!s_text || !s_end) {
+			co_terminal_print("\n  _text or _end missing\n");
+			goto out_end;
+		}
+
+		m.ram_bytes = ram;
+		m.text_va   = co_elf_get_symbol_value(s_text);
+		m.end_va    = co_elf_get_symbol_value(s_end);
+
+		co_terminal_print("\n  giving the guest %llu MB of RAM and a linear map at\n",
+				  ram >> 20);
+		co_terminal_print("  PAGE_OFFSET, with the image visible at both its link\n");
+		co_terminal_print("  addresses and its physical ones\n");
+
+		rc = co_manager_kram(handle, &m);
+		if (!CO_OK(rc) || !CO_OK(m.rc)) {
+			co_terminal_print("  building guest RAM failed (rc %x / %x)\n",
+					  (int)rc, (int)m.rc);
+			goto out_end;
+		}
+		co_terminal_print("    %lu pages allocated, %lu page-table pages total\n",
+				  m.ram_pages, m.tables);
+
+		/*
+		 * boot_params, written straight into the guest at its symbol.
+		 *
+		 * x86_64_start_kernel would normally build this with copy_bootdata,
+		 * and we skip that function because it reloads CR3. Skipping it
+		 * without doing its job is what left the kernel believing it had no
+		 * memory at all.
+		 */
+		s_bp = co_get_symbol_by_name(pl, "boot_params");
+		s_cl = co_get_symbol_by_name(pl, "boot_command_line");
+		if (!s_bp || !s_cl) {
+			co_terminal_print("\n  boot_params or boot_command_line missing\n");
+			goto out_end;
+		}
+
+		memset(bp, 0, sizeof(bp));
+		bp[0x1e8] = 2;					/* e820_entries */
+		co_e820_entry(bp + 0x2d0 +  0, 0x0000ULL,   0x9fc00ULL,        1);
+		co_e820_entry(bp + 0x2d0 + 20, 0x100000ULL, ram - 0x100000ULL, 1);
+
+		rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_bp),
+					    bp, sizeof(bp), 0);
+		if (!CO_OK(rc)) {
+			co_terminal_print("  writing boot_params failed (rc %x)\n", (int)rc);
+			goto out_end;
+		}
+
+		memset(cmdline, 0, sizeof(cmdline));
+		strcpy(cmdline, "earlyprintk=colinux,keep console=earlycolinux");
+		rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_cl),
+					    cmdline, sizeof(cmdline), 0);
+		if (!CO_OK(rc)) {
+			co_terminal_print("  writing boot_command_line failed (rc %x)\n", (int)rc);
+			goto out_end;
+		}
+
+		co_terminal_print("    e820: 0x0-0x9fc00 and 0x100000-0x%llx usable\n", ram);
+		co_terminal_print("    cmdline: %s\n", cmdline);
 
 		b.entry_va           = addr[0];
 		b.initial_code_va    = addr[1];

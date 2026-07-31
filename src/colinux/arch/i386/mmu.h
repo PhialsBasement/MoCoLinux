@@ -57,6 +57,17 @@ typedef unsigned long co_pfn_t;
  * arch-specific for no reason.
  */
 #define CO_ARCH_VA_CANONICAL(va) (1)
+
+/*
+ * x86-64 splits what i386 calls PAGE_OFFSET in two: a linear map of physical
+ * memory, and a separate window the kernel image is linked into. On i386 there
+ * is no split -- the image lives inside the linear map -- so both names point at
+ * PAGE_OFFSET. Shared code that computes a physical address as
+ * (virtual - CO_ARCH_KERNEL_MAP) and maps it back at CO_ARCH_DIRECT_MAP is then
+ * correct on both, rather than being 64-bit only.
+ */
+#define CO_ARCH_DIRECT_MAP      CO_ARCH_KERNEL_OFFSET
+#define CO_ARCH_KERNEL_MAP      CO_ARCH_KERNEL_OFFSET
 #define CO_ARCH_KERNEL_OFFSET   0xc0000000
 
 #endif

@@ -1,87 +1,64 @@
-An early console for Cooperative Linux.
-
-The guest has no device to talk to -- it runs inside a host process's address
-space and its only channel out is memory both sides can see. So the console
-appends bytes to a ring in the passage page and the host drains it after the
-next world switch.
-
-co_colinux_console_ring is filled in by the host *before* the guest executes
-anything, which is the point: output works from the first instruction rather
-than from whenever setup_early_printk() runs during setup_arch(). A real
-machine must bootstrap its own console and is blind until it does. Being blind
-through early boot is how a port like this gets stuck.
-
-`written` counts everything the guest tried to emit, including what did not
-fit, so the host can report truncation instead of silently showing a short log.
-
 --- a/arch/x86/kernel/early_printk.c
 +++ b/arch/x86/kernel/early_printk.c
-@@ -370,6 +370,57 @@
+@@ -421,6 +421,31 @@
  	.index =	-1,
  };
  
 +/*
-+ * Cooperative Linux: an early console that writes into the passage page.
++ * Register the cooperative console as early as setup_arch can manage.
 + *
-+ * There is no device here to talk to. The guest runs inside a host process's
-+ * address space and its only channel out is memory both sides can see, so the
-+ * console appends bytes to a ring in the passage page and the host drains it
-+ * after the next world switch.
++ * Waiting for parse_early_param() to act on earlyprintk= is too late. In
++ * setup_arch the order is idt_setup_early_traps() at the top, then
++ * e820__memory_setup(), then parse_early_param() -- so the stretch where a
++ * cooperative guest is most likely to die first is also the stretch with no
++ * console registered and, because the kernel has just replaced the host's
++ * interrupt stubs, nothing able to report a fault either.
 + *
-+ * co_colinux_console_ring is filled in by the host before the guest executes
-+ * anything. That matters: it means output works from the very first
-+ * instruction, rather than from whenever setup_early_printk() happens to run
-+ * during setup_arch(). A real machine has to bootstrap its own console and is
-+ * blind until it does; the host can simply write the pointer in beforehand,
-+ * and being blind through early boot is exactly how a port like this gets
-+ * stuck.
-+ *
-+ * written counts everything the guest tried to emit, including what did not
-+ * fit. The host compares it against capacity to report truncation rather than
-+ * silently showing a short log.
++ * Self-gating: it does nothing unless the host has filled in the ring pointer,
++ * so a kernel booted normally on real hardware is unaffected.
 + */
-+struct co_console_ring {
-+	volatile unsigned long long written;
-+	volatile unsigned long long capacity;
-+	volatile char text[];
-+};
++static void early_console_register(struct console *con, int keep_early);
 +
-+struct co_console_ring *co_colinux_console_ring;
-+EXPORT_SYMBOL(co_colinux_console_ring);
-+
-+static void early_colinux_write(struct console *con, const char *s, unsigned n)
++void co_colinux_console_init(void)
 +{
-+	struct co_console_ring *ring = co_colinux_console_ring;
-+
-+	if (!ring)
++	if (!co_colinux_console_ring)
++		return;
++	if (early_console)
 +		return;
 +
-+	while (n-- > 0) {
-+		if (ring->written < ring->capacity)
-+			ring->text[ring->written] = *s;
-+		ring->written++;
-+		s++;
-+	}
++	early_console_register(&early_colinux_console, 1);
 +}
-+
-+static struct console early_colinux_console = {
-+	.name =		"earlycolinux",
-+	.write =	early_colinux_write,
-+	.flags =	CON_PRINTBUFFER,
-+	.index =	-1,
-+};
 +
  static void early_console_register(struct console *con, int keep_early)
  {
  	if (con->index != -1) {
-@@ -398,6 +449,10 @@
- 	keep = (strstr(buf, "keep") != NULL);
+--- a/include/linux/console.h
++++ b/include/linux/console.h
+@@ -741,4 +741,11 @@
+ void dummycon_register_output_notifier(struct notifier_block *nb);
+ void dummycon_unregister_output_notifier(struct notifier_block *nb);
  
- 	while (*buf != '\0') {
-+		if (!strncmp(buf, "colinux", 7)) {
-+			buf += 7;
-+			early_console_register(&early_colinux_console, keep);
-+		}
- 		if (!strncmp(buf, "mmio32", 6)) {
- 			buf += 6;
- 			early_mmio_serial_init(buf);
++/* Cooperative Linux: register the passage-page console at the top of setup_arch. */
++#ifdef CONFIG_EARLY_PRINTK
++void co_colinux_console_init(void);
++#else
++static inline void co_colinux_console_init(void) { }
++#endif
++
+ #endif /* _LINUX_CONSOLE_H */
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -933,6 +933,13 @@
+ 	 */
+ 	olpc_ofw_detect();
+ 
++	/*
++	 * Before anything that can fail. A cooperative guest has a console the
++	 * moment the host hands it a ring, and everything from here to
++	 * parse_early_param() is otherwise silent.
++	 */
++	co_colinux_console_init();
++
+ 	idt_setup_early_traps();
+ 	early_cpu_init();
+ 	jump_label_init();
