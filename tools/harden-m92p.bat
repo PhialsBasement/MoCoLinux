@@ -16,6 +16,8 @@ set PEER=192.168.137.1
 set ROOT=F:\xfer
 set PORT=5000
 
+rem  The account the box logs straight into. Leave LOGONPASS empty if it has
+rem  no password.
 set LOGONUSER=Administrator
 set LOGONPASS=
 
@@ -50,17 +52,19 @@ copy /y "%~dp0run-agent.bat" "%ALLUSERSPROFILE%\Start Menu\Programs\Startup\run-
 
 echo.
 echo === 5. log on without a human ===
-if "%LOGONPASS%"=="" (
-  echo   LOGONPASS is blank -- skipping autologon.
-  echo   Set it at the top of this file and re-run if you want the box to come
-  echo   all the way back on its own. It goes into the registry in clear text,
-  echo   which is why it is not filled in for you.
-) else (
-  reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 1 /f
-  reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d "%LOGONUSER%" /f
-  reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /t REG_SZ /d "%LOGONPASS%" /f
-  echo   autologon set for %LOGONUSER%
-)
+rem  This is the step that makes the whole thing work. Without it the box boots
+rem  to a login prompt and is just as unreachable as before.
+rem
+rem  A blank LOGONPASS is fine if the account has no password -- XP allows
+rem  autologon with an empty DefaultPassword, and LimitBlankPasswordUse only
+rem  restricts network logons, not the console one this uses.
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 1 /f
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d "%LOGONUSER%" /f
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /t REG_SZ /d "%LOGONPASS%" /f
+reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoLogonCount /f >nul 2>&1
+rem  Winlogon decrements AutoLogonCount and stops autologging in when it hits
+rem  zero, so a stale one from anything else would make this work once.
+echo   autologon set for %LOGONUSER%
 
 echo.
 echo === 6. start it now, so you can see it work ===
