@@ -1557,7 +1557,14 @@ static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 	 * own gdt_table and the switch loads it.
 	 */
 	{
-		unsigned long long* guest_gdt = &pp->params[8];
+		/*
+		 * params[64], not params[8]. Ten entries is eighty bytes, and
+		 * from params[8] that runs to params[17] -- straight over
+		 * params[16..18], which the fault stub writes the vector, the
+		 * error code and CR2 into. The GDT was four entries when it was
+		 * put there.
+		 */
+		unsigned long long* guest_gdt = &pp->params[64];
 		unsigned char* host_temp = (unsigned char*)&pp->host_temp;
 		struct co_x86_64_tss* tss = (struct co_x86_64_tss*)
 			(host_temp + CO_PP_TSS_PAGE * CO_ARCH_PAGE_SIZE);
@@ -1568,16 +1575,51 @@ static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 		tss->ist[0]     = ist_top;	/* IST1: a whole page, growing down */
 		tss->iomap_base = sizeof(*tss);	/* past the limit: no I/O bitmap */
 
-		guest_gdt[0] = 0x0000000000000000ULL;	/* null */
-		guest_gdt[1] = 0x00209a0000000000ULL;	/* 64-bit code, selector 0x08 */
-		co_build_tss_descriptor(&guest_gdt[2],
+		/*
+		 * Laid out exactly as Linux lays out its own GDT, because the
+		 * guest reaches userspace through selectors it does not get to
+		 * choose.
+		 *
+		 * A kernel returning to ring 3 uses __USER_CS and __USER_DS by
+		 * number -- iretq loads them from the frame it built, and
+		 * sysretq computes them from STAR, which syscall_init() sets to
+		 * (__USER32_CS << 48) | (__KERNEL_CS << 32). Those numbers are
+		 * fixed in asm/segment.h: index 6 for 64-bit user code, 5 for
+		 * user data, 2 for kernel code. A GDT with a null descriptor
+		 * and one code segment satisfies a far return between kernel
+		 * addresses and nothing else, so the first exec of init raised
+		 * #GP with error code 0x30 -- which is not an address, it is
+		 * the selector: index 6, __USER_CS, the entry that was not
+		 * there.
+		 *
+		 * So the entries are Linux's, with Linux's values:
+		 *
+		 *   1 0x08 __KERNEL32_CS   2 0x10 __KERNEL_CS   3 0x18 __KERNEL_DS
+		 *   4 0x20 __USER32_CS     5 0x28 __USER_DS     6 0x30 __USER_CS
+		 *   8 0x40 the TSS, sixteen bytes, as GDT_ENTRY_TSS
+		 *
+		 * The guest's own gdt_page is built and maintained by the
+		 * kernel as usual; it simply never gets loaded, because lgdt is
+		 * still guarded. This table is what GDTR actually points at,
+		 * and it now agrees with the kernel about what every selector
+		 * means.
+		 */
+		co_memset(guest_gdt, 0, 10 * 8);
+		guest_gdt[0] = 0x0000000000000000ULL;	/* null			*/
+		guest_gdt[1] = 0x00cf9b000000ffffULL;	/* 0x08 kernel code, 32	*/
+		guest_gdt[2] = 0x00af9b000000ffffULL;	/* 0x10 kernel code, 64	*/
+		guest_gdt[3] = 0x00cf93000000ffffULL;	/* 0x18 kernel data	*/
+		guest_gdt[4] = 0x00cffb000000ffffULL;	/* 0x20 user code, 32	*/
+		guest_gdt[5] = 0x00cff3000000ffffULL;	/* 0x28 user data	*/
+		guest_gdt[6] = 0x00affb000000ffffULL;	/* 0x30 user code, 64	*/
+		co_build_tss_descriptor(&guest_gdt[8],
 					(unsigned long long)(size_t)tss,
-					sizeof(*tss) - 1);	/* selector 0x10 */
+					sizeof(*tss) - 1);	/* selector 0x40 */
 
 		pp->linuxvm_state.gdt.base  = (struct x86_dt_entry*)guest_gdt;
-		pp->linuxvm_state.gdt.limit = (4 * 8) - 1;
-		pp->linuxvm_state.cs        = 0x08;
-		pp->linuxvm_state.tr        = 0x10;
+		pp->linuxvm_state.gdt.limit = (10 * 8) - 1;
+		pp->linuxvm_state.cs        = 0x10;	/* __KERNEL_CS */
+		pp->linuxvm_state.tr        = 0x40;	/* GDT_ENTRY_TSS */
 		/*
 		 * Null, deliberately. Long mode allows it at CPL 0, and it means the
 		 * guest never carries a selector that has to be valid in a GDT with
@@ -1678,7 +1720,15 @@ static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 		 * exactly a page, which is why they get one of their own.
 		 */
 		co_build_guest_stubs(stubs, stubs_va, handler);
-		co_build_guest_idt(idt, stubs_va, 0x08);
+		/*
+		 * 0x10, __KERNEL_CS, and the number matters: since the guest
+		 * GDT was laid out as Linux lays out its own, 0x08 is
+		 * __KERNEL32_CS -- a 32-bit segment. A gate naming it would
+		 * drop the processor out of long mode on the way into the
+		 * fault handler, which is a reset with no report, on the exact
+		 * path that exists to produce reports.
+		 */
+		co_build_guest_idt(idt, stubs_va, 0x10);
 
 		pp->linuxvm_state.idt.table = (struct x86_idt_entry*)idt;
 		pp->linuxvm_state.idt.size  = (256 * 16) - 1;
