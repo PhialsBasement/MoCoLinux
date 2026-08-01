@@ -1,33 +1,29 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5 with an orderly shutdown.
+Authoritative cumulative snapshot of ref/linux-7.1.5 with the cooperative
+ethernet device, R1: the device registers and nothing more runs.
 
-Generated against download/linux-7.1.5.tar.xz on 2026-08-01. Verified on the
-M92p from both entrances -- "poweroff" under BusyBox init, and
-"echo o > /proc/sysrq-trigger" under an Arch root -- each ending with the
-daemon exiting cleanly and the host still running.
+Generated against download/linux-7.1.5.tar.xz on 2026-08-01.
 
-Over the terminal snapshot:
+Over the shutdown snapshot:
 
-  * co_colinux_terminate() (process.c) sends CO_OPERATION_TERMINATE with a
-    reason, and machine_halt, machine_power_off and machine_restart call it.
-    The protocol always had the message and the host always handled it; the
-    guest simply never sent one. Its only way of saying "I am finished" was
-    native_halt()'s ud2; ud2, which the host recognises by reading the
-    instruction stream to tell it from a WARN's single ud2. That stays for the
-    paths that arrive at halt without planning to -- a panic, a BUG -- and is
-    the wrong way to report an orderly poweroff.
+  * drivers/net/conet_colinux.c -- a cooperative ethernet netdev on the
+    console's transport, one size up: co_colinux_net_io holds a TX and an RX
+    byte ring in ordinary kernel .bss (128 KB each), one writer per word per
+    direction, frames carried whole as a 32-bit length plus payload padded to
+    a four-byte boundary. Records start four-byte aligned so the length word
+    never straddles the wrap. The host will reach the rings the way it reaches
+    the console's, by resolving the symbol and walking the guest's page
+    tables; the struct layout is ABI and is documented in the file.
 
-  * native_machine_shutdown() returns immediately for a cooperative guest, and
-    this is the one that mattered. It calls clear_IO_APIC(), lapic_shutdown()
-    and restore_boot_irq_mode(): IOAPIC registers, the local APIC, and outb to
-    the 8259 and the IMCR. None of it is virtualised, because this kernel runs
-    at ring 0 on the real processor -- so the guest's last act was reprogramming
-    the interrupt controller the host was using, and the host went deaf
-    immediately afterwards. No crash, nothing to bugcheck, just a freeze.
-    Shutting down had never been reachable before, which is why a rule already
-    applied to the boot-time APIC setup had a hole here.
+    TX copies the skb into the ring and yields, exactly the trade put_chars
+    makes; a full ring drops the frame rather than stopping the queue,
+    because a stopped queue wedges every writer against a host that may never
+    drain. RX is a polling kthread, started at ndo_open, feeding netif_rx; a
+    ring desync is reported and resynchronised empty rather than parsed.
 
-The terminate call is placed before machine_shutdown() in each path, so the
-orderly route never reaches any of that hardware even with the guard in place.
+    In this snapshot the interface is registered and DOWN: the TX path, RX
+    kthread and rings are compiled in and inert until something opens the
+    device. Self-gated on co_colinux_guest, obj-y like cobd, no Kconfig
+    symbol to forget.
 
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
@@ -1957,6 +1953,302 @@ index 0000000..8277ac1
 + * initialises later.
 + */
 +device_initcall(cobd_init);
+diff --git a/drivers/net/Makefile b/drivers/net/Makefile
+index b87a741..86661c4 100644
+--- a/drivers/net/Makefile
++++ b/drivers/net/Makefile
+@@ -21,6 +21,9 @@ obj-$(CONFIG_MACVTAP) += macvtap.o
+ obj-$(CONFIG_MII) += mii.o
+ obj-$(CONFIG_MDIO) += mdio.o
+ obj-$(CONFIG_NET) += loopback.o
++# Cooperative Linux: built unconditionally and self-gated on co_colinux_guest,
++# so there is no Kconfig symbol to forget when the config is regenerated.
++obj-y += conet_colinux.o
+ obj-$(CONFIG_NETDEV_LEGACY_INIT) += Space.o
+ obj-$(CONFIG_NETCONSOLE) += netconsole.o
+ obj-$(CONFIG_NETKIT) += netkit.o
+diff --git a/mnt/big-bricks/RProject/MoCoLinux/ref/linux-7.1.5/drivers/net/conet_colinux.c b/drivers/net/conet_colinux.c
+new file mode 100644
+index 0000000..b9f9615
+--- /dev/null
++++ b/drivers/net/conet_colinux.c
+@@ -0,0 +1,276 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * A cooperative ethernet device for a coLinux guest.
++ *
++ * The transport is the console's, one size up: two rings in an ordinary
++ * kernel object, one writer per word per direction, reached from the host by
++ * walking the guest's page tables. Nothing here is mapped anywhere special
++ * and nothing is shared with the crossing -- the host's half (a pump ioctl
++ * serviced by a second daemon process) copies frames in and out while the
++ * guest runs, exactly as the terminal does with keystrokes.
++ *
++ * Frames travel whole: a 32-bit length, the frame, padding up to a four-byte
++ * boundary. Every record starts four-byte aligned and the rings are a
++ * multiple of four, so the length word never straddles the wrap and both
++ * sides read it in one piece. The indices free-run and are masked, as the
++ * console's are, so full is head - tail == size with no spare-slot ambiguity.
++ *
++ * A full TX ring drops the frame rather than stopping the queue. This is
++ * ethernet: a dropped frame is a thing the protocols above already survive,
++ * and the ring is only ever full when nothing is draining it -- at which
++ * point a stopped queue would wedge every writer against a host that may
++ * never come. The console made the same choice for the same reason.
++ *
++ * There is no interrupt to receive with, so RX is a kthread polling the ring
++ * a few times per millisecond of guest time, like hvc's. The latency floor is
++ * really the host's idle re-entry cadence, not the poll period.
++ *
++ * The host finds the rings by resolving co_colinux_net_io from the image, as
++ * it resolves the console object. The layout is therefore ABI:
++ *
++ *   0x00 tx_head   guest writes    0x08 rx_head   host writes
++ *   0x04 tx_tail   host writes     0x0c rx_tail   guest writes
++ *   0x10           tx ring         0x10 + TX_SIZE rx ring
++ *
++ * (tx and rx are named from where this file stands: tx is guest to host.)
++ */
++
++#include <linux/console.h>	/* co_colinux_guest, co_colinux_yield */
++#include <linux/etherdevice.h>
++#include <linux/init.h>
++#include <linux/kthread.h>
++#include <linux/netdevice.h>
++#include <linux/sched.h>
++#include <linux/skbuff.h>
++#include <linux/types.h>
++
++#define CO_NET_TX_SIZE		(128 * 1024)
++#define CO_NET_RX_SIZE		(128 * 1024)
++#define CO_NET_MAX_FRAME	1514
++
++struct co_net_io {
++	volatile u32 tx_head;		/* guest writes */
++	volatile u32 tx_tail;		/* host writes  */
++	volatile u32 rx_head;		/* host writes  */
++	volatile u32 rx_tail;		/* guest writes */
++	u8 tx[CO_NET_TX_SIZE];
++	u8 rx[CO_NET_RX_SIZE];
++};
++
++struct co_net_io co_colinux_net_io;
++EXPORT_SYMBOL(co_colinux_net_io);
++
++static struct net_device *co_net_dev;
++static struct task_struct *co_net_rx_thread;
++
++/*
++ * Locally administered, unicast, and constant. There is exactly one of these
++ * devices in exactly one guest, and a fixed address means a failure on the
++ * wire reads as itself across runs instead of changing name every boot.
++ */
++static const u8 co_net_mac[ETH_ALEN] = { 0x02, 0xc0, 0x11, 0x00, 0x00, 0x01 };
++
++/* One record's footprint in a ring: the length word, the frame, the pad. */
++static inline u32 co_net_record_bytes(u32 len)
++{
++	return 4 + ALIGN(len, 4);
++}
++
++static netdev_tx_t co_net_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct co_net_io *io = &co_colinux_net_io;
++	u32 head = io->tx_head;
++	u32 tail = io->tx_tail;
++	u32 len = skb->len;
++	u32 off, first;
++
++	if (len > CO_NET_MAX_FRAME) {
++		dev->stats.tx_dropped++;
++		goto out;
++	}
++
++	if ((head - tail) + co_net_record_bytes(len) > CO_NET_TX_SIZE) {
++		dev->stats.tx_dropped++;
++		goto out;
++	}
++
++	off = head & (CO_NET_TX_SIZE - 1);
++	*(u32 *)&io->tx[off] = len;
++	off = (off + 4) & (CO_NET_TX_SIZE - 1);
++
++	first = min_t(u32, len, CO_NET_TX_SIZE - off);
++	skb_copy_bits(skb, 0, &io->tx[off], first);
++	if (first < len)
++		skb_copy_bits(skb, first, &io->tx[0], len - first);
++
++	/*
++	 * The frame must be visible before the head that announces it; the
++	 * host may look from another processor at any moment.
++	 */
++	smp_wmb();
++	io->tx_head = head + co_net_record_bytes(len);
++
++	dev->stats.tx_packets++;
++	dev->stats.tx_bytes += len;
++
++out:
++	dev_kfree_skb(skb);
++
++	/*
++	 * Hand the host the CPU so the frame leaves promptly. A guest that
++	 * has just sent a request is usually about to go idle waiting for
++	 * the answer; this is the same trade put_chars makes after a prompt.
++	 */
++	co_colinux_yield();
++
++	return NETDEV_TX_OK;
++}
++
++/*
++ * Drain whatever the host has queued. Returns the number of frames taken,
++ * so the poll loop can spin while there is work and sleep when there is not.
++ */
++static int co_net_rx_drain(struct net_device *dev)
++{
++	struct co_net_io *io = &co_colinux_net_io;
++	u32 head = io->rx_head;
++	u32 tail = io->rx_tail;
++	int taken = 0;
++
++	while (tail != head) {
++		struct sk_buff *skb;
++		u32 off, first, len;
++
++		/* the record was written before rx_head advanced */
++		smp_rmb();
++
++		off = tail & (CO_NET_RX_SIZE - 1);
++		len = *(u32 *)&io->rx[off];
++
++		/*
++		 * A length that cannot be a frame, or that reaches past what
++		 * the host has published, means the rings have desynchronised.
++		 * There is no way to find the next record boundary from inside
++		 * the corruption, so drop the lot and start empty -- and say
++		 * so, because a resync is a bug's footprint, not weather.
++		 */
++		if (len == 0 || len > CO_NET_MAX_FRAME ||
++		    co_net_record_bytes(len) > head - tail) {
++			net_err_ratelimited(
++				"conet: rx ring desync (len %u, used %u), resetting\n",
++				len, head - tail);
++			dev->stats.rx_errors++;
++			tail = head;
++			break;
++		}
++
++		off = (off + 4) & (CO_NET_RX_SIZE - 1);
++
++		skb = netdev_alloc_skb(dev, len + NET_IP_ALIGN);
++		if (!skb) {
++			dev->stats.rx_dropped++;
++		} else {
++			skb_reserve(skb, NET_IP_ALIGN);
++			first = min_t(u32, len, CO_NET_RX_SIZE - off);
++			skb_put_data(skb, &io->rx[off], first);
++			if (first < len)
++				skb_put_data(skb, &io->rx[0], len - first);
++
++			skb->protocol = eth_type_trans(skb, dev);
++			dev->stats.rx_packets++;
++			dev->stats.rx_bytes += len;
++			netif_rx(skb);
++		}
++
++		tail += co_net_record_bytes(len);
++		taken++;
++	}
++
++	/*
++	 * Consumed. On x86 this store cannot become visible before the loads
++	 * above complete, which is what keeps the host from overwriting bytes
++	 * still being read; the console's get_chars leans on the same
++	 * ordering.
++	 */
++	io->rx_tail = tail;
++
++	return taken;
++}
++
++static int co_net_rx_poll(void *arg)
++{
++	struct net_device *dev = arg;
++
++	while (!kthread_should_stop()) {
++		if (co_net_rx_drain(dev) == 0) {
++			set_current_state(TASK_INTERRUPTIBLE);
++			if (!kthread_should_stop())
++				schedule_timeout(max(1ul, msecs_to_jiffies(2)));
++			__set_current_state(TASK_RUNNING);
++		}
++	}
++
++	return 0;
++}
++
++static int co_net_open(struct net_device *dev)
++{
++	struct task_struct *t;
++
++	t = kthread_run(co_net_rx_poll, dev, "conet-rx");
++	if (IS_ERR(t))
++		return PTR_ERR(t);
++
++	co_net_rx_thread = t;
++	netif_start_queue(dev);
++	return 0;
++}
++
++static int co_net_stop(struct net_device *dev)
++{
++	netif_stop_queue(dev);
++
++	if (co_net_rx_thread) {
++		kthread_stop(co_net_rx_thread);
++		co_net_rx_thread = NULL;
++	}
++
++	return 0;
++}
++
++static const struct net_device_ops co_net_ops = {
++	.ndo_open		= co_net_open,
++	.ndo_stop		= co_net_stop,
++	.ndo_start_xmit		= co_net_xmit,
++	.ndo_validate_addr	= eth_validate_addr,
++};
++
++static int __init co_net_init(void)
++{
++	struct net_device *dev;
++	int rc;
++
++	if (!co_colinux_guest)
++		return 0;
++
++	dev = alloc_etherdev(0);
++	if (!dev)
++		return -ENOMEM;
++
++	dev->netdev_ops = &co_net_ops;
++	eth_hw_addr_set(dev, co_net_mac);
++
++	rc = register_netdev(dev);
++	if (rc) {
++		free_netdev(dev);
++		return rc;
++	}
++
++	co_net_dev = dev;
++	netdev_info(dev, "conet: cooperative ethernet, %pM, rings at %px (%u+%u)\n",
++		    dev->dev_addr, &co_colinux_net_io,
++		    CO_NET_TX_SIZE, CO_NET_RX_SIZE);
++
++	return 0;
++}
++device_initcall(co_net_init);
 diff --git a/drivers/tty/hvc/Makefile b/drivers/tty/hvc/Makefile
 index 98880e3..8559d02 100644
 --- a/drivers/tty/hvc/Makefile
