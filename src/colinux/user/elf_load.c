@@ -1211,7 +1211,21 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 				" acpi=off noapic nolapic nohpet no_timer_check"
 				" noxsave noxsaveopt noxsaves disable_mtrr_trim"
 				" pci=off nopat io_delay=none mce=off dis_ucode_ldr"
-				" nowatchdog 8250.nr_uarts=0 lpj=1600000");
+				" nowatchdog 8250.nr_uarts=0 lpj=1600000"
+				/*
+				 * No PCID. The guest owns CR3 now, and with
+				 * CR4.PCIDE set the kernel puts an address
+				 * space identifier in the low bits of every
+				 * value it loads and stops issuing full
+				 * flushes. The host measured CR4 as 0x6f8 --
+				 * PCIDE clear -- so the world switch has never
+				 * carried a tagged CR3 across, and a stale
+				 * entry for the wrong address space is the
+				 * kind of fault that lands nowhere near its
+				 * cause. One variable fewer while ring 3 is
+				 * the thing under test.
+				 */
+				" nopcid");
 
 		/*
 		 * A root filesystem, if the host attached one. Without it the

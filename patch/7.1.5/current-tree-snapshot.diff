@@ -1,33 +1,37 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5 at the ext4-root
-checkpoint.  Generated against download/linux-7.1.5.tar.xz on 2026-08-01, the
-run where the guest mounted a real ext4 filesystem off a real disk on the M92p:
+Authoritative cumulative snapshot of ref/linux-7.1.5 at the ring-3 checkpoint.
+Generated against download/linux-7.1.5.tar.xz on 2026-08-01, the run where the
+guest executed its first user-mode instruction on the M92p:
 
-    EXT4-fs (cobd0): mounted filesystem ... r/w with ordered data mode
-    VFS: Mounted root (ext4 filesystem) on device 253:0.
-    devtmpfs: mounted
-    VFS: Pivoted into new rootfs
+    vector 14 at rip 0x00000000004038b1
+    error code 0x14  cr2 0x00000000004038b1
 
-On top of the virtual-time checkpoint this adds:
+0x4038b1 is inside busybox, which is linked at 0x400000, and error code 0x14
+is user-mode + instruction-fetch + not-present. That is init demand-paging its
+own text: the guest reached ring 3 and faulted the way a process is supposed
+to.
 
-  - drivers/block/cobd.c, the cooperative block device.  A transfer is a
-    world switch: the guest puts unit/offset/length and the *physical*
-    address of the bio segment in the passage page and calls the switch; the
-    host reads or writes its backing store straight into that memory and
-    returns.  No bounce buffer and no DMA mapping, because guest physical is
-    host physical here.  Synchronous, so there is no completion path at all.
-    Built unconditionally and self-gated on co_colinux_guest.
+On top of the ext4-root checkpoint this changes one thing in the guest tree:
 
-  - The tick handler is given a register frame.  tick_periodic() reads
-    user_mode(get_irq_regs()), which on real hardware the interrupt entry
-    path fills in; a synthesised tick left it NULL and the guest faulted at
-    NULL+0x88, which is where cs sits in struct pt_regs.
+  - native_write_cr3() is no longer a no-op for a cooperative guest
+    (asm/special_insns.h). It had to stop being one: execve builds a new mm
+    and switch_mm() activates it with exactly that instruction, so with the
+    write skipped the new process ran in the previous address space and died
+    with EFAULT before its first instruction. It is safe now for a reason
+    that did not hold earlier -- the guest runs in the kernel's own
+    init_top_pgt, which *is* swapper_pg_dir, and pgd_alloc() clones indices
+    273..511 out of it into every new process, which is where all three of
+    the host's grafted mappings live (direct map 273, boot stack 289, passage
+    page 501). Every address space the kernel builds therefore contains the
+    world-switch code by construction.
 
-Known and unfixed here, and the next thing: native_write_cr3() is still a
-no-op for a cooperative guest (asm/special_insns.h).  That was right while the
-host owned the address space, but the guest now runs in the kernel's own
-init_top_pgt, and execve's switch_mm therefore never activates the new
-process's tables -- so /sbin/init dies with EFAULT before its first
-instruction.
+Known and unfixed here, and the next piece of work: the guest still runs on
+the host's IDT, so that page fault was reported to the host instead of being
+handled by Linux, and demand paging cannot happen. Userspace needs a hybrid:
+vectors 0-31 delivered to the kernel's own handlers so faults are serviced,
+vectors 32-255 still delivered to the passage-page stubs so the host keeps
+receiving Windows' clock and IPIs. That also means the kernel's TSS and its
+RSP0, since a fault from CPL 3 through a non-IST gate takes its stack from
+there.
 
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
@@ -320,44 +324,49 @@ index 6f25de0..539a05d 100644
  	asm volatile("hlt": : :"memory");
  }
 diff --git a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
-index 46aa2c9..00a94e7 100644
+index 46aa2c9..a66560d 100644
 --- a/arch/x86/include/asm/special_insns.h
 +++ b/arch/x86/include/asm/special_insns.h
-@@ -38,8 +38,34 @@ static __always_inline unsigned long __native_read_cr3(void)
+@@ -38,6 +38,39 @@ static __always_inline unsigned long __native_read_cr3(void)
  	return val;
  }
  
 +/*
-+ * A cooperative guest does not own CR3 -- see the descriptor-table note in
-+ * asm/desc.h, of which this is the third and least survivable case.
++ * A cooperative guest owns CR3 again, and has to.
 + *
-+ * The host built the guest's address space, mapped the kernel image at its
-+ * link addresses, and put the passage page -- the code performing the world
-+ * switch, and the stack it runs on -- at an address valid on both sides. A CR3
-+ * write from inside the guest replaces all of that with a table describing a
-+ * machine that was never there. The instruction after it is fetched from an
-+ * address space that does not contain it; the page fault is delivered through
-+ * an IDT that is no longer mapped; the double fault handler is not mapped
-+ * either. Triple fault, immediate reset, no bugcheck and no dump on a host
-+ * that is not a virtual machine but the actual computer.
++ * This was a no-op for the whole of bring-up, and that was right then: the
++ * host built the address space the guest ran in, and a CR3 write replaced it
++ * with a table describing a machine that was never there -- the next
++ * instruction fetched from an address space not containing it, the fault
++ * delivered through an unmapped IDT, the double-fault handler unmapped as
++ * well. Triple fault and an immediate reset, on a host that is not a virtual
++ * machine but the actual computer.
 + *
-+ * setup_arch() reaches one of these on every boot: init_mem_mapping() finishes
-+ * by loading swapper_pg_dir.
++ * What changed is that the guest no longer runs in the host's arrangement. It
++ * was switched into the kernel's own init_top_pgt, with the host's three
++ * mappings -- the direct map, the boot stack, and the passage page carrying
++ * the switch code and its stack -- grafted into the top level. So the tables
++ * are the kernel's to manage, and every process address space it builds
++ * inherits those three by construction: init_top_pgt *is* swapper_pg_dir, and
++ * pgd_alloc() clones KERNEL_PGD_BOUNDARY..511 out of it, which is indices
++ * 273..511, and the three grafts sit at 273, 289 and 501.
 + *
-+ * Skipping it also skips the TLB flushes written as a CR3 reload, which is
-+ * harmless here: the mappings under the guest are the host's and do not
-+ * change while it runs.
++ * Refusing the write is what stopped userspace existing. execve builds a new
++ * mm and switch_mm() activates it with exactly this instruction; skipped, the
++ * process runs with the previous address space, its own pages are not mapped,
++ * and the first access to them faults. That is init dying with EFAULT before
++ * its first instruction, which is where this port sat until the guard came
++ * off.
++ *
++ * The passage page must be present in every table loaded here, or the crossing
++ * that follows has nowhere to execute. Nothing checks it at each write --
++ * there is no cheap way to, and the guest is trusted, as it is upstream.
 + */
 +extern int co_colinux_guest;
 +
  static __always_inline void native_write_cr3(unsigned long val)
  {
-+	if (co_colinux_guest)
-+		return;
-+
  	asm volatile("mov %0,%%cr3": : "r" (val) : "memory");
- }
- 
 diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
 index 62936a3..1eccd6a 100644
 --- a/arch/x86/kernel/alternative.c
