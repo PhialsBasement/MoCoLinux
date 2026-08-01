@@ -1,41 +1,38 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5 at the terminal
-checkpoint. Generated against download/linux-7.1.5.tar.xz on 2026-08-01, the
-run with an interactive shell:
+Authoritative cumulative snapshot of ref/linux-7.1.5, at the point where the
+world switch stopped being interruptible.
 
-    / # echo HELLO-FROM-XP-X64
-    HELLO-FROM-XP-X64
-    / # uname -a
-    Linux (none) 7.1.5 #39 PREEMPT_DYNAMIC x86_64 GNU/Linux
-    / # cat /proc/uptime
-    92.23 92.24
+Generated against download/linux-7.1.5.tar.xz on 2026-08-01. Verified on the
+M92p by the thing that found the bug: switching a USB KVM away from the box and
+back, twice, with the guest idling at a shell prompt. Before this change that
+was a reliable reset.
 
-What this adds over the userspace snapshot:
+The one change over the terminal snapshot is in co_colinux_switch()
+(arch/x86/kernel/process.c): real interrupts are saved and cleared across the
+crossing, and restored after.
 
-  * drivers/tty/hvc/hvc_colinux.c -- an hvc backend over two rings. hvc exists
-    for a console whose transport is a hypervisor rather than a UART, and asks
-    for two functions; the tty, the line discipline, job control and
-    /dev/hvc0 are the hvc core's. No interrupt, so it polls from its own
-    kthread, which suits a guest whose clock arrives at idle.
+The switch writes CR3 several instructions before it loads the entering side's
+IDTR. In that gap the processor is already in the other address space while
+IDTR still points at the table the leaving side was using. That was harmless
+for the whole of bring-up because the guest's IDT lived in the passage page,
+which is mapped at the same address in both address spaces -- so the stale
+IDTR still resolved. It stopped being harmless the moment the guest adopted its
+own IDT: idt_table is ordinary guest kernel memory and the host does not map
+it. An interrupt in that gap makes the CPU fetch a gate from an unmapped page,
+and the handler for that fault is equally unreachable: page fault, double
+fault, triple fault. The machine resets with no bugcheck, no dump, and nothing
+in the log, because the records still in the driver's ring die with it.
 
-  * co_colinux_console_io in arch/x86/kernel/early_printk.c -- the rings
-    themselves, in ordinary kernel memory rather than the passage page, which
-    has none to spare: host_temp is seven pages and all seven are spoken for.
-    The host reaches them by walking the guest's page tables, the same way it
-    reads anything else in the guest.
+Two of the three ways into the switch were already covered. The monitor loop
+clears IF before it enters the guest, and the fault stubs are reached through
+interrupt gates, which clear IF on delivery. The voluntary yield was the one
+crossing with interrupts enabled -- deliberately, because real IF stays on for
+the life of a free-running guest, which is what keeps the host answering its
+clock. An idle guest takes that path thousands of times a second.
 
-    One writer per word per direction is what makes them safe with no lock
-    between two kernels that do not share a scheduler: the host owns in_head
-    and out_tail, the guest owns in_tail and out_head. Indices free-run and
-    are masked, so full is head - tail == size with no ambiguity to resolve.
-
-  * put_chars yields to the host after writing. Without it the output sits in
-    the ring until the guest crosses for some other reason, and at a shell
-    prompt there is no other reason -- the guest is idle precisely when it has
-    just finished printing.
-
-The kernel command line gains console=hvc0, last, so /dev/console resolves to
-it; earlycolinux stays for the boot log, which is the only record if the guest
-dies before hvc0 is up.
+The flags are saved and restored rather than unconditionally re-enabled: the
+yield is called from contexts that legitimately have real interrupts off
+already. The guest's logical interrupt state is the virtual flag and is not
+involved.
 
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
@@ -1003,7 +1000,7 @@ index 90a22e2..64afc0a 100644
   * idt_setup_early_handler - Initializes the idt table with early handlers
   */
 diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
-index 4c718f8..b895019 100644
+index 4c718f8..3a0e256 100644
 --- a/arch/x86/kernel/process.c
 +++ b/arch/x86/kernel/process.c
 @@ -54,6 +54,10 @@
@@ -1017,7 +1014,7 @@ index 4c718f8..b895019 100644
  
  #include "process.h"
  
-@@ -773,6 +777,215 @@ EXPORT_SYMBOL(default_idle);
+@@ -773,6 +777,252 @@ EXPORT_SYMBOL(default_idle);
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -1057,14 +1054,51 @@ index 4c718f8..b895019 100644
 +	register void *leaving  asm("rcx") = pp + CO_PP_LINUXVM_STATE;
 +	register void *entering asm("rdx") = pp + CO_PP_HOST_STATE;
 +	void *code = pp + CO_PP_CODE;
++	unsigned long flags;
 +
 +	*(volatile unsigned long long *)(pp + CO_PP_OPERATION) = operation;
++
++	/*
++	 * Real interrupts off across the crossing, and this is not the virtual
++	 * flag -- it is the hardware one, the only place in the guest that
++	 * touches it deliberately.
++	 *
++	 * The switch changes CR3 several instructions before it loads the
++	 * entering side's IDTR. In that gap the processor is already in the
++	 * other address space while IDTR still points at the table this side
++	 * was using. That was harmless for as long as the guest's IDT lived in
++	 * the passage page, which is mapped at the same address in both
++	 * spaces. It stopped being harmless when the guest adopted its own
++	 * IDT: idt_table is ordinary guest kernel memory, and the host does not
++	 * map it. An interrupt arriving in that gap makes the CPU read a gate
++	 * from an unmapped page, whose fault handler is equally unreachable --
++	 * page fault, double fault, triple fault, and the machine resets with
++	 * no bugcheck and nothing in the log.
++	 *
++	 * The other two ways into the switch are already covered: the monitor
++	 * loop clears IF before it enters the guest, and the fault stubs are
++	 * reached through interrupt gates, which clear IF on delivery. This
++	 * voluntary path was the one left running with interrupts enabled, and
++	 * an idle guest takes it thousands of times a second.
++	 *
++	 * It was found by hitting a USB KVM switch, which sprays the pinned
++	 * core with device interrupts and turns a window of a few instructions
++	 * into a reproducible reset.
++	 */
++	asm volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
 +
 +	asm volatile(
 +		"call *%[code]\n"
 +		: "+r"(leaving), "+r"(entering)
 +		: [code] "r"(code)
 +		: "rax", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory", "cc");
++
++	/*
++	 * Restored rather than unconditionally set: this is called from
++	 * contexts that legitimately have real interrupts off already, and the
++	 * guest's own logical state lives in the virtual flag regardless.
++	 */
++	asm volatile("pushq %0; popfq" : : "r"(flags) : "memory", "cc");
 +}
 +
 +/*
@@ -1233,7 +1267,7 @@ index 4c718f8..b895019 100644
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +1149,18 @@ out:
+@@ -936,6 +1186,18 @@ out:
  
  void __init select_idle_routine(void)
  {
