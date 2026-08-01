@@ -50,6 +50,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KRAM,
 	CO_MANAGER_IOCTL_KREAD,
 	CO_MANAGER_IOCTL_COBD,
+	CO_MANAGER_IOCTL_CONSOLE,
 } co_manager_ioctl_t;
 
 /*
@@ -323,6 +324,27 @@ typedef struct {
 	unsigned long long size;	/* out: bytes */
 } co_manager_ioctl_cobd_t;
 
+/*
+ * interface for CO_MANAGER_IOCTL_CONSOLE: one turn of the terminal.
+ *
+ * Keystrokes in, screen output out, in a single call so a client is one poll
+ * loop rather than two. It is deliberately callable while the guest is running
+ * -- the monitor loop holds its own ioctl for as long as a hundred and twenty
+ * seconds, and a terminal that could only be serviced between runs would not
+ * be a terminal. Nothing here takes the manager lock; the two rings have one
+ * writer each per direction, so the console client and the monitor loop touch
+ * disjoint words.
+ */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long	   in_size;	/* in: keystrokes offered */
+	unsigned long	   in_taken;	/* out: how many fitted */
+	unsigned long	   out_size;	/* in: room for output */
+	unsigned long	   out_len;	/* out: bytes produced */
+	char		   in[512];
+	char		   out[2048];
+} co_manager_ioctl_console_t;
+
 /* interface for CO_MANAGER_IOCTL_KRAM: give the guest physical memory */
 #define CO_KRAM_MAX_RANGES 16
 typedef struct {
@@ -386,6 +408,8 @@ typedef struct {
 	unsigned long long ex_table_stop;
 	/* where the guest keeps co_colinux_passage_page, for cooperative yields */
 	unsigned long long passage_symbol_va;
+	/* where the guest keeps co_colinux_console_io, for the terminal */
+	unsigned long long console_io_va;
 	/* out */
 	unsigned long long guest_cr3;
 	unsigned long	   tables;

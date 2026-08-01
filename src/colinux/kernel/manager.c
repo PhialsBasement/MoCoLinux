@@ -29,6 +29,7 @@
 #include "reversedpfns.h"
 #include "kload.h"
 #include "cobd.h"
+#include "console.h"
 
 #ifndef min
 # define min(a,b) 	((a)<(b)?(a):(b))
@@ -119,6 +120,10 @@ co_rc_t co_manager_load(co_manager_t *manager)
 
 	manager->state = CO_MANAGER_STATE_INITIALIZED_OSDEP;
 
+	rc = co_console_init();
+	if (!CO_OK(rc))
+		goto out_err_os;
+
 	rc = co_manager_alloc_reversed_pfns(manager);
 	if (!CO_OK(rc))
 		goto out_err_os;
@@ -169,6 +174,47 @@ void co_manager_unload(co_manager_t* manager)
 	 * arch layer and reads page tables through the manager, both of which
 	 * are torn down below.
 	 */
+	/*
+	 * Before anything is freed: stop any monitor loop still running.
+	 *
+	 * The process that started it may already be gone -- taskkill /f on a
+	 * daemon inside the boot ioctl kills the process but cannot interrupt
+	 * its thread, which is executing driver code. Freeing the driver's
+	 * state underneath that thread is a use-after-free, and the first
+	 * thing it touches is the debug system: bugcheck 0xD5, a write into
+	 * freed special pool, at the list insert in co_debug_writev.
+	 *
+	 * The loop checks the flag every crossing, which is microseconds, so
+	 * this waits milliseconds in practice. The bound is there because a
+	 * loop that never answers must not hang the unload forever -- and if
+	 * that ever happens the machine is already lost.
+	 */
+	if (co_arch_boot_running()) {
+		int spins;
+
+		co_debug("unload: a monitor loop is still running -- asking it to stop");
+		co_arch_boot_abort();
+
+		for (spins = 0; spins < 1000 && co_arch_boot_running(); spins++)
+			co_os_msleep(10);
+
+		if (co_arch_boot_running())
+			co_debug_error("unload: the monitor loop did not stop; "
+				       "freeing anyway is not survivable, but "
+				       "neither is waiting");
+		else
+			co_debug("unload: the monitor loop stopped");
+	}
+
+	/*
+	 * The console next, and before co_kload_free: it reaches guest memory
+	 * by walking the guest's page tables, and a console client is a
+	 * different process that has no idea this is happening. Retiring the
+	 * address takes the console lock, so a pump already inside a walk
+	 * finishes before the tables go away.
+	 */
+	co_console_set_address(0);
+
 	if (manager->state >= CO_MANAGER_STATE_INITIALIZED)
 		co_kload_free(manager);
 
@@ -193,6 +239,8 @@ void co_manager_unload(co_manager_t* manager)
 
 	if (manager->state >= CO_MANAGER_STATE_INITIALIZED_DEBUG)
 		co_debug_free(&manager->debug);
+
+	co_console_free();
 
 	manager->state = CO_MANAGER_STATE_NOT_INITIALIZED;
 }
@@ -739,6 +787,26 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_CONSOLE: {
+		co_manager_ioctl_console_t* params = (typeof(params))(io_buffer);
+		unsigned long offered;
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		*return_size = sizeof(*params);
+
+		offered = params->in_size;
+		if (offered > sizeof(params->in))
+			offered = sizeof(params->in);
+
+		params->rc = co_console_pump(manager,
+					     params->in, offered, &params->in_taken,
+					     params->out, sizeof(params->out),
+					     &params->out_len);
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_KBOOT: {
 		co_manager_ioctl_kboot_t* params = (typeof(params))(io_buffer);
 		co_arch_boot_t in;
@@ -763,6 +831,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.ex_table_start = params->ex_table_start;
 		in.ex_table_stop  = params->ex_table_stop;
 		in.passage_symbol_va  = params->passage_symbol_va;
+		co_console_set_address(params->console_io_va);
 		in.max_switches       = params->max_switches ? params->max_switches : 4096;
 
 		co_memset(params, 0, sizeof(*params));
@@ -840,6 +909,14 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 	}
 
 	case CO_MANAGER_IOCTL_KLOAD_END: {
+		/*
+		 * Retire the console before the address space it reads through
+		 * is freed. A console client is another process entirely and
+		 * would otherwise keep walking page tables that have been
+		 * returned to the host -- which is a use-after-free in a
+		 * driver, so it bugchecks rather than fails.
+		 */
+		co_console_set_address(0);
 		co_kload_free(manager);
 		*return_size = 0;
 		return CO_RC(OK);

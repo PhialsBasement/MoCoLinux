@@ -1208,6 +1208,16 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 */
 		memset(cmdline, 0, sizeof(cmdline));
 		strcpy(cmdline, "earlyprintk=colinux,keep console=earlycolinux"
+				/*
+				 * The interactive console, last so it is the
+				 * one /dev/console resolves to: the kernel
+				 * makes the final console= on the line the
+				 * one init inherits. earlycolinux stays for
+				 * the boot log, which is drained after the
+				 * run and is the only record if the guest
+				 * dies before hvc0 is up.
+				 */
+				" console=hvc0"
 				" acpi=off noapic nolapic nohpet no_timer_check"
 				" noxsave noxsaveopt noxsaves disable_mtrr_trim"
 				" pci=off nopat io_delay=none mce=off dis_ucode_ldr"
@@ -1408,6 +1418,24 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			} else {
 				co_terminal_print("\n  co_colinux_passage_page missing -- the guest\n"
 						  "  cannot yield cooperatively and idle will spin\n");
+			}
+		}
+
+		/*
+		 * And where it keeps the interactive console's rings, so a
+		 * second process can serve a terminal against them while this
+		 * one is inside the boot ioctl. Absent is not fatal: a guest
+		 * without it boots exactly as before, with the one-way early
+		 * console and no way in.
+		 */
+		{
+			co_elf_symbol_t* s_cio = co_get_symbol_by_name(pl, "co_colinux_console_io");
+
+			if (s_cio) {
+				b.console_io_va = co_elf_get_symbol_value(s_cio);
+				co_terminal_print("    console rings at 0x%016llx"
+						  "  (--console PORT to attach)\n",
+						  b.console_io_va);
 			}
 		}
 

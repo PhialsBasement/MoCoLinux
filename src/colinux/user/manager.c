@@ -202,6 +202,51 @@ co_rc_t co_manager_cobd(co_manager_handle_t handle, int unit, const char* path,
 	return rc;
 }
 
+/*
+ * One turn of the terminal: offer keystrokes, collect output.
+ *
+ * Safe to call while a boot is running in another thread or another process --
+ * the driver takes no lock for this and the two rings have a single writer per
+ * direction. That is the whole point: the monitor loop owns its ioctl for as
+ * long as the guest runs.
+ */
+co_rc_t co_manager_console(co_manager_handle_t handle,
+			   const char* in, unsigned long in_size,
+			   unsigned long* in_taken,
+			   char* out, unsigned long out_size,
+			   unsigned long* out_len)
+{
+	co_manager_ioctl_console_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	if (in_size > sizeof(params.in))
+		in_size = sizeof(params.in);
+
+	params.in_size  = in_size;
+	params.out_size = out_size;
+	if (in_size)
+		co_memcpy(params.in, in, in_size);
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_CONSOLE,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (!CO_OK(rc))
+		return rc;
+
+	*in_taken = params.in_taken;
+
+	*out_len = params.out_len;
+	if (*out_len > out_size)
+		*out_len = out_size;
+	if (*out_len)
+		co_memcpy(out, params.out, *out_len);
+
+	return rc;
+}
+
 co_rc_t co_manager_kload_verify(co_manager_handle_t handle,
 				co_manager_ioctl_kload_verify_t* out)
 {

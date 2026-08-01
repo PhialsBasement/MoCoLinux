@@ -28,6 +28,7 @@
 #include <colinux/os/user/misc.h>
 
 #include "cmdline.h"
+#include "console.h"
 #include "misc.h"
 #include "service.h"
 #include "driver.h"
@@ -254,6 +255,18 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 
 	if (winnt_parameters.probe_passage) {
 		return co_winnt_probe_passage();
+	}
+
+	if (winnt_parameters.console) {
+		unsigned long port = 0;
+
+		if (!co_parse_count(winnt_parameters.console_arg, &port) ||
+		    port == 0 || port > 65535) {
+			co_terminal_print("--console wants a TCP port number\n");
+			return CO_RC(INVALID_PARAMETER);
+		}
+
+		return co_winnt_console_server((unsigned short)port);
 	}
 
 	if (winnt_parameters.boot_kernel) {
