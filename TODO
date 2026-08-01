@@ -87,7 +87,33 @@
    * Some iptables functionality not working? (see ML)
    * Spurious 'Floating Point Exception' with an athlon optimised vmlinux.
 
+ * Debug daemon, after networking and pacman -S work:
+   * It needs a clean shutdown. `colinux-debug-daemon -d` holds a handle on
+     \\.\CoLinuxDriver forever and blocks inside a co_debug_read ioctl waiting
+     for records, so there is no way to ask it to stop. `sc stop
+     CoLinuxDriver` then reports success and parks the service in
+     STOP_PENDING: the I/O manager will not call DriverUnload while a handle
+     is open, and the driver stays resident and half-stopped.
+
+     That leaves only two ways to swap a driver, and both are worse than the
+     problem. taskkill ends the process but cannot interrupt its thread while
+     that thread is inside the driver, so the handles close afterwards and the
+     driver is released underneath kernel-mode code -- which is precisely the
+     bugcheck 0x50 in the handle-close path that took this box down four times
+     in one evening. Or reboot, which is what we do, at a couple of minutes
+     each and several times a session.
+
+     What it wants is a way to be asked: an event the daemon waits on
+     alongside the ring, or a second ioctl that makes the blocking read
+     return, so it can close its handle and exit on request. Then
+     reload-driver.sh stops needing to kill anything, and `sc stop` means what
+     it says.
+
  * Cleanups:
+   * debug.c resize_section() cannot grow a buffer: it computes new_size, then
+     returns early on `old_size != new_size`, which is true in exactly the
+     cases where a resize was wanted. So a burst of logging drops records
+     instead of doubling the buffer, silently.
    * Merge console into console-base.
    * Clear out some function naming brain damage and make more use
      of the 'static' keyword :).
