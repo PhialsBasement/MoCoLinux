@@ -21,7 +21,7 @@ co_pa_t co_os_virt_to_phys(void *addr)
 	return pa.QuadPart;
 }
 
-co_rc_t co_os_physical_memory_pages(unsigned long *pages)
+co_rc_t co_os_physical_memory_pages(unsigned long long *pages)
 {
 	SYSTEM_BASIC_INFORMATION sbi;
 	NTSTATUS status;

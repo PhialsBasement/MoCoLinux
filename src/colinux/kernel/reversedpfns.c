@@ -19,7 +19,43 @@
 #include "monitor.h"
 #include "pages.h"
 
+/*
+ * The reversed physical mapping is not built on x86-64.
+ *
+ * It exists for the i386 monitor path: a physical-to-pseudo-PFN table that
+ * co_monitor_* consults through CO_VPTR_PHYSICAL_TO_PSEUDO_PFN_MAP. This port
+ * does not use that path at all -- it loads a kernel with kload and runs it
+ * from co_arch_boot_loaded, where guest physical *is* host physical and there
+ * is nothing to reverse.
+ *
+ * Building it anyway was expensive and got worse with memory: one page per 512
+ * pages of host RAM, allocated at driver load and never freed until unload --
+ * 8 MB of nonpaged memory per 4 GB of host RAM, so 128 MB on a 64 GB machine,
+ * for a table nothing reads. That cost was invisible while the driver refused
+ * to load above 4 GB; removing the refusal is what made it worth removing.
+ *
+ * The code is left in place rather than deleted because the i386 monitor path
+ * is still compiled and may be revived; co_manager_set_reversed_pfn below
+ * reports the feature as absent rather than failing, so a caller that does not
+ * need it is not broken by its absence.
+ */
 co_rc_t co_manager_alloc_reversed_pfns(co_manager_t *manager)
+{
+	manager->reversed_page_count     = 0;
+	manager->reversed_map_pfns       = NULL;
+	manager->reversed_map_pgds       = NULL;
+	manager->reversed_map_pgds_count = 0;
+
+	co_debug("reversed physical mapping not built: %llu MB of host RAM "
+		 "would have cost %llu KB of nonpaged memory, and the x86-64 "
+		 "path does not read it",
+		 manager->hostmem_amount,
+		 (manager->hostmem_pages / PTRS_PER_PTE) * 4);
+
+	return CO_RC(OK);
+}
+
+co_rc_t co_manager_alloc_reversed_pfns_unused(co_manager_t *manager)
 {
 	unsigned long map_size, covered_physical;
 	unsigned long reversed_page_count;
@@ -123,6 +159,14 @@ co_rc_t co_manager_set_reversed_pfn(co_manager_t *manager, co_pfn_t real_pfn, co
 	int entry, top_level;
 	co_pfn_t *reversed_pfns;
 	co_pfn_t mapped_pfn;
+
+	/*
+	 * Absent rather than out of range: the table is not built on x86-64
+	 * (see above), and a caller asking to record a mapping nothing will
+	 * read has not failed at anything.
+	 */
+	if (manager->reversed_page_count == 0)
+		return CO_RC(OK);
 
 	top_level = real_pfn / PTRS_PER_PTE;
 	if (top_level >= manager->reversed_page_count)

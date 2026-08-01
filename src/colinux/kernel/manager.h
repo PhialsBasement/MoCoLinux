@@ -53,10 +53,17 @@ typedef struct co_manager_open_desc {
 typedef struct co_manager {
 	co_manager_state_t state;
 
-	unsigned long hostmem_amount;
-	unsigned long hostmem_used;
-	unsigned long hostmem_usage_limit;
-	unsigned long hostmem_pages;
+	/*
+	 * 64-bit because "unsigned long" is 32 bits on Windows x64, and these
+	 * are byte counts and page counts for the whole machine. The old
+	 * "more than 4GB is not supported" check made that safe by refusing to
+	 * load at all; with the check gone, hostmem_usage_limit <<= 20 on an
+	 * 8 GB box would overflow and silently come back as about 3.9 GB.
+	 */
+	unsigned long long hostmem_amount;
+	unsigned long long hostmem_used;
+	unsigned long long hostmem_usage_limit;
+	unsigned long long hostmem_pages;
 
 	co_pfn_t *reversed_map_pfns;
 	unsigned long reversed_page_count;

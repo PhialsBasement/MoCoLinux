@@ -494,7 +494,41 @@ asm(".text                                                          \n"
     "    mov %rax, " CO_ARCH_STATE_STACK_DR7 "(%rcx)                \n"
     "    mov $0x400, %eax                                           \n"
     "    mov %rax, %dr7                                             \n"
-    /* --- the crossing --- */
+    /*
+     * --- the crossing ---
+     *
+     * Uninterruptible, and this is the only place it can be done.
+     *
+     * The CR3 write below lands several instructions before the lidt, and in
+     * that gap the processor is already in the entering side's address space
+     * while IDTR still points at the table the leaving side was using. That
+     * was survivable for as long as the guest's IDT lived in this page, which
+     * is mapped at the same address in both spaces. Once the guest adopted its
+     * own IDT -- ordinary guest kernel memory, unmapped on the host side -- an
+     * interrupt arriving in the gap made the processor fetch a gate from an
+     * unmapped page, with a fault handler equally unreachable: page fault,
+     * double fault, triple fault, and an instant reset with no bugcheck and
+     * nothing in the log.
+     *
+     * Only a cli, with nothing saved and nothing restored, because there is
+     * nowhere here to put it. RSP still belongs to the leaving side until the
+     * stack switch further down, so a push between the CR3 write and that
+     * point touches memory the entering address space need not map; and r11,
+     * the obvious scratch, is taken by the ltr sequence below.
+     *
+     * Nothing is lost by not restoring. Each side already owns its own
+     * interrupt state on the far side of the crossing: the monitor loop puts
+     * the host's saved flags back when the switch returns to it, and the guest
+     * re-enables explicitly after its yield (co_colinux_switch in the guest
+     * tree), because a guest must always run with real interrupts on.
+     *
+     * Doing this in the C caller instead was tried and was much worse: the
+     * call it would wrap contains the host's entire monitor-loop iteration,
+     * so any resume path not returning through the matching restore left the
+     * guest running deaf -- a host freeze rather than a reset, and harder to
+     * recognise for it.
+     */
+    "    cli                                                        \n"
     "    mov " CO_ARCH_STATE_STACK_CR3 "(%rdx), %rax                \n"
     "    mov %rax, %cr3                                             \n"
     "    mov " CO_ARCH_STATE_STACK_CR4 "(%rdx), %rax                \n"
@@ -508,6 +542,7 @@ asm(".text                                                          \n"
     "    lgdt " CO_ARCH_STATE_STACK_GDT "(%rdx)                     \n"
     "    lidt " CO_ARCH_STATE_STACK_IDT "(%rdx)                     \n"
     "    lldt " CO_ARCH_STATE_STACK_LDT "(%rdx)                     \n"
+
     /*
      * And SS, which the switch used to leave alone.
      *
