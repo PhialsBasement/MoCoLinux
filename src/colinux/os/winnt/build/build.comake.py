@@ -30,7 +30,22 @@ targets['executables'] = Target(
     tool = Empty(),
 )
 
-def generate_options(compiler_def_type, libs=None, lflags=None):
+# The libraries every winnt daemon links, named once so the slirp daemon's
+# hand-written link line below cannot drift away from generate_options(). The
+# C runtime is not in here: it differs per architecture and is added by both
+# callers.
+winnt_daemon_libs = [
+    'user32', 'gdi32', 'ws2_32', 'ntdll', 'kernel32', 'ole32', 'uuid', 'gdi32',
+]
+
+# Both users below take the list as a default argument rather than reading it
+# from module scope. This file is exec'd with separate globals and locals -- the
+# note above generate_options()'s own import says so -- so a name defined here
+# is not visible from inside a function body. Defaults are evaluated at def
+# time, where it is.
+
+def generate_options(compiler_def_type, libs=None, lflags=None,
+                     winnt_daemon_libs=winnt_daemon_libs):
     if not libs:
         libs = []
     if not lflags:
@@ -74,9 +89,7 @@ def generate_options(compiler_def_type, libs=None, lflags=None):
         # runtime, and a second missing-DLL dialog is no better than the first.
         #
         linker_flags = lflags + [ '-static' ],
-        compiler_libs = libs + [
-            'user32', 'gdi32', 'ws2_32', 'ntdll', 'kernel32', 'ole32', 'uuid', 'gdi32',
-        ] + crt + ['shlwapi']),
+        compiler_libs = libs + winnt_daemon_libs + crt + ['shlwapi']),
     )
 
 def generate_wx_options():
@@ -130,13 +143,58 @@ targets['colinux-ndis-net-daemon.exe'] = Target(
     mono_options = generate_options('gcc'),
 )
 
+#
+# The slirp daemon is confined to a 2 GB address space, so that every pointer
+# in the process fits in 32 bits.
+#
+# It needs that because the vendored slirp's protocol structures are overlays
+# on wire format: the queue links inside them are u_int32_t and
+# insque_32/remque_32 store pointers through them (slirp/misc.c, and the note
+# in slirp/slirp_config.h). Widening those fields is not available -- their
+# size is the IP header's.
+#
+# Two halves. --image-base 0x400000 puts the image itself low, because
+# mingw-w64 defaults to 0x140000000 and the IP fragment queue head is a static:
+# above 4 GB, the first fragment queued truncates its address and the next
+# traversal dereferences the remains. Clearing
+# IMAGE_FILE_LARGE_ADDRESS_AWARE then caps the heap. ld can do the second part
+# itself for i386 (--disable-large-address-aware); the x86-64 linker rejects
+# that option outright, so a post-link pass does it, chained onto the link so
+# it cannot be forgotten.
+#
+# i386 keeps its ordinary link: a 32-bit process has no addresses to lose.
+#
+# The confinement costs nothing here. This daemon relays frames between a
+# socket and the monitor; it maps no guest memory.
+#
+def slirp_daemon_cmdline(scripter, tool_run_inf,
+                         winnt_daemon_libs=winnt_daemon_libs):
+    inputs = ' '.join([i.pathname for i in tool_run_inf.target.inputs])
+    target = tool_run_inf.target.pathname
+    gcc = scripter.get_cross_build_tool('gcc', tool_run_inf)
+
+    from comake.settings import settings
+
+    low, fixup = '', ''
+    if settings.arch == 'x86_64':
+        low = '-Wl,--image-base,0x400000 '
+        fixup = ' && python3 tools/pe-clear-laa.py ' + target
+
+    return ('%s -static %s-o %s %s %s%s' %
+            (gcc, low, target, inputs,
+             ' '.join(['-l' + l for l in
+                       ['iphlpapi'] + winnt_daemon_libs +
+                       ['msvcrt', 'shlwapi']]),
+             fixup))
+
+
 targets['colinux-slirp-net-daemon.exe'] = Target(
     inputs = [
         Input('../user/daemon/res/colinux-slirp-net.res'),
         Input('../user/conet-slirp-daemon/build.o'),
         Input('../../../user/slirp/build.o'),
     ] + user_dep,
-    tool = Compiler(),
+    tool = Script(slirp_daemon_cmdline),
     mono_options = generate_options('gcc', libs=['iphlpapi']),
 )
 

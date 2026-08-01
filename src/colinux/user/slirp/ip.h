@@ -76,12 +76,24 @@ typedef u_int32_t n_long;                 /* long as received from the net */
 /*
  * Structure of an internet header, naked of options.
  */
+/*
+ * The two nibbles share one byte, and the type has to say so.
+ *
+ * Declared as u_int:4 these compile to a four-byte storage unit under
+ * mingw-w64, which defaults to -mms-bitfields: struct ip measures 24 bytes
+ * with ip_src at offset 16 where the wire has it at 12, and every datagram
+ * parses as garbage in both directions. A u_int8_t pair occupies one byte
+ * under the MS and the GNU layout alike, which is what the wire format says
+ * and what every other field in these headers already assumes. The comment
+ * in struct ipasfrag below records someone hitting this on Linux 2.0 and
+ * fixing that one struct only.
+ */
 struct ip {
 #ifdef WORDS_BIGENDIAN
-	u_int ip_v:4,			/* version */
+	u_int8_t ip_v:4,		/* version */
 		ip_hl:4;		/* header length */
 #else
-	u_int ip_hl:4,		/* header length */
+	u_int8_t ip_hl:4,		/* header length */
 		ip_v:4;			/* version */
 #endif
 	u_int8_t ip_tos;			/* type of service */
@@ -237,10 +249,10 @@ struct ipq {
  */
 struct	ipasfrag {
 #ifdef WORDS_BIGENDIAN
-	u_int	ip_v:4,
+	u_int8_t ip_v:4,
  		ip_hl:4;
 #else
-	u_int	ip_hl:4,
+	u_int8_t ip_hl:4,
 		ip_v:4;
 #endif
                                         /* BUG : u_int changed to u_int8_t.

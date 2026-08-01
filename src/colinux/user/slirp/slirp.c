@@ -1,5 +1,20 @@
 #include "slirp.h"
 
+/*
+ * The protocol structures are overlaid on live packet bytes, so their sizes
+ * are wire format, not a matter of taste. Five lines that would have saved a
+ * long evening: the toolchain silently made struct ip 24 bytes and ipovly 32,
+ * and nothing anywhere said so -- packets simply parsed as nonsense. A
+ * mis-set SIZEOF_CHAR_P, a compiler defaulting to -mms-bitfields, or a
+ * padding change now stops the build instead of the network.
+ */
+_Static_assert(sizeof(struct ip)        == 20, "struct ip must be 20 bytes (wire format)");
+_Static_assert(sizeof(struct tcphdr)    == 20, "struct tcphdr must be 20 bytes (wire format)");
+_Static_assert(sizeof(struct ipovly)    == 20, "struct ipovly overlays a 20-byte IP header");
+_Static_assert(sizeof(struct tcpiphdr) == 40, "struct tcpiphdr must be 20+20");
+_Static_assert(sizeof(struct udpiphdr) == 28, "struct udpiphdr must be 20+8");
+_Static_assert(sizeof(struct ipasfrag)  == 20, "struct ipasfrag aliases struct ip");
+
 /* host address */
 struct in_addr our_addr;
 /* host dns address */

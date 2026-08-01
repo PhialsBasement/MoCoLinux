@@ -155,8 +155,27 @@
 #define SIZEOF_INT 4
 
 /* Define to sizeof(char *) */
-/* XXX: patch it */
-#define SIZEOF_CHAR_P 4
+/*
+ * 8, and it must be 8 for a 64-bit build even though every other value here
+ * looks like a lie about this machine.
+ *
+ * This is not a description of the host so much as a switch selecting which
+ * shape the protocol structures take. With 4, caddr32_t becomes caddr_t --
+ * a real 8-byte pointer under LLP64 -- and struct ipovly grows from 20 bytes
+ * to 32 (two pointers plus the alignment padding they force). Those structs
+ * are overlaid on live packet bytes, so every IP, UDP and TCP header would be
+ * read at the wrong offsets: nothing works, in either direction, at any
+ * layer. With 8 the overlays are the 20 and 40 bytes the wire actually uses,
+ * and the 32-bit queue-link fields hold what they were designed to hold.
+ *
+ * The cost of 8 is that ipqp_32, ipasfragp_32, tcpiphdrp_32 and mbufp_32
+ * become u_int32_t and insque_32/remque_32 store pointers through them. That
+ * is only safe while every address in this process fits in 32 bits, which is
+ * why the daemon is linked without IMAGE_FILE_LARGE_ADDRESS_AWARE -- see
+ * os/winnt/build/build.comake.py. Both halves are required; either alone is
+ * broken.
+ */
+#define SIZEOF_CHAR_P 8
 
 /* Define if you have random() */
 #undef HAVE_RANDOM
