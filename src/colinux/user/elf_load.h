@@ -44,6 +44,13 @@ extern co_rc_t co_elf_dump(const char *filename);
 extern co_rc_t co_elf_net_dump_live(void);
 
 /*
+ * Like the dump, then consume: advance tx_tail to the printed snapshot's
+ * head through the validated TAKE ioctl. An explicit NEWTAIL argument asks
+ * the driver for exactly that value, to test its validation.
+ */
+extern co_rc_t co_elf_net_take_live(const char *new_tail_arg);
+
+/*
  * Load an image into a guest address space in the driver, optionally entering
  * it. max_switches caps the boot monitor loop (enter == 3); 0 takes the
  * default. It exists so a run that would take the host down hard can be made

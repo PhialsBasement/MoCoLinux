@@ -19,6 +19,7 @@
 #include <linux/elf.h>
 
 #include "daemon.h"
+#include <stdlib.h>
 #include <string.h>
 
 #include <colinux/os/alloc.h>
@@ -423,9 +424,9 @@ static void co_net_describe_frame(const unsigned char* f, unsigned int len)
  * because a decoder that exists twice is a decoder that disagrees with
  * itself the first time only one copy is fixed.
  */
-static void co_net_print_rings(unsigned int tx_head, unsigned int tx_tail,
-			       unsigned int rx_head, unsigned int rx_tail,
-			       const unsigned char* ring)
+static int co_net_print_rings(unsigned int tx_head, unsigned int tx_tail,
+			      unsigned int rx_head, unsigned int rx_tail,
+			      const unsigned char* ring)
 {
 	unsigned int used, pos, frames = 0;
 
@@ -437,7 +438,7 @@ static void co_net_print_rings(unsigned int tx_head, unsigned int tx_tail,
 	used = tx_head - tx_tail;
 	if (used > CO_NETIO_TX_SIZE) {
 		co_terminal_print("  tx indices are not a ring state -- desynchronised\n");
-		return;
+		return -1;
 	}
 	if (used == 0)
 		goto rx_check;
@@ -454,7 +455,7 @@ static void co_net_print_rings(unsigned int tx_head, unsigned int tx_tail,
 			co_terminal_print("  RECORD %u at +%u IS NOT A FRAME: len %u"
 					  " with %u bytes left -- ring corrupt\n",
 					  frames, off, len, tx_head - pos);
-			return;
+			return -1;
 		}
 
 		off = (off + 4) & (CO_NETIO_TX_SIZE - 1);
@@ -487,6 +488,7 @@ rx_check:
 	else
 		co_terminal_print("  RX RING NOT PRISTINE -- nothing should have"
 				  " written it yet\n");
+	return 0;
 }
 
 static void co_dump_net_rings(co_manager_handle_t handle, co_elf_data_t* pl)
@@ -562,13 +564,73 @@ static void co_dump_net_rings(co_manager_handle_t handle, co_elf_data_t* pl)
  * not move in this rung), and a full ring drops rather than overwrites -- so
  * every byte in the snapshot's tail..head range is immutable once published.
  */
+/*
+ * Fetch only what the ring actually holds.
+ *
+ * The first call asks for nothing but the indices; the rest fetch the
+ * tail..head range and no more. Reading all 128 KB to look at a few hundred
+ * bytes is not merely wasteful -- each call is a METHOD_BUFFERED ioctl, so
+ * the I/O manager allocates and frees a multi-page block of non-paged pool
+ * per call, and a poll loop doing sixteen of those per iteration churns pool
+ * hard for no reason. A dozen frames now costs one small allocation.
+ *
+ * Requests are clamped so none straddles the ring's wrap, which keeps each
+ * returned window contiguous at its own masked offset -- the parser indexes
+ * the buffer exactly as the guest does, by masking a free-running position.
+ */
+static co_rc_t co_net_fetch_live(co_manager_handle_t handle,
+				 unsigned int* tx_head, unsigned int* tx_tail,
+				 unsigned int* rx_head, unsigned int* rx_tail,
+				 unsigned char* ring)
+{
+	unsigned int h2, t2, r2h, r2t;
+	unsigned int used, done, got;
+	co_rc_t rc;
+
+	/*
+	 * Only tail..head is fetched below, and the parser reads nothing
+	 * outside it -- but a zeroed buffer makes a parser bug deterministic
+	 * rather than a function of whatever the heap last held.
+	 */
+	memset(ring, 0, CO_NETIO_TX_SIZE);
+
+	got = 0;
+	rc = co_manager_conet_dump(handle, tx_head, tx_tail, rx_head, rx_tail,
+				   0, ring, &got);
+	if (!CO_OK(rc))
+		return rc;
+
+	used = *tx_head - *tx_tail;
+	if (used == 0 || used > CO_NETIO_TX_SIZE)
+		return CO_RC(OK);	/* nothing to fetch, or a state the caller will reject */
+
+	for (done = 0; done < used; done += got) {
+		unsigned int pos  = *tx_tail + done;
+		unsigned int off  = pos & (CO_NETIO_TX_SIZE - 1);
+		unsigned int room = CO_NETIO_TX_SIZE - off;
+
+		got = used - done;
+		if (got > 8192)
+			got = 8192;
+		if (got > room)			/* never straddle the wrap */
+			got = room;
+
+		rc = co_manager_conet_dump(handle, &h2, &t2, &r2h, &r2t,
+					   pos, ring + off, &got);
+		if (!CO_OK(rc))
+			return rc;
+		if (got == 0)
+			return CO_RC(ERROR);
+	}
+
+	return CO_RC(OK);
+}
+
 co_rc_t co_elf_net_dump_live(void)
 {
 	co_manager_handle_t handle;
 	unsigned char* ring;
 	unsigned int tx_head = 0, tx_tail = 0, rx_head = 0, rx_tail = 0;
-	unsigned int h2, t2, r2h, r2t;
-	unsigned int off, got;
 	co_rc_t rc;
 
 	handle = co_os_manager_open();
@@ -583,27 +645,102 @@ co_rc_t co_elf_net_dump_live(void)
 		return CO_RC(OUT_OF_MEMORY);
 	}
 
-	for (off = 0; off < CO_NETIO_TX_SIZE; off += got) {
-		got = 8192;
-		rc = co_manager_conet_dump(handle,
-					   off ? &h2 : &tx_head, off ? &t2 : &tx_tail,
-					   off ? &r2h : &rx_head, off ? &r2t : &rx_tail,
-					   off, ring + off, &got);
-		if (!CO_OK(rc)) {
-			co_terminal_print("net-dump: no live guest with net rings"
-					  " (rc %x)\n", (int)rc);
-			goto out;
-		}
-		if (got == 0) {
-			co_terminal_print("net-dump: driver returned an empty window\n");
-			rc = CO_RC(ERROR);
-			goto out;
-		}
+	rc = co_net_fetch_live(handle, &tx_head, &tx_tail, &rx_head, &rx_tail, ring);
+	if (!CO_OK(rc)) {
+		co_terminal_print("net-dump: no live guest with net rings (rc %x)\n",
+				  (int)rc);
+		goto out;
 	}
 
 	co_terminal_print("the guest's network rings, live:\n");
 	co_net_print_rings(tx_head, tx_tail, rx_head, rx_tail, ring);
 	rc = CO_RC(OK);
+
+out:
+	co_os_free(ring);
+	co_os_manager_close(handle);
+	return rc;
+}
+
+/*
+ * --net-take: print the TX ring like --net-dump, then consume it -- advance
+ * tx_tail to the head of the snapshot just printed, through the validated
+ * TAKE ioctl. Only a ring that parsed clean is consumed; a corrupt ring is
+ * left exactly as found, because consuming what could not be decoded
+ * destroys the evidence.
+ *
+ * An explicit NEWTAIL argument bypasses the parse and asks the driver for
+ * exactly that value. It exists to test the driver's validation from the
+ * command line -- a bogus tail must come back refused, with nothing written.
+ */
+co_rc_t co_elf_net_take_live(const char* new_tail_arg)
+{
+	co_manager_handle_t handle;
+	unsigned char* ring;
+	unsigned int tx_head = 0, tx_tail = 0, rx_head = 0, rx_tail = 0;
+	co_rc_t rc;
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		co_terminal_print("net-take: cannot open the driver -- is it loaded?\n");
+		return CO_RC(ERROR);
+	}
+
+	if (new_tail_arg && new_tail_arg[0]) {
+		unsigned int asked = (unsigned int)strtoul(new_tail_arg, NULL, 0);
+
+		rc = co_manager_conet_take(handle, asked,
+					   &tx_head, &tx_tail, &rx_head, &rx_tail);
+		if (CO_OK(rc))
+			co_terminal_print("net-take: tail set to %u (head %u)\n",
+					  tx_tail, tx_head);
+		else
+			co_terminal_print("net-take: REFUSED tail %u (rc %x),"
+					  " nothing written\n", asked, (int)rc);
+		co_os_manager_close(handle);
+		return rc;
+	}
+
+	ring = (unsigned char*)co_os_malloc(CO_NETIO_TX_SIZE);
+	if (!ring) {
+		co_os_manager_close(handle);
+		return CO_RC(OUT_OF_MEMORY);
+	}
+
+	rc = co_net_fetch_live(handle, &tx_head, &tx_tail, &rx_head, &rx_tail, ring);
+	if (!CO_OK(rc)) {
+		co_terminal_print("net-take: no live guest with net rings (rc %x)\n",
+				  (int)rc);
+		goto out;
+	}
+
+	co_terminal_print("the guest's network rings, live:\n");
+	if (co_net_print_rings(tx_head, tx_tail, rx_head, rx_tail, ring) != 0) {
+		co_terminal_print("net-take: NOT consuming a ring that did not parse\n");
+		rc = CO_RC(ERROR);
+		goto out;
+	}
+
+	if (tx_head == tx_tail) {
+		co_terminal_print("net-take: nothing to consume\n");
+		rc = CO_RC(OK);
+		goto out;
+	}
+
+	{
+		unsigned int old_tail = tx_tail, want = tx_head - tx_tail;
+
+		rc = co_manager_conet_take(handle, tx_head,
+					   &tx_head, &tx_tail, &rx_head, &rx_tail);
+		if (CO_OK(rc))
+			co_terminal_print("net-take: consumed %u bytes -- tail"
+					  " %u -> %u, ring now holds %u\n",
+					  want, old_tail, tx_tail,
+					  tx_head - tx_tail);
+		else
+			co_terminal_print("net-take: consume refused or failed"
+					  " (rc %x)\n", (int)rc);
+	}
 
 out:
 	co_os_free(ring);

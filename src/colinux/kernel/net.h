@@ -22,6 +22,15 @@ extern void co_net_set_address(unsigned long long va);
  * window of ring bytes starting at absolute position `start`. Writes nothing
  * into the guest, not even tx_tail.
  */
+/*
+ * Advance tx_tail to new_tail -- the host's consume. Validated under the
+ * lock: only forward, at most to the current head. INVALID_PARAMETER names
+ * a refused tail; nothing is written on refusal.
+ */
+extern co_rc_t co_net_take(co_manager_t* manager, unsigned int new_tail,
+			   unsigned int* tx_head, unsigned int* tx_tail,
+			   unsigned int* rx_head, unsigned int* rx_tail);
+
 extern co_rc_t co_net_dump(co_manager_t* manager,
 			   unsigned int* tx_head, unsigned int* tx_tail,
 			   unsigned int* rx_head, unsigned int* rx_tail,

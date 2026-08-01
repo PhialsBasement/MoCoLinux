@@ -308,6 +308,10 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		return co_elf_net_dump_live();
 	}
 
+	if (winnt_parameters.net_take) {
+		return co_elf_net_take_live(winnt_parameters.net_take_arg);
+	}
+
 	if (winnt_parameters.stop) {
 		co_manager_handle_t handle;
 		int was_running = 0;

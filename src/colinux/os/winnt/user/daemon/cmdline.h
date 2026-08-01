@@ -71,6 +71,8 @@ typedef struct co_winnt_parameters {
 	char   dump_vmlinux_arg[0x100];
 	bool_t stop;
 	bool_t net_dump;
+	bool_t net_take;
+	char   net_take_arg[0x20];
 	bool_t save_state;
 	bool_t restore_state;
 	bool_t test_switch;

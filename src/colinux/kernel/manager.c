@@ -322,6 +322,7 @@ co_rc_t co_manager_open(co_manager_t* manager, co_manager_open_desc_t* opened_ou
 		return rc;
 	}
 
+	opened->magic = CO_MANAGER_OPEN_MAGIC;
 	opened->monitor = NULL;
 	opened->debug_section = NULL;
 	opened->ref_count = 1;
@@ -339,9 +340,39 @@ co_rc_t co_manager_open(co_manager_t* manager, co_manager_open_desc_t* opened_ou
 	return CO_RC(OK);
 }
 
+/*
+ * Is this descriptor still alive?
+ *
+ * Every close path asks before touching anything, because the alternative is
+ * what the minidumps show: a descriptor whose pool block has been recycled,
+ * read at offset 0x48 for a pointer that is now somebody else's data, handed
+ * to ExFreePool, and a 0x50 inside the pool allocator with nothing left to
+ * say which path released it twice. A refusal here costs a leaked descriptor
+ * and a log line, and keeps the machine and the evidence.
+ */
+static bool_t co_manager_open_alive(co_manager_open_desc_t opened, const char* where)
+{
+	if (opened && opened->magic == CO_MANAGER_OPEN_MAGIC)
+		return PTRUE;
+
+	co_debug_error("%s: open descriptor %p is not live (magic 0x%llx) -- "
+		       "already released, refusing to touch it", where, opened,
+		       opened ? opened->magic : 0ULL);
+	return PFALSE;
+}
+
 static co_rc_t co_manager_close_(co_manager_t*          manager,
 				 co_manager_open_desc_t opened)
 {
+	if (!co_manager_open_alive(opened, "co_manager_close_"))
+		return CO_RC(ERROR);
+
+	/*
+	 * Cleared before anything is released, so a second arrival is refused
+	 * above rather than repeating the frees below.
+	 */
+	opened->magic = 0;
+
 	co_os_manager_userspace_close(opened);
 
 	if (opened->monitor != NULL) {
@@ -362,6 +393,7 @@ static co_rc_t co_manager_close_(co_manager_t*          manager,
 
 	co_os_mutex_destroy(opened->lock);
 	co_queue_flush(&opened->out_queue);
+	co_debug("close: releasing desc %p", opened);
 	co_os_free(opened);
 
 	return CO_RC(OK);
@@ -386,6 +418,9 @@ co_rc_t co_manager_close(co_manager_t *manager, co_manager_open_desc_t opened)
 {
 	bool_t close;
 
+	if (!co_manager_open_alive(opened, "co_manager_close"))
+		return CO_RC(ERROR);
+
 	co_os_mutex_acquire(opened->lock);
 	opened->ref_count--;
 	close = (opened->ref_count == 0);
@@ -403,6 +438,9 @@ co_rc_t co_manager_open_desc_deactive_and_close(co_manager_t*	       manager,
 {
 	co_rc_t rc;
 
+	if (!co_manager_open_alive(opened, "co_manager_open_desc_deactive_and_close"))
+		return CO_RC(ERROR);
+
 	opened->active = PFALSE;
 	if (opened->monitor != NULL) {
 		co_monitor_t* mon = opened->monitor;
@@ -414,7 +452,17 @@ co_rc_t co_manager_open_desc_deactive_and_close(co_manager_t*	       manager,
 				continue;
 
 			mon->connected_modules[index] = NULL;
-			co_manager_close(manager, opened);
+
+			/*
+			 * This can be the last reference, and then `opened` is
+			 * gone -- so the loop must not keep comparing against
+			 * it and the close below must not run. Both did.
+			 */
+			if (!CO_OK(co_manager_close(manager, opened)) ||
+			    opened->magic != CO_MANAGER_OPEN_MAGIC) {
+				co_os_mutex_release(mon->connected_modules_write_lock);
+				return CO_RC(OK);
+			}
 		}
 		co_os_mutex_release(mon->connected_modules_write_lock);
 	}
@@ -968,6 +1016,19 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 					 params->start, params->data,
 					 &params->size);
 		*return_size = sizeof(*params) + params->size;
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_CONET_TAKE: {
+		co_manager_ioctl_conet_take_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_net_take(manager, params->new_tail,
+					 &params->tx_head, &params->tx_tail,
+					 &params->rx_head, &params->rx_tail);
+		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}
 

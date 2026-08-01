@@ -73,6 +73,9 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("                                   the loaded image and back.\n");
 	co_terminal_print("      --net-dump                   Print the running guest's network rings,\n");
 	co_terminal_print("                                   read-only -- the guest cannot tell.\n");
+	co_terminal_print("      --net-take [NEWTAIL]         Print the TX ring, then consume it (advance\n");
+	co_terminal_print("                                   tx_tail past what was printed). An explicit\n");
+	co_terminal_print("                                   NEWTAIL tests the driver's validation.\n");
 	co_terminal_print("      --stop                       End a running boot loop now. The run's own\n");
 	co_terminal_print("                                   daemon prints its report and cleans up as\n");
 	co_terminal_print("                                   usual; this only asks the loop to return.\n");
@@ -243,6 +246,15 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		cmdline,
 		"--net-dump",
 		&winnt_parameters->net_dump);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--net-take",
+		&winnt_parameters->net_take,
+		winnt_parameters->net_take_arg,
+		sizeof(winnt_parameters->net_take_arg));
 
 	if (!CO_OK(rc))
 		return rc;
