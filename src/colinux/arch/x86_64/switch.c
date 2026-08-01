@@ -3367,10 +3367,12 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		 * with a terminal attached gets long enough to be used, since
 		 * a person at a prompt is the slowest thing in the system.
 		 */
-		unsigned long long deadline = co_os_monotonic_100ns()
-			+ (co_console_get_address() ? CO_BOOT_CONSOLE_SECONDS
-						    : CO_BOOT_MAX_SECONDS)
-			  * 10000000ULL;
+		unsigned long deadline_secs = co_console_get_address()
+			? CO_BOOT_CONSOLE_SECONDS : CO_BOOT_MAX_SECONDS;
+		/* Zero seconds means no deadline; see switch.h. */
+		unsigned long long deadline = deadline_secs
+			? co_os_monotonic_100ns() + deadline_secs * 10000000ULL
+			: 0;
 		unsigned long guest_crossings = 0;
 		int i;
 
@@ -3391,7 +3393,13 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				break;
 			}
 
-			if (guest_crossings >= (unsigned long)in->max_switches) {
+			/*
+			 * Zero is no limit, for the same reason the console
+			 * deadline is: an interactive guest must not be
+			 * stopped out from under whoever is using it.
+			 */
+			if (in->max_switches &&
+			    guest_crossings >= (unsigned long)in->max_switches) {
 				out->hit_limit = PTRUE;
 				break;
 			}
@@ -3483,12 +3491,12 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			pp->params[49] = co_os_monotonic_100ns();
 			pp->params[50] = co_os_get_time();
 
-			if (pp->params[49] >= deadline) {
+			if (deadline && pp->params[49] >= deadline) {
 				out->hit_deadline = PTRUE;
-				co_debug("boot: %d second deadline reached after "
+				co_debug("boot: %ld second deadline reached after "
 					 "%ld switches (%ld of them the guest's, "
 					 "%ld replayed interrupts)",
-					 CO_BOOT_MAX_SECONDS, out->switches,
+					 deadline_secs, out->switches,
 					 guest_crossings, out->interrupts);
 				break;
 			}

@@ -141,10 +141,21 @@ extern int  co_arch_boot_running(void);
 #define CO_BOOT_MAX_SECONDS 120
 
 /*
- * And how long with a terminal attached, where the guest is meant to sit at a
- * prompt doing nothing until somebody types.
+ * And how long with a terminal attached: no limit at all.
+ *
+ * Zero means no deadline. A guest with a console is one somebody is using, and
+ * ending it on a timer is wrong twice over -- it interrupts a session that was
+ * working, and it does it during whatever was running at the time, which for a
+ * package install is the worst possible moment. It was 900 seconds, and a
+ * pacman run outlived it.
+ *
+ * What makes removing it safe is that the deadline is no longer the only way to
+ * end a run. CO_MANAGER_IOCTL_KSTOP asks the loop to stop from another process
+ * and it answers within a crossing (stop.bat), and driver unload does the same
+ * and waits. The headless bound below stays, because a bring-up run with
+ * nobody attached still needs to stop by itself and report.
  */
-#define CO_BOOT_CONSOLE_SECONDS 900
+#define CO_BOOT_CONSOLE_SECONDS 0
 
 /* Booting the loaded kernel: enter co_arch_start_kernel and see how far it gets. */
 typedef struct {

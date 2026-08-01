@@ -64,7 +64,8 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("                                   booted the guest is inside its ioctl.\n");
 	co_terminal_print("                                   (default 4096). 1 means one world switch\n");
 	co_terminal_print("                                   per instruction, which is 3.6us each.\n");
-	co_terminal_print("      --max-switches N             Stop --boot-kernel after N world switches\n");
+	co_terminal_print("      --max-switches N|none        Stop --boot-kernel after N world switches,\n");
+	co_terminal_print("                                   or none for no limit (stop.bat ends it)\n");
 	co_terminal_print("                                   (default 200000). Bisects a hard reset:\n");
 	co_terminal_print("                                   a run that stops in time still reports.\n");
 	co_terminal_print("      --call-kernel FILE           Load a vmlinux, then call memset and\n");
