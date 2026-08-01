@@ -514,7 +514,7 @@ static int pvsnfmt_int(char **pinsertion, long *nmax, char fmt, int flags,
                 numbersigned = 0;
                 break;
              case 'p':
-                unumber = (unsigned long) va_arg(*ap, void *);
+                unumber = (unsigned long long)(size_t) va_arg(*ap, void *);
                 numbersigned = 0;
         }
         break;
@@ -552,7 +552,7 @@ static int pvsnfmt_int(char **pinsertion, long *nmax, char fmt, int flags,
                 numbersigned = 0;
                 break;
              case 'p':
-                unumber = (unsigned long) va_arg(*ap, void *);
+                unumber = (unsigned long long)(size_t) va_arg(*ap, void *);
                 numbersigned = numbersigned;
         }
         break;
@@ -571,7 +571,7 @@ static int pvsnfmt_int(char **pinsertion, long *nmax, char fmt, int flags,
                 numbersigned = 0;
                 break;
              case 'p':
-                unumber = (unsigned long) va_arg(*ap, void *);
+                unumber = (unsigned long long)(size_t) va_arg(*ap, void *);
                 numbersigned = 0;
          }
     } /* switch fmt to retrieve number */
