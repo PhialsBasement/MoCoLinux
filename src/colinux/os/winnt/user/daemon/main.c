@@ -272,19 +272,21 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		}
 
 		return co_elf_load_into_guest(winnt_parameters.boot_kernel_arg, 3,
-					      limit, batch);
+					      limit, batch,
+					      winnt_parameters.cobd0 ?
+						winnt_parameters.cobd0_arg : NULL);
 	}
 
 	if (winnt_parameters.call_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0, 0);
+		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0, 0, NULL);
 	}
 
 	if (winnt_parameters.enter_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0, 0);
+		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0, 0, NULL);
 	}
 
 	if (winnt_parameters.load_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0);
+		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0, NULL);
 	}
 
 	if (winnt_parameters.dump_vmlinux) {

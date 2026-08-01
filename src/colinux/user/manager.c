@@ -181,6 +181,27 @@ co_rc_t co_manager_kread(co_manager_handle_t handle, unsigned long long va,
 	return rc;
 }
 
+co_rc_t co_manager_cobd(co_manager_handle_t handle, int unit, const char* path,
+			unsigned long long* size_out)
+{
+	co_manager_ioctl_cobd_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	params.unit = unit;
+	co_snprintf(params.path, sizeof(params.path), "%s", path);
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_COBD,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (CO_OK(rc))
+		*size_out = params.size;
+
+	return rc;
+}
+
 co_rc_t co_manager_kload_verify(co_manager_handle_t handle,
 				co_manager_ioctl_kload_verify_t* out)
 {

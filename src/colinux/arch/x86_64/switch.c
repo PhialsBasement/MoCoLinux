@@ -45,6 +45,7 @@
 #include <colinux/arch/state.h>
 #include <colinux/arch/space.h>
 #include <colinux/kernel/kload.h>
+#include <colinux/kernel/cobd.h>
 
 #include "mmu.h"
 #include "utils.h"
@@ -52,7 +53,9 @@
 #include "extable.h"
 
 /* x86-64 extension to the original co_operation_t wire values. */
-#define CO_OPERATION_YIELD 16
+#define CO_OPERATION_YIELD		16
+#define CO_OPERATION_BLOCK_PROBE	17
+#define CO_OPERATION_BLOCK_IO		18
 
 /*
  * Position independent by construction: no RIP-relative operand, no absolute
@@ -1613,7 +1616,34 @@ static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 		pp->linuxvm_state.sysenter_cs = 0;
 		pp->linuxvm_state.sysenter_esp = 0;
 		pp->linuxvm_state.sysenter_eip = 0;
-		pp->linuxvm_state.cr8          = 0;
+		/*
+		 * The guest runs at DISPATCH_LEVEL, not at PASSIVE_LEVEL.
+		 *
+		 * CR8 is IRQL on x64 and it is the processor's task priority:
+		 * an interrupt whose vector priority is not above CR8 is not
+		 * delivered at all, it stays pending in the local APIC. So this
+		 * value decides which of Windows' interrupts the guest is
+		 * allowed to receive.
+		 *
+		 * At 0 the guest received everything, including vector 0x2f --
+		 * which is not a device at all. 0x20-0x2f are Windows' software
+		 * interrupt levels, and 0x2f is the one the kernel raises to
+		 * make a processor run its DPC queue. The guest's stub accepted
+		 * it, the host replayed it with `int 0x2f`, and Windows ran its
+		 * deferred procedures by hand from inside a driver ioctl, on a
+		 * pinned thread, at the wrong IRQL. The captured log shows this
+		 * happening 22 switches into a boot, and the bugchecks it
+		 * produced land in whatever DPC ran -- netbios and ipnat frames
+		 * on the faulting stack, nothing to do with the guest.
+		 *
+		 * DISPATCH_LEVEL masks exactly 0x20-0x2f while leaving the
+		 * clock (0xd1) and IPIs (0xe1) to arrive, so the host still
+		 * bounds the guest and its DPCs simply wait -- which is what a
+		 * driver holding a processor is supposed to make them do. They
+		 * are delivered by Windows itself, at the right IRQL, the
+		 * moment the crossing lowers CR8 back to the host's value.
+		 */
+		pp->linuxvm_state.cr8          = 2;	/* DISPATCH_LEVEL */
 
 		out->guest_gdt = (unsigned long long)(size_t)guest_gdt;
 		out->guest_tss = (unsigned long long)(size_t)tss;
@@ -2909,6 +2939,34 @@ bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long vector)
 	/* host_idt is restored live by the switch; retain checks as tripwires. */
 	if (host_idt == NULL || vector < 32 || vector > 255)
 		return PFALSE;
+
+	/*
+	 * Vectors 0x20-0x2f are Windows' own software-service gates, and
+	 * replaying one is not forwarding an interrupt, it is calling a system
+	 * service by hand:
+	 *
+	 *   0x2a KiGetTickCount   0x2b KiCallbackReturn
+	 *   0x2c KiRaiseAssertion 0x2d KiDebugServiceTrap
+	 *
+	 * int 0x2d raises STATUS_BREAKPOINT, and with no kernel debugger
+	 * attached that is an unhandled kernel exception -- bugcheck 0x3B,
+	 * SYSTEM_SERVICE_EXCEPTION, first parameter 0x80000003. That is exactly
+	 * the bugcheck this guard was written for, and 0x2c would produce its
+	 * assertion twin.
+	 *
+	 * No hardware interrupt is ever delivered on these vectors: the HAL
+	 * assigns device interrupts from 0x30 up. So capturing one means
+	 * something other than an interrupt happened -- the guest executed a
+	 * software int, or a vector was recorded wrongly -- and either is worth
+	 * stopping to report rather than executing blind.
+	 */
+	if (vector >= 0x20 && vector <= 0x2f) {
+		co_debug_error("boot: refusing to replay vector 0x%llx -- that is a "
+			       "Windows software-service gate, not a hardware "
+			       "interrupt", vector);
+		return PFALSE;
+	}
+
 	gate = &((struct co_x86_64_gate*)host_idt)[vector];
 	if (!(gate->flags & 0x8000))
 		return PFALSE;
@@ -3060,6 +3118,11 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	pp->params[20] = in->entry_va;
 	pp->params[29] = in->step ? 1 : 0;
 	pp->params[48] = 0;	/* virtual ticks banked while the host slept at IDLE */
+	/*
+	 * Once, before the first entry. The loop no longer clears this every
+	 * time round -- see the comment there -- so it has to start empty.
+	 */
+	pp->operation  = CO_OPERATION_EMPTY;
 	pp->linuxvm_state.return_rip = (unsigned long long)(size_t)pp->code
 		+ (unsigned long)(&co_boot_shim - &co_switch_full);
 	pp->linuxvm_state.rsp = stack_va + CO_ARCH_PAGE_SIZE - 0x40;
@@ -3158,7 +3221,25 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			unsigned long long host_flags;
 
 			pp->params[4] = 0;		/* faulted */
-			pp->operation = CO_OPERATION_EMPTY;	/* set by voluntary yields */
+
+			/*
+			 * pp->operation is deliberately NOT cleared here.
+			 *
+			 * The guest writes it and then calls the switch, and
+			 * those are two instructions with a gap between them.
+			 * Now that the guest runs with real interrupts on, a
+			 * hardware interrupt can land in that gap: the stub
+			 * crosses back, this loop forwards the interrupt and
+			 * resumes the guest, and the guest then executes its
+			 * call -- with the operation this loop had just wiped.
+			 * The crossing arrives as CO_OPERATION_EMPTY and the
+			 * run stops with 'unhandled operation 0', naming
+			 * nothing.
+			 *
+			 * Each voluntary branch below clears the field once it
+			 * has read it, which is the only point at which the
+			 * value is known to have been consumed.
+			 */
 
 			/*
 			 * How many instructions the guest may step through on
@@ -3341,6 +3422,59 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				unsigned long long op = pp->operation;
 
 				pp->operation = 0;
+
+				/*
+				 * Block I/O, done here and not by the guest.
+				 *
+				 * The guest hands over a unit, an offset, a
+				 * length and a guest physical address, and the
+				 * host reads or writes the backing store
+				 * straight into that memory -- no bounce
+				 * buffer, because guest physical is host
+				 * physical and the driver allocated the pages.
+				 * Synchronous: the transfer completes before
+				 * the guest's own call returns, which is what
+				 * lets the guest-side driver be a few dozen
+				 * lines with no completion path.
+				 *
+				 * This runs in host context at PASSIVE_LEVEL
+				 * inside the ioctl, which is where file I/O is
+				 * legal -- the reason the transfer happens
+				 * after the crossing rather than being
+				 * attempted from inside the guest.
+				 */
+				if (op == CO_OPERATION_BLOCK_IO) {
+					co_rc_t brc;
+
+					brc = co_cobd_request(manager,
+							      (int)pp->params[51],
+							      pp->params[52],
+							      pp->params[54],
+							      (unsigned long)pp->params[53],
+							      pp->params[55] ? PTRUE : PFALSE);
+
+					pp->params[56] = CO_OK(brc) ? 0 : 1;
+					out->block_requests++;
+					if (!CO_OK(brc))
+						out->block_errors++;
+					continue;
+				}
+
+				/*
+				 * How many units there are and how big each
+				 * one is. Asked once per unit as the guest's
+				 * driver probes, so that the guest's idea of
+				 * the geometry comes from the host rather than
+				 * from a constant the two could disagree on.
+				 */
+				if (op == CO_OPERATION_BLOCK_PROBE) {
+					int unit = (int)pp->params[51];
+
+					pp->params[52] = co_cobd_present(unit)
+						? co_cobd_size(unit) : 0;
+					pp->params[56] = 0;
+					continue;
+				}
 
 				if (op == CO_OPERATION_IDLE) {
 					out->idle_yields++;
@@ -3728,9 +3862,25 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				break;
 			}
 
-			if (out->interrupts == 0)
-				co_debug("boot: replaying first host interrupt vector %lld "
-					 "through the live Windows IDT", out->vector);
+			/*
+			 * Every distinct vector, once. A count alone says how
+			 * busy the machine was; which vectors were replayed is
+			 * what says whether the host was handed something it
+			 * never raises -- and that is the question a bugcheck
+			 * inside Windows' own dispatch leaves you with.
+			 */
+			{
+				static unsigned char seen_vector[256];
+				unsigned v = (unsigned)(out->vector & 0xff);
+
+				if (!seen_vector[v]) {
+					seen_vector[v] = 1;
+					co_debug("boot: replaying host interrupt vector "
+						 "0x%x (%u) through the live Windows IDT, "
+						 "after %ld switches",
+						 v, v, out->switches);
+				}
+			}
 
 			if (!co_arch_forward_host_interrupt(pp->host_state.idt.table,
 							    out->vector)) {

@@ -646,7 +646,8 @@ static void co_report_bug_at(co_elf_data_t* pl, unsigned long long rip)
 }
 
 co_rc_t co_elf_load_into_guest(const char* filename, int enter,
-			       unsigned long max_switches, unsigned long batch)
+			       unsigned long max_switches, unsigned long batch,
+			       const char* cobd0)
 {
 	co_elf_data_t* pl;
 	co_manager_handle_t handle;
@@ -935,7 +936,20 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		co_manager_ioctl_kboot_t b = {0, };
 		co_manager_ioctl_kram_t  m = {0, };
 		unsigned char bp[4096];
-		char cmdline[256];
+		/*
+		 * Sized against COMMAND_LINE_SIZE (2048 on x86), not against
+		 * what the string happens to be today.
+		 *
+		 * At 256 this overflowed the moment root= was added: the
+		 * options are 226 characters and the root arguments another
+		 * 51, so strcat ran off the end of a stack buffer and what
+		 * reached the guest stopped at "rootfstype=ex". The kernel
+		 * then asked for a filesystem called "ex", get_fs_type()
+		 * returned -ENODEV, and the boot panicked with "Cannot open
+		 * root device ... error -19" -- which reads as a broken block
+		 * device and is nothing of the kind.
+		 */
+		char cmdline[1024];
 		co_elf_symbol_t* s_bp;
 		co_elf_symbol_t* s_cl;
 		co_elf_symbol_t* s_text;
@@ -995,6 +1009,29 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 				  m.ram_pages, m.tables);
 		co_terminal_print("    %d blocks, %llu MB usable of %llu MB asked\n",
 				  m.range_count, m.total_usable >> 20, ram >> 20);
+
+		/*
+		 * The root device, attached before the guest runs so that the
+		 * driver's probe finds it. Fatal if it was asked for and could
+		 * not be opened: booting on anyway would reach prepare_namespace
+		 * and panic about the root filesystem, which says nothing about
+		 * the file that is actually missing or locked.
+		 */
+		if (cobd0) {
+			unsigned long long dsize = 0;
+
+			rc = co_manager_cobd(handle, 0, cobd0, &dsize);
+			if (!CO_OK(rc)) {
+				co_terminal_print("\n  cannot attach cobd0 to '%s' (rc %x)\n",
+						  cobd0, (int)rc);
+				co_terminal_print("  the driver opens this path itself, so it is an NT\n");
+				co_terminal_print("  object path, and it must not be a volume Windows has mounted\n");
+				goto out_end;
+			}
+
+			co_terminal_print("    cobd0 -> %s\n", cobd0);
+			co_terminal_print("          %llu MB, root=/dev/cobd0\n", dsize >> 20);
+		}
 
 		/*
 		 * boot_params, written straight into the guest at its symbol.
@@ -1175,6 +1212,30 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 				" noxsave noxsaveopt noxsaves disable_mtrr_trim"
 				" pci=off nopat io_delay=none mce=off dis_ucode_ldr"
 				" nowatchdog 8250.nr_uarts=0 lpj=1600000");
+
+		/*
+		 * A root filesystem, if the host attached one. Without it the
+		 * kernel reaches prepare_namespace with nothing to mount and
+		 * panics -- which is the correct end for a kernel with no
+		 * disk, and is exactly where the boot stopped before cobd
+		 * existed.
+		 */
+		if (cobd0)
+			strcat(cmdline, " root=/dev/cobd0 rootfstype=ext4 rw"
+					" init=/sbin/init");
+
+		/*
+		 * Refuse rather than truncate. A command line that is silently
+		 * cut short does not fail where it was built, it fails deep in
+		 * the guest as a wrong-looking kernel error, which is exactly
+		 * how the 256-byte buffer cost a boot.
+		 */
+		if (strlen(cmdline) >= sizeof(cmdline) - 1) {
+			co_terminal_print("\n  the kernel command line does not fit in %d bytes\n",
+					  (int)sizeof(cmdline));
+			goto out_end;
+		}
+		co_terminal_print("    cmdline is %d bytes\n", (int)strlen(cmdline));
 		rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_cl),
 					    cmdline, sizeof(cmdline), 0);
 		if (!CO_OK(rc)) {
@@ -1377,6 +1438,9 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		co_terminal_print("  %lu instructions stepped, %lu captured interrupts%s\n",
 				  b.steps, b.interrupts,
 				  b.hit_limit ? "  (hit the limit)" : "");
+		if (b.block_requests || b.block_errors)
+			co_terminal_print("  %lu block transfers, %lu of them failed\n",
+					  b.block_requests, b.block_errors);
 		if (b.steps) {
 			unsigned long i, n = (b.trace_next < 16) ? b.trace_next : 16;
 

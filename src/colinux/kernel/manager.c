@@ -28,6 +28,7 @@
 #include "pages.h"
 #include "reversedpfns.h"
 #include "kload.h"
+#include "cobd.h"
 
 #ifndef min
 # define min(a,b) 	((a)<(b)?(a):(b))
@@ -170,6 +171,14 @@ void co_manager_unload(co_manager_t* manager)
 	 */
 	if (manager->state >= CO_MANAGER_STATE_INITIALIZED)
 		co_kload_free(manager);
+
+	/*
+	 * And the backing stores, for the same reason: a handle the driver
+	 * opened is the driver's to close. Leaving one open holds a write lock
+	 * on the image or the partition, so the next run cannot open it and
+	 * reports a file in use rather than anything about itself.
+	 */
+	co_cobd_detach_all();
 
 	if (manager->state >= CO_MANAGER_STATE_INITIALIZED) {
 		co_manager_free_reversed_pfns(manager);
@@ -571,6 +580,25 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_COBD: {
+		co_manager_ioctl_cobd_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		/*
+		 * The path arrives from userspace, so it is not trusted to be
+		 * terminated: co_os_bdev_open hands it to the string
+		 * conversion, which walks to the first zero.
+		 */
+		params->path[sizeof(params->path) - 1] = '\0';
+		params->size = 0;
+		params->rc   = co_cobd_attach((int)params->unit, params->path,
+					      &params->size);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_KLOAD_ENTER: {
 		co_manager_ioctl_test_switch_t* params = (typeof(params))(io_buffer);
 		co_arch_switch_test_t result;
@@ -785,6 +813,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->reached_idle	 = result.reached_idle;
 		params->run_yields	 = result.run_yields;
 		params->idle_yields	 = result.idle_yields;
+		params->block_requests	 = result.block_requests;
+		params->block_errors	 = result.block_errors;
 		params->terminated	 = result.terminated;
 		params->terminate_reason = result.terminate_reason;
 		params->stop_operation	 = result.stop_operation;

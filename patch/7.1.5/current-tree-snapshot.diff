@@ -1,24 +1,33 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5 at the virtual-time
+Authoritative cumulative snapshot of ref/linux-7.1.5 at the ext4-root
 checkpoint.  Generated against download/linux-7.1.5.tar.xz on 2026-08-01, the
-day the kernel first booted to PID 1 on the M92p -- every initcall run, kernel
-threads scheduled, host wall time in the audit timestamps -- and panicked only
-for the root filesystem it does not have yet.
+run where the guest mounted a real ext4 filesystem off a real disk on the M92p:
 
-On top of the real-IF interrupt-forwarding checkpoint this adds virtual time:
+    EXT4-fs (cobd0): mounted filesystem ... r/w with ordered data mode
+    VFS: Mounted root (ext4 filesystem) on device 253:0.
+    devtmpfs: mounted
+    VFS: Pivoted into new rootfs
 
-  - A cooperative clock_event_device ("cotimer", periodic-only, HZ=1000)
-    registered via x86_init.timers.timer_init.  Ticks are synthesised from the
-    host's monotonic clock, which the host stamps into passage-page params[49]
-    (100 ns units) before every re-entry; co_colinux_drain_time() converts the
-    elapsed time to N calls of the tick handler inside irq_enter/irq_exit,
-    clamped to one second, at the idle boundary (co_cpu_idle).
+On top of the virtual-time checkpoint this adds:
 
-  - x86_platform.get_wallclock reads the host's UTC time_t from params[50],
-    so timekeeping starts at the host's real date instead of 1970.
+  - drivers/block/cobd.c, the cooperative block device.  A transfer is a
+    world switch: the guest puts unit/offset/length and the *physical*
+    address of the bio segment in the passage page and calls the switch; the
+    host reads or writes its backing store straight into that memory and
+    returns.  No bounce buffer and no DMA mapping, because guest physical is
+    host physical here.  Synchronous, so there is no completion path at all.
+    Built unconditionally and self-gated on co_colinux_guest.
 
-  - calibrate_delay is skipped with lpj= on the command line (the daemon
-    passes lpj=1600000): virtual time is delivered at idle boundaries and the
-    calibration spin runs before the boot ever idles.
+  - The tick handler is given a register frame.  tick_periodic() reads
+    user_mode(get_irq_regs()), which on real hardware the interrupt entry
+    path fills in; a synthesised tick left it NULL and the guest faulted at
+    NULL+0x88, which is where cs sits in struct pt_regs.
+
+Known and unfixed here, and the next thing: native_write_cr3() is still a
+no-op for a cooperative guest (asm/special_insns.h).  That was right while the
+host owned the address space, but the guest now runs in the kernel's own
+init_top_pgt, and execve's switch_mm therefore never activates the new
+process's tables -- so /sbin/init dies with EFAULT before its first
+instruction.
 
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
@@ -840,20 +849,21 @@ index 90a22e2..7cd11dd 100644
  	void *entry;
  
 diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
-index 4c718f8..4f674b8 100644
+index 4c718f8..9c305b7 100644
 --- a/arch/x86/kernel/process.c
 +++ b/arch/x86/kernel/process.c
-@@ -54,6 +54,9 @@
+@@ -54,6 +54,10 @@
  #include <asm/mmu_context.h>
  #include <asm/msr.h>
  #include <asm/shstk.h>
 +#include <linux/console.h>	/* co_colinux_guest */
 +#include <linux/clockchips.h>	/* the cooperative tick device */
 +#include <linux/hardirq.h>	/* irq_enter/irq_exit around delivered ticks */
++#include <asm/irq_regs.h>	/* the register frame the tick handler reads */
  
  #include "process.h"
  
-@@ -773,6 +776,172 @@ EXPORT_SYMBOL(default_idle);
+@@ -773,6 +777,200 @@ EXPORT_SYMBOL(default_idle);
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -961,6 +971,7 @@ index 4c718f8..4f674b8 100644
 +	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
 +	const u64 per_tick = 10000000 / HZ;	/* 100 ns units */
 +	static u64 last_mono;
++	struct pt_regs *old, regs;
 +	u64 now;
 +	unsigned int n;
 +
@@ -990,9 +1001,32 @@ index 4c718f8..4f674b8 100644
 +	}
 +	last_mono += (u64)n * per_tick;
 +
++	/*
++	 * A register frame for the tick to look at.
++	 *
++	 * tick_periodic() asks user_mode(get_irq_regs()) whether the tick
++	 * interrupted userspace, and profile_tick() wants the interrupted RIP.
++	 * On real hardware the interrupt entry path fills that pointer in;
++	 * these ticks have no entry path, so it stays NULL and user_mode()
++	 * dereferences it -- a fault at NULL + 0x88, which is where cs sits in
++	 * struct pt_regs, and exactly what the first run of this code did.
++	 *
++	 * The honest answer is kernel mode: ticks are drained at the idle
++	 * boundary, so the guest was in co_cpu_idle when time passed, never in
++	 * userspace. Time is therefore accounted to the idle task, which is
++	 * what actually consumed it.
++	 */
++	memset(&regs, 0, sizeof(regs));
++	regs.cs	   = __KERNEL_CS;
++	regs.ss	   = __KERNEL_DS;
++	regs.ip	   = _THIS_IP_;
++	regs.sp	   = (unsigned long)&regs;
++
 +	irq_enter();
++	old = set_irq_regs(&regs);
 +	while (n--)
 +		co_colinux_clockevent.event_handler(&co_colinux_clockevent);
++	set_irq_regs(old);
 +	irq_exit();
 +}
 +
@@ -1019,14 +1053,18 @@ index 4c718f8..4f674b8 100644
 +static void co_cpu_idle(void)
 +{
 +	co_colinux_switch(CO_OPERATION_IDLE);
-+	co_colinux_drain_time();
++	/*
++	 * Interrupts off before the ticks are delivered: irq_enter/irq_exit
++	 * emulate hardirq entry, and irq_exit expects to be entered that way.
++	 */
 +	raw_local_irq_disable();
++	co_colinux_drain_time();
 +}
 +
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +1105,18 @@ out:
+@@ -936,6 +1134,18 @@ out:
  
  void __init select_idle_routine(void)
  {
@@ -1246,6 +1284,303 @@ index 467311b..24d4b74 100644
  	/*
  	 * The init function returns an non zero value when
  	 * pci_legacy_init should be invoked.
+diff --git a/drivers/block/Makefile b/drivers/block/Makefile
+index 2d8096e..bc1634b 100644
+--- a/drivers/block/Makefile
++++ b/drivers/block/Makefile
+@@ -20,6 +20,9 @@ obj-$(CONFIG_AMIGA_Z2RAM)	+= z2ram.o
+ obj-$(CONFIG_N64CART)		+= n64cart.o
+ obj-$(CONFIG_BLK_DEV_RAM)	+= brd.o
+ obj-$(CONFIG_BLK_DEV_LOOP)	+= loop.o
++# Cooperative Linux: built unconditionally and self-gated on co_colinux_guest,
++# so there is no Kconfig symbol to forget when the config is regenerated.
++obj-y				+= cobd.o
+ obj-$(CONFIG_SUNVDC)		+= sunvdc.o
+ 
+ obj-$(CONFIG_BLK_DEV_NBD)	+= nbd.o
+diff --git a/mnt/big-bricks/RProject/MoCoLinux/ref/linux-7.1.5/drivers/block/cobd.c b/drivers/block/cobd.c
+new file mode 100644
+index 0000000..8277ac1
+--- /dev/null
++++ b/drivers/block/cobd.c
+@@ -0,0 +1,277 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * cobd -- the cooperative block device.
++ *
++ * The guest has no disk controller and must never touch the host's. Its
++ * storage is a file or a partition the host holds open, and a transfer is a
++ * world switch: the guest fills in a request in the passage page, calls the
++ * switch, and the host performs the I/O straight into the guest's memory
++ * before switching back.
++ *
++ * That the host can write into the guest's buffer directly is the whole reason
++ * this driver is short. Guest physical addresses are host physical addresses
++ * here -- the guest's RAM is host allocations described at their true
++ * addresses in the e820 -- so page_to_phys() of a bio's page is something the
++ * host can resolve and address. There is no bounce buffer, no scatter list
++ * handed to hardware, and no DMA mapping.
++ *
++ * The transfer is synchronous: it is complete by the time the switch returns,
++ * so there is no completion interrupt, no request tracking and no timeout
++ * path. The cost is that the guest blocks for the duration of host I/O, which
++ * for a cooperative guest is the same trade every other yield makes.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/blkdev.h>
++#include <linux/blk-mq.h>
++#include <linux/console.h>	/* co_colinux_guest */
++#include <linux/major.h>
++
++#define COBD_MAX_UNITS		4
++#define COBD_MINORS		16	/* unit + 15 partitions */
++#define COBD_SECTOR_SIZE	512
++
++/* Passage-page offsets and operations -- see arch/x86/kernel/process.c. */
++#define CO_PP_CODE		0x38
++#define CO_PP_HOST_STATE	0x740
++#define CO_PP_LINUXVM_STATE	0x880
++#define CO_PP_OPERATION		0x9c0
++#define CO_PP_PARAMS		0x9c8	/* params[0] */
++
++#define CO_PP_PARAM(n)		(CO_PP_PARAMS + (n) * 8)
++
++#define CO_OPERATION_BLOCK_PROBE	17
++#define CO_OPERATION_BLOCK_IO		18
++
++extern unsigned long long co_colinux_passage_page;
++
++struct cobd_dev {
++	struct gendisk		*disk;
++	struct blk_mq_tag_set	tag_set;
++	unsigned long long	size;
++	int			unit;
++};
++
++static struct cobd_dev cobd_devs[COBD_MAX_UNITS];
++static int cobd_major;
++
++/*
++ * The switch call itself.
++ *
++ * Identical in shape to co_colinux_switch() in process.c, and deliberately a
++ * separate copy rather than an export: this one must not be instrumented or
++ * traced, and it is called from block submission context where a detour
++ * through the tracer would be a poor idea.
++ */
++static void cobd_switch(unsigned long long operation)
++{
++	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
++	register void *leaving  asm("rcx") = pp + CO_PP_LINUXVM_STATE;
++	register void *entering asm("rdx") = pp + CO_PP_HOST_STATE;
++	void *code = pp + CO_PP_CODE;
++
++	*(volatile unsigned long long *)(pp + CO_PP_OPERATION) = operation;
++
++	asm volatile(
++		"call *%[code]\n"
++		: "+r"(leaving), "+r"(entering)
++		: [code] "r"(code)
++		: "rax", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory", "cc");
++}
++
++static int cobd_io(int unit, u64 offset, phys_addr_t pa, u32 len, bool write)
++{
++	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
++
++	*(volatile u64 *)(pp + CO_PP_PARAM(51)) = unit;
++	*(volatile u64 *)(pp + CO_PP_PARAM(52)) = offset;
++	*(volatile u64 *)(pp + CO_PP_PARAM(53)) = len;
++	*(volatile u64 *)(pp + CO_PP_PARAM(54)) = pa;
++	*(volatile u64 *)(pp + CO_PP_PARAM(55)) = write ? 1 : 0;
++	*(volatile u64 *)(pp + CO_PP_PARAM(56)) = ~0ULL;
++
++	cobd_switch(CO_OPERATION_BLOCK_IO);
++
++	return *(volatile u64 *)(pp + CO_PP_PARAM(56)) ? -EIO : 0;
++}
++
++static u64 cobd_probe(int unit)
++{
++	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
++
++	*(volatile u64 *)(pp + CO_PP_PARAM(51)) = unit;
++	*(volatile u64 *)(pp + CO_PP_PARAM(52)) = 0;
++
++	cobd_switch(CO_OPERATION_BLOCK_PROBE);
++
++	return *(volatile u64 *)(pp + CO_PP_PARAM(52));
++}
++
++static blk_status_t cobd_queue_rq(struct blk_mq_hw_ctx *hctx,
++				  const struct blk_mq_queue_data *bd)
++{
++	struct request *req = bd->rq;
++	struct cobd_dev *dev = req->q->queuedata;
++	blk_status_t status = BLK_STS_OK;
++	struct req_iterator iter;
++	struct bio_vec bvec;
++	u64 pos;
++
++	blk_mq_start_request(req);
++
++	switch (req_op(req)) {
++	case REQ_OP_READ:
++	case REQ_OP_WRITE:
++		pos = (u64)blk_rq_pos(req) << SECTOR_SHIFT;
++
++		rq_for_each_segment(bvec, req, iter) {
++			phys_addr_t pa = page_to_phys(bvec.bv_page) +
++					 bvec.bv_offset;
++
++			if (cobd_io(dev->unit, pos, pa, bvec.bv_len,
++				    op_is_write(req_op(req)))) {
++				status = BLK_STS_IOERR;
++				break;
++			}
++
++			pos += bvec.bv_len;
++		}
++		break;
++
++	/*
++	 * The host writes through -- ZwWriteFile against a handle opened
++	 * without caching promises, and nothing of the transfer is left
++	 * anywhere the guest owns once the switch returns. So a flush has
++	 * nothing left to do and succeeds rather than being refused, which
++	 * would fail every journal commit ext4 makes.
++	 */
++	case REQ_OP_FLUSH:
++		break;
++
++	default:
++		status = BLK_STS_NOTSUPP;
++		break;
++	}
++
++	blk_mq_end_request(req, status);
++
++	return BLK_STS_OK;
++}
++
++static const struct blk_mq_ops cobd_mq_ops = {
++	.queue_rq = cobd_queue_rq,
++};
++
++static const struct block_device_operations cobd_fops = {
++	.owner = THIS_MODULE,
++};
++
++static int cobd_add_disk(struct cobd_dev *dev, int unit, u64 size)
++{
++	struct queue_limits lim = {
++		.logical_block_size	= COBD_SECTOR_SIZE,
++		.physical_block_size	= COBD_SECTOR_SIZE,
++		/*
++		 * One page per segment and no merging across pages: every
++		 * segment becomes one host transfer resolved through one
++		 * guest frame, so a segment that spanned pages could span two
++		 * host allocations that are not adjacent.
++		 */
++		.max_segment_size	= PAGE_SIZE,
++		.seg_boundary_mask	= PAGE_SIZE - 1,
++		.max_segments		= BLK_MAX_SEGMENTS,
++	};
++	struct gendisk *disk;
++	int err;
++
++	dev->unit = unit;
++	dev->size = size;
++
++	dev->tag_set.ops		= &cobd_mq_ops;
++	dev->tag_set.nr_hw_queues	= 1;
++	dev->tag_set.queue_depth	= 16;
++	dev->tag_set.numa_node		= NUMA_NO_NODE;
++	dev->tag_set.cmd_size		= 0;
++	dev->tag_set.flags		= BLK_MQ_F_BLOCKING;
++	dev->tag_set.driver_data	= dev;
++
++	err = blk_mq_alloc_tag_set(&dev->tag_set);
++	if (err)
++		return err;
++
++	disk = blk_mq_alloc_disk(&dev->tag_set, &lim, dev);
++	if (IS_ERR(disk)) {
++		err = PTR_ERR(disk);
++		blk_mq_free_tag_set(&dev->tag_set);
++		return err;
++	}
++
++	dev->disk		= disk;
++	disk->major		= cobd_major;
++	disk->first_minor	= unit * COBD_MINORS;
++	disk->minors		= COBD_MINORS;
++	disk->fops		= &cobd_fops;
++	disk->private_data	= dev;
++	disk->queue->queuedata	= dev;
++	snprintf(disk->disk_name, DISK_NAME_LEN, "cobd%d", unit);
++	set_capacity(disk, size >> SECTOR_SHIFT);
++
++	err = add_disk(disk);
++	if (err) {
++		put_disk(disk);
++		blk_mq_free_tag_set(&dev->tag_set);
++		dev->disk = NULL;
++		return err;
++	}
++
++	pr_info("cobd%d: %llu MB\n", unit, size >> 20);
++
++	return 0;
++}
++
++static int __init cobd_init(void)
++{
++	int unit, found = 0;
++
++	if (!co_colinux_guest || !co_colinux_passage_page)
++		return 0;
++
++	cobd_major = register_blkdev(0, "cobd");
++	if (cobd_major < 0) {
++		pr_err("cobd: cannot register a major number\n");
++		return cobd_major;
++	}
++
++	for (unit = 0; unit < COBD_MAX_UNITS; unit++) {
++		u64 size = cobd_probe(unit);
++
++		/*
++		 * Size zero means the host has nothing attached to this unit.
++		 * A unit whose backing store is smaller than one sector is
++		 * refused too, rather than registered as a disk with no
++		 * sectors for the partition scanner to read.
++		 */
++		if (size < COBD_SECTOR_SIZE)
++			continue;
++
++		if (cobd_add_disk(&cobd_devs[unit], unit, size) == 0)
++			found++;
++	}
++
++	if (!found) {
++		pr_info("cobd: no devices attached by the host\n");
++		unregister_blkdev(cobd_major, "cobd");
++		cobd_major = 0;
++	}
++
++	return 0;
++}
++
++/*
++ * device_initcall rather than module_init's usual placement: the root
++ * filesystem is mounted from an initcall that runs after this level, so the
++ * disk has to exist by then, and nothing here depends on a subsystem that
++ * initialises later.
++ */
++device_initcall(cobd_init);
 diff --git a/include/linux/console.h b/include/linux/console.h
 index 5520e44..08b07d0 100644
 --- a/include/linux/console.h
