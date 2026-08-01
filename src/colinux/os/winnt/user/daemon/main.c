@@ -304,6 +304,33 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0, NULL, NULL);
 	}
 
+	if (winnt_parameters.stop) {
+		co_manager_handle_t handle;
+		int was_running = 0;
+		co_rc_t rc;
+
+		handle = co_os_manager_open();
+		if (!handle) {
+			co_terminal_print("stop: cannot open the driver -- is it loaded?\n");
+			return CO_RC(ERROR);
+		}
+
+		rc = co_manager_kstop(handle, &was_running);
+		co_os_manager_close(handle);
+
+		if (!CO_OK(rc)) {
+			co_terminal_print("stop: ioctl failed (rc %x)\n", (int)rc);
+			return rc;
+		}
+
+		if (was_running)
+			co_terminal_print("stop: a boot loop was running; it has been"
+					  " asked to end and will report as usual\n");
+		else
+			co_terminal_print("stop: no boot loop is running\n");
+		return CO_RC(OK);
+	}
+
 	if (winnt_parameters.dump_vmlinux) {
 		return co_elf_dump(winnt_parameters.dump_vmlinux_arg);
 	}
