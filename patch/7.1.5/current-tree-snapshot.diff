@@ -1,29 +1,26 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5 with the cooperative
-ethernet device, R1: the device registers and nothing more runs.
+Authoritative cumulative snapshot of ref/linux-7.1.5: the conet ethernet
+device, and runtime text pokes through the kernel's own poking mm.
 
 Generated against download/linux-7.1.5.tar.xz on 2026-08-01.
 
-Over the shutdown snapshot:
+Over the R1 snapshot:
 
-  * drivers/net/conet_colinux.c -- a cooperative ethernet netdev on the
-    console's transport, one size up: co_colinux_net_io holds a TX and an RX
-    byte ring in ordinary kernel .bss (128 KB each), one writer per word per
-    direction, frames carried whole as a 32-bit length plus payload padded to
-    a four-byte boundary. Records start four-byte aligned so the length word
-    never straddles the wrap. The host will reach the rings the way it reaches
-    the console's, by resolving the symbol and walking the guest's page
-    tables; the struct layout is ABI and is documented in the file.
+  * text-poke-direct is gone, because both of its premises died on Aug 1.
+    It bypassed __text_poke()'s temporary-mm machinery on the grounds that
+    native_write_cr3() was a no-op (stale since the ring-3 commit made CR3
+    writes real) and that mark_rodata_ro()'s protection was never applied
+    (stale since boots started completing -- the first runtime jump-label
+    poke faulted with error code 0x3, present+write, which is read-only
+    text announcing itself). The upstream path is the right one now: the
+    poking-mm CR3 switch is the same operation every execve performs, and
+    the passage page is grafted into every mm pgd_alloc builds, so a
+    hardware interrupt mid-poke crosses exactly as it does from any
+    process. Boot-time static-key flips exercise this path before
+    userspace ever starts.
 
-    TX copies the skb into the ring and yields, exactly the trade put_chars
-    makes; a full ring drops the frame rather than stopping the queue,
-    because a stopped queue wedges every writer against a host that may never
-    drain. RX is a polling kthread, started at ndo_open, feeding netif_rx; a
-    ring desync is reported and resynchronised empty rather than parsed.
-
-    In this snapshot the interface is registered and DOWN: the TX path, RX
-    kthread and rings are compiled in and inert until something opens the
-    device. Self-gated on co_colinux_guest, obj-y like cobd, no Kconfig
-    symbol to forget.
+  * drivers/net/conet_colinux.c as in R1: registered and inert until
+    opened; TX verified on hardware in R2 (ring accounting exact, frames
+    as predicted).
 
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
@@ -391,7 +388,7 @@ index 46aa2c9..a66560d 100644
  {
  	asm volatile("mov %0,%%cr3": : "r" (val) : "memory");
 diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
-index 62936a3..1eccd6a 100644
+index 62936a3..5f2aaf6 100644
 --- a/arch/x86/kernel/alternative.c
 +++ b/arch/x86/kernel/alternative.c
 @@ -6,6 +6,7 @@
@@ -429,42 +426,6 @@ index 62936a3..1eccd6a 100644
  
  	/*
  	 * The patching is not fully atomic, so try to avoid local
-@@ -2559,6 +2578,35 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
- 	 */
- 	BUG_ON(!after_bootmem);
- 
-+	/*
-+	 * A cooperative guest writes straight to the target.
-+	 *
-+	 * The whole apparatus below -- a temporary mm with the page aliased at a
-+	 * user address, a CR3 switch into it, the write, a CR3 switch back --
-+	 * exists for one reason: kernel text is mapped read-only, so it has to
-+	 * be reached through a second, writable mapping. Under coLinux the image
-+	 * is mapped by the host with _PAGE_RW and mark_rodata_ro()'s protection
-+	 * was never applied, so the text is already writable at its own address.
-+	 *
-+	 * And the mechanism cannot run here regardless: use_temporary_mm()
-+	 * switches mm by writing CR3, which native_write_cr3() suppresses for a
-+	 * cooperative guest -- the host owns the address space and a guest CR3
-+	 * load would discard it. So the switch is a no-op, the guest stays on
-+	 * its own tables, and the memcpy lands on the poking address, which is
-+	 * unmapped there. That is the #PF at text_poke_memcpy this replaces.
-+	 *
-+	 * Writing to addr directly reaches the same bytes the alias would have,
-+	 * with the same verification kept.
-+	 */
-+	if (co_colinux_guest) {
-+		local_irq_save(flags);
-+		func(addr, src, len);
-+		if (func == text_poke_memcpy)
-+			BUG_ON(memcmp(addr, src, len));
-+		local_irq_restore(flags);
-+		return addr;
-+	}
-+
- 	if (!core_kernel_text((unsigned long)addr)) {
- 		pages[0] = vmalloc_to_page(addr);
- 		if (cross_page_boundary)
 diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
 index a4268c4..a043725 100644
 --- a/arch/x86/kernel/cpu/common.c
