@@ -21,7 +21,11 @@
 #include <colinux/user/slirp/libslirp.h>
 #include <colinux/user/slirp/ctl.h>
 #include <colinux/user/slirp/co_main.h>
+#include <colinux/os/alloc.h>
 #include <colinux/os/user/misc.h>
+#include <colinux/os/user/manager.h>
+#include <colinux/user/manager.h>
+#include <colinux/user/conet_ring.h>
 
 /*******************************************************************************
  * Type Declarations
@@ -33,6 +37,7 @@
 typedef struct start_parameters {
 	bool_t show_help;
 	bool_t selftest;
+	bool_t ring;
 	unsigned int index;
 	co_id_t instance;
 } start_parameters_t;
@@ -93,6 +98,12 @@ static co_rc_t monitor_receive(co_reactor_user_t user, unsigned char *buffer, un
  * the layouts that were wrong, and what pacman needs first, since a guest with
  * no lease resolves no names.
  */
+/*
+ * Declared here because slirp_output() is above the bridge and routes to it.
+ */
+static co_manager_handle_t ring_handle;
+static void slirp_output_to_ring(const uint8_t *pkt, int pkt_len);
+
 static bool_t	     selftest_active;
 static unsigned char selftest_frame[16][1600];
 static int	     selftest_len[16];
@@ -111,6 +122,11 @@ void slirp_output(const uint8_t *pkt, int pkt_len)
 			selftest_len[selftest_count] = pkt_len;
 			selftest_count++;
 		}
+		return;
+	}
+
+	if (ring_handle) {
+		slirp_output_to_ring(pkt, pkt_len);
 		return;
 	}
 
@@ -304,6 +320,155 @@ static co_rc_t co_slirp_selftest(void)
 	return failures ? CO_RC(ERROR) : CO_RC(OK);
 }
 
+/*
+ * The bridge: slirp on one side, the guest's rings on the other.
+ *
+ * This replaces the 2004 arrangement, where the daemon exchanged
+ * co_message_t's with a monitor instance over the driver's message queue. That
+ * machinery is for the i386 monitor path, which this port does not build a
+ * monitor for; the x86-64 guest has ring buffers in its own memory instead,
+ * reached through the CONET ioctls (kernel/net.c).
+ *
+ * It lives in this binary rather than in colinux-daemon because slirp needs
+ * the 2 GB address-space confinement this executable is linked for -- see the
+ * note in slirp_config.h and the link rule in os/winnt/build. Moving the
+ * bridge into the main daemon would mean confining that too, for no reason.
+ *
+ * Frames from the guest go straight into slirp_input. Frames from slirp arrive
+ * via slirp_output, which puts them in the guest's RX ring. A full RX ring is
+ * back-pressure, not an error: the frame that produced it stays unconsumed so
+ * the guest offers it again, which is why the walk callback returns a bool.
+ */
+static bool_t		   ring_rx_full;
+static unsigned long	   ring_in, ring_out, ring_deferred;
+
+static void slirp_output_to_ring(const uint8_t *pkt, int pkt_len)
+{
+	co_rc_t rc = co_manager_conet_put(ring_handle, pkt, pkt_len);
+
+	if (CO_OK(rc)) {
+		ring_out++;
+		return;
+	}
+
+	/*
+	 * OUT_OF_MEMORY here means the guest has not drained its RX ring, not
+	 * that anything failed. Remember it so the frame being processed is
+	 * left in the TX ring and offered again; slirp will resend on its own
+	 * timers regardless.
+	 */
+	ring_rx_full = PTRUE;
+}
+
+static bool_t ring_frame(void *data, const unsigned char *frame, unsigned int len)
+{
+	if (ring_rx_full)
+		return PFALSE;
+
+	ring_in++;
+	co_slirp_mutex_lock();
+	slirp_input(frame, len);
+	co_slirp_mutex_unlock();
+
+	/*
+	 * slirp_output may have run inside that call and found the RX ring
+	 * full. If so this frame is the last one consumed: stopping here keeps
+	 * the next one for the following round.
+	 */
+	return ring_rx_full ? PFALSE : PTRUE;
+}
+
+static co_rc_t ring_loop(void)
+{
+	unsigned char *ring;
+	unsigned long quiet = 0;
+
+	ring = co_os_malloc(CO_NETIO_TX_SIZE);
+	if (!ring)
+		return CO_RC(OUT_OF_MEMORY);
+
+	co_terminal_print("conet-slirp-daemon: bridging slirp to the guest's rings\n");
+
+	for (;;) {
+		unsigned int tx_head = 0, tx_tail = 0, rx_head = 0, rx_tail = 0;
+		unsigned int consumed = 0;
+		int frames;
+		fd_set rfds, wfds, xfds;
+		struct timeval tv;
+		int nfds = -1;
+		co_rc_t rc;
+
+		ring_rx_full = PFALSE;
+
+		rc = co_net_fetch(ring_handle, &tx_head, &tx_tail,
+				  &rx_head, &rx_tail, ring);
+		if (!CO_OK(rc)) {
+			/*
+			 * The guest is gone, or has not booted far enough to
+			 * have registered its rings. Neither is an error worth
+			 * exiting for on a first attempt, but a run that never
+			 * finds them should say so rather than spin silently.
+			 */
+			if (++quiet == 1 || quiet % 500 == 0)
+				co_terminal_print("conet-slirp-daemon: no guest rings"
+						  " (rc %x)\n", (int)rc);
+			co_os_user_msleep(20);
+			continue;
+		}
+		quiet = 0;
+
+		frames = co_net_walk(ring, tx_head, tx_tail, ring_frame, NULL,
+				     &consumed);
+		if (frames < 0) {
+			co_terminal_print("conet-slirp-daemon: the guest's tx ring"
+					  " is corrupt -- stopping rather than"
+					  " feeding slirp nonsense\n");
+			co_os_free(ring);
+			return CO_RC(ERROR);
+		}
+
+		if (consumed != tx_tail) {
+			unsigned int h, t, rh, rt;
+
+			rc = co_manager_conet_take(ring_handle, consumed,
+						   &h, &t, &rh, &rt);
+			if (!CO_OK(rc)) {
+				co_terminal_print("conet-slirp-daemon: consume"
+						  " refused (rc %x)\n", (int)rc);
+				co_os_free(ring);
+				return CO_RC(ERROR);
+			}
+		}
+
+		/*
+		 * slirp's own timers and sockets. This is the loop the 2004
+		 * daemon ran, minus the reactor: the host end of every
+		 * connection lives in these descriptors, so it has to be
+		 * serviced whether or not the guest said anything.
+		 */
+		FD_ZERO(&rfds);
+		FD_ZERO(&wfds);
+		FD_ZERO(&xfds);
+		co_slirp_mutex_lock();
+		slirp_select_fill(&nfds, &rfds, &wfds, &xfds);
+		co_slirp_mutex_unlock();
+
+		tv.tv_sec  = 0;
+		tv.tv_usec = frames ? 0 : 2000;
+
+		if (select(nfds + 1, &rfds, &wfds, &xfds, &tv) >= 0) {
+			co_slirp_mutex_lock();
+			slirp_select_poll(&rfds, &wfds, &xfds);
+			co_slirp_mutex_unlock();
+		}
+
+		if (ring_rx_full) {
+			ring_deferred++;
+			co_os_user_msleep(2);
+		}
+	}
+}
+
 static co_rc_t wait_loop(void)
 {
 	int ret, nfds;
@@ -348,6 +513,8 @@ static void syntax(void)
 	co_terminal_print("  colinux-slirp-net-daemon -i pid -u unit [-h]\n");
 	co_terminal_print("\n");
 	co_terminal_print("    -h                      Show this help text\n");
+	co_terminal_print("    -R                      Bridge slirp to the guest's network rings\n");
+	co_terminal_print("                            through the driver. Needs no instance or unit.\n");
 	co_terminal_print("    -t                      Self-test: feed slirp canned ARP and DHCP\n");
 	co_terminal_print("                            frames and check its replies. Needs no guest,\n");
 	co_terminal_print("                            no monitor and no network.\n");
@@ -440,6 +607,17 @@ co_slirp_parse_args(co_command_line_params_t cmdline, start_parameters_t *parame
 	if (!CO_OK(rc))
 		return rc;
 
+	rc = co_cmdline_params_argumentless_parameter(cmdline, "-R", &parameters->ring);
+	if (!CO_OK(rc))
+		return rc;
+
+	/*
+	 * Ring mode needs no instance id and no unit: it finds the guest
+	 * through the driver, which learned the rings' address at boot.
+	 */
+	if (parameters->ring)
+		return CO_RC(OK);
+
 	/*
 	 * The self-test takes no instance and no unit, so it has to be
 	 * answered before the checks that insist on both.
@@ -514,6 +692,29 @@ co_rc_t co_slirp_main(int argc, char *argv[])
 	if (g_daemon_parameters.selftest) {
 		rc = co_slirp_selftest();
 		goto out_params;
+	}
+
+	if (g_daemon_parameters.ring) {
+		rc = co_slirp_mutex_init();
+		if (!CO_OK(rc))
+			goto out_params;
+
+		ring_handle = co_os_manager_open();
+		if (!ring_handle) {
+			co_terminal_print("conet-slirp-daemon: cannot open the"
+					  " driver -- is it loaded?\n");
+			rc = CO_RC(ERROR);
+			goto out_mutex;
+		}
+
+		rc = ring_loop();
+
+		co_terminal_print("conet-slirp-daemon: %lu frames in, %lu out,"
+				  " %lu rounds deferred on a full rx ring\n",
+				  ring_in, ring_out, ring_deferred);
+		co_os_manager_close(ring_handle);
+		ring_handle = NULL;
+		goto out_mutex;
 	}
 
 	co_debug("conet-slirp-daemon: create mutex");
