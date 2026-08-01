@@ -31,6 +31,14 @@ extern co_rc_t co_net_take(co_manager_t* manager, unsigned int new_tail,
 			   unsigned int* tx_head, unsigned int* tx_tail,
 			   unsigned int* rx_head, unsigned int* rx_tail);
 
+/*
+ * Deliver one frame to the guest by appending it to the RX ring. Returns
+ * OUT_OF_MEMORY when the ring is full, so the caller can keep the frame and
+ * retry rather than have it silently dropped here.
+ */
+extern co_rc_t co_net_put(co_manager_t* manager, const unsigned char* data,
+			  unsigned int len);
+
 extern co_rc_t co_net_dump(co_manager_t* manager,
 			   unsigned int* tx_head, unsigned int* tx_tail,
 			   unsigned int* rx_head, unsigned int* rx_tail,

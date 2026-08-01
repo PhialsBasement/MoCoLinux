@@ -8,9 +8,16 @@
  *
  */
 
+#include <unistd.h>
+
 #include <colinux/os/user/misc.h>
 
 void co_process_high_priority_set(void)
 {
 	/* nothing */
+}
+
+void co_os_user_msleep(unsigned long msec)
+{
+	usleep(msec * 1000);
 }

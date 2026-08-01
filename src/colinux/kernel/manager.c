@@ -1019,6 +1019,22 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_CONET_PUT: {
+		co_manager_ioctl_conet_put_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+		if (params->size > CO_CONET_PUT_MAX ||
+		    in_size < sizeof(*params) + params->size)
+			return CO_RC(INVALID_PARAMETER);
+		if (out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_net_put(manager, params->data, params->size);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_CONET_TAKE: {
 		co_manager_ioctl_conet_take_t* params = (typeof(params))(io_buffer);
 

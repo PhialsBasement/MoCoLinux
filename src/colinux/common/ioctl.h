@@ -54,6 +54,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KSTOP,
 	CO_MANAGER_IOCTL_CONET_DUMP,
 	CO_MANAGER_IOCTL_CONET_TAKE,
+	CO_MANAGER_IOCTL_CONET_PUT,
 } co_manager_ioctl_t;
 
 /*
@@ -386,6 +387,21 @@ typedef struct {
 	unsigned int	   rx_head;	/* out */
 	unsigned int	   rx_tail;	/* out */
 } co_manager_ioctl_conet_take_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_CONET_PUT: deliver one frame to the guest.
+ *
+ * The frame is appended to the RX ring and published by advancing rx_head.
+ * A full ring answers OUT_OF_MEMORY with nothing written, because the guest
+ * may be reading the record at rx_tail and must never have it rewritten
+ * underneath it -- the caller keeps the frame and retries.
+ */
+#define CO_CONET_PUT_MAX 1514
+typedef struct {
+	co_rc_t		   rc;
+	unsigned int	   size;	/* in: frame length */
+	unsigned char	   data[0];	/* in */
+} co_manager_ioctl_conet_put_t;
 
 /*
  * interface for CO_MANAGER_IOCTL_KSTOP: end a running boot loop, now.

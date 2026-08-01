@@ -673,6 +673,233 @@ out:
  * exactly that value. It exists to test the driver's validation from the
  * command line -- a bogus tail must come back refused, with nothing written.
  */
+/*
+ * A peer on the other end of the wire.
+ *
+ * Everything below this point is a stand-in for slirp: enough of a host to
+ * answer the two things a guest says when it is told it has a network, so
+ * that both ring directions can be exercised with real kernel involvement on
+ * the guest side -- netif_rx delivering into the IP stack, and ping seeing
+ * replies -- before a line of 2004-era NAT code is allowed to run.
+ *
+ * The peer is 10.0.2.2 at 02:c0:11:00:00:02, which is where slirp's gateway
+ * will be, so the guest's configuration does not change when slirp replaces
+ * this.
+ */
+static const unsigned char co_peer_mac[6] = { 0x02, 0xc0, 0x11, 0x00, 0x00, 0x02 };
+static const unsigned char co_peer_ip[4]  = { 10, 0, 2, 2 };
+
+static unsigned int co_net_ip_csum(const unsigned char* p, unsigned int len)
+{
+	unsigned long sum = 0;
+
+	while (len > 1) {
+		sum += ((unsigned long)p[0] << 8) | p[1];
+		p += 2;
+		len -= 2;
+	}
+	if (len)
+		sum += (unsigned long)p[0] << 8;
+
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+
+	return (unsigned int)(~sum & 0xffff);
+}
+
+/*
+ * Build a reply to one frame, or return 0 if this peer has nothing to say
+ * about it. ARP requests for our address get an answer; ICMP echo requests
+ * to it get an echo reply. Everything else -- the guest's IPv6 chatter, in
+ * practice -- is ignored exactly as an absent host would.
+ */
+static unsigned int co_net_peer_reply(const unsigned char* f, unsigned int len,
+				      unsigned char* out)
+{
+	unsigned int ethertype;
+
+	if (len < 14)
+		return 0;
+
+	ethertype = ((unsigned int)f[12] << 8) | f[13];
+
+	if (ethertype == 0x0806 && len >= 42) {
+		unsigned int op = ((unsigned int)f[20] << 8) | f[21];
+
+		if (op != 1 || memcmp(f + 38, co_peer_ip, 4) != 0)
+			return 0;
+
+		memcpy(out + 0, f + 6, 6);		/* to the asker	     */
+		memcpy(out + 6, co_peer_mac, 6);
+		out[12] = 0x08; out[13] = 0x06;
+		out[14] = 0x00; out[15] = 0x01;		/* ethernet	     */
+		out[16] = 0x08; out[17] = 0x00;		/* IPv4		     */
+		out[18] = 6;    out[19] = 4;
+		out[20] = 0x00; out[21] = 0x02;		/* reply	     */
+		memcpy(out + 22, co_peer_mac, 6);	/* sender = us	     */
+		memcpy(out + 28, co_peer_ip, 4);
+		memcpy(out + 32, f + 22, 6);		/* target = asker    */
+		memcpy(out + 38, f + 28, 4);
+		return 42;
+	}
+
+	if (ethertype == 0x0800 && len >= 34) {
+		unsigned int ihl = (f[14] & 0x0f) * 4;
+		unsigned int icmp = 14 + ihl;
+
+		if (f[23] != 1 || ihl < 20 || len < icmp + 8)
+			return 0;				/* not ICMP	     */
+		if (memcmp(f + 30, co_peer_ip, 4) != 0)
+			return 0;				/* not to us	     */
+		if (f[icmp] != 8)
+			return 0;				/* not an echo	     */
+
+		memcpy(out, f, len);
+		memcpy(out + 0, f + 6, 6);
+		memcpy(out + 6, co_peer_mac, 6);
+		memcpy(out + 26, f + 30, 4);			/* src = us	     */
+		memcpy(out + 30, f + 26, 4);			/* dst = the guest   */
+		out[icmp] = 0;					/* echo reply	     */
+
+		/*
+		 * The IP header checksum is unchanged: swapping the two
+		 * addresses adds the same words in a different order. The ICMP
+		 * checksum is recomputed rather than adjusted, because getting
+		 * an incremental update wrong produces a reply the guest
+		 * silently discards, which looks exactly like the ring not
+		 * working.
+		 */
+		out[icmp + 2] = 0;
+		out[icmp + 3] = 0;
+		{
+			unsigned int c = co_net_ip_csum(out + icmp, len - icmp);
+
+			out[icmp + 2] = (unsigned char)(c >> 8);
+			out[icmp + 3] = (unsigned char)(c & 0xff);
+		}
+		return len;
+	}
+
+	return 0;
+}
+
+co_rc_t co_elf_net_peer_live(const char* seconds_arg)
+{
+	co_manager_handle_t handle;
+	unsigned char* ring;
+	unsigned int tx_head = 0, tx_tail = 0, rx_head = 0, rx_tail = 0;
+	unsigned int seen = 0, replied = 0, full = 0, rounds = 0;
+	unsigned long deadline_ms, waited_ms = 0;
+	co_rc_t rc;
+
+	deadline_ms = seconds_arg && seconds_arg[0]
+		    ? strtoul(seconds_arg, NULL, 0) * 1000 : 60000;
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		co_terminal_print("net-peer: cannot open the driver -- is it loaded?\n");
+		return CO_RC(ERROR);
+	}
+
+	ring = (unsigned char*)co_os_malloc(CO_NETIO_TX_SIZE);
+	if (!ring) {
+		co_os_manager_close(handle);
+		return CO_RC(OUT_OF_MEMORY);
+	}
+
+	co_terminal_print("net-peer: answering ARP and ICMP echo for 10.0.2.2"
+			  " (%02x:%02x:%02x:%02x:%02x:%02x) for %lu ms\n",
+			  co_peer_mac[0], co_peer_mac[1], co_peer_mac[2],
+			  co_peer_mac[3], co_peer_mac[4], co_peer_mac[5],
+			  deadline_ms);
+
+	while (waited_ms < deadline_ms) {
+		unsigned int pos, took = 0;
+
+		rc = co_net_fetch_live(handle, &tx_head, &tx_tail,
+				       &rx_head, &rx_tail, ring);
+		if (!CO_OK(rc)) {
+			co_terminal_print("net-peer: the guest's rings went away"
+					  " (rc %x) after %u frames\n", (int)rc, seen);
+			break;
+		}
+
+		rounds++;
+
+		if (tx_head == tx_tail || tx_head - tx_tail > CO_NETIO_TX_SIZE) {
+			co_os_user_msleep(2);
+			waited_ms += 2;
+			continue;
+		}
+
+		for (pos = tx_tail; pos != tx_head; ) {
+			unsigned int off = pos & (CO_NETIO_TX_SIZE - 1);
+			unsigned int flen = co_net_le32(ring + off);
+			unsigned int record = 4 + ((flen + 3) & ~3u);
+			unsigned char frame[CO_NETIO_MAX_FRAME];
+			unsigned char reply[CO_NETIO_MAX_FRAME];
+			unsigned int first, rlen;
+
+			if (flen == 0 || flen > CO_NETIO_MAX_FRAME ||
+			    record > tx_head - pos) {
+				co_terminal_print("net-peer: ring corrupt at +%u"
+						  " (len %u) -- stopping\n", off, flen);
+				goto done;
+			}
+
+			off = (off + 4) & (CO_NETIO_TX_SIZE - 1);
+			first = flen < CO_NETIO_TX_SIZE - off
+			      ? flen : CO_NETIO_TX_SIZE - off;
+			memcpy(frame, ring + off, first);
+			if (first < flen)
+				memcpy(frame + first, ring, flen - first);
+
+			seen++;
+			pos += record;
+			took = pos;
+
+			rlen = co_net_peer_reply(frame, flen, reply);
+			if (!rlen)
+				continue;
+
+			rc = co_manager_conet_put(handle, reply, rlen);
+			if (CO_OK(rc)) {
+				replied++;
+			} else {
+				/*
+				 * A full RX ring is the guest not draining
+				 * fast enough, not an error. Stop consuming
+				 * here so the frame that produced this reply
+				 * is offered again next round.
+				 */
+				full++;
+				took = pos - record;
+				break;
+			}
+		}
+
+		if (took != tx_tail) {
+			unsigned int h, t, rh, rt;
+
+			rc = co_manager_conet_take(handle, took, &h, &t, &rh, &rt);
+			if (!CO_OK(rc)) {
+				co_terminal_print("net-peer: consume refused"
+						  " (rc %x)\n", (int)rc);
+				break;
+			}
+		}
+	}
+
+done:
+	co_terminal_print("net-peer: %u frames seen, %u answered, %u deferred"
+			  " on a full rx ring, %u polls\n",
+			  seen, replied, full, rounds);
+
+	co_os_free(ring);
+	co_os_manager_close(handle);
+	return CO_RC(OK);
+}
+
 co_rc_t co_elf_net_take_live(const char* new_tail_arg)
 {
 	co_manager_handle_t handle;
