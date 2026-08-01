@@ -68,6 +68,12 @@ ln -sf /bin/busybox init
 
 cat > etc/inittab <<'EOF'
 ::sysinit:/etc/rc
+# A shell on the cooperative console. hvc0 is the guest end of the two rings
+# the host serves over TCP (colinux-daemon --console PORT), so this is the
+# terminal a person actually connects to. askfirst rather than respawn so it
+# prints a prompt and waits, which is also how you can tell the input
+# direction works before typing anything useful.
+hvc0::respawn:/bin/sh
 ::respawn:/bin/sh
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/bin/umount -a -r

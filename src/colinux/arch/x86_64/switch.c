@@ -46,6 +46,7 @@
 #include <colinux/arch/space.h>
 #include <colinux/kernel/kload.h>
 #include <colinux/kernel/cobd.h>
+#include <colinux/kernel/console.h>
 
 #include "mmu.h"
 #include "utils.h"
@@ -3042,6 +3043,32 @@ bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long vector)
 	return PTRUE;
 }
 
+/*
+ * Is a monitor loop running, and should it stop?
+ *
+ * The loop holds a thread inside the driver for as long as the guest runs --
+ * up to fifteen minutes with a terminal attached. Killing the daemon does not
+ * end it: TerminateProcess cannot interrupt a thread that is already in kernel
+ * mode, so the process dies, its handles close, the driver unloads, and this
+ * loop carries on executing driver code whose state has just been freed. The
+ * first thing it touches is the debug system, on the next co_debug -- which is
+ * a write into freed pool, and bugcheck 0xD5 under Driver Verifier.
+ *
+ * So unload asks the loop to stop and waits for it to say it has.
+ */
+static volatile int boot_loop_active;
+static volatile int boot_loop_abort;
+
+void co_arch_boot_abort(void)
+{
+	boot_loop_abort = 1;
+}
+
+int co_arch_boot_running(void)
+{
+	return boot_loop_active;
+}
+
 co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			    co_arch_boot_t* in, co_arch_boot_result_t* out)
 {
@@ -3300,14 +3327,34 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		 * is now measured directly rather than inferred from a count
 		 * whose cost per unit was never constant.
 		 */
+		/*
+		 * A guest nobody is talking to gets the bring-up bound; one
+		 * with a terminal attached gets long enough to be used, since
+		 * a person at a prompt is the slowest thing in the system.
+		 */
 		unsigned long long deadline = co_os_monotonic_100ns()
-			+ CO_BOOT_MAX_SECONDS * 10000000ULL;
+			+ (co_console_get_address() ? CO_BOOT_CONSOLE_SECONDS
+						    : CO_BOOT_MAX_SECONDS)
+			  * 10000000ULL;
 		unsigned long guest_crossings = 0;
 		int i;
+
+		boot_loop_abort  = 0;
+		boot_loop_active = 1;
 
 		for (i = 0; ; i++) {
 			unsigned long long batch;
 			unsigned long long host_flags;
+
+			/*
+			 * The driver is going away and this thread is inside
+			 * it. Stop now, before the next co_debug writes into a
+			 * debug system that is being torn down.
+			 */
+			if (boot_loop_abort) {
+				out->hit_deadline = PTRUE;
+				break;
+			}
 
 			if (guest_crossings >= (unsigned long)in->max_switches) {
 				out->hit_limit = PTRUE;
@@ -3634,8 +3681,17 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 					 * normally over an idle guest -- long
 					 * enough to prove the freeze is gone,
 					 * bounded enough to report.
+					 *
+					 * Unless someone is holding a terminal
+					 * open, in which case idle is not the
+					 * end of anything: a shell waiting for
+					 * a keystroke is idle by definition,
+					 * and stopping there would end the
+					 * session at the prompt. The wall-clock
+					 * deadline still bounds the run.
 					 */
-					if (out->idle_yields >= 500) {
+					if (co_console_get_address() == 0 &&
+					    out->idle_yields >= 500) {
 						co_debug("boot: %ld cooperative "
 							 "idle yields, host alive "
 							 "throughout -- stopping "
@@ -4049,6 +4105,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		}
 
 		out->guest_switches = guest_crossings;
+		boot_loop_active    = 0;
 
 		/*
 		 * The stub's ring, which is where the fine-grained trace lives

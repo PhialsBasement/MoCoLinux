@@ -118,6 +118,16 @@ extern co_rc_t co_arch_test_kernel_code(co_manager_t* manager,
  */
 extern bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long vector);
 
+/*
+ * Ask a running monitor loop to stop, and see whether one still is.
+ *
+ * Called from driver unload: the loop may be holding a thread inside the
+ * driver long after the process that started it was killed, and tearing the
+ * driver's state down underneath it is a use-after-free.
+ */
+extern void co_arch_boot_abort(void);
+extern int  co_arch_boot_running(void);
+
 #define CO_BOOT_TRACE 16	/* power of two: the loop masks with it */
 
 /*
@@ -129,6 +139,12 @@ extern bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long 
  * one that does not stop.
  */
 #define CO_BOOT_MAX_SECONDS 120
+
+/*
+ * And how long with a terminal attached, where the guest is meant to sit at a
+ * prompt doing nothing until somebody types.
+ */
+#define CO_BOOT_CONSOLE_SECONDS 900
 
 /* Booting the loaded kernel: enter co_arch_start_kernel and see how far it gets. */
 typedef struct {

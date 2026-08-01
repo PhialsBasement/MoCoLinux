@@ -199,7 +199,35 @@ static co_rc_t co_debug_writev(co_manager_debug_t *debug,
 		debug->sections_count++;
 		debug->sections_total_size += section->buffer_size;
 
+		/*
+		 * freeing is tested again here, inside the lock, and it is not
+		 * redundant with the test above.
+		 *
+		 * That one is a plain read of a flag another thread sets, so a
+		 * writer can pass it and then be descheduled while co_debug_free
+		 * empties the list and frees every section. The add that follows
+		 * links the new section against a stale sections.prev -- a
+		 * section that has been returned to the pool -- and the store to
+		 * old_prev->next is a write into freed memory. With Driver
+		 * Verifier's special pool that is bugcheck 0xD5 at exactly this
+		 * instruction, which is how it was found; without Verifier it is
+		 * silent corruption of whatever now owns that page.
+		 *
+		 * co_debug_free takes the same lock to set the flag and to tear
+		 * the list down, so a writer that gets here either arrives
+		 * before the teardown and is linked into a live list, or arrives
+		 * after and is refused.
+		 */
 		co_os_mutex_acquire_critical(debug->mutex);
+		if (debug->freeing) {
+			co_os_mutex_release_critical(debug->mutex);
+			co_os_mutex_destroy(section->mutex);
+			co_os_free(section->buffer);
+			co_os_free(section);
+			debug->sections_count--;
+			debug->sections_total_size -= CO_DEBUG_SECTION_BUFFER_START_SIZE;
+			return CO_RC(OK);
+		}
 		co_list_add_tail(&section->node, &debug->sections);
 		co_os_mutex_release_critical(debug->mutex);
 
@@ -379,6 +407,14 @@ co_rc_t co_debug_free(co_manager_debug_t *debug)
 
 	report_status("freeing all sections", debug);
 	debug->ready = PFALSE;
+
+	/*
+	 * The flag and the teardown under one lock, because writers add to this
+	 * list under the same lock. Setting the flag outside it left a window
+	 * in which a writer had already decided the debug system was alive and
+	 * was about to link a section into a list this loop was dismantling.
+	 */
+	co_os_mutex_acquire(debug->mutex);
 	debug->freeing = PTRUE;
 
 	co_list_each_entry_safe(section, section_new, &debug->sections, node) {
@@ -387,6 +423,7 @@ co_rc_t co_debug_free(co_manager_debug_t *debug)
 		section->refcount--;
 		put_section(debug, section);
 	}
+	co_os_mutex_release(debug->mutex);
 
 	co_os_wait_destroy(debug->read_wait);
 	co_os_mutex_destroy(debug->mutex);

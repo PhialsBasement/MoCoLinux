@@ -56,6 +56,9 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("                                   what the kernel printed before stopping\n");
 	co_terminal_print("      --batch N                    Instructions the guest steps per crossing\n");
 	co_terminal_print("      --cobd0 PATH                 Backing store for the guest's root device\n");
+	co_terminal_print("      --console PORT               Serve the running guest's terminal on a\n");
+	co_terminal_print("                                   TCP port. A second process: the one that\n");
+	co_terminal_print("                                   booted the guest is inside its ioctl.\n");
 	co_terminal_print("                                   (default 4096). 1 means one world switch\n");
 	co_terminal_print("                                   per instruction, which is 3.6us each.\n");
 	co_terminal_print("      --max-switches N             Stop --boot-kernel after N world switches\n");
@@ -276,6 +279,15 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		&winnt_parameters->batch,
 		winnt_parameters->batch_arg,
 		sizeof(winnt_parameters->batch_arg));
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--console",
+		&winnt_parameters->console,
+		winnt_parameters->console_arg,
+		sizeof(winnt_parameters->console_arg));
 
 	if (!CO_OK(rc))
 		return rc;

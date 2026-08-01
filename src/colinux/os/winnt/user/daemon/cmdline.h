@@ -51,6 +51,12 @@ typedef struct co_winnt_parameters {
 	 * \??\\PhysicalDrive0\Partition3. The driver opens it, so it is the
 	 * driver's idea of the path that matters, not the daemon's.
 	 */
+	/*
+	 * Serve the guest's console on this TCP port and nothing else. A second
+	 * process alongside the one running the guest; see console.c.
+	 */
+	bool_t console;
+	char   console_arg[0x20];
 	bool_t cobd0;
 	char   cobd0_arg[0x200];
 	bool_t call_kernel;

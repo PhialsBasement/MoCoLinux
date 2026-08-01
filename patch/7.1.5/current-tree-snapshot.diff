@@ -1,60 +1,41 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5 at the userspace
+Authoritative cumulative snapshot of ref/linux-7.1.5 at the terminal
 checkpoint. Generated against download/linux-7.1.5.tar.xz on 2026-08-01, the
-run where Linux booted to a shell on the M92p:
+run with an interactive shell:
 
-    mount (46) used greatest stack depth: 14016 bytes left
-    free (50) used greatest stack depth: 14008 bytes left
-    rc (45) used greatest stack depth: 13848 bytes left
-    sh (54) used greatest stack depth: 13752 bytes left
+    / # echo HELLO-FROM-XP-X64
+    HELLO-FROM-XP-X64
+    / # uname -a
+    Linux (none) 7.1.5 #39 PREEMPT_DYNAMIC x86_64 GNU/Linux
+    / # cat /proc/uptime
+    92.23 92.24
 
-Those are BusyBox processes with pids: init ran /etc/init.d/rc, which ran
-mount, free and a shell. 2341 world switches, 2108 of them the guest's own,
-1292 block transfers with none failed, 500 cooperative idle yields, and the
-host still running.
+What this adds over the userspace snapshot:
 
-What this snapshot adds over the ring-3 one:
+  * drivers/tty/hvc/hvc_colinux.c -- an hvc backend over two rings. hvc exists
+    for a console whose transport is a hypervisor rather than a UART, and asks
+    for two functions; the tty, the line discipline, job control and
+    /dev/hvc0 are the hvc core's. No interrupt, so it polls from its own
+    kthread, which suits a guest whose clock arrives at idle.
 
-  * The kernel owns its descriptor tables (idt.c, desc.h, traps.c). It builds
-    idt_table exactly as on bare metal, then co_colinux_adopt_traps() -- at
-    the end of trap_init(), when the handlers, the TSS and the IST stacks all
-    exist -- rewrites vectors 32-255 and NMI to point at the host's stubs and
-    performs the one lgdt/ltr/lidt. Exceptions are serviced by Linux, so
-    demand paging works; external interrupts still cross to Windows.
+  * co_colinux_console_io in arch/x86/kernel/early_printk.c -- the rings
+    themselves, in ordinary kernel memory rather than the passage page, which
+    has none to spare: host_temp is seven pages and all seven are spoken for.
+    The host reaches them by walking the guest's page tables, the same way it
+    reads anything else in the guest.
 
-  * The virtual interrupt flag is saved and restored across an exception
-    (irqentry_enter/exit), because a gate clears the hardware flag and the
-    iretq restores it, and the guest's flag had neither. It rides in
-    irqentry_state_t. It must NOT ride in regs->flags: that bit is what iretq
-    loads, and frames outlive handlers -- ret_from_fork hands a child its
-    parent's pt_regs -- so a cleared IF escapes into a context that never runs
-    the exit path and the guest resumes deaf. That froze the host.
+    One writer per word per direction is what makes them safe with no lock
+    between two kernels that do not share a scheduler: the host owns in_head
+    and out_tail, the guest owns in_tail and out_head. Indices free-run and
+    are masked, so full is head - tail == size with no ambiguity to resolve.
 
-  * native_irq_enable() now sti's the real flag as well as setting the virtual
-    bit (irqflags.h). Owning the IDT meant hardware started clearing the real
-    flag behind Linux's back: an interrupt gate clears IF for the length of
-    the handler, SYSCALL clears it from MSR_SYSCALL_MASK for the length of the
-    syscall. Linux believes it re-enabled -- local_irq_enable() at syscall
-    entry, cond_local_irq_enable() in fault handlers -- and a virtual-only
-    enable left the processor deaf for a whole syscall or fault. Arming the
-    real flag where Linux says interrupts are on makes the invariant repair
-    itself, and cannot break guest semantics: guest state is the virtual bit,
-    the real bit is the host's.
+  * put_chars yields to the host after writing. Without it the output sits in
+    the ring until the guest crosses for some other reason, and at a shell
+    prompt there is no other reason -- the guest is idle precisely when it has
+    just finished printing.
 
-  * handle_bug() saves and restores the virtual flag by hand. It is the one
-    exception handler that runs outside irqentry_enter/exit, and it ends in
-    raw_local_irq_disable(), balanced on real hardware by the iretq. With a
-    virtual flag nothing rebalanced it, so every WARN disabled the guest's
-    interrupts permanently -- and the kernel WARNs during boot. PID 1 died on
-    BUG_ON(irqs_disabled()) in the buffer cache looking up /sbin/init, a long
-    way from the leak.
-
-  * co_cpu_idle() returns with interrupts enabled, which is arch_cpu_idle()'s
-    contract. On real hardware each task carries its own flag in its saved
-    EFLAGS, so leaving it clear would end with the idle task; the guest's flag
-    is one global, so it would have ended with the machine.
-
-CONFIG_DEBUG_ENTRY is off in the build: its asserts ud2 on the real IF at the
-exception return paths, which is exactly the bit this design keeps set.
+The kernel command line gains console=hvc0, last, so /dev/console resolves to
+it; earlycolinux stays for the boot log, which is the only record if the guest
+dies before hvc0 is up.
 
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
@@ -546,10 +527,10 @@ index a4268c4..a043725 100644
  	asm volatile("mov %0,%%cr4": "+r" (val) : : "memory");
  
 diff --git a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
-index cba7530..425a359 100644
+index cba7530..21fde01 100644
 --- a/arch/x86/kernel/early_printk.c
 +++ b/arch/x86/kernel/early_printk.c
-@@ -370,6 +370,150 @@ static struct console early_serial_console = {
+@@ -370,6 +370,187 @@ static struct console early_serial_console = {
  	.index =	-1,
  };
  
@@ -581,6 +562,43 @@ index cba7530..425a359 100644
 +
 +struct co_console_ring *co_colinux_console_ring;
 +EXPORT_SYMBOL(co_colinux_console_ring);
++
++/*
++ * The interactive console's two rings, and why they live here rather than in
++ * the passage page.
++ *
++ * The early ring above is one-way and write-only: the guest appends, the host
++ * reads it when the run ends. A terminal needs the other direction and needs
++ * both to work while the guest is still running, which means a circular
++ * buffer in each direction rather than an append-until-full log.
++ *
++ * The passage page has no room -- host_temp is exactly seven pages and every
++ * one is spoken for (IDT, stubs, IST stack, a deliberate gap, TSS, early
++ * console, FPU) -- so this is an ordinary kernel object at an ordinary kernel
++ * address, and the host reaches it the way it reaches any other guest memory,
++ * by walking the guest's page tables. co_kload_read/co_kload_write already do
++ * exactly that, and the daemon already knows how to resolve a symbol.
++ *
++ * Each ring is a free-running head and tail with power-of-two sizes, so an
++ * index is masked rather than compared and neither side has to write the
++ * other's counter: for input the host owns in_head and the guest owns in_tail,
++ * for output the guest owns out_head and the host owns out_tail. One writer
++ * per word is what makes this safe without a lock across two worlds.
++ */
++#define CO_CONSOLE_IN_SIZE	1024
++#define CO_CONSOLE_OUT_SIZE	4096
++
++struct co_console_io {
++	volatile unsigned int in_head;		/* host writes  */
++	volatile unsigned int in_tail;		/* guest writes */
++	volatile unsigned int out_head;		/* guest writes */
++	volatile unsigned int out_tail;		/* host writes  */
++	volatile char in[CO_CONSOLE_IN_SIZE];
++	volatile char out[CO_CONSOLE_OUT_SIZE];
++};
++
++struct co_console_io co_colinux_console_io;
++EXPORT_SYMBOL(co_colinux_console_io);
 +
 +/*
 + * Set by the host before the guest runs. Distinct from the console ring so that
@@ -700,7 +718,7 @@ index cba7530..425a359 100644
  static void early_console_register(struct console *con, int keep_early)
  {
  	if (con->index != -1) {
-@@ -398,6 +542,10 @@ static int __init setup_early_printk(char *buf)
+@@ -398,6 +579,10 @@ static int __init setup_early_printk(char *buf)
  	keep = (strstr(buf, "keep") != NULL);
  
  	while (*buf != '\0') {
@@ -1782,6 +1800,165 @@ index 0000000..8277ac1
 + * initialises later.
 + */
 +device_initcall(cobd_init);
+diff --git a/drivers/tty/hvc/Makefile b/drivers/tty/hvc/Makefile
+index 98880e3..8559d02 100644
+--- a/drivers/tty/hvc/Makefile
++++ b/drivers/tty/hvc/Makefile
+@@ -5,6 +5,7 @@ obj-$(CONFIG_HVC_OLD_HVSI)	+= hvsi.o
+ obj-$(CONFIG_HVC_RTAS)		+= hvc_rtas.o
+ obj-$(CONFIG_HVC_DCC)		+= hvc_dcc.o
+ obj-$(CONFIG_HVC_DRIVER)	+= hvc_console.o
++obj-$(CONFIG_HVC_DRIVER)	+= hvc_colinux.o
+ obj-$(CONFIG_HVC_IRQ)		+= hvc_irq.o
+ obj-$(CONFIG_HVC_XEN)		+= hvc_xen.o
+ obj-$(CONFIG_HVC_IUCV)		+= hvc_iucv.o
+diff --git a/mnt/big-bricks/RProject/MoCoLinux/ref/linux-7.1.5/drivers/tty/hvc/hvc_colinux.c b/drivers/tty/hvc/hvc_colinux.c
+new file mode 100644
+index 0000000..242ec2c
+--- /dev/null
++++ b/drivers/tty/hvc/hvc_colinux.c
+@@ -0,0 +1,141 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * An interactive console for a cooperative Linux guest.
++ *
++ * The early console this port has had since the first boot is a one-way log:
++ * the guest appends bytes to a ring in the passage page and the host prints
++ * them when the run is over. That is the right instrument for finding out how
++ * far a boot got, and it is not a terminal -- nothing arrives from the other
++ * direction, and nothing appears until the guest has stopped.
++ *
++ * hvc is the natural shape for the real thing. It exists for exactly this
++ * situation, a console whose transport is a hypervisor rather than a UART, and
++ * it asks for two functions: put a buffer, get a buffer. Everything a terminal
++ * needs above that -- the tty, line discipline, job control, /dev/hvc0 -- is
++ * the hvc core's, already written and already correct.
++ *
++ * There is no interrupt to register, so hvc polls from its own kthread. That
++ * costs a wakeup every few milliseconds and needs nothing from the host, which
++ * suits a guest whose only clock is the one the host hands it at idle.
++ */
++
++#include <linux/console.h>
++#include <linux/export.h>
++#include <linux/init.h>
++#include <linux/moduleparam.h>
++#include <linux/types.h>
++
++#include "hvc_console.h"
++
++#define CO_CONSOLE_IN_SIZE	1024
++#define CO_CONSOLE_OUT_SIZE	4096
++
++struct co_console_io {
++	volatile unsigned int in_head;		/* host writes  */
++	volatile unsigned int in_tail;		/* guest writes */
++	volatile unsigned int out_head;		/* guest writes */
++	volatile unsigned int out_tail;		/* host writes  */
++	volatile char in[CO_CONSOLE_IN_SIZE];
++	volatile char out[CO_CONSOLE_OUT_SIZE];
++};
++
++extern struct co_console_io co_colinux_console_io;
++extern int co_colinux_guest;
++extern void co_colinux_yield(void);
++
++/*
++ * Bytes out.
++ *
++ * A short return tells hvc to come back with the rest, so a full ring is
++ * simply back-pressure rather than lost output -- but only while something is
++ * draining it. Nothing is: if no console client is attached the host never
++ * advances out_tail, and returning 0 forever would wedge every writer,
++ * including printk. So a completely undrained ring is treated as consumed,
++ * which loses the oldest output of an unwatched guest and keeps it running.
++ * The early console still has the boot log, and that is the thing worth
++ * keeping.
++ */
++static ssize_t hvc_co_put_chars(u32 vtermno, const u8 *buf, size_t count)
++{
++	struct co_console_io *io = &co_colinux_console_io;
++	unsigned int head = io->out_head;
++	unsigned int tail = io->out_tail;
++	size_t i;
++
++	for (i = 0; i < count; i++) {
++		if (head - tail >= CO_CONSOLE_OUT_SIZE)
++			break;
++		io->out[head & (CO_CONSOLE_OUT_SIZE - 1)] = buf[i];
++		head++;
++	}
++
++	/*
++	 * The bytes must be visible before the host is told they are there,
++	 * and the host may look at any moment from another processor.
++	 */
++	smp_wmb();
++	io->out_head = head;
++
++	/*
++	 * Hand the host the CPU so it can drain promptly. Without this the
++	 * output sits in the ring until the guest happens to cross for some
++	 * other reason, which at a shell prompt could be a long time -- the
++	 * guest is idle precisely when it has just finished printing.
++	 */
++	if (co_colinux_guest)
++		co_colinux_yield();
++
++	return i ? (ssize_t)i : (ssize_t)count;
++}
++
++static ssize_t hvc_co_get_chars(u32 vtermno, u8 *buf, size_t count)
++{
++	struct co_console_io *io = &co_colinux_console_io;
++	unsigned int tail = io->in_tail;
++	size_t i = 0;
++
++	while (i < count && tail != io->in_head) {
++		/* the byte was written before in_head advanced */
++		smp_rmb();
++		buf[i++] = io->in[tail & (CO_CONSOLE_IN_SIZE - 1)];
++		tail++;
++	}
++
++	io->in_tail = tail;
++
++	return i;
++}
++
++static const struct hv_ops hvc_co_ops = {
++	.get_chars = hvc_co_get_chars,
++	.put_chars = hvc_co_put_chars,
++};
++
++/*
++ * Claimed early so that console=hvc0 on the command line resolves, which has
++ * to happen before the tty layer exists.
++ */
++static int __init hvc_co_console_init(void)
++{
++	if (!co_colinux_guest)
++		return 0;
++
++	return hvc_instantiate(0, 0, &hvc_co_ops);
++}
++console_initcall(hvc_co_console_init);
++
++static int __init hvc_co_init(void)
++{
++	struct hvc_struct *hp;
++
++	if (!co_colinux_guest)
++		return 0;
++
++	/* no interrupt: hvc polls, which is all this transport can offer */
++	hp = hvc_alloc(0, 0, &hvc_co_ops, 128);
++	if (IS_ERR(hp))
++		return PTR_ERR(hp);
++
++	return 0;
++}
++device_initcall(hvc_co_init);
 diff --git a/include/linux/console.h b/include/linux/console.h
 index 5520e44..08b07d0 100644
 --- a/include/linux/console.h
