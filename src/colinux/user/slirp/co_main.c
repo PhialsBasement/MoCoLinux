@@ -32,6 +32,7 @@
 
 typedef struct start_parameters {
 	bool_t show_help;
+	bool_t selftest;
 	unsigned int index;
 	co_id_t instance;
 } start_parameters_t;
@@ -45,6 +46,7 @@ static co_user_monitor_t *g_monitor_handle;
 
 /* from slirp.c */
 extern struct in_addr client_addr;
+extern struct in_addr alias_addr;
 
 static co_rc_t monitor_receive(co_reactor_user_t user, unsigned char *buffer, unsigned long size)
 {
@@ -68,6 +70,34 @@ static co_rc_t monitor_receive(co_reactor_user_t user, unsigned char *buffer, un
 	return CO_RC(OK);
 }
 
+/*
+ * Self-test mode.
+ *
+ * This slirp has never executed on Win64. It is 2004 code whose protocol
+ * structures are overlays on wire format, so a compiler that lays a bitfield
+ * out differently, or a SIZEOF_CHAR_P that disagrees with the pointer width,
+ * does not produce an error -- it produces packets that parse as nonsense,
+ * silently, in a NAT bridged to a guest kernel. slirp.c now asserts the six
+ * structure sizes at compile time, but a size being right is not the same as
+ * the code working.
+ *
+ * So it runs here first: in its own process, fed frames from memory, replies
+ * checked byte by byte, before any of it goes near the driver or a guest. A
+ * crash kills a test program and nothing else.
+ *
+ * ARP and DHCP are the two exchanges worth having and neither needs a network.
+ * ARP is answered inside slirp.c without touching the IP path, which makes it
+ * the narrowest "is slirp alive" question there is. DHCP is the interesting
+ * one: a DISCOVER traverses ip_input, udp_input and bootp_input, so it
+ * exercises struct ip, struct udphdr and struct udpiphdr in both directions --
+ * the layouts that were wrong, and what pacman needs first, since a guest with
+ * no lease resolves no names.
+ */
+static bool_t	     selftest_active;
+static unsigned char selftest_frame[16][1600];
+static int	     selftest_len[16];
+static int	     selftest_count;
+
 int slirp_can_output(void)
 {
 	return 1;
@@ -75,6 +105,15 @@ int slirp_can_output(void)
 
 void slirp_output(const uint8_t *pkt, int pkt_len)
 {
+	if (selftest_active) {
+		if (selftest_count < 16 && pkt_len > 0 && pkt_len <= 1600) {
+			memcpy(selftest_frame[selftest_count], pkt, pkt_len);
+			selftest_len[selftest_count] = pkt_len;
+			selftest_count++;
+		}
+		return;
+	}
+
 	/* Received packet from Slirp */
 	struct {
 		co_message_t message;
@@ -94,6 +133,175 @@ void slirp_output(const uint8_t *pkt, int pkt_len)
 
 	g_monitor_handle->reactor_user->send(g_monitor_handle->reactor_user,
 					     (unsigned char *)&message, sizeof(message));
+}
+
+/*
+ * A DHCP DISCOVER, built from byte offsets rather than from slirp's own
+ * structs. Those structs are the thing under test; using them to build the
+ * input would hide exactly the layout errors this is looking for. If these
+ * offsets and slirp's idea of a header ever disagree, that disagreement is the
+ * finding.
+ */
+static int selftest_build_discover(unsigned char *f, const unsigned char *mac)
+{
+	int udp_len = 8 + 244;
+	int ip_len  = 20 + udp_len;
+	unsigned long sum = 0;
+	int i;
+
+	memset(f, 0, 14 + ip_len);
+
+	memset(f + 0, 0xff, 6);
+	memcpy(f + 6, mac, 6);
+	f[12] = 0x08; f[13] = 0x00;
+
+	f[14] = 0x45;
+	f[16] = (unsigned char)(ip_len >> 8);
+	f[17] = (unsigned char)(ip_len & 0xff);
+	f[22] = 64;
+	f[23] = 17;
+	memset(f + 30, 0xff, 4);
+
+	for (i = 0; i < 20; i += 2)
+		sum += ((unsigned long)f[14 + i] << 8) | f[15 + i];
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	sum = ~sum & 0xffff;
+	f[24] = (unsigned char)(sum >> 8);
+	f[25] = (unsigned char)(sum & 0xff);
+
+	f[34] = 0x00; f[35] = 68;
+	f[36] = 0x00; f[37] = 67;
+	f[38] = (unsigned char)(udp_len >> 8);
+	f[39] = (unsigned char)(udp_len & 0xff);
+
+	f[42] = 1;
+	f[43] = 1;
+	f[44] = 6;
+	f[46] = 0x12; f[47] = 0x34; f[48] = 0x56; f[49] = 0x78;
+	memcpy(f + 70, mac, 6);
+	f[278] = 0x63; f[279] = 0x82;
+	f[280] = 0x53; f[281] = 0x63;
+	f[282] = 53; f[283] = 1; f[284] = 1;
+	f[285] = 0xff;
+
+	return 14 + ip_len;
+}
+
+static co_rc_t co_slirp_selftest(void)
+{
+	static const unsigned char mac[6] = { 0x02, 0xc0, 0x11, 0x00, 0x00, 0x01 };
+	unsigned char frame[1600];
+	int len, i, failures = 0;
+	void *probe;
+
+	selftest_active = PTRUE;
+
+	/*
+	 * Addresses first, because everything else rests on them. slirp keeps
+	 * pointers in the u_int32_t link fields inside its wire structures, so
+	 * this process has to be confined to 32 bits of address space -- which
+	 * is why the daemon is linked at 0x400000 with its
+	 * large-address-aware flag cleared. If either half of that did not
+	 * happen, it fails here, in a report, instead of as corruption in the
+	 * middle of a download.
+	 */
+	probe = malloc(4096);
+	co_terminal_print("addresses (all must fit in 32 bits):\n");
+	co_terminal_print("  a static (client_addr)   %p\n", (void *)&client_addr);
+	co_terminal_print("  a heap block             %p\n", probe);
+	co_terminal_print("  code (this function)     %p\n", (void *)co_slirp_selftest);
+
+	if ((unsigned long long)(size_t)&client_addr >> 32 ||
+	    (unsigned long long)(size_t)probe >> 32 ||
+	    (unsigned long long)(size_t)co_slirp_selftest >> 32) {
+		co_terminal_print("  FAIL: an address is above 4 GB. slirp's 32-bit queue\n");
+		co_terminal_print("        links cannot hold it -- check the daemon was\n");
+		co_terminal_print("        linked --image-base 0x400000 and had\n");
+		co_terminal_print("        IMAGE_FILE_LARGE_ADDRESS_AWARE cleared.\n");
+		failures++;
+	} else {
+		co_terminal_print("  ok\n");
+	}
+	free(probe);
+
+	slirp_init();
+	co_terminal_print("slirp_init() returned\n");
+
+	/* ARP: answered in slirp.c, no IP path involved. */
+	selftest_count = 0;
+	memset(frame, 0, sizeof(frame));
+	memset(frame + 0, 0xff, 6);
+	memcpy(frame + 6, mac, 6);
+	frame[12] = 0x08; frame[13] = 0x06;
+	frame[14] = 0x00; frame[15] = 0x01;
+	frame[16] = 0x08; frame[17] = 0x00;
+	frame[18] = 6;    frame[19] = 4;
+	frame[20] = 0x00; frame[21] = 0x01;
+	memcpy(frame + 22, mac, 6);
+	memcpy(frame + 28, &client_addr, 4);
+	memcpy(frame + 38, &alias_addr, 4);
+	slirp_input(frame, 42);
+
+	if (selftest_count == 1 && selftest_len[0] == 42 &&
+	    selftest_frame[0][20] == 0 && selftest_frame[0][21] == 2 &&
+	    memcmp(selftest_frame[0] + 28, &alias_addr, 4) == 0) {
+		co_terminal_print("ARP:  reply from %02x:%02x:%02x:%02x:%02x:%02x  ok\n",
+				  selftest_frame[0][22], selftest_frame[0][23],
+				  selftest_frame[0][24], selftest_frame[0][25],
+				  selftest_frame[0][26], selftest_frame[0][27]);
+	} else {
+		co_terminal_print("ARP:  FAIL -- %d frames out", selftest_count);
+		if (selftest_count)
+			co_terminal_print(", first %d bytes, opcode %d",
+					  selftest_len[0],
+					  (selftest_frame[0][20] << 8) | selftest_frame[0][21]);
+		co_terminal_print("\n");
+		failures++;
+	}
+
+	/*
+	 * DHCP: through ip_input, udp_input and bootp_input, the path that
+	 * reads struct ip and struct udpiphdr. A wrong layout here is the bug
+	 * that presents as "the guest never gets a lease".
+	 */
+	selftest_count = 0;
+	len = selftest_build_discover(frame, mac);
+	slirp_input(frame, len);
+
+	if (selftest_count >= 1 && selftest_len[0] >= 286 &&
+	    selftest_frame[0][42] == 2 &&
+	    selftest_frame[0][282] == 53 && selftest_frame[0][284] == 2) {
+		const unsigned char *y = selftest_frame[0] + 58;
+
+		co_terminal_print("DHCP: OFFER of %d.%d.%d.%d, %d bytes  ok\n",
+				  y[0], y[1], y[2], y[3], selftest_len[0]);
+	} else {
+		co_terminal_print("DHCP: FAIL -- %d frames out", selftest_count);
+		if (selftest_count)
+			co_terminal_print(", first %d bytes, op %d, dhcp type %d",
+					  selftest_len[0], selftest_frame[0][42],
+					  selftest_frame[0][284]);
+		co_terminal_print("\n");
+		failures++;
+	}
+
+	/* On failure, the bytes themselves, because a verdict is not evidence. */
+	for (i = 0; failures && i < selftest_count; i++) {
+		int j;
+
+		co_terminal_print("  frame %d (%d bytes):", i, selftest_len[i]);
+		for (j = 0; j < selftest_len[i] && j < 64; j++)
+			co_terminal_print("%s%02x", (j % 16) ? " " : "\n    ",
+					  selftest_frame[i][j]);
+		co_terminal_print("\n");
+	}
+
+	co_terminal_print("slirp selftest: %s\n",
+			  failures ? "FAILED" : "all checks passed");
+
+	selftest_active = PFALSE;
+	return failures ? CO_RC(ERROR) : CO_RC(OK);
 }
 
 static co_rc_t wait_loop(void)
@@ -140,6 +348,9 @@ static void syntax(void)
 	co_terminal_print("  colinux-slirp-net-daemon -i pid -u unit [-h]\n");
 	co_terminal_print("\n");
 	co_terminal_print("    -h                      Show this help text\n");
+	co_terminal_print("    -t                      Self-test: feed slirp canned ARP and DHCP\n");
+	co_terminal_print("                            frames and check its replies. Needs no guest,\n");
+	co_terminal_print("                            no monitor and no network.\n");
 	co_terminal_print("    -i pid                  coLinux instance ID to connect to\n");
 	co_terminal_print("    -u unit                 Network device index number (0 for eth0, 1 for\n");
 	co_terminal_print("                            eth1, etc.)\n");
@@ -225,6 +436,17 @@ co_slirp_parse_args(co_command_line_params_t cmdline, start_parameters_t *parame
 	if (!CO_OK(rc))
 		return rc;
 
+	rc = co_cmdline_params_argumentless_parameter(cmdline, "-t", &parameters->selftest);
+	if (!CO_OK(rc))
+		return rc;
+
+	/*
+	 * The self-test takes no instance and no unit, so it has to be
+	 * answered before the checks that insist on both.
+	 */
+	if (parameters->selftest)
+		return CO_RC(OK);
+
 	if (parameters->show_help)
 		return CO_RC(OK);
 
@@ -283,6 +505,15 @@ co_rc_t co_slirp_main(int argc, char *argv[])
 	if (g_daemon_parameters.show_help) {
 		syntax();
 		goto out;
+	}
+
+	/*
+	 * Before the mutex, the reactor or the monitor: the self-test needs
+	 * none of them and has to run on a box with no guest at all.
+	 */
+	if (g_daemon_parameters.selftest) {
+		rc = co_slirp_selftest();
+		goto out_params;
 	}
 
 	co_debug("conet-slirp-daemon: create mutex");

@@ -193,6 +193,16 @@ int inet_aton _P((const char *cp, struct in_addr *ia));
 
 #include "debug.h"
 
+/*
+ * struct mbuf is used by prototypes in the protocol headers below, and mbuf.h
+ * comes after them. With SIZEOF_CHAR_P 4 the mbufp_32 typedef in tcp_var.h
+ * happened to declare it in time; with 8 that typedef is a u_int32_t and the
+ * struct first appears inside a prototype's own scope, which GCC 14 and later
+ * reject outright. Declare it here rather than depend on a typedef's side
+ * effect.
+ */
+struct mbuf;
+
 #include "ip.h"
 #include "tcp.h"
 #include "tcp_timer.h"

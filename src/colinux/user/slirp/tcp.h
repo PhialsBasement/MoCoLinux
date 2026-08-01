@@ -53,16 +53,17 @@ extern struct socket *tcp_last_so;
  * TCP header.
  * Per RFC 793, September, 1981.
  */
+/* u_int8_t for the nibble pair, not u_int -- see struct ip in ip.h. */
 struct tcphdr {
 	u_int16_t	th_sport;		/* source port */
 	u_int16_t	th_dport;		/* destination port */
 	tcp_seq	th_seq;			/* sequence number */
 	tcp_seq	th_ack;			/* acknowledgement number */
 #ifdef WORDS_BIGENDIAN
-	u_int	th_off:4,		/* data offset */
+	u_int8_t th_off:4,		/* data offset */
 		th_x2:4;		/* (unused) */
 #else
-	u_int	th_x2:4,		/* (unused) */
+	u_int8_t th_x2:4,		/* (unused) */
 		th_off:4;		/* data offset */
 #endif
 	u_int8_t	th_flags;
