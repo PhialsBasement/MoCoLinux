@@ -14,7 +14,6 @@ running
 :: Synchronizing package databases...
  core downloading...
  extra downloading...
-[root@mocolinux ~]# pacman -S nano
 ```
 
 That is Arch Linux with systemd, an ext4 root and a working network connection,
@@ -127,7 +126,12 @@ a pointer at all.
 
 ## Building
 
-Needs a cross toolchain (`mingw-w64-gcc`, `binutils`) and a Linux kernel tree.
+Needs a cross toolchain (`mingw-w64-gcc`, `binutils`) and two kernel trees, which
+is less odd than it looks: the Windows side still builds against 2.6.33 headers,
+because the passage-page ABI is a header inside the guest kernel tree and the
+driver includes it, while the guest itself is 7.1.5. The 2.6.33 tree is a header
+source and nothing else — no part of it is built or run.
+
 See `doc/building-modern` for the full recipe; briefly:
 
 ```sh
@@ -164,8 +168,18 @@ ip route add default via 10.0.2.2
 echo nameserver 10.0.2.3 > /etc/resolv.conf
 ```
 
-`tools/mkrootfs.sh` builds an ext4 root image with BusyBox in it, and
 `tools/coterm.py` is a client for the console port.
+
+On root filesystems, plainly: `tools/mkrootfs.sh` builds the **minimal BusyBox**
+image, which is what the early bring-up used and what `--init /bin/sh` is for.
+The **Arch root in the transcript above was built by hand** from
+`download/archlinux-bootstrap-x86_64.tar.zst` — unpacked into an image with
+`mke2fs -d`, then given a populated pacman keyring, a mirror, a network unit and
+`systemd-networkd` enabled, all through the guest's own terminal. Nothing in the
+tree reproduces that yet, which is the first entry under "The Arch root
+filesystem is not reproducible" in `TODO`; the keyring in particular is not
+optional, since without `pacman-key --populate archlinux` every package fails
+verification as untrusted even though its signature is good.
 
 The processes are separate on purpose: the one running the guest is inside a
 single `ioctl` for as long as the guest lives, so it cannot also service a
