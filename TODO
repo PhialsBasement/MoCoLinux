@@ -87,6 +87,103 @@
    * Some iptables functionality not working? (see ML)
    * Spurious 'Floating Point Exception' with an athlon optimised vmlinux.
 
+ * Guest kernel config:
+   * CONFIG_SECURITY_LANDLOCK is off, so pacman 7 refuses to download anything:
+     it sandboxes downloads with Landlock and an alpm user, and without the
+     kernel support it fails before fetching. --disable-sandbox works around it
+     and should not have to. Turning it on is a config change and a vmlinux
+     rebuild, with no host risk.
+   * "x86/mm: Checked W+X mappings: FAILED, 125045 W+X pages found" on every
+     boot, from the kernel's own page-table auditor. The host builds the direct
+     map with _PAGE_RW and no NX, so every page of it is writable and
+     executable. It is harmless for a guest that runs at ring 0 anyway -- it has
+     no privilege boundary to protect -- but nothing in the tree says so, and it
+     reads like a security finding to whoever sees it next. Either mark the map
+     NX where the guest never executes, or write down why it is not worth doing.
+
+ * The Arch root filesystem is not reproducible:
+   * tools/mkrootfs.sh builds the busybox root (root.img) and nothing builds
+     root-arch.img. That image is a bootstrap tarball plus a pile of changes
+     made by hand through the terminal: the pacman keyring initialised and
+     populated (pacman-key --init && --populate archlinux, without which every
+     package fails signature verification as TRUST_UNDEFINED even though the
+     signature is good), a Server line in /etc/pacman.d/mirrorlist, the systemd
+     OSC-context symlink removed and its tmpfiles snippet masked,
+     /etc/systemd/network/10-eth0.network, and systemd-networkd enabled. None of
+     that survives losing the image.
+   * So: a mkarchrootfs.sh that goes from download/archlinux-bootstrap to a
+     bootable image with all of the above applied. Note while writing it that
+     the image cannot be pushed to the box afterwards -- 1.2 GB through the
+     transfer agent OOMs a 4 GB machine, because the agent buffers and deploy.sh
+     then reads it back to verify. Build it there or accept a reboot.
+   * And a rule that cost an evening: changes made inside a running guest are
+     only on disk after a clean poweroff. stop.bat and the run deadline do not
+     unmount, so a file written seconds earlier comes back as a journaled inode
+     with no data -- zero bytes, which looks like the write never happened.
+
+ * The box-side scripts are not in the tree:
+   * deploy.sh, run-arch.bat, run-linux.bat, console.bat, net.bat, stop.bat,
+     reboot.bat, dbg-start.bat, verifier-on/off.bat and getdumps.bat all live in
+     dist-x64/, which is outside the repository. Every one of them encodes
+     something learned the hard way -- why the debug stream must be launched
+     detached, why shutdown.exe has to be called by full path, why a deploy
+     verifies by reading files back -- and none of it is version controlled.
+     tools/harden-m92p.bat is in the tree; the rest should be too.
+
+ * KREAD has no lock against teardown:
+   * CO_MANAGER_IOCTL_KREAD walks the guest's page tables with no protection
+     against co_kload_free destroying the address space underneath it. It is
+     safe today only because its one caller is the boot daemon itself,
+     sequenced before its own KLOAD_END. Any second process using it would be
+     the use-after-free that the CONET path needed net_lock to avoid. Either
+     give it the same retire-under-lock treatment or document that it is
+     single-caller by construction.
+
+ * i386 does not build:
+   * src/colinux/kernel/kload.c uses CO_ARCH_PGD_INDEX and _PAGE_GLOBAL, which
+     exist only in arch/x86_64/mmu.h, so the i386 target has not compiled since
+     f2ed1128. Nothing in this port needs i386, but "the 32-bit build still
+     works" was a stated property of the early milestones and it quietly stopped
+     being true. Either exclude the x86-64-only kernel loader from that build or
+     drop the claim.
+
+ * Consoles (this port's, not the 2004 ones):
+   * colinux-daemon --console serves one client at a time: listen(backlog 1) and
+     a single accept loop, so a second connection is reset rather than refused
+     with a reason, and there is no way to look at a guest somebody else is
+     already attached to.
+   * colinux-console-nt cannot attach to an x86-64 guest at all. It opens a
+     monitor instance (co_user_monitor_open with CO_MODULE_CONSOLE) and expects
+     screen-buffer updates from the guest's coconsole driver; this port creates
+     no monitor instance and the guest uses hvc, which is a byte stream. Making
+     it work means either porting the monitor path and coconsole, or teaching it
+     to read the CONSOLE ioctl and parse VT sequences itself.
+
+ * One-click bring-up:
+   * Starting a networked guest currently takes three windows on the box and
+     four commands inside it: run-arch.bat, console.bat, net.bat, and then
+     ip link / ip addr / ip route / resolv.conf by hand. Every one of those is
+     a step that can be forgotten or done in the wrong order, and the failure
+     when the guest has no address is "cannot resolve host", which reads as a
+     DNS or a slirp problem rather than a missing step.
+   * The guest half is done: /etc/systemd/network/10-eth0.network plus
+     systemd-networkd enabled, so a booted guest addresses itself. That lives
+     in root-arch.img, which means it is not reproducible from the tree --
+     tools/mkrootfs.sh should write it when it builds an image, or there should
+     be a documented way to reapply it.
+   * The host half wants one script that installs the driver if it is not
+     installed, refuses if a guest is already running (run-boot.sh has that
+     guard; run-arch.bat does not, and going around it cost a box), starts the
+     debug stream, then launches the boot, the console and the net bridge in
+     their own windows. `start /min` per daemon, in the order that does not
+     wedge the transfer agent -- see dbg-start.bat's notes on why the stream
+     must be launched detached and never waited on.
+   * And the two things that still need a flag or an edit before pacman works:
+     CONFIG_SECURITY_LANDLOCK in the guest kernel (pacman 7 sandboxes downloads
+     and refuses without it), and a Server line in
+     /etc/pacman.d/mirrorlist, which the Arch bootstrap ships entirely
+     commented out.
+
  * Debug daemon, after networking and pacman -S work:
    * It needs a clean shutdown. `colinux-debug-daemon -d` holds a handle on
      \\.\CoLinuxDriver forever and blocks inside a co_debug_read ioctl waiting
