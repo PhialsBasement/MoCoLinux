@@ -345,6 +345,190 @@ co_rc_t co_elf_dump(const char *filename)
 }
 
 /*
+ * Read the guest's network rings out of guest memory, after the run.
+ *
+ * The guest driver (drivers/net/conet_colinux.c) keeps two byte rings in
+ * co_colinux_net_io and the layout is ABI: four u32 indices at +0, the TX
+ * ring at +0x10, the RX ring after it. Records are a 32-bit length, the
+ * frame, padding to a four-byte boundary; every record starts aligned so the
+ * length word never straddles the wrap.
+ *
+ * This runs where the printk-ring decoder runs: in the boot daemon, after the
+ * run, before KLOAD_END. That placement is the safety argument, not a
+ * convenience. CO_MANAGER_IOCTL_KREAD takes no lock against teardown -- its
+ * only caller has always been this process, sequenced before its own
+ * KLOAD_END, and a *cross-process* reader could race the space being freed
+ * and walk freed page tables, which in a driver is a bugcheck. So the rings
+ * are decoded here, on the same thread, where the race cannot be expressed.
+ * A live reader is R3's business, and it arrives together with the lock that
+ * makes it legal.
+ *
+ * Offsets are numbers here rather than a shared struct, for the reason the
+ * printk decoder gives: this is a Win64 program parsing an LP64 kernel's
+ * memory, and the two compilers must not be allowed to disagree.
+ */
+#define CO_NETIO_TX_HEAD	0x00
+#define CO_NETIO_TX_TAIL	0x04
+#define CO_NETIO_RX_HEAD	0x08
+#define CO_NETIO_RX_TAIL	0x0c
+#define CO_NETIO_TX		0x10
+#define CO_NETIO_TX_SIZE	(128 * 1024)
+#define CO_NETIO_RX_SIZE	(128 * 1024)
+#define CO_NETIO_MAX_FRAME	1514
+
+static unsigned int co_net_le32(const unsigned char* p)
+{
+	return (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
+	       ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+}
+
+static void co_net_describe_frame(const unsigned char* f, unsigned int len)
+{
+	unsigned int ethertype;
+
+	if (len < 14) {
+		co_terminal_print("      (runt: shorter than an ethernet header)\n");
+		return;
+	}
+
+	ethertype = ((unsigned int)f[12] << 8) | f[13];
+	co_terminal_print("      dst %02x:%02x:%02x:%02x:%02x:%02x"
+			  "  src %02x:%02x:%02x:%02x:%02x:%02x  type 0x%04x\n",
+			  f[0], f[1], f[2], f[3], f[4], f[5],
+			  f[6], f[7], f[8], f[9], f[10], f[11], ethertype);
+
+	if (ethertype == 0x0806 && len >= 42) {
+		unsigned int op = ((unsigned int)f[20] << 8) | f[21];
+
+		co_terminal_print("      ARP %s  sender %u.%u.%u.%u"
+				  " (%02x:%02x:%02x:%02x:%02x:%02x)"
+				  "  target %u.%u.%u.%u\n",
+				  op == 1 ? "who-has" : op == 2 ? "reply" : "op?",
+				  f[28], f[29], f[30], f[31],
+				  f[22], f[23], f[24], f[25], f[26], f[27],
+				  f[38], f[39], f[40], f[41]);
+	} else if (ethertype == 0x86dd) {
+		co_terminal_print("      IPv6%s\n",
+				  (len >= 54 && f[20] == 58) ? " (ICMPv6)" : "");
+	} else if (ethertype == 0x0800) {
+		co_terminal_print("      IPv4\n");
+	}
+}
+
+static void co_dump_net_rings(co_manager_handle_t handle, co_elf_data_t* pl)
+{
+	co_elf_symbol_t* s_io = co_get_symbol_by_name(pl, "co_colinux_net_io");
+	unsigned long long io_va;
+	unsigned char hdr[16];
+	unsigned char* ring;
+	unsigned int tx_head, tx_tail, rx_head, rx_tail;
+	unsigned int used, pos, frames = 0;
+	co_rc_t rc;
+
+	if (!s_io)
+		return;		/* a kernel without the conet driver */
+	io_va = co_elf_get_symbol_value(s_io);
+
+	rc = co_manager_kread(handle, io_va, hdr, sizeof(hdr));
+	if (!CO_OK(rc)) {
+		co_terminal_print("  net rings unreadable at 0x%016llx (rc %x)\n",
+				  io_va, (int)rc);
+		return;
+	}
+
+	tx_head = co_net_le32(hdr + CO_NETIO_TX_HEAD);
+	tx_tail = co_net_le32(hdr + CO_NETIO_TX_TAIL);
+	rx_head = co_net_le32(hdr + CO_NETIO_RX_HEAD);
+	rx_tail = co_net_le32(hdr + CO_NETIO_RX_TAIL);
+
+	co_terminal_print("  co_colinux_net_io at 0x%016llx\n", io_va);
+	co_terminal_print("  tx head %u  tail %u  (%u bytes in the ring)\n",
+			  tx_head, tx_tail, tx_head - tx_tail);
+	co_terminal_print("  rx head %u  tail %u  (%u bytes in the ring)\n",
+			  rx_head, rx_tail, rx_head - rx_tail);
+
+	used = tx_head - tx_tail;
+	if (used > CO_NETIO_TX_SIZE) {
+		co_terminal_print("  tx indices are not a ring state -- desynchronised\n");
+		return;
+	}
+	if (used == 0)
+		goto rx_check;
+
+	ring = (unsigned char*)co_os_malloc(CO_NETIO_TX_SIZE);
+	if (!ring)
+		return;
+
+	/*
+	 * The whole TX array, in pieces the ioctl's staging buffer keeps
+	 * small. Records wrap; masks are cheaper to apply to a local copy
+	 * than to scatter across reads.
+	 */
+	{
+		unsigned int chunk = 4096, off;
+
+		for (off = 0; off < CO_NETIO_TX_SIZE; off += chunk) {
+			rc = co_manager_kread(handle, io_va + CO_NETIO_TX + off,
+					      ring + off, chunk);
+			if (!CO_OK(rc)) {
+				co_terminal_print("  tx ring read failed at +%u (rc %x)\n",
+						  off, (int)rc);
+				co_os_free(ring);
+				return;
+			}
+		}
+	}
+
+	for (pos = tx_tail; pos != tx_head; frames++) {
+		unsigned int off = pos & (CO_NETIO_TX_SIZE - 1);
+		unsigned int len = co_net_le32(ring + off);
+		unsigned int record = 4 + ((len + 3) & ~3u);
+		unsigned int i, first;
+		unsigned char frame[CO_NETIO_MAX_FRAME];
+
+		if (len == 0 || len > CO_NETIO_MAX_FRAME ||
+		    record > tx_head - pos) {
+			co_terminal_print("  RECORD %u at +%u IS NOT A FRAME: len %u"
+					  " with %u bytes left -- ring corrupt\n",
+					  frames, off, len, tx_head - pos);
+			co_os_free(ring);
+			return;
+		}
+
+		off = (off + 4) & (CO_NETIO_TX_SIZE - 1);
+		first = len < CO_NETIO_TX_SIZE - off ? len : CO_NETIO_TX_SIZE - off;
+		memcpy(frame, ring + off, first);
+		if (first < len)
+			memcpy(frame + first, ring, len - first);
+
+		co_terminal_print("\n  frame %u, %u bytes:\n", frames, len);
+		for (i = 0; i < len; i += 16) {
+			unsigned int j, n = (len - i < 16) ? len - i : 16;
+			char line[3 * 16 + 1];
+
+			for (j = 0; j < n; j++)
+				co_snprintf(line + 3 * j, 4, "%02x ", frame[i + j]);
+			co_terminal_print("      %s\n", line);
+		}
+		co_net_describe_frame(frame, len);
+
+		pos += record;
+	}
+
+	co_os_free(ring);
+	co_terminal_print("\n  %u frames, %u bytes, and they account for the ring"
+			  " exactly: pos == tx_head\n", frames, used);
+
+rx_check:
+	if (rx_head == 0 && rx_tail == 0)
+		co_terminal_print("  rx ring untouched (head == tail == 0),"
+				  " as it must be while no host writes it\n");
+	else
+		co_terminal_print("  RX RING NOT PRISTINE -- nothing should have"
+				  " written it yet\n");
+}
+
+/*
  * Load a kernel image into a guest address space in the driver, then enter it.
  *
  * The sections go over in chunks rather than whole: a section can be megabytes
@@ -1702,6 +1886,15 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 */
 		co_terminal_print("\n  ------------------ the kernel's own log ------------------\n");
 		co_dump_kernel_log(handle, pl);
+		co_terminal_print("  -----------------------------------------------------------\n");
+
+		/*
+		 * The network rings, same arrangement as the log above: the
+		 * guest is stopped, its memory is mapped until KLOAD_END, and
+		 * this thread is the one that will call it.
+		 */
+		co_terminal_print("\n  -------------------- the network rings --------------------\n");
+		co_dump_net_rings(handle, pl);
 		co_terminal_print("  -----------------------------------------------------------\n");
 
 		goto out_end;
