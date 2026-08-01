@@ -67,7 +67,19 @@ struct co_osdep_manager {
 	Irp->CancelRoutine = func;
 
 
+/*
+ * Stamped at open, cleared immediately before the block is freed.
+ *
+ * This exists because the block's address is what ExFreePool faults on: five
+ * bugchecks in one evening, all 0x50, all reading pool metadata from
+ * co_os_manager_userspace_close's call to co_os_free. A pointer that does not
+ * carry this word is not a block this driver allocated, and handing it to the
+ * pool allocator ends the machine and the investigation together.
+ */
+#define CO_OPEN_OS_MAGIC 0x4f50454e4f534d31ULL	/* "OPENOSM1" */
+
 struct co_manager_open_desc_os {
+	unsigned long long magic;
 	PIRP irp;
 };
 

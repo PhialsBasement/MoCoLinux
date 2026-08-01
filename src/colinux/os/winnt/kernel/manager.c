@@ -72,29 +72,146 @@ co_rc_t co_os_manager_userspace_open(co_manager_open_desc_t opened)
 		return CO_RC(OUT_OF_MEMORY);
 
 	memset(opened->os, 0, sizeof(*opened->os));
+	opened->os->magic = CO_OPEN_OS_MAGIC;
+
+	/*
+	 * Both pointers, at every open, so the close-side report below can be
+	 * paired with the open that produced it: a close naming a block no
+	 * open ever announced is a stale or wild pointer, and a close naming
+	 * one that a previous close already released is a double free. Neither
+	 * is distinguishable from the other without this line.
+	 */
+	co_debug("open: desc %p os %p", opened, opened->os);
 
 	return CO_RC(OK);
 }
 
-void co_os_manager_userspace_close(co_manager_open_desc_t opened)
+/*
+ * Take ownership of the pended IRP, or find that somebody else already has.
+ *
+ * The pointer must be read and cleared inside one hold of the cancel spin
+ * lock. Reading it outside the lock and clearing it inside -- which is what
+ * all three consumers below used to do -- lets two paths observe the same
+ * non-NULL IRP before either takes the lock. They then serialize, both clear
+ * it (the second harmlessly), and both call IoCompleteRequest on it. The
+ * second completion walks an IRP the I/O manager has already freed: bugcheck
+ * 0x50, a read of unmapped pool, faulting instruction inside ntoskrnl with
+ * the caller of this one frame below it.
+ *
+ * That is not hypothetical. Three dumps in one day carry the identical
+ * signature -- 0x50, parameter 2 zero (a read), parameter 3
+ * ntoskrnl+0xaf8a3 -- and the stack of the last one resolves to
+ * dispatch_wrapper -> co_manager_close -> co_os_manager_userspace_close.
+ * Every client that exits with a read pending races this, so a daemon that
+ * opens the driver, polls, and quits is enough; a test harness that does it
+ * six hundred times makes it certain.
+ *
+ * manager_irp_cancel is called by the I/O manager with this same lock held
+ * and clears the pointer as well, so the lock is the only thing that can
+ * decide which path owns the completion. Completing happens after the
+ * release, because IoAcquireCancelSpinLock raises to DISPATCH_LEVEL and the
+ * work that follows a completion here takes mutexes.
+ */
+static PIRP co_os_claim_pended_irp(co_manager_open_desc_t opened)
 {
+	co_manager_open_desc_os_t os = opened->os;
 	KIRQL irql;
 	PIRP Irp;
 
-	Irp = opened->os->irp;
-	if (Irp) {
-		IoAcquireCancelSpinLock(&irql);
-		fixme_IoSetCancelRoutine(Irp, NULL);
-		opened->os->irp = NULL;
-		IoReleaseCancelSpinLock(irql);
+	/*
+	 * The same three questions the close path asks, for the same reason:
+	 * reading ->irp out of a block that is not ours faults with the cancel
+	 * spin lock held, which is a worse place to fault than most.
+	 */
+	if (!os || ((ULONG_PTR)os & 0xf) != 0 || !MmIsAddressValid((PVOID)os) ||
+	    os->magic != CO_OPEN_OS_MAGIC) {
+		co_debug_error("claim: desc %p os %p is not usable -- "
+			       "not touching its IRP", opened, os);
+		return NULL;
+	}
 
+	IoAcquireCancelSpinLock(&irql);
+	Irp = os->irp;
+	if (Irp) {
+		fixme_IoSetCancelRoutine(Irp, NULL);
+		os->irp = NULL;
+	}
+	IoReleaseCancelSpinLock(irql);
+
+	return Irp;
+}
+
+/*
+ * Is this a block this driver allocated, and is it still allocated?
+ *
+ * Asked before the pool allocator is asked, because the pool allocator's way
+ * of answering is a bugcheck. Three tests, cheapest first: pool blocks are
+ * 16-byte aligned on x86-64, so an unaligned pointer is not one; the page has
+ * to be resident, or reading the magic faults instead of reporting; and the
+ * magic itself says whether the block is ours and live.
+ *
+ * A refusal leaks eight bytes of non-paged pool and prints why. That is the
+ * right trade against a bugcheck, which loses the machine, the log, and the
+ * chance to find out what the pointer actually was.
+ */
+static bool_t co_os_open_os_usable(co_manager_open_desc_t opened,
+				   co_manager_open_desc_os_t os)
+{
+	if (!os) {
+		co_debug_error("close: desc %p has no os block", opened);
+		return PFALSE;
+	}
+
+	if (((ULONG_PTR)os & 0xf) != 0) {
+		co_debug_error("close: desc %p os %p is not 16-byte aligned -- "
+			       "not a pool block, refusing to free it",
+			       opened, os);
+		return PFALSE;
+	}
+
+	if (!MmIsAddressValid((PVOID)os)) {
+		co_debug_error("close: desc %p os %p is not resident -- "
+			       "refusing to free it", opened, os);
+		return PFALSE;
+	}
+
+	if (os->magic != CO_OPEN_OS_MAGIC) {
+		co_debug_error("close: desc %p os %p magic 0x%llx wrong -- "
+			       "already freed or never ours, refusing",
+			       opened, os, os->magic);
+		return PFALSE;
+	}
+
+	return PTRUE;
+}
+
+void co_os_manager_userspace_close(co_manager_open_desc_t opened)
+{
+	co_manager_open_desc_os_t os = opened->os;
+	PIRP Irp;
+
+	co_debug("close: desc %p os %p", opened, os);
+
+	if (!co_os_open_os_usable(opened, os)) {
+		opened->os = NULL;
+		return;
+	}
+
+	Irp = co_os_claim_pended_irp(opened);
+
+	if (Irp) {
 		Irp->IoStatus.Status = STATUS_CANCELLED;
 		Irp->IoStatus.Information = 0;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
 	}
 
-	co_os_free(opened->os);
+	/*
+	 * Cleared before the free, so a second arrival at this block is
+	 * refused above rather than freeing it twice.
+	 */
+	os->magic = 0;
 	opened->os = NULL;
+	co_os_free(os);
 }
 
 bool_t co_os_manager_userspace_try_send_direct(
@@ -102,53 +219,45 @@ bool_t co_os_manager_userspace_try_send_direct(
 	co_manager_open_desc_t opened,
 	co_message_t *message)
 {
-	PIRP Irp;
+	PIRP Irp = co_os_claim_pended_irp(opened);
+	unsigned char *io_buffer;
+	unsigned long size = message->size + sizeof(*message);
+	unsigned long buffer_size;
 
-	Irp = opened->os->irp;
-	if (Irp) {
-		KIRQL irql;
-		unsigned char *io_buffer;
-		unsigned long size = message->size + sizeof(*message);
-		unsigned long buffer_size = Irp->IoStatus.Information;
+	if (!Irp)
+		return PFALSE;
 
-		IoAcquireCancelSpinLock(&irql);
-		fixme_IoSetCancelRoutine(Irp, NULL);
-		opened->os->irp = NULL;
-		IoReleaseCancelSpinLock(irql);
+	/*
+	 * The IRP is this path's alone from here: it was taken out of
+	 * opened->os->irp under the lock, so no other consumer and no cancel
+	 * can reach it. Its fields are therefore safe to read, which they were
+	 * not before -- buffer_size used to be read before the claim.
+	 */
+	co_manager_close(manager, opened);
 
-		co_manager_close(manager, opened);
+	buffer_size = Irp->IoStatus.Information;
+	io_buffer   = Irp->AssociatedIrp.SystemBuffer;
 
-		io_buffer = Irp->AssociatedIrp.SystemBuffer;
-
-		if (size <= buffer_size) {
-			co_memcpy(io_buffer, message, size);
-			Irp->IoStatus.Status = STATUS_SUCCESS;
-			Irp->IoStatus.Information = size;
-			IoCompleteRequest(Irp, IO_NETWORK_INCREMENT);
-			return PTRUE;
-		} else {
-			Irp->IoStatus.Status = STATUS_CANCELLED;
-			Irp->IoStatus.Information = 0;
-			IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		}
+	if (size <= buffer_size) {
+		co_memcpy(io_buffer, message, size);
+		Irp->IoStatus.Status = STATUS_SUCCESS;
+		Irp->IoStatus.Information = size;
+		IoCompleteRequest(Irp, IO_NETWORK_INCREMENT);
+		return PTRUE;
 	}
+
+	Irp->IoStatus.Status = STATUS_CANCELLED;
+	Irp->IoStatus.Information = 0;
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 
 	return PFALSE;
 }
 
 co_rc_t co_os_manager_userspace_eof(co_manager_t *manager, co_manager_open_desc_t opened)
 {
-	PIRP Irp;
+	PIRP Irp = co_os_claim_pended_irp(opened);
 
-	Irp = opened->os->irp;
 	if (Irp) {
-		KIRQL irql;
-
-		IoAcquireCancelSpinLock(&irql);
-		fixme_IoSetCancelRoutine(Irp, NULL);
-		opened->os->irp = NULL;
-		IoReleaseCancelSpinLock(irql);
-
 		co_manager_close(manager, opened);
 
 		Irp->IoStatus.Status = STATUS_PIPE_BROKEN;
