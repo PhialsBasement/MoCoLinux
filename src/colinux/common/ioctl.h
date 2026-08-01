@@ -49,6 +49,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KBOOT,
 	CO_MANAGER_IOCTL_KRAM,
 	CO_MANAGER_IOCTL_KREAD,
+	CO_MANAGER_IOCTL_COBD,
 } co_manager_ioctl_t;
 
 /*
@@ -307,6 +308,21 @@ typedef struct {
 	unsigned char	   data[0];
 } co_manager_ioctl_kread_t;
 
+/*
+ * interface for CO_MANAGER_IOCTL_COBD: attach a backing store to a unit.
+ *
+ * The path is opened by the driver rather than passed as a handle, because a
+ * handle opened by the daemon belongs to a user-mode process and would go away
+ * when it exits -- while the guest is still running inside the driver, holding
+ * a filesystem mounted on it.
+ */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long	   unit;	/* in */
+	char		   path[512];	/* in: NT object path */
+	unsigned long long size;	/* out: bytes */
+} co_manager_ioctl_cobd_t;
+
 /* interface for CO_MANAGER_IOCTL_KRAM: give the guest physical memory */
 #define CO_KRAM_MAX_RANGES 16
 typedef struct {
@@ -407,6 +423,8 @@ typedef struct {
 	/* the cooperative protocol: voluntary crossings, by kind */
 	unsigned long	   run_yields;
 	unsigned long	   idle_yields;
+	unsigned long	   block_requests;
+	unsigned long	   block_errors;
 	int		   terminated;
 	unsigned long long terminate_reason;
 	unsigned long long stop_operation;

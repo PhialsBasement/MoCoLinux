@@ -54,6 +54,13 @@ extern co_rc_t co_manager_kcall(co_manager_handle_t handle,
 				co_manager_ioctl_kcall_t* out);
 extern co_rc_t co_manager_kram(co_manager_handle_t handle,
 			       co_manager_ioctl_kram_t* out);
+/*
+ * Attach a backing store to a cooperative block device unit. The driver opens
+ * the path itself and holds it for the life of the guest; see ioctl.h.
+ */
+extern co_rc_t co_manager_cobd(co_manager_handle_t handle, int unit,
+			       const char* path, unsigned long long* size_out);
+
 extern co_rc_t co_manager_kboot(co_manager_handle_t handle,
 				co_manager_ioctl_kboot_t* out);
 extern co_rc_t co_manager_kload_end(co_manager_handle_t handle);

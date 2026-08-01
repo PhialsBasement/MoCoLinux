@@ -220,6 +220,15 @@ typedef struct {
 	 */
 	unsigned long	   run_yields;
 	unsigned long	   idle_yields;
+	/*
+	 * Cooperative block I/O. block_errors counts transfers the host
+	 * refused or the backing store failed; the guest is told about each
+	 * one and turns it into an I/O error, so a run that mounts a
+	 * filesystem successfully but reports errors here has been reading
+	 * something it should not have.
+	 */
+	unsigned long	   block_requests;
+	unsigned long	   block_errors;
 	int		   terminated;
 	unsigned long long terminate_reason;
 	unsigned long long stop_operation;

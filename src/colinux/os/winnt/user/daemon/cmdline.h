@@ -45,6 +45,14 @@ typedef struct co_winnt_parameters {
 	 */
 	bool_t batch;
 	char   batch_arg[0x20];
+	/*
+	 * Backing store for cobd0, the guest's root device. An NT object path:
+	 * an image file as \??\F:\xfer\root.img, or a raw partition as
+	 * \??\\PhysicalDrive0\Partition3. The driver opens it, so it is the
+	 * driver's idea of the path that matters, not the daemon's.
+	 */
+	bool_t cobd0;
+	char   cobd0_arg[0x200];
 	bool_t call_kernel;
 	char   call_kernel_arg[0x100];
 	bool_t enter_kernel;
