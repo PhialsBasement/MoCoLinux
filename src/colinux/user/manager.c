@@ -194,6 +194,31 @@ co_rc_t co_manager_conet_dump(co_manager_handle_t handle,
 	return rc;
 }
 
+co_rc_t co_manager_conet_put(co_manager_handle_t handle,
+			     const unsigned char* data, unsigned int size)
+{
+	co_manager_ioctl_conet_put_t* params;
+	unsigned long returned = 0;
+	unsigned long total = sizeof(*params) + size;
+	co_rc_t rc;
+
+	params = co_os_malloc(total);
+	if (!params)
+		return CO_RC(OUT_OF_MEMORY);
+
+	co_memset(params, 0, sizeof(*params));
+	params->size = size;
+	co_memcpy(params->data, data, size);
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_CONET_PUT,
+				 params, total, params, sizeof(*params), &returned);
+	if (CO_OK(rc))
+		rc = params->rc;
+
+	co_os_free(params);
+	return rc;
+}
+
 co_rc_t co_manager_conet_take(co_manager_handle_t handle, unsigned int new_tail,
 			      unsigned int* tx_head, unsigned int* tx_tail,
 			      unsigned int* rx_head, unsigned int* rx_tail)

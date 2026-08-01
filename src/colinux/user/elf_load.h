@@ -51,6 +51,14 @@ extern co_rc_t co_elf_net_dump_live(void);
 extern co_rc_t co_elf_net_take_live(const char *new_tail_arg);
 
 /*
+ * Stand in for the other end of the wire: answer ARP and ICMP echo for
+ * 10.0.2.2 out of the RX ring, consuming the TX ring as it goes, until the
+ * deadline. Exercises both directions with the guest's own IP stack, with no
+ * slirp involved.
+ */
+extern co_rc_t co_elf_net_peer_live(const char *seconds_arg);
+
+/*
  * Load an image into a guest address space in the driver, optionally entering
  * it. max_switches caps the boot monitor loop (enter == 3); 0 takes the
  * default. It exists so a run that would take the host down hard can be made

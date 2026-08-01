@@ -35,6 +35,9 @@
 #define CO_NIO_RX_TAIL		0x0c
 #define CO_NIO_TX		0x10
 #define CO_NIO_TX_SIZE		(128 * 1024)
+#define CO_NIO_RX		(CO_NIO_TX + CO_NIO_TX_SIZE)
+#define CO_NIO_RX_SIZE		(128 * 1024)
+#define CO_NIO_MAX_FRAME	1514
 
 static unsigned long long net_io_va;
 static co_os_mutex_t	  net_lock;
@@ -133,6 +136,91 @@ co_rc_t co_net_take(co_manager_t* manager, unsigned int new_tail,
 
 	if (!CO_OK(co_net_read_u32(manager, CO_NIO_RX_HEAD, rx_head)) ||
 	    !CO_OK(co_net_read_u32(manager, CO_NIO_RX_TAIL, rx_tail)))
+		rc = CO_RC(ERROR);
+
+out:
+	co_os_mutex_release(net_lock);
+	return rc;
+}
+
+/*
+ * Deliver a frame to the guest: append a record to the RX ring and publish it.
+ *
+ * The mirror of the guest's own transmit, and it obeys the same two rules.
+ * The record is a 32-bit length, the frame, and padding to a four-byte
+ * boundary, so every record starts aligned and the length word never
+ * straddles the wrap. And the bytes are written before rx_head announces
+ * them -- on x86 stores are not reordered with each other, so the ordinary
+ * store order here is the barrier the guest's smp_rmb pairs with.
+ *
+ * A full ring is refused rather than overwritten. The guest owns rx_tail and
+ * may be part-way through reading the record at it; overwriting from this
+ * side would hand it a frame that changes underneath it. The caller can
+ * retry, which is what a host-side queue is for -- and dropping is legal
+ * ethernet besides.
+ */
+co_rc_t co_net_put(co_manager_t* manager, const unsigned char* data,
+		   unsigned int len)
+{
+	unsigned int head, tail, record, off, first;
+	co_rc_t rc = CO_RC(OK);
+
+	if (!net_lock)
+		return CO_RC(NOT_FOUND);
+
+	if (len == 0 || len > CO_NIO_MAX_FRAME)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(net_lock);
+
+	if (!net_io_va) {
+		co_os_mutex_release(net_lock);
+		return CO_RC(NOT_FOUND);
+	}
+
+	if (!CO_OK(co_net_read_u32(manager, CO_NIO_RX_HEAD, &head)) ||
+	    !CO_OK(co_net_read_u32(manager, CO_NIO_RX_TAIL, &tail))) {
+		rc = CO_RC(ERROR);
+		goto out;
+	}
+
+	record = 4 + ((len + 3) & ~3u);
+
+	if (head - tail > CO_NIO_RX_SIZE) {
+		rc = CO_RC(ERROR);		/* not a ring state */
+		goto out;
+	}
+
+	if ((head - tail) + record > CO_NIO_RX_SIZE) {
+		rc = CO_RC(OUT_OF_MEMORY);	/* full; the caller keeps it */
+		goto out;
+	}
+
+	off = head & (CO_NIO_RX_SIZE - 1);
+	if (!CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX + off,
+				  (const unsigned char*)&len, 4))) {
+		rc = CO_RC(ERROR);
+		goto out;
+	}
+
+	off   = (off + 4) & (CO_NIO_RX_SIZE - 1);
+	first = len < CO_NIO_RX_SIZE - off ? len : CO_NIO_RX_SIZE - off;
+
+	if (!CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX + off,
+				  data, first))) {
+		rc = CO_RC(ERROR);
+		goto out;
+	}
+	if (first < len &&
+	    !CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX,
+				  data + first, len - first))) {
+		rc = CO_RC(ERROR);
+		goto out;
+	}
+
+	head += record;
+	if (!CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX_HEAD,
+				  (const unsigned char*)&head, 4)))
 		rc = CO_RC(ERROR);
 
 out:

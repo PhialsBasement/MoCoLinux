@@ -73,6 +73,8 @@ typedef struct co_winnt_parameters {
 	bool_t net_dump;
 	bool_t net_take;
 	char   net_take_arg[0x20];
+	bool_t net_peer;
+	char   net_peer_arg[0x20];
 	bool_t save_state;
 	bool_t restore_state;
 	bool_t test_switch;

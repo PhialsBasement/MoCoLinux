@@ -30,6 +30,12 @@ extern void co_terminal_print_color(co_terminal_color_t color, const char* forma
 	__attribute__ ((format (printf, 2, 3)));
 extern void co_set_terminal_print_hook(co_terminal_print_hook_func_t func);
 extern void co_process_high_priority_set(void);
+/*
+ * Give the processor up for a while. A poll loop against a live guest needs
+ * this and there was no OS-independent way to ask for it -- the console
+ * server is in the winnt tree and reaches straight for Sleep().
+ */
+extern void co_os_user_msleep(unsigned long msec);
 extern int co_udp_socket_connect(const char* addr, unsigned short int port);
 extern int co_udp_socket_send(int sock, const char* buffer, unsigned long size);
 extern void co_udp_socket_close(int sock);

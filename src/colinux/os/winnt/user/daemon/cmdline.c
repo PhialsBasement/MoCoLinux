@@ -73,6 +73,9 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("                                   the loaded image and back.\n");
 	co_terminal_print("      --net-dump                   Print the running guest's network rings,\n");
 	co_terminal_print("                                   read-only -- the guest cannot tell.\n");
+	co_terminal_print("      --net-peer [SECONDS]         Answer ARP and ICMP echo for 10.0.2.2 out of\n");
+	co_terminal_print("                                   the RX ring -- a stand-in for slirp, so ping\n");
+	co_terminal_print("                                   works in the guest with no NAT code running.\n");
 	co_terminal_print("      --net-take [NEWTAIL]         Print the TX ring, then consume it (advance\n");
 	co_terminal_print("                                   tx_tail past what was printed). An explicit\n");
 	co_terminal_print("                                   NEWTAIL tests the driver's validation.\n");
@@ -246,6 +249,15 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		cmdline,
 		"--net-dump",
 		&winnt_parameters->net_dump);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--net-peer",
+		&winnt_parameters->net_peer,
+		winnt_parameters->net_peer_arg,
+		sizeof(winnt_parameters->net_peer_arg));
 
 	if (!CO_OK(rc))
 		return rc;

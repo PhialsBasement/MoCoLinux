@@ -18,3 +18,8 @@ void co_process_high_priority_set(void)
 	if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
 		co_terminal_print_last_error("SetPriorityClass");
 }
+
+void co_os_user_msleep(unsigned long msec)
+{
+	Sleep(msec);
+}
