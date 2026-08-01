@@ -120,6 +120,16 @@ extern bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long 
 
 #define CO_BOOT_TRACE 16	/* power of two: the loop masks with it */
 
+/*
+ * How long the monitor loop may hold the ioctl thread, in seconds.
+ *
+ * The runaway backstop, and the only bound that means anything now that
+ * replayed host interrupts no longer spend the guest's switch budget. A guest
+ * that has finished booting stops on its own at the idle cap; this is for the
+ * one that does not stop.
+ */
+#define CO_BOOT_MAX_SECONDS 120
+
 /* Booting the loaded kernel: enter co_arch_start_kernel and see how far it gets. */
 typedef struct {
 	unsigned long long entry_va;
@@ -163,6 +173,8 @@ typedef struct {
 	int		   faulted;
 	int		   returned_voluntarily;
 	int		   hit_limit;
+	int		   hit_deadline;
+	unsigned long	   guest_switches;
 	int		   unforwardable;
 	int		   vmx_present;
 	unsigned long	   switches;

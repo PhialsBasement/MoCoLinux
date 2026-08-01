@@ -792,6 +792,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->faulted		 = result.faulted;
 		params->returned_voluntarily = result.returned_voluntarily;
 		params->hit_limit	 = result.hit_limit;
+		params->hit_deadline	 = result.hit_deadline;
+		params->guest_switches	 = result.guest_switches;
 		params->unforwardable	 = result.unforwardable;
 		params->vmx_present	 = result.vmx_present;
 		params->switches	 = result.switches;

@@ -1,46 +1,69 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5 at the ring-3 checkpoint.
-Generated against download/linux-7.1.5.tar.xz on 2026-08-01, the run where the
-guest executed its first user-mode instruction on the M92p:
+Authoritative cumulative snapshot of ref/linux-7.1.5 at the userspace
+checkpoint. Generated against download/linux-7.1.5.tar.xz on 2026-08-01, the
+run where Linux booted to a shell on the M92p:
 
-    vector 14 at rip 0x00000000004038b1
-    error code 0x14  cr2 0x00000000004038b1
+    mount (46) used greatest stack depth: 14016 bytes left
+    free (50) used greatest stack depth: 14008 bytes left
+    rc (45) used greatest stack depth: 13848 bytes left
+    sh (54) used greatest stack depth: 13752 bytes left
 
-0x4038b1 is inside busybox, which is linked at 0x400000, and error code 0x14
-is user-mode + instruction-fetch + not-present. That is init demand-paging its
-own text: the guest reached ring 3 and faulted the way a process is supposed
-to.
+Those are BusyBox processes with pids: init ran /etc/init.d/rc, which ran
+mount, free and a shell. 2341 world switches, 2108 of them the guest's own,
+1292 block transfers with none failed, 500 cooperative idle yields, and the
+host still running.
 
-On top of the ext4-root checkpoint this changes one thing in the guest tree:
+What this snapshot adds over the ring-3 one:
 
-  - native_write_cr3() is no longer a no-op for a cooperative guest
-    (asm/special_insns.h). It had to stop being one: execve builds a new mm
-    and switch_mm() activates it with exactly that instruction, so with the
-    write skipped the new process ran in the previous address space and died
-    with EFAULT before its first instruction. It is safe now for a reason
-    that did not hold earlier -- the guest runs in the kernel's own
-    init_top_pgt, which *is* swapper_pg_dir, and pgd_alloc() clones indices
-    273..511 out of it into every new process, which is where all three of
-    the host's grafted mappings live (direct map 273, boot stack 289, passage
-    page 501). Every address space the kernel builds therefore contains the
-    world-switch code by construction.
+  * The kernel owns its descriptor tables (idt.c, desc.h, traps.c). It builds
+    idt_table exactly as on bare metal, then co_colinux_adopt_traps() -- at
+    the end of trap_init(), when the handlers, the TSS and the IST stacks all
+    exist -- rewrites vectors 32-255 and NMI to point at the host's stubs and
+    performs the one lgdt/ltr/lidt. Exceptions are serviced by Linux, so
+    demand paging works; external interrupts still cross to Windows.
 
-Known and unfixed here, and the next piece of work: the guest still runs on
-the host's IDT, so that page fault was reported to the host instead of being
-handled by Linux, and demand paging cannot happen. Userspace needs a hybrid:
-vectors 0-31 delivered to the kernel's own handlers so faults are serviced,
-vectors 32-255 still delivered to the passage-page stubs so the host keeps
-receiving Windows' clock and IPIs. That also means the kernel's TSS and its
-RSP0, since a fault from CPL 3 through a non-IST gate takes its stack from
-there.
+  * The virtual interrupt flag is saved and restored across an exception
+    (irqentry_enter/exit), because a gate clears the hardware flag and the
+    iretq restores it, and the guest's flag had neither. It rides in
+    irqentry_state_t. It must NOT ride in regs->flags: that bit is what iretq
+    loads, and frames outlive handlers -- ret_from_fork hands a child its
+    parent's pt_regs -- so a cleared IF escapes into a context that never runs
+    the exit path and the guest resumes deaf. That froze the host.
+
+  * native_irq_enable() now sti's the real flag as well as setting the virtual
+    bit (irqflags.h). Owning the IDT meant hardware started clearing the real
+    flag behind Linux's back: an interrupt gate clears IF for the length of
+    the handler, SYSCALL clears it from MSR_SYSCALL_MASK for the length of the
+    syscall. Linux believes it re-enabled -- local_irq_enable() at syscall
+    entry, cond_local_irq_enable() in fault handlers -- and a virtual-only
+    enable left the processor deaf for a whole syscall or fault. Arming the
+    real flag where Linux says interrupts are on makes the invariant repair
+    itself, and cannot break guest semantics: guest state is the virtual bit,
+    the real bit is the host's.
+
+  * handle_bug() saves and restores the virtual flag by hand. It is the one
+    exception handler that runs outside irqentry_enter/exit, and it ends in
+    raw_local_irq_disable(), balanced on real hardware by the iretq. With a
+    virtual flag nothing rebalanced it, so every WARN disabled the guest's
+    interrupts permanently -- and the kernel WARNs during boot. PID 1 died on
+    BUG_ON(irqs_disabled()) in the buffer cache looking up /sbin/init, a long
+    way from the leak.
+
+  * co_cpu_idle() returns with interrupts enabled, which is arch_cpu_idle()'s
+    contract. On real hardware each task carries its own flag in its saved
+    EFLAGS, so leaving it clear would end with the idle task; the guest's flag
+    is one global, so it would have ended with the machine.
+
+CONFIG_DEBUG_ENTRY is off in the build: its asserts ud2 on the real IF at the
+exception return paths, which is exactly the bit this design keeps set.
 
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
 
 diff --git a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
-index 00aeae8..d2cb2d1 100644
+index 00aeae8..be67d20 100644
 --- a/arch/x86/include/asm/desc.h
 +++ b/arch/x86/include/asm/desc.h
-@@ -205,13 +205,42 @@ static inline void native_set_ldt(const void *addr, unsigned int entries)
+@@ -205,13 +205,49 @@ static inline void native_set_ldt(const void *addr, unsigned int entries)
  	}
  }
  
@@ -62,14 +85,21 @@ index 00aeae8..d2cb2d1 100644
 + * mapped in the guest's address space, and the world switch carries GDTR and
 + * IDTR across every crossing in both directions.
 + *
-+ * The guest will want its own tables eventually. That belongs after it can
-+ * survive taking a fault, not before.
++ * "Eventually" is co_colinux_adopt_traps(), at the end of trap_init(): by then
++ * idt_table holds real handlers, the TSS descriptor is written and the IST
++ * stacks exist, so the kernel can survive taking a fault. It sets
++ * co_colinux_own_idt and performs the one lgdt/ltr/lidt sequence itself; the
++ * guards stay closed for everything before that point and open for everything
++ * after, so cpu_init()'s loads during early boot are still skipped but the
++ * kernel owns its tables for the rest of its life.
 + */
 +extern int co_colinux_guest;
++extern int co_colinux_own_idt;
++void co_colinux_adopt_traps(void);
 +
  static inline void native_load_gdt(const struct desc_ptr *dtr)
  {
-+	if (co_colinux_guest)
++	if (co_colinux_guest && !co_colinux_own_idt)
 +		return;
 +
  	asm volatile("lgdt %0"::"m" (*dtr));
@@ -77,25 +107,24 @@ index 00aeae8..d2cb2d1 100644
  
  static __always_inline void native_load_idt(const struct desc_ptr *dtr)
  {
-+	if (co_colinux_guest)
++	if (co_colinux_guest && !co_colinux_own_idt)
 +		return;
 +
  	asm volatile("lidt %0"::"m" (*dtr));
  }
  
-@@ -258,6 +287,17 @@ static inline void native_load_tr_desc(void)
+@@ -258,6 +294,16 @@ static inline void native_load_tr_desc(void)
  	bool restore = 0;
  	struct desc_struct *fixmap_gdt;
  
 +	/*
-+	 * The task register goes with the GDT that is actually loaded. The
-+	 * host's TSS is what makes IST work, and IST is what lets a fault be
-+	 * reported when the guest's own stack pointer is the thing that broke.
-+	 * GDT_ENTRY_TSS indexes the kernel's table, which is not the one loaded
-+	 * here, so this would load whatever happens to sit at that index in the
-+	 * host's -- and then a fault has nowhere to land.
++	 * The task register goes with the GDT that is actually loaded. Until
++	 * co_colinux_adopt_traps() has switched to the kernel's own GDT,
++	 * GDT_ENTRY_TSS indexes a table that is not the one in GDTR, so this
++	 * would load whatever happens to sit at that index in the host's --
++	 * and then a fault has nowhere to land.
 +	 */
-+	if (co_colinux_guest)
++	if (co_colinux_guest && !co_colinux_own_idt)
 +		return;
 +
  	native_store_gdt(&gdt);
@@ -191,7 +220,7 @@ index 7f4847b..912c599 100644
  		type *value = (type *)addr;				\
  		while (count) {						\
 diff --git a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
-index 6f25de0..539a05d 100644
+index 6f25de0..3de85cc 100644
 --- a/arch/x86/include/asm/irqflags.h
 +++ b/arch/x86/include/asm/irqflags.h
 @@ -12,6 +12,37 @@
@@ -232,7 +261,7 @@ index 6f25de0..539a05d 100644
  /* Declaration required for gcc < 4.9 to prevent -Werror=missing-prototypes */
  extern inline unsigned long native_save_fl(void);
  extern __always_inline unsigned long native_save_fl(void)
-@@ -29,27 +60,90 @@ extern __always_inline unsigned long native_save_fl(void)
+@@ -29,27 +60,115 @@ extern __always_inline unsigned long native_save_fl(void)
  		     : /* no input */
  		     : "memory");
  
@@ -257,16 +286,41 @@ index 6f25de0..539a05d 100644
  {
 +	if (co_colinux_guest) {
 +		/*
-+		 * The virtual bit only. Real IF is already set -- the host
-+		 * entered the guest that way and hardware interrupts bound the
-+		 * guest via the stub crossing -- so there is nothing to yield
-+		 * for here. The yield this used to make was also the only
-+		 * bound the guest had, which meant every stretch that never
-+		 * toggled virtual IF ran unbounded with real interrupts off:
-+		 * that was the host-freeze, and real-IF-on is its fix.
++		 * The virtual bit, AND the real one.
++		 *
++		 * For most of this port the real flag needed no help here: the
++		 * host entered the guest with interrupts on and nothing in the
++		 * guest could clear them, because every cli was virtual and
++		 * every gate in the guest's IDT went straight to a host stub
++		 * that crossed back within microseconds.
++		 *
++		 * Owning the IDT ended that. Two things now clear the real
++		 * flag behind Linux's back, both in hardware, neither of them
++		 * anything the guest chose:
++		 *
++		 *   - an interrupt gate clears IF on delivery, and vectors
++		 *     0-31 are the kernel's own handlers now, so the flag
++		 *     stays clear for as long as the handler runs -- and a
++		 *     user page fault runs until the block layer has been to
++		 *     the disk and back.
++		 *   - SYSCALL clears IF from MSR_SYSCALL_MASK, so it stays
++		 *     clear for the whole system call.
++		 *
++		 * In both, Linux believes it re-enabled interrupts: syscall
++		 * entry calls local_irq_enable(), fault handlers call
++		 * cond_local_irq_enable(). Setting only the virtual bit there
++		 * left the processor deaf for the entire syscall or fault,
++		 * which is the host freeze -- the same failure as the old
++		 * yield-only policy, arriving by a new route.
++		 *
++		 * So sti here, where Linux says interrupts are on. It makes
++		 * the invariant repair itself: whatever cleared the real flag,
++		 * the next enable puts it back, and the windows that remain
++		 * are the short prologues Linux already keeps short. The
++		 * virtual bit continues to be what the guest reads back.
 +		 */
 +		co_colinux_virtual_if = X86_EFLAGS_IF;
-+		asm volatile("" : : : "memory");
++		asm volatile("sti" : : : "memory");
 +		return;
 +	}
 +
@@ -492,10 +546,10 @@ index a4268c4..a043725 100644
  	asm volatile("mov %0,%%cr4": "+r" (val) : : "memory");
  
 diff --git a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
-index cba7530..704430e 100644
+index cba7530..425a359 100644
 --- a/arch/x86/kernel/early_printk.c
 +++ b/arch/x86/kernel/early_printk.c
-@@ -370,6 +370,139 @@ static struct console early_serial_console = {
+@@ -370,6 +370,150 @@ static struct console early_serial_console = {
  	.index =	-1,
  };
  
@@ -543,12 +597,23 @@ index cba7530..704430e 100644
 + */
 +unsigned long co_colinux_virtual_if;
 +EXPORT_SYMBOL(co_colinux_virtual_if);
++
++/*
++ * Zero until co_colinux_adopt_traps() has loaded the kernel's own descriptor
++ * tables. While it is zero, lgdt/lidt/ltr are no-ops (asm/desc.h) and the
++ * guest runs on the tables the host installed; once set, the kernel owns them
++ * and the world switch carries whatever is live, because it saves GDTR, IDTR
++ * and TR from the registers on every crossing rather than from setup values.
++ */
++int co_colinux_own_idt;
++EXPORT_SYMBOL(co_colinux_own_idt);
 +/*
 + * arch/x86/boot/startup is compiled with every symbol prefixed __pi_, so it can
 + * only reach what has been deliberately aliased. It gets here through the
 + * guards in asm/desc.h, which it includes for native_load_gdt/native_load_idt.
 + */
 +SYM_PIC_ALIAS(co_colinux_guest);
++SYM_PIC_ALIAS(co_colinux_own_idt);
 +
 +static void early_colinux_write(struct console *con, const char *s, unsigned n)
 +{
@@ -635,7 +700,7 @@ index cba7530..704430e 100644
  static void early_console_register(struct console *con, int keep_early)
  {
  	if (con->index != -1) {
-@@ -398,6 +531,10 @@ static int __init setup_early_printk(char *buf)
+@@ -398,6 +542,10 @@ static int __init setup_early_printk(char *buf)
  	keep = (strstr(buf, "keep") != NULL);
  
  	while (*buf != '\0') {
@@ -788,7 +853,7 @@ index 7ed5520..65805ce 100644
  	/* Pass the boot_params pointer as first argument */
  	movq	%r15, %rdi
 diff --git a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
-index 90a22e2..7cd11dd 100644
+index 90a22e2..64afc0a 100644
 --- a/arch/x86/kernel/idt.c
 +++ b/arch/x86/kernel/idt.c
 @@ -3,6 +3,7 @@
@@ -799,12 +864,12 @@ index 90a22e2..7cd11dd 100644
  
  #include <asm/cpu_entry_area.h>
  #include <asm/set_memory.h>
-@@ -222,8 +223,27 @@ static __init void set_intr_gate(unsigned int n, const void *addr)
+@@ -222,6 +223,26 @@ static __init void set_intr_gate(unsigned int n, const void *addr)
   * before cpu_init() is invoked and sets up TSS. The IST variants are
   * installed after that.
   */
 +/*
-+ * Cooperative Linux keeps the host's interrupt table.
++ * Cooperative Linux keeps the host's interrupt table through early boot.
 + *
 + * The host installs an IDT whose every vector lands on a stub that records what
 + * happened and hands control back, on an IST stack so that even a destroyed
@@ -814,40 +879,19 @@ index 90a22e2..7cd11dd 100644
 + * double fault, and then a triple fault, which resets the machine the guest is
 + * a process inside.
 + *
-+ * So while bringing a guest up, these are left alone. The kernel runs on the
-+ * host's stubs, every exception is reported, and nothing can escalate. A guest
-+ * that is actually working will want its own traps eventually; that is a later
-+ * decision, and it belongs after the kernel can survive taking one.
++ * So the setup functions here run for a cooperative guest and fill idt_table
++ * exactly as on bare hardware -- but every load_idt() inside them is a no-op
++ * until co_colinux_adopt_traps() (below) declares the table live, which
++ * happens once, at the end of trap_init(), when the handlers and the TSS
++ * behind them actually exist. The one exception is
++ * idt_setup_apic_and_irq_gates(): vectors 32-255 are never the kernel's here.
++ * They belong to the machine Windows is running, and the adopt step points
++ * them at the host's stubs instead.
 + */
  void __init idt_setup_early_traps(void)
  {
-+	if (co_colinux_guest)
-+		return;
-+
  	idt_setup_from_table(idt_table, early_idts, ARRAY_SIZE(early_idts),
- 			     true);
- 	load_idt(&idt_descr);
-@@ -234,6 +254,9 @@ void __init idt_setup_early_traps(void)
-  */
- void __init idt_setup_traps(void)
- {
-+	if (co_colinux_guest)
-+		return;
-+
- 	idt_setup_from_table(idt_table, def_idts, ARRAY_SIZE(def_idts), true);
- 
- 	if (ia32_enabled())
-@@ -263,6 +286,9 @@ static const __initconst struct idt_data early_pf_idts[] = {
-  */
- void __init idt_setup_early_pf(void)
- {
-+	if (co_colinux_guest)
-+		return;
-+
- 	idt_setup_from_table(idt_table, early_pf_idts,
- 			     ARRAY_SIZE(early_pf_idts), true);
- }
-@@ -293,6 +319,9 @@ static void __init idt_map_in_cea(void)
+@@ -293,6 +314,9 @@ static void __init idt_map_in_cea(void)
   */
  void __init idt_setup_apic_and_irq_gates(void)
  {
@@ -857,8 +901,91 @@ index 90a22e2..7cd11dd 100644
  	int i = FIRST_EXTERNAL_VECTOR;
  	void *entry;
  
+@@ -324,6 +348,82 @@ void __init idt_setup_apic_and_irq_gates(void)
+ 	idt_setup_done = true;
+ }
+ 
++/*
++ * The hybrid interrupt table, and the moment the kernel takes ownership of it.
++ *
++ * Called once, at the end of trap_init(), when everything a fault needs is in
++ * place: idt_table holds the kernel's real handlers (idt_setup_traps), the TSS
++ * descriptor is written and the IST stacks exist (cpu_init_exception_handling),
++ * and the syscall MSRs are set (cpu_init). Until here the guest ran on the
++ * IDT the host built, where every vector is a stub that reports and crosses
++ * back; that is why the ring-3 milestone ended on a *reported* page fault --
++ * demand paging cannot happen while the host owns vector 14.
++ *
++ * The table this loads is a hybrid, because the machine is shared:
++ *
++ *   0-31 except NMI    the kernel's own handlers, so exceptions -- above all
++ *                      the page fault -- are serviced, not reported.
++ *   NMI and 32-255     the host's stubs, copied out of the IDT that is live
++ *                      right now (sidt), because external interrupts are
++ *                      Windows' clock and IPIs and must keep crossing back.
++ *                      This also covers 0x80: IA32_EMULATION put int80 there,
++ *                      but on this machine 0x80 is a hardware vector.
++ *
++ * The stub gates are rebuilt rather than copied verbatim: the host's carry
++ * IST1, which in the kernel's TSS is the double-fault stack. With IST 0 an
++ * interrupt from ring 0 stays on the interrupted stack and one from ring 3
++ * takes RSP0, exactly like any other kernel entry.
++ *
++ * Ordering within the flip is what makes it interrupt-safe. Real IF is on and
++ * cannot be masked, so every intermediate state must be consistent: gate
++ * copies into idt_table change nothing until lidt; the GDT swap is transparent
++ * because the host's table was built to the kernel's exact layout, selector
++ * for selector; ltr indexes GDT_ENTRY_TSS in whichever of the two is live and
++ * both hold a valid TSS by now. An interrupt landing between any two of these
++ * instructions is delivered through a coherent pair of tables. The direct
++ * (writable) GDT is loaded, never the read-only fixmap alias, because the
++ * world switch clears the TSS busy bit in the live GDT before every ltr --
++ * through a read-only mapping that write is a page fault inside the crossing.
++ *
++ * After this, GDTR/IDTR/TR ride the world switch like every other register:
++ * saved live on each exit, restored on each entry.
++ */
++void __init co_colinux_adopt_traps(void)
++{
++	struct desc_ptr host_idt;
++	gate_desc *host_gate;
++	int i;
++
++	store_idt(&host_idt);
++	host_gate = (gate_desc *)host_idt.address;
++
++	for (i = 0; i < IDT_ENTRIES; i++) {
++		unsigned long addr;
++		gate_desc g = { };
++
++		if (i != X86_TRAP_NMI && i < FIRST_EXTERNAL_VECTOR)
++			continue;
++
++		addr		= gate_offset(&host_gate[i]);
++		g.offset_low	= (u16)addr;
++		g.segment	= __KERNEL_CS;
++		g.bits.type	= GATE_INTERRUPT;
++		g.bits.p	= 1;
++		g.offset_middle	= (u16)(addr >> 16);
++		g.offset_high	= (u32)(addr >> 32);
++		write_idt_entry(idt_table, i, &g);
++	}
++
++	co_colinux_own_idt = 1;
++
++	load_direct_gdt(raw_smp_processor_id());
++	native_load_tr_desc();
++	load_idt(&idt_descr);
++
++	pr_info("colinux: adopted own GDT, TSS and hybrid IDT; "
++		"exceptions are the kernel's, interrupts are the host's\n");
++}
++
+ /**
+  * idt_setup_early_handler - Initializes the idt table with early handlers
+  */
 diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
-index 4c718f8..9c305b7 100644
+index 4c718f8..b895019 100644
 --- a/arch/x86/kernel/process.c
 +++ b/arch/x86/kernel/process.c
 @@ -54,6 +54,10 @@
@@ -872,7 +999,7 @@ index 4c718f8..9c305b7 100644
  
  #include "process.h"
  
-@@ -773,6 +777,200 @@ EXPORT_SYMBOL(default_idle);
+@@ -773,6 +777,215 @@ EXPORT_SYMBOL(default_idle);
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -1068,12 +1195,27 @@ index 4c718f8..9c305b7 100644
 +	 */
 +	raw_local_irq_disable();
 +	co_colinux_drain_time();
++	/*
++	 * And on again, because that is this function's contract: the generic
++	 * idle loop calls arch_cpu_idle() with interrupts disabled and every
++	 * implementation returns with them enabled -- default_idle ends in
++	 * "sti; hlt", and do_idle warns if it comes back otherwise.
++	 *
++	 * On real hardware the flag is a per-CPU register that each task
++	 * carries in its own saved EFLAGS, so leaving it clear would end with
++	 * this task. The guest's flag is one global variable, so leaving it
++	 * clear ends with the *machine*: the idle task disables, returns, and
++	 * every task scheduled afterwards sees interrupts disabled forever.
++	 * PID 1 then walked into BUG_ON(irqs_disabled()) in the buffer cache
++	 * while looking up /sbin/init, which is a long way from the leak.
++	 */
++	raw_local_irq_enable();
 +}
 +
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +1134,18 @@ out:
+@@ -936,6 +1149,18 @@ out:
  
  void __init select_idle_routine(void)
  {
@@ -1178,6 +1320,56 @@ index 46882ce..528e41f 100644
  	idt_setup_early_traps();
  	early_cpu_init();
  	jump_label_init();
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 0ca3912..067126c 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -404,6 +404,21 @@ noinstr bool handle_bug(struct pt_regs *regs)
+ 	bool handled = false;
+ 	int ud_type, ud_len;
+ 	s32 ud_imm;
++	/*
++	 * This function is the one exception handler that runs outside
++	 * irqentry_enter()/irqentry_exit() -- see exc_invalid_op(), which calls
++	 * it first and returns without them. So the virtual interrupt flag has
++	 * to be saved and restored here by hand.
++	 *
++	 * It matters because of the enable/disable pair below. On real hardware
++	 * that pair is balanced by the iretq, which reloads the real IF from
++	 * the frame. The guest's flag is a variable no iretq touches, so the
++	 * trailing raw_local_irq_disable() was permanent: every WARN left the
++	 * guest with interrupts logically off forever, and the kernel WARNs
++	 * during boot. PID 1 then hit BUG_ON(irqs_disabled()) in the buffer
++	 * cache while looking up /sbin/init.
++	 */
++	unsigned long co_if = co_colinux_virtual_if;
+ 
+ 	ud_type = decode_bug(addr, &ud_imm, &ud_len);
+ 	if (ud_type == BUG_NONE)
+@@ -473,6 +488,8 @@ noinstr bool handle_bug(struct pt_regs *regs)
+ 
+ 	if (regs->flags & X86_EFLAGS_IF)
+ 		raw_local_irq_disable();
++	if (co_colinux_guest)
++		co_colinux_virtual_if = co_if;	/* what the iretq cannot do */
+ 	instrumentation_end();
+ 
+ 	return handled;
+@@ -1695,4 +1712,14 @@ void __init trap_init(void)
+ 		idt_setup_traps();
+ 
+ 	cpu_init();
++
++	/*
++	 * Everything a fault from ring 0 or ring 3 needs now exists: handlers
++	 * in idt_table, a TSS with IST stacks, syscall MSRs. A cooperative
++	 * guest has been running on the host's reporting stubs until this
++	 * line; from here the kernel owns its descriptor tables, with vectors
++	 * 32-255 still routed to the host. See co_colinux_adopt_traps().
++	 */
++	if (co_colinux_guest)
++		co_colinux_adopt_traps();
+ }
 diff --git a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
 index 12c8180..6dd31c0 100644
 --- a/arch/x86/mm/ioremap.c
@@ -1617,6 +1809,185 @@ index 5520e44..08b07d0 100644
 +#endif
 +
  #endif /* _LINUX_CONSOLE_H */
+diff --git a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
+index 1fabf0f..da98486 100644
+--- a/include/linux/irq-entry-common.h
++++ b/include/linux/irq-entry-common.h
+@@ -266,6 +266,9 @@ static __always_inline void irqentry_exit_to_user_mode_prepare(struct pt_regs *r
+  */
+ static __always_inline void exit_to_user_mode(void)
+ {
++	extern int co_colinux_guest;
++	extern unsigned long co_colinux_virtual_if;
++
+ 	instrumentation_begin();
+ 	unwind_reset_info();
+ 	trace_hardirqs_on_prepare();
+@@ -275,6 +278,26 @@ static __always_inline void exit_to_user_mode(void)
+ 	user_enter_irqoff();
+ 	arch_exit_to_user_mode();
+ 	lockdep_hardirqs_on(CALLER_ADDR0);
++
++	/*
++	 * "Syscall/interrupt exit enables interrupts" -- by sysret or iretq
++	 * restoring IF, neither of which touches a cooperative guest's
++	 * virtual flag. User mode always runs interruptible, so the virtual
++	 * flag goes on here, the common last step of every return to user.
++	 * Without this, the local_irq_disable() in the exit-work loop was
++	 * the guest's final word, and the first exception taken from
++	 * userspace found interrupts "already off". (asm/irqflags.h)
++	 */
++	if (co_colinux_guest) {
++		co_colinux_virtual_if = 0x200;	/* X86_EFLAGS_IF */
++		/*
++		 * And the real flag off for the return sequence, as in
++		 * irqentry_exit(). sysret reloads RFLAGS from r11 and iretq
++		 * from the frame, both of which have IF set, so userspace
++		 * runs interruptible either way.
++		 */
++		asm volatile("cli" : : : "memory");
++	}
+ }
+ 
+ /**
+@@ -338,6 +361,18 @@ typedef struct irqentry_state {
+ 		bool	exit_rcu;
+ 		bool	lockdep;
+ 	};
++	/*
++	 * The interrupted context's virtual interrupt flag, for a cooperative
++	 * guest (see irqentry_enter()). It rides here rather than in
++	 * regs->flags because the real IF bit in every frame must stay set:
++	 * the host is a live Windows kernel, and a frame that iretq's with
++	 * interrupts off puts the machine's only unpinned core to sleep.
++	 * Nesting is free -- this lives on the handler's own stack -- and
++	 * nothing can copy it into a task's saved frame, which is how the
++	 * regs->flags version froze the box: ret_from_fork hands a child the
++	 * parent's pt_regs, IF bit and all.
++	 */
++	unsigned long	co_virtual_if;
+ } irqentry_state_t;
+ #endif
+ 
+diff --git a/kernel/entry/common.c b/kernel/entry/common.c
+index 19d2244..1745340 100644
+--- a/kernel/entry/common.c
++++ b/kernel/entry/common.c
+@@ -103,18 +103,78 @@ __always_inline unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
+ 	}
+ }
+ 
++/*
++ * The virtual interrupt flag is saved and restored across an exception, the
++ * way the hardware flag is by the gate and the iretq.
++ *
++ * A cooperative guest runs with the real IF permanently on and substitutes a
++ * variable for it (asm/irqflags.h in this tree). That variable has the
++ * lifecycle problem the hardware flag solves in silicon: an interrupt gate
++ * clears IF on delivery and iretq restores it, so a handler's
++ * cond_local_irq_enable()/cond_local_irq_disable() pair nets out to nothing.
++ * With a virtual flag and neither the gate nor the iretq touching it, every
++ * exception the kernel serviced left virtual interrupts off permanently --
++ * which announced itself as "initcall msr_init returned with disabled
++ * interrupts", once per MSR-probing initcall, on the first boot after the
++ * kernel took ownership of its IDT and began fixing up its own rdmsr_safe
++ * faults.
++ *
++ * So the flag is saved on entry and restored on exit, at the one choke point
++ * every exception passes. It is deliberately NOT stashed in regs->flags,
++ * although that is where the hardware keeps its equivalent and the first
++ * version of this did exactly that. The real IF bit in a frame is not
++ * bookkeeping: it is what the CPU loads on the way out, and the host is a
++ * live Windows kernel that dies if its core stops taking interrupts. Frames
++ * outlive handlers -- ret_from_fork gives a child its parent's saved pt_regs
++ * -- so a cleared IF bit escapes into a context that never runs this exit
++ * path, and the guest resumes with real interrupts off. The machine freezes
++ * hard enough to need the power button, which is what it did.
++ */
++extern int co_colinux_guest;
++extern unsigned long co_colinux_virtual_if;
++
+ noinstr irqentry_state_t irqentry_enter(struct pt_regs *regs)
+ {
++	unsigned long co_if = co_colinux_virtual_if;
++
++	if (co_colinux_guest) {
++		co_colinux_virtual_if = 0;	/* what the gate does to IF */
++		/*
++		 * And put the real flag back, which the gate just cleared.
++		 *
++		 * The guest's interrupt state is the virtual bit, cleared
++		 * above; the real bit belongs to the host and must be on
++		 * whenever the guest is executing, however long this handler
++		 * runs and whether or not it ever enables interrupts. Arming
++		 * it here rather than waiting for the handler's own
++		 * cond_local_irq_enable() bounds the deaf window at the
++		 * prologue instead of at the handler.
++		 *
++		 * Safe for #PF specifically: exc_page_fault reads CR2 before
++		 * calling this, so no replayed host interrupt can clobber the
++		 * faulting address. And safe for stacks: the asm entry path
++		 * has already switched to the kernel stack and swapped GS by
++		 * the time any of this C code runs.
++		 */
++		asm volatile("sti" : : : "memory");
++	}
++
+ 	if (user_mode(regs)) {
+ 		irqentry_state_t ret = {
+ 			.exit_rcu = false,
+ 		};
+ 
++		ret.co_virtual_if = co_if;
+ 		irqentry_enter_from_user_mode(regs);
+ 		return ret;
+ 	}
+ 
+-	return irqentry_enter_from_kernel_mode(regs);
++	{
++		irqentry_state_t ret = irqentry_enter_from_kernel_mode(regs);
++
++		ret.co_virtual_if = co_if;
++		return ret;
++	}
+ }
+ 
+ /**
+@@ -162,6 +222,34 @@ noinstr void irqentry_exit(struct pt_regs *regs, irqentry_state_t state)
+ 		irqentry_exit_to_user_mode(regs);
+ 	else
+ 		irqentry_exit_to_kernel_mode(regs, state);
++
++	/*
++	 * The iretq half of the save described above irqentry_enter(): the
++	 * interrupted context gets its interrupt state back. Last thing
++	 * before the asm return path, after every handler and preemption
++	 * point that manipulated the virtual flag has finished doing so.
++	 *
++	 * regs->flags is not touched here or anywhere on this path. The real
++	 * IF bit stays exactly as the guest was entered with -- set -- so
++	 * whatever the guest's virtual state, the processor keeps taking the
++	 * host's interrupts.
++	 */
++	if (co_colinux_guest) {
++		co_colinux_virtual_if = user_mode(regs) ? 0x200
++						       : state.co_virtual_if;
++		/*
++		 * Real interrupts off for the epilogue only.
++		 *
++		 * The asm that follows -- restore the registers, swapgs,
++		 * iretq -- is written to be uninterruptible, and
++		 * CONFIG_DEBUG_ENTRY asserts exactly that with a ud2 on the
++		 * real flag. The iretq then loads regs->flags, whose IF bit
++		 * is set because the guest always runs with it set, so the
++		 * guest resumes interruptible. The deaf window is the twenty
++		 * instructions to the iretq, not the handler.
++		 */
++		asm volatile("cli" : : : "memory");
++	}
+ }
+ 
+ irqentry_state_t noinstr irqentry_nmi_enter(struct pt_regs *regs)
 diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
 index 4c3729c..0fc6e84 100644
 --- a/kernel/trace/trace.c

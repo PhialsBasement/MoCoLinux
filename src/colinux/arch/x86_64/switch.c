@@ -3264,11 +3264,55 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		unsigned long long ist_top = (unsigned long long)(size_t)&pp->host_temp
 			+ (CO_PP_ISTSTACK_PAGE + 1) * CO_ARCH_PAGE_SIZE;
 		co_host_snapshot_t host_was;
+		/*
+		 * The stub's frame, bounced through the guest's page tables:
+		 * fifteen GPRs, vector, error code, then the CPU's five-word
+		 * iretq frame -- 0xb0 bytes. Read fresh every fault crossing,
+		 * edited here, written back by whichever resume path changed
+		 * it. See the comment at the read for why a direct pointer
+		 * dereference is a host bugcheck.
+		 */
+		unsigned long long frame_buf[0xb0 / 8];
+		unsigned long long* frame;
+		/*
+		 * The budget counts guest crossings, not crossings.
+		 *
+		 * With the guest free-running on real interrupts, the great
+		 * majority of returns from the switch are Windows' own clock
+		 * arriving through the guest's IDT -- 399207 of the last run's
+		 * 400000. Charging those to the guest's budget meant the limit
+		 * measured how long the host's timer had been ticking, so a
+		 * run "of 400000 switches" was seven minutes of wall clock in
+		 * which the guest did almost nothing, and a guest that booted
+		 * and idled could not finish early because the ticks kept
+		 * spending its allowance. That is not a bound on the guest at
+		 * all, and it is the opposite of running at native speed.
+		 *
+		 * So a replayed hardware interrupt is free: it is the host's
+		 * business, it happens at whatever rate Windows wants, and the
+		 * guest is not making progress through it. What the budget
+		 * bounds is what the guest does -- voluntary yields, faults,
+		 * single steps.
+		 *
+		 * The wall-clock deadline is the real backstop, and the honest
+		 * one. This runs inside a driver ioctl and must give the
+		 * thread back; the thing that matters is elapsed time, which
+		 * is now measured directly rather than inferred from a count
+		 * whose cost per unit was never constant.
+		 */
+		unsigned long long deadline = co_os_monotonic_100ns()
+			+ CO_BOOT_MAX_SECONDS * 10000000ULL;
+		unsigned long guest_crossings = 0;
 		int i;
 
-		for (i = 0; i < in->max_switches; i++) {
+		for (i = 0; ; i++) {
 			unsigned long long batch;
 			unsigned long long host_flags;
+
+			if (guest_crossings >= (unsigned long)in->max_switches) {
+				out->hit_limit = PTRUE;
+				break;
+			}
 
 			pp->params[4] = 0;		/* faulted */
 
@@ -3356,6 +3400,16 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 */
 			pp->params[49] = co_os_monotonic_100ns();
 			pp->params[50] = co_os_get_time();
+
+			if (pp->params[49] >= deadline) {
+				out->hit_deadline = PTRUE;
+				co_debug("boot: %d second deadline reached after "
+					 "%ld switches (%ld of them the guest's, "
+					 "%ld replayed interrupts)",
+					 CO_BOOT_MAX_SECONDS, out->switches,
+					 guest_crossings, out->interrupts);
+				break;
+			}
 
 			asm volatile("pushfq; popq %0; cli"
 				     : "=r"(host_flags) : : "memory", "cc");
@@ -3470,6 +3524,8 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				 * it exactly where its yield left off.
 				 */
 				unsigned long long op = pp->operation;
+
+				guest_crossings++;	/* the guest's own doing */
 
 				pp->operation = 0;
 
@@ -3619,27 +3675,56 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			out->cr2        = pp->params[18];
 
 			/*
+			 * Below 32 is an exception the guest raised -- a fault,
+			 * a step, a warning it meant to take. At 32 and above it
+			 * is a hardware interrupt belonging to Windows, which
+			 * arrives on the host's schedule and is not the guest
+			 * doing anything. Only the former spends the budget.
+			 */
+			if (out->vector < 32)
+				guest_crossings++;
+
+			/*
 			 * The operand. The stub's frame is fifteen registers
 			 * pushed in a known order, so rdi is at 0x48 and rax
 			 * at 0x70 -- see the layout comment on the stub.
+			 *
+			 * The frame is at a guest virtual address, and it is
+			 * NOT dereferenced directly, although it was for the
+			 * whole of bring-up and every crossing worked: the
+			 * stub's frames all lived on the passage page's IST
+			 * stack, mapped at the same address on both sides.
+			 * The moment the guest adopted its own IDT with IST
+			 * clear, frames started landing on whatever stack the
+			 * kernel was running on -- the init task's boot stack
+			 * was the first -- and the old direct read became a
+			 * host page fault in nonpaged area, bugcheck 0x50,
+			 * on the first replayed interrupt. So the frame is
+			 * copied out through the guest's page tables, edited
+			 * here in the buffer, and written back through the
+			 * same walk by the resume paths that change it.
+			 * frame == NULL means unrecorded or unreadable, and
+			 * every user below already handles that.
 			 */
-			{
-				const unsigned long long* f =
-					(const unsigned long long*)(size_t)pp->params[28];
+			frame = NULL;
+			if (pp->params[28] &&
+			    CO_OK(co_kload_read(manager, pp->params[28],
+						(unsigned char*)frame_buf,
+						sizeof(frame_buf))))
+				frame = frame_buf;
 
-				if (f) {
-					int r;
+			if (frame) {
+				int r;
 
-					out->fault_rdi = f[0x48 / 8];
-					out->fault_rax = f[0x70 / 8];
-					/*
-					 * The whole frame, so the last step before a
-					 * stop -- fault or budget -- carries its
-					 * registers out. Fifteen GPRs at f[0..14].
-					 */
-					for (r = 0; r < 15; r++)
-						out->stop_regs[r] = f[r];
-				}
+				out->fault_rdi = frame[0x48 / 8];
+				out->fault_rax = frame[0x70 / 8];
+				/*
+				 * The whole frame, so the last step before a
+				 * stop -- fault or budget -- carries its
+				 * registers out. Fifteen GPRs at frame[0..14].
+				 */
+				for (r = 0; r < 15; r++)
+					out->stop_regs[r] = frame[r];
 			}
 
 			/*
@@ -3691,39 +3776,38 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				 *
 				 * The frame is at params[28] and RFLAGS sits at
 				 * +0x98 in it, after fifteen registers, the
-				 * vector, the error code, RIP and CS. It is
-				 * readable directly because the passage page has
-				 * the same address in both spaces.
+				 * vector, the error code, RIP and CS. It was
+				 * read into frame_buf above; the edit is made
+				 * there and written back through the guest's
+				 * tables.
 				 */
-				{
-					unsigned long long* frame =
-						(unsigned long long*)(size_t)pp->params[28];
-
-					/*
-					 * TF on, IF off, on every resume.
-					 *
-					 * IF matters as much as TF and for the
-					 * same reason: both are the guest's to
-					 * change and neither may be left to it.
-					 * A guest running with interrupts
-					 * enabled takes the host's interrupts
-					 * through the guest's IDT, which means
-					 * the host's handler has to be called
-					 * by hand afterwards, off a synthesised
-					 * frame, from inside a driver ioctl.
-					 * Clearing it here leaves the interrupt
-					 * pending until the switch back
-					 * restores the host's own flags, and
-					 * Windows takes it normally.
-					 *
-					 * The kernel will execute `sti` during
-					 * boot; this undoes it before the next
-					 * instruction runs.
-					 */
-					if (frame) {
-						frame[0x98 / 8] |= 0x100ULL;
-						frame[0x98 / 8] &= ~0x200ULL;
-					}
+				/*
+				 * TF on, IF off, on every resume.
+				 *
+				 * IF matters as much as TF and for the
+				 * same reason: both are the guest's to
+				 * change and neither may be left to it.
+				 * A guest running with interrupts
+				 * enabled takes the host's interrupts
+				 * through the guest's IDT, which means
+				 * the host's handler has to be called
+				 * by hand afterwards, off a synthesised
+				 * frame, from inside a driver ioctl.
+				 * Clearing it here leaves the interrupt
+				 * pending until the switch back
+				 * restores the host's own flags, and
+				 * Windows takes it normally.
+				 *
+				 * The kernel will execute `sti` during
+				 * boot; this undoes it before the next
+				 * instruction runs.
+				 */
+				if (frame) {
+					frame[0x98 / 8] |= 0x100ULL;
+					frame[0x98 / 8] &= ~0x200ULL;
+					co_kload_write(manager, pp->params[28],
+						       (const unsigned char*)frame_buf,
+						       sizeof(frame_buf));
 				}
 
 				pp->linuxvm_state.return_rip = resume_rip;
@@ -3769,8 +3853,6 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 * at a named address.
 			 */
 			if (out->vector == 6) {
-				unsigned long long* frame =
-					(unsigned long long*)(size_t)pp->params[28];
 				static const unsigned char ud2[]      = { 0x0f, 0x0b };
 				static const unsigned char warninsn[] =
 					{ 0x67, 0x48, 0x0f, 0xb9, 0x3a };
@@ -3850,6 +3932,9 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 						 */
 						frame[0x98 / 8] &= ~0x100ULL;	/* no TF */
 					}
+					co_kload_write(manager, pp->params[28],
+						       (const unsigned char*)frame_buf,
+						       sizeof(frame_buf));
 
 					pp->linuxvm_state.return_rip = resume_rip;
 					pp->linuxvm_state.rsp        = ist_top - 0x200;
@@ -3873,11 +3958,10 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 * also a deliberate fault and has its own table.
 			 */
 			if (out->vector < 32) {
-				unsigned long long* frame =
-					(unsigned long long*)(size_t)pp->params[28];
 				int extype = 0;
 
-				if (co_arch_extable_fixup(frame, out->vector, &extype)) {
+				if (frame &&
+				    co_arch_extable_fixup(frame, out->vector, &extype)) {
 					if (out->fixups < 8) {
 						out->fixup_rip[out->fixups]  = out->fault_rip;
 						out->fixup_type[out->fixups] = extype;
@@ -3893,6 +3977,9 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 						 * step-over above. */
 						frame[0x98 / 8] &= ~0x100ULL;
 					}
+					co_kload_write(manager, pp->params[28],
+						       (const unsigned char*)frame_buf,
+						       sizeof(frame_buf));
 
 					pp->linuxvm_state.return_rip = resume_rip;
 					pp->linuxvm_state.rsp        = ist_top - 0x200;
@@ -3961,8 +4048,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			pp->linuxvm_state.rsp        = ist_top - 0x200;
 		}
 
-		if (out->switches >= in->max_switches)
-			out->hit_limit = PTRUE;
+		out->guest_switches = guest_crossings;
 
 		/*
 		 * The stub's ring, which is where the fine-grained trace lives

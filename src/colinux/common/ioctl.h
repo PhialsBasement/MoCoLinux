@@ -396,6 +396,8 @@ typedef struct {
 	int		   faulted;
 	int		   returned_voluntarily;
 	int		   hit_limit;
+	int		   hit_deadline;
+	unsigned long	   guest_switches;
 	int		   unforwardable;
 	int		   vmx_present;
 	unsigned long	   switches;

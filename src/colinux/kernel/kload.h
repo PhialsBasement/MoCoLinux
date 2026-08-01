@@ -46,6 +46,8 @@ extern co_rc_t co_kload_chunk(co_manager_t* manager, unsigned long long va,
 			      const unsigned char* data, unsigned long size, bool_t zero);
 extern co_rc_t co_kload_verify(co_manager_t* manager, unsigned long long va,
 			       unsigned long size, unsigned long long* sum_out);
+extern co_rc_t co_kload_write(co_manager_t* manager, unsigned long long va,
+			      const unsigned char* buf, unsigned long size);
 extern co_rc_t co_kload_read(co_manager_t* manager, unsigned long long va,
 			     unsigned char* buf, unsigned long size);
 extern co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_bytes,
