@@ -52,6 +52,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_COBD,
 	CO_MANAGER_IOCTL_CONSOLE,
 	CO_MANAGER_IOCTL_KSTOP,
+	CO_MANAGER_IOCTL_CONET_DUMP,
 } co_manager_ioctl_t;
 
 /*
@@ -347,6 +348,29 @@ typedef struct {
 } co_manager_ioctl_console_t;
 
 /*
+ * interface for CO_MANAGER_IOCTL_CONET_DUMP: a read-only window into the
+ * guest's TX network ring, live.
+ *
+ * Returns the four ring indices, fresh, plus `size` bytes of raw ring
+ * starting at absolute position `start`. Nothing in the guest is written --
+ * not even tx_tail, so the guest cannot observe the read and two identical
+ * calls return identical bytes. Record parsing belongs to the caller. The
+ * walk runs under the net lock, which is what makes a call racing the run's
+ * teardown a clean NOT_FOUND instead of a walk through freed page tables.
+ */
+#define CO_CONET_DUMP_MAX 8192
+typedef struct {
+	co_rc_t		   rc;
+	unsigned int	   tx_head;	/* out */
+	unsigned int	   tx_tail;	/* out */
+	unsigned int	   rx_head;	/* out */
+	unsigned int	   rx_tail;	/* out */
+	unsigned int	   start;	/* in: absolute tx ring position */
+	unsigned int	   size;	/* in: bytes wanted; out: returned */
+	unsigned char	   data[0];	/* out */
+} co_manager_ioctl_conet_dump_t;
+
+/*
  * interface for CO_MANAGER_IOCTL_KSTOP: end a running boot loop, now.
  *
  * Sets the same abort flag driver unload uses; the monitor loop checks it on
@@ -429,6 +453,8 @@ typedef struct {
 	unsigned long long passage_symbol_va;
 	/* where the guest keeps co_colinux_console_io, for the terminal */
 	unsigned long long console_io_va;
+	/* where it keeps co_colinux_net_io, for the network rings */
+	unsigned long long net_io_va;
 	/* out */
 	unsigned long long guest_cr3;
 	unsigned long	   tables;

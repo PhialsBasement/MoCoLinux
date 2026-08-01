@@ -154,6 +154,46 @@ co_rc_t co_manager_kload_chunk(co_manager_handle_t handle, unsigned long long va
 	return rc;
 }
 
+co_rc_t co_manager_conet_dump(co_manager_handle_t handle,
+			      unsigned int* tx_head, unsigned int* tx_tail,
+			      unsigned int* rx_head, unsigned int* rx_tail,
+			      unsigned int start, unsigned char* data,
+			      unsigned int* size)
+{
+	co_manager_ioctl_conet_dump_t* params;
+	unsigned long returned = 0;
+	unsigned long total = sizeof(*params) + *size;
+	co_rc_t rc;
+
+	params = co_os_malloc(total);
+	if (!params)
+		return CO_RC(OUT_OF_MEMORY);
+
+	co_memset(params, 0, sizeof(*params));
+	params->start = start;
+	params->size  = *size;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_CONET_DUMP,
+				 params, sizeof(*params), params, total, &returned);
+	if (CO_OK(rc))
+		rc = params->rc;
+
+	if (CO_OK(rc)) {
+		*tx_head = params->tx_head;
+		*tx_tail = params->tx_tail;
+		*rx_head = params->rx_head;
+		*rx_tail = params->rx_tail;
+		*size    = params->size;
+		if (params->size)
+			co_memcpy(data, params->data, params->size);
+	} else {
+		*size = 0;
+	}
+
+	co_os_free(params);
+	return rc;
+}
+
 co_rc_t co_manager_kstop(co_manager_handle_t handle, int* was_running)
 {
 	co_manager_ioctl_kstop_t params = {0, };

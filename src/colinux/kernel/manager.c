@@ -30,6 +30,7 @@
 #include "kload.h"
 #include "cobd.h"
 #include "console.h"
+#include "net.h"
 
 #ifndef min
 # define min(a,b) 	((a)<(b)?(a):(b))
@@ -134,6 +135,10 @@ co_rc_t co_manager_load(co_manager_t *manager)
 	if (!CO_OK(rc))
 		goto out_err_os;
 
+	rc = co_net_init();
+	if (!CO_OK(rc))
+		goto out_err_os;
+
 	rc = co_manager_alloc_reversed_pfns(manager);
 	if (!CO_OK(rc))
 		goto out_err_os;
@@ -221,9 +226,11 @@ void co_manager_unload(co_manager_t* manager)
 	 * by walking the guest's page tables, and a console client is a
 	 * different process that has no idea this is happening. Retiring the
 	 * address takes the console lock, so a pump already inside a walk
-	 * finishes before the tables go away.
+	 * finishes before the tables go away. The network rings are the same
+	 * arrangement and get the same treatment.
 	 */
 	co_console_set_address(0);
+	co_net_set_address(0);
 
 	if (manager->state >= CO_MANAGER_STATE_INITIALIZED)
 		co_kload_free(manager);
@@ -250,6 +257,7 @@ void co_manager_unload(co_manager_t* manager)
 	if (manager->state >= CO_MANAGER_STATE_INITIALIZED_DEBUG)
 		co_debug_free(&manager->debug);
 
+	co_net_free();
 	co_console_free();
 
 	manager->state = CO_MANAGER_STATE_NOT_INITIALIZED;
@@ -842,6 +850,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.ex_table_stop  = params->ex_table_stop;
 		in.passage_symbol_va  = params->passage_symbol_va;
 		co_console_set_address(params->console_io_va);
+		co_net_set_address(params->net_io_va);
 		in.max_switches       = params->max_switches ? params->max_switches : 4096;
 
 		co_memset(params, 0, sizeof(*params));
@@ -881,6 +890,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 				 "closing its disks and retiring its console",
 				 result.terminate_reason);
 			co_console_set_address(0);
+			co_net_set_address(0);
 			co_cobd_detach_all();
 		}
 
@@ -943,6 +953,24 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_CONET_DUMP: {
+		co_manager_ioctl_conet_dump_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+		if (params->size > CO_CONET_DUMP_MAX ||
+		    out_size < sizeof(*params) + params->size)
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_net_dump(manager,
+					 &params->tx_head, &params->tx_tail,
+					 &params->rx_head, &params->rx_tail,
+					 params->start, params->data,
+					 &params->size);
+		*return_size = sizeof(*params) + params->size;
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_KSTOP: {
 		co_manager_ioctl_kstop_t* params = (typeof(params))(io_buffer);
 
@@ -972,9 +1000,11 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		 * is freed. A console client is another process entirely and
 		 * would otherwise keep walking page tables that have been
 		 * returned to the host -- which is a use-after-free in a
-		 * driver, so it bugchecks rather than fails.
+		 * driver, so it bugchecks rather than fails. The network rings
+		 * are read the same way by --net-dump and retire the same way.
 		 */
 		co_console_set_address(0);
+		co_net_set_address(0);
 		co_cobd_detach_all();
 		co_kload_free(manager);
 		*return_size = 0;

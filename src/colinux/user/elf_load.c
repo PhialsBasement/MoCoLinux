@@ -415,33 +415,20 @@ static void co_net_describe_frame(const unsigned char* f, unsigned int len)
 	}
 }
 
-static void co_dump_net_rings(co_manager_handle_t handle, co_elf_data_t* pl)
+/*
+ * Parse and print a snapshot of the rings: the four indices and, when the TX
+ * ring holds anything, a full-size copy of its byte array indexed by the
+ * same masks the guest uses. One parser for both viewers -- the post-run
+ * dump (bytes via KREAD) and --net-dump (bytes via the CONET_DUMP ioctl) --
+ * because a decoder that exists twice is a decoder that disagrees with
+ * itself the first time only one copy is fixed.
+ */
+static void co_net_print_rings(unsigned int tx_head, unsigned int tx_tail,
+			       unsigned int rx_head, unsigned int rx_tail,
+			       const unsigned char* ring)
 {
-	co_elf_symbol_t* s_io = co_get_symbol_by_name(pl, "co_colinux_net_io");
-	unsigned long long io_va;
-	unsigned char hdr[16];
-	unsigned char* ring;
-	unsigned int tx_head, tx_tail, rx_head, rx_tail;
 	unsigned int used, pos, frames = 0;
-	co_rc_t rc;
 
-	if (!s_io)
-		return;		/* a kernel without the conet driver */
-	io_va = co_elf_get_symbol_value(s_io);
-
-	rc = co_manager_kread(handle, io_va, hdr, sizeof(hdr));
-	if (!CO_OK(rc)) {
-		co_terminal_print("  net rings unreadable at 0x%016llx (rc %x)\n",
-				  io_va, (int)rc);
-		return;
-	}
-
-	tx_head = co_net_le32(hdr + CO_NETIO_TX_HEAD);
-	tx_tail = co_net_le32(hdr + CO_NETIO_TX_TAIL);
-	rx_head = co_net_le32(hdr + CO_NETIO_RX_HEAD);
-	rx_tail = co_net_le32(hdr + CO_NETIO_RX_TAIL);
-
-	co_terminal_print("  co_colinux_net_io at 0x%016llx\n", io_va);
 	co_terminal_print("  tx head %u  tail %u  (%u bytes in the ring)\n",
 			  tx_head, tx_tail, tx_head - tx_tail);
 	co_terminal_print("  rx head %u  tail %u  (%u bytes in the ring)\n",
@@ -455,30 +442,6 @@ static void co_dump_net_rings(co_manager_handle_t handle, co_elf_data_t* pl)
 	if (used == 0)
 		goto rx_check;
 
-	ring = (unsigned char*)co_os_malloc(CO_NETIO_TX_SIZE);
-	if (!ring)
-		return;
-
-	/*
-	 * The whole TX array, in pieces the ioctl's staging buffer keeps
-	 * small. Records wrap; masks are cheaper to apply to a local copy
-	 * than to scatter across reads.
-	 */
-	{
-		unsigned int chunk = 4096, off;
-
-		for (off = 0; off < CO_NETIO_TX_SIZE; off += chunk) {
-			rc = co_manager_kread(handle, io_va + CO_NETIO_TX + off,
-					      ring + off, chunk);
-			if (!CO_OK(rc)) {
-				co_terminal_print("  tx ring read failed at +%u (rc %x)\n",
-						  off, (int)rc);
-				co_os_free(ring);
-				return;
-			}
-		}
-	}
-
 	for (pos = tx_tail; pos != tx_head; frames++) {
 		unsigned int off = pos & (CO_NETIO_TX_SIZE - 1);
 		unsigned int len = co_net_le32(ring + off);
@@ -491,7 +454,6 @@ static void co_dump_net_rings(co_manager_handle_t handle, co_elf_data_t* pl)
 			co_terminal_print("  RECORD %u at +%u IS NOT A FRAME: len %u"
 					  " with %u bytes left -- ring corrupt\n",
 					  frames, off, len, tx_head - pos);
-			co_os_free(ring);
 			return;
 		}
 
@@ -515,7 +477,6 @@ static void co_dump_net_rings(co_manager_handle_t handle, co_elf_data_t* pl)
 		pos += record;
 	}
 
-	co_os_free(ring);
 	co_terminal_print("\n  %u frames, %u bytes, and they account for the ring"
 			  " exactly: pos == tx_head\n", frames, used);
 
@@ -526,6 +487,128 @@ rx_check:
 	else
 		co_terminal_print("  RX RING NOT PRISTINE -- nothing should have"
 				  " written it yet\n");
+}
+
+static void co_dump_net_rings(co_manager_handle_t handle, co_elf_data_t* pl)
+{
+	co_elf_symbol_t* s_io = co_get_symbol_by_name(pl, "co_colinux_net_io");
+	unsigned long long io_va;
+	unsigned char hdr[16];
+	unsigned char* ring = NULL;
+	unsigned int tx_head, tx_tail, rx_head, rx_tail;
+	co_rc_t rc;
+
+	if (!s_io)
+		return;		/* a kernel without the conet driver */
+	io_va = co_elf_get_symbol_value(s_io);
+
+	rc = co_manager_kread(handle, io_va, hdr, sizeof(hdr));
+	if (!CO_OK(rc)) {
+		co_terminal_print("  net rings unreadable at 0x%016llx (rc %x)\n",
+				  io_va, (int)rc);
+		return;
+	}
+
+	tx_head = co_net_le32(hdr + CO_NETIO_TX_HEAD);
+	tx_tail = co_net_le32(hdr + CO_NETIO_TX_TAIL);
+	rx_head = co_net_le32(hdr + CO_NETIO_RX_HEAD);
+	rx_tail = co_net_le32(hdr + CO_NETIO_RX_TAIL);
+
+	co_terminal_print("  co_colinux_net_io at 0x%016llx\n", io_va);
+
+	if (tx_head != tx_tail && tx_head - tx_tail <= CO_NETIO_TX_SIZE) {
+		unsigned int chunk = 4096, off;
+
+		ring = (unsigned char*)co_os_malloc(CO_NETIO_TX_SIZE);
+		if (!ring)
+			return;
+
+		/*
+		 * The whole TX array, in pieces the ioctl's staging buffer
+		 * keeps small. Records wrap; masks are cheaper to apply to a
+		 * local copy than to scatter across reads.
+		 */
+		for (off = 0; off < CO_NETIO_TX_SIZE; off += chunk) {
+			rc = co_manager_kread(handle, io_va + CO_NETIO_TX + off,
+					      ring + off, chunk);
+			if (!CO_OK(rc)) {
+				co_terminal_print("  tx ring read failed at +%u (rc %x)\n",
+						  off, (int)rc);
+				co_os_free(ring);
+				return;
+			}
+		}
+	}
+
+	co_net_print_rings(tx_head, tx_tail, rx_head, rx_tail, ring);
+
+	if (ring)
+		co_os_free(ring);
+}
+
+/*
+ * --net-dump: the same view, live, from a second process.
+ *
+ * The bytes come through CO_MANAGER_IOCTL_CONET_DUMP rather than KREAD,
+ * because KREAD's walk is unprotected against the run's teardown and this
+ * caller is exactly the cross-process reader that could race it. The CONET
+ * ioctl walks under the net lock and answers NOT_FOUND once the address is
+ * retired, so a dump racing the run's end fails politely instead of walking
+ * freed page tables.
+ *
+ * The indices come from the first call and the bytes from as many calls as
+ * the window needs. That snapshot stays consistent without a lock across
+ * calls: the guest only appends, the host never consumes here (tx_tail does
+ * not move in this rung), and a full ring drops rather than overwrites -- so
+ * every byte in the snapshot's tail..head range is immutable once published.
+ */
+co_rc_t co_elf_net_dump_live(void)
+{
+	co_manager_handle_t handle;
+	unsigned char* ring;
+	unsigned int tx_head = 0, tx_tail = 0, rx_head = 0, rx_tail = 0;
+	unsigned int h2, t2, r2h, r2t;
+	unsigned int off, got;
+	co_rc_t rc;
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		co_terminal_print("net-dump: cannot open the driver -- is it loaded?\n");
+		return CO_RC(ERROR);
+	}
+
+	ring = (unsigned char*)co_os_malloc(CO_NETIO_TX_SIZE);
+	if (!ring) {
+		co_os_manager_close(handle);
+		return CO_RC(OUT_OF_MEMORY);
+	}
+
+	for (off = 0; off < CO_NETIO_TX_SIZE; off += got) {
+		got = 8192;
+		rc = co_manager_conet_dump(handle,
+					   off ? &h2 : &tx_head, off ? &t2 : &tx_tail,
+					   off ? &r2h : &rx_head, off ? &r2t : &rx_tail,
+					   off, ring + off, &got);
+		if (!CO_OK(rc)) {
+			co_terminal_print("net-dump: no live guest with net rings"
+					  " (rc %x)\n", (int)rc);
+			goto out;
+		}
+		if (got == 0) {
+			co_terminal_print("net-dump: driver returned an empty window\n");
+			rc = CO_RC(ERROR);
+			goto out;
+		}
+	}
+
+	co_terminal_print("the guest's network rings, live:\n");
+	co_net_print_rings(tx_head, tx_tail, rx_head, rx_tail, ring);
+	rc = CO_RC(OK);
+
+out:
+	co_os_free(ring);
+	co_os_manager_close(handle);
+	return rc;
 }
 
 /*
@@ -1636,12 +1719,19 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 */
 		{
 			co_elf_symbol_t* s_cio = co_get_symbol_by_name(pl, "co_colinux_console_io");
+			co_elf_symbol_t* s_nio = co_get_symbol_by_name(pl, "co_colinux_net_io");
 
 			if (s_cio) {
 				b.console_io_va = co_elf_get_symbol_value(s_cio);
 				co_terminal_print("    console rings at 0x%016llx"
 						  "  (--console PORT to attach)\n",
 						  b.console_io_va);
+			}
+			if (s_nio) {
+				b.net_io_va = co_elf_get_symbol_value(s_nio);
+				co_terminal_print("    net rings at     0x%016llx"
+						  "  (--net-dump to watch)\n",
+						  b.net_io_va);
 			}
 		}
 

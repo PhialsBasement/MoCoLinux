@@ -37,6 +37,13 @@ extern co_rc_t co_elf_image_load(struct co_daemon *daemon);
 extern co_rc_t co_elf_dump(const char *filename);
 
 /*
+ * Print the live guest's network rings from a second process, read-only,
+ * through the locked CONET_DUMP ioctl. Needs no vmlinux: the driver learned
+ * the rings' address at KBOOT.
+ */
+extern co_rc_t co_elf_net_dump_live(void);
+
+/*
  * Load an image into a guest address space in the driver, optionally entering
  * it. max_switches caps the boot monitor loop (enter == 3); 0 takes the
  * default. It exists so a run that would take the host down hard can be made
