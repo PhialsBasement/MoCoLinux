@@ -49,6 +49,11 @@ extern co_rc_t co_manager_kload_verify(co_manager_handle_t handle,
 /* End a running boot loop now; was_running says whether one existed. */
 extern co_rc_t co_manager_kstop(co_manager_handle_t handle, int* was_running);
 
+/* Consume the TX ring: advance tx_tail (forward only, at most to head). */
+extern co_rc_t co_manager_conet_take(co_manager_handle_t handle, unsigned int new_tail,
+				     unsigned int* tx_head, unsigned int* tx_tail,
+				     unsigned int* rx_head, unsigned int* rx_tail);
+
 /* Read-only live window into the guest's TX network ring. */
 extern co_rc_t co_manager_conet_dump(co_manager_handle_t handle,
 				     unsigned int* tx_head, unsigned int* tx_tail,

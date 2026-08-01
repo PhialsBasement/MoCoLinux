@@ -76,6 +76,70 @@ static co_rc_t co_net_read_u32(co_manager_t* manager, unsigned long offset,
 			     (unsigned char*)out, sizeof(*out));
 }
 
+/*
+ * Consume: advance tx_tail, the one word in the TX ring the ABI assigns to
+ * the host. This is the host's first write into guest memory on the network
+ * path, and the validation is most of the point. A tail past head makes the
+ * guest's fullness arithmetic (head - tail) wrap enormous and the device
+ * drops everything forever -- so the new tail may only move forward, and at
+ * most to the head, both read fresh under the same lock hold that performs
+ * the write. In free-running u32 arithmetic one comparison covers both
+ * directions: a backward tail wraps (new - cur) huge and fails the same
+ * test.
+ *
+ * Nothing here allocates and nothing here is remembered: co_kload_write is
+ * a table walk and a memcpy into frames the host already maps by arithmetic,
+ * and the address it walks from is only ever read under net_lock, exactly as
+ * the dump's reads are.
+ */
+co_rc_t co_net_take(co_manager_t* manager, unsigned int new_tail,
+		    unsigned int* tx_head, unsigned int* tx_tail,
+		    unsigned int* rx_head, unsigned int* rx_tail)
+{
+	unsigned int head, tail;
+	co_rc_t rc = CO_RC(OK);
+
+	if (!net_lock)
+		return CO_RC(NOT_FOUND);
+
+	co_os_mutex_acquire(net_lock);
+
+	if (!net_io_va) {
+		co_os_mutex_release(net_lock);
+		return CO_RC(NOT_FOUND);
+	}
+
+	if (!CO_OK(co_net_read_u32(manager, CO_NIO_TX_HEAD, &head)) ||
+	    !CO_OK(co_net_read_u32(manager, CO_NIO_TX_TAIL, &tail))) {
+		rc = CO_RC(ERROR);
+		goto out;
+	}
+
+	if (new_tail - tail > head - tail) {
+		rc = CO_RC(INVALID_PARAMETER);
+		goto out;
+	}
+
+	if (new_tail != tail &&
+	    !CO_OK(co_kload_write(manager, net_io_va + CO_NIO_TX_TAIL,
+				  (const unsigned char*)&new_tail,
+				  sizeof(new_tail)))) {
+		rc = CO_RC(ERROR);
+		goto out;
+	}
+
+	*tx_head = head;
+	*tx_tail = new_tail;
+
+	if (!CO_OK(co_net_read_u32(manager, CO_NIO_RX_HEAD, rx_head)) ||
+	    !CO_OK(co_net_read_u32(manager, CO_NIO_RX_TAIL, rx_tail)))
+		rc = CO_RC(ERROR);
+
+out:
+	co_os_mutex_release(net_lock);
+	return rc;
+}
+
 co_rc_t co_net_dump(co_manager_t* manager,
 		    unsigned int* tx_head, unsigned int* tx_tail,
 		    unsigned int* rx_head, unsigned int* rx_tail,

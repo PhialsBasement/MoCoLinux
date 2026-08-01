@@ -53,6 +53,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_CONSOLE,
 	CO_MANAGER_IOCTL_KSTOP,
 	CO_MANAGER_IOCTL_CONET_DUMP,
+	CO_MANAGER_IOCTL_CONET_TAKE,
 } co_manager_ioctl_t;
 
 /*
@@ -369,6 +370,22 @@ typedef struct {
 	unsigned int	   size;	/* in: bytes wanted; out: returned */
 	unsigned char	   data[0];	/* out */
 } co_manager_ioctl_conet_dump_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_CONET_TAKE: consume the TX ring by moving
+ * tx_tail forward -- the host's one writable word there. The driver reads
+ * head and tail fresh under its lock, refuses a tail that would move
+ * backward or past the head (INVALID_PARAMETER, nothing written), and
+ * returns all four indices as they stood after the write.
+ */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned int	   new_tail;	/* in */
+	unsigned int	   tx_head;	/* out */
+	unsigned int	   tx_tail;	/* out (== new_tail on success) */
+	unsigned int	   rx_head;	/* out */
+	unsigned int	   rx_tail;	/* out */
+} co_manager_ioctl_conet_take_t;
 
 /*
  * interface for CO_MANAGER_IOCTL_KSTOP: end a running boot loop, now.

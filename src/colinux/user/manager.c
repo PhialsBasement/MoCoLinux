@@ -194,6 +194,31 @@ co_rc_t co_manager_conet_dump(co_manager_handle_t handle,
 	return rc;
 }
 
+co_rc_t co_manager_conet_take(co_manager_handle_t handle, unsigned int new_tail,
+			      unsigned int* tx_head, unsigned int* tx_tail,
+			      unsigned int* rx_head, unsigned int* rx_tail)
+{
+	co_manager_ioctl_conet_take_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	params.new_tail = new_tail;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_CONET_TAKE,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (CO_OK(rc)) {
+		*tx_head = params.tx_head;
+		*tx_tail = params.tx_tail;
+		*rx_head = params.rx_head;
+		*rx_tail = params.rx_tail;
+	}
+
+	return rc;
+}
+
 co_rc_t co_manager_kstop(co_manager_handle_t handle, int* was_running)
 {
 	co_manager_ioctl_kstop_t params = {0, };
