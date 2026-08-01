@@ -304,6 +304,10 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0, NULL, NULL);
 	}
 
+	if (winnt_parameters.net_dump) {
+		return co_elf_net_dump_live();
+	}
+
 	if (winnt_parameters.stop) {
 		co_manager_handle_t handle;
 		int was_running = 0;
