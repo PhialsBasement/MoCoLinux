@@ -1991,9 +1991,13 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		}
 
 		co_terminal_print("\n  booting:\n");
-		co_terminal_print("    stopping after %d world switches%s\n",
-				  b.max_switches,
-				  max_switches ? "  (--max-switches)" : "");
+		if (b.max_switches == ~0UL)
+			co_terminal_print("    no switch limit and no deadline"
+					  " -- stop.bat ends the run\n");
+		else
+			co_terminal_print("    stopping after %d world switches%s\n",
+					  b.max_switches,
+					  max_switches ? "  (--max-switches)" : "");
 		if (b.step)
 			co_terminal_print("    stepped, %d instructions per crossing  (--batch)\n",
 					  b.batch);

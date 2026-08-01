@@ -272,10 +272,21 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 	if (winnt_parameters.boot_kernel) {
 		unsigned long limit = 0, batch = 0;
 
-		if (winnt_parameters.max_switches &&
-		    !co_parse_count(winnt_parameters.max_switches_arg, &limit)) {
-			co_terminal_print("--max-switches wants a positive decimal count\n");
-			return CO_RC(INVALID_PARAMETER);
+		if (winnt_parameters.max_switches) {
+			/*
+			 * "none" rather than 0, because co_parse_count refuses
+			 * zero on purpose -- a mistyped digit must not quietly
+			 * become a different run. A word cannot be a typo for a
+			 * number.
+			 */
+			if (!strcmp(winnt_parameters.max_switches_arg, "none")) {
+				limit = ~0UL;
+			} else if (!co_parse_count(winnt_parameters.max_switches_arg,
+						   &limit)) {
+				co_terminal_print("--max-switches wants a positive"
+						  " decimal count, or none\n");
+				return CO_RC(INVALID_PARAMETER);
+			}
 		}
 
 		if (winnt_parameters.batch &&
