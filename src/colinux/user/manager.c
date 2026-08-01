@@ -154,6 +154,23 @@ co_rc_t co_manager_kload_chunk(co_manager_handle_t handle, unsigned long long va
 	return rc;
 }
 
+co_rc_t co_manager_kstop(co_manager_handle_t handle, int* was_running)
+{
+	co_manager_ioctl_kstop_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KSTOP,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (was_running)
+		*was_running = params.was_running;
+
+	return rc;
+}
+
 co_rc_t co_manager_kread(co_manager_handle_t handle, unsigned long long va,
 			 void* data, unsigned long size)
 {

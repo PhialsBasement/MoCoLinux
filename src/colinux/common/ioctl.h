@@ -51,6 +51,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KREAD,
 	CO_MANAGER_IOCTL_COBD,
 	CO_MANAGER_IOCTL_CONSOLE,
+	CO_MANAGER_IOCTL_KSTOP,
 } co_manager_ioctl_t;
 
 /*
@@ -344,6 +345,24 @@ typedef struct {
 	char		   in[512];
 	char		   out[2048];
 } co_manager_ioctl_console_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_KSTOP: end a running boot loop, now.
+ *
+ * Sets the same abort flag driver unload uses; the monitor loop checks it on
+ * every crossing, so a guest that is still crossing -- and a live guest
+ * always is, the host's clock arrives through it -- stops within
+ * milliseconds. The run then ends through its ordinary exit: the daemon that
+ * booted the guest prints its full report and calls KLOAD_END itself, so
+ * nothing about teardown is new. This exists for a guest that is wedged but
+ * alive, where the alternatives are the fifteen-minute deadline or the power
+ * button, and the second of those has already cost stranded memory and a
+ * walk to the machine.
+ */
+typedef struct {
+	co_rc_t		   rc;
+	int		   was_running;	/* out: a loop existed to stop */
+} co_manager_ioctl_kstop_t;
 
 /* interface for CO_MANAGER_IOCTL_KRAM: give the guest physical memory */
 #define CO_KRAM_MAX_RANGES 16

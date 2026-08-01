@@ -71,6 +71,9 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("                                   strlen out of it. Runs kernel code.\n");
 	co_terminal_print("      --enter-kernel FILE          The same, then transfer control into\n");
 	co_terminal_print("                                   the loaded image and back.\n");
+	co_terminal_print("      --stop                       End a running boot loop now. The run's own\n");
+	co_terminal_print("                                   daemon prints its report and cleans up as\n");
+	co_terminal_print("                                   usual; this only asks the loop to return.\n");
 	co_terminal_print("      --dump-vmlinux FILE          Parse an ELF kernel image and print its\n");
 	co_terminal_print("                                   sections and key symbols. Porting aid.\n");
 	co_terminal_print("      --probe-sweep                Map which of the 256 kernel PML4 slots\n");
@@ -230,6 +233,14 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		cmdline,
 		"--restore-state",
 		&winnt_parameters->restore_state);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_argumentless_parameter(
+		cmdline,
+		"--stop",
+		&winnt_parameters->stop);
 
 	if (!CO_OK(rc))
 		return rc;

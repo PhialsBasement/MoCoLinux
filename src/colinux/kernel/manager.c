@@ -943,6 +943,29 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_KSTOP: {
+		co_manager_ioctl_kstop_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		/*
+		 * One flag write, checked by the loop on every crossing --
+		 * the mechanism driver unload already trusts. Nothing is
+		 * freed or touched here: the run ends through its own exit
+		 * path, in the process that owns it. Unsynchronised on
+		 * purpose; the flag is monotonic within a run and the reader
+		 * is volatile.
+		 */
+		params->was_running = co_arch_boot_running();
+		if (params->was_running)
+			co_arch_boot_abort();
+
+		params->rc   = CO_RC(OK);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_KLOAD_END: {
 		/*
 		 * Retire the console before the address space it reads through
