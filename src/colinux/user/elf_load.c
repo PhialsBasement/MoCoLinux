@@ -19,6 +19,7 @@
 #include <linux/elf.h>
 
 #include "daemon.h"
+#include "conet_ring.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -368,54 +369,6 @@ co_rc_t co_elf_dump(const char *filename)
  * printk decoder gives: this is a Win64 program parsing an LP64 kernel's
  * memory, and the two compilers must not be allowed to disagree.
  */
-#define CO_NETIO_TX_HEAD	0x00
-#define CO_NETIO_TX_TAIL	0x04
-#define CO_NETIO_RX_HEAD	0x08
-#define CO_NETIO_RX_TAIL	0x0c
-#define CO_NETIO_TX		0x10
-#define CO_NETIO_TX_SIZE	(128 * 1024)
-#define CO_NETIO_RX_SIZE	(128 * 1024)
-#define CO_NETIO_MAX_FRAME	1514
-
-static unsigned int co_net_le32(const unsigned char* p)
-{
-	return (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
-	       ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
-}
-
-static void co_net_describe_frame(const unsigned char* f, unsigned int len)
-{
-	unsigned int ethertype;
-
-	if (len < 14) {
-		co_terminal_print("      (runt: shorter than an ethernet header)\n");
-		return;
-	}
-
-	ethertype = ((unsigned int)f[12] << 8) | f[13];
-	co_terminal_print("      dst %02x:%02x:%02x:%02x:%02x:%02x"
-			  "  src %02x:%02x:%02x:%02x:%02x:%02x  type 0x%04x\n",
-			  f[0], f[1], f[2], f[3], f[4], f[5],
-			  f[6], f[7], f[8], f[9], f[10], f[11], ethertype);
-
-	if (ethertype == 0x0806 && len >= 42) {
-		unsigned int op = ((unsigned int)f[20] << 8) | f[21];
-
-		co_terminal_print("      ARP %s  sender %u.%u.%u.%u"
-				  " (%02x:%02x:%02x:%02x:%02x:%02x)"
-				  "  target %u.%u.%u.%u\n",
-				  op == 1 ? "who-has" : op == 2 ? "reply" : "op?",
-				  f[28], f[29], f[30], f[31],
-				  f[22], f[23], f[24], f[25], f[26], f[27],
-				  f[38], f[39], f[40], f[41]);
-	} else if (ethertype == 0x86dd) {
-		co_terminal_print("      IPv6%s\n",
-				  (len >= 54 && f[20] == 58) ? " (ICMPv6)" : "");
-	} else if (ethertype == 0x0800) {
-		co_terminal_print("      IPv4\n");
-	}
-}
-
 /*
  * Parse and print a snapshot of the rings: the four indices and, when the TX
  * ring holds anything, a full-size copy of its byte array indexed by the
@@ -564,68 +517,6 @@ static void co_dump_net_rings(co_manager_handle_t handle, co_elf_data_t* pl)
  * not move in this rung), and a full ring drops rather than overwrites -- so
  * every byte in the snapshot's tail..head range is immutable once published.
  */
-/*
- * Fetch only what the ring actually holds.
- *
- * The first call asks for nothing but the indices; the rest fetch the
- * tail..head range and no more. Reading all 128 KB to look at a few hundred
- * bytes is not merely wasteful -- each call is a METHOD_BUFFERED ioctl, so
- * the I/O manager allocates and frees a multi-page block of non-paged pool
- * per call, and a poll loop doing sixteen of those per iteration churns pool
- * hard for no reason. A dozen frames now costs one small allocation.
- *
- * Requests are clamped so none straddles the ring's wrap, which keeps each
- * returned window contiguous at its own masked offset -- the parser indexes
- * the buffer exactly as the guest does, by masking a free-running position.
- */
-static co_rc_t co_net_fetch_live(co_manager_handle_t handle,
-				 unsigned int* tx_head, unsigned int* tx_tail,
-				 unsigned int* rx_head, unsigned int* rx_tail,
-				 unsigned char* ring)
-{
-	unsigned int h2, t2, r2h, r2t;
-	unsigned int used, done, got;
-	co_rc_t rc;
-
-	/*
-	 * Only tail..head is fetched below, and the parser reads nothing
-	 * outside it -- but a zeroed buffer makes a parser bug deterministic
-	 * rather than a function of whatever the heap last held.
-	 */
-	memset(ring, 0, CO_NETIO_TX_SIZE);
-
-	got = 0;
-	rc = co_manager_conet_dump(handle, tx_head, tx_tail, rx_head, rx_tail,
-				   0, ring, &got);
-	if (!CO_OK(rc))
-		return rc;
-
-	used = *tx_head - *tx_tail;
-	if (used == 0 || used > CO_NETIO_TX_SIZE)
-		return CO_RC(OK);	/* nothing to fetch, or a state the caller will reject */
-
-	for (done = 0; done < used; done += got) {
-		unsigned int pos  = *tx_tail + done;
-		unsigned int off  = pos & (CO_NETIO_TX_SIZE - 1);
-		unsigned int room = CO_NETIO_TX_SIZE - off;
-
-		got = used - done;
-		if (got > 8192)
-			got = 8192;
-		if (got > room)			/* never straddle the wrap */
-			got = room;
-
-		rc = co_manager_conet_dump(handle, &h2, &t2, &r2h, &r2t,
-					   pos, ring + off, &got);
-		if (!CO_OK(rc))
-			return rc;
-		if (got == 0)
-			return CO_RC(ERROR);
-	}
-
-	return CO_RC(OK);
-}
-
 co_rc_t co_elf_net_dump_live(void)
 {
 	co_manager_handle_t handle;
@@ -645,7 +536,7 @@ co_rc_t co_elf_net_dump_live(void)
 		return CO_RC(OUT_OF_MEMORY);
 	}
 
-	rc = co_net_fetch_live(handle, &tx_head, &tx_tail, &rx_head, &rx_tail, ring);
+	rc = co_net_fetch(handle, &tx_head, &tx_tail, &rx_head, &rx_tail, ring);
 	if (!CO_OK(rc)) {
 		co_terminal_print("net-dump: no live guest with net rings (rc %x)\n",
 				  (int)rc);
@@ -816,7 +707,7 @@ co_rc_t co_elf_net_peer_live(const char* seconds_arg)
 	while (waited_ms < deadline_ms) {
 		unsigned int pos, took = 0;
 
-		rc = co_net_fetch_live(handle, &tx_head, &tx_tail,
+		rc = co_net_fetch(handle, &tx_head, &tx_tail,
 				       &rx_head, &rx_tail, ring);
 		if (!CO_OK(rc)) {
 			co_terminal_print("net-peer: the guest's rings went away"
@@ -934,7 +825,7 @@ co_rc_t co_elf_net_take_live(const char* new_tail_arg)
 		return CO_RC(OUT_OF_MEMORY);
 	}
 
-	rc = co_net_fetch_live(handle, &tx_head, &tx_tail, &rx_head, &rx_tail, ring);
+	rc = co_net_fetch(handle, &tx_head, &tx_tail, &rx_head, &rx_tail, ring);
 	if (!CO_OK(rc)) {
 		co_terminal_print("net-take: no live guest with net rings (rc %x)\n",
 				  (int)rc);
