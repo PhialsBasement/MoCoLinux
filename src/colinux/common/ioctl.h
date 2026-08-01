@@ -115,8 +115,8 @@ typedef struct {
 
 /* interface for CO_MANAGER_IOCTL_INFO: */
 typedef struct {
-	unsigned long hostmem_usage_limit;
-	unsigned long hostmem_used;
+	unsigned long long hostmem_usage_limit;
+	unsigned long long hostmem_used;
 } co_manager_ioctl_info_t;
 
 #define CO_MANAGER_ATTACH_MAX_MODULES 0x10

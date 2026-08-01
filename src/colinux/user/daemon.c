@@ -404,9 +404,9 @@ memory_usage_limit_resached(co_manager_ioctl_create_t *create_params)
 	}
 	co_os_manager_close(handle);
 
-	co_terminal_print("colinux: memory usage limit: %ld MB\n",
+	co_terminal_print("colinux: memory usage limit: %llu MB\n",
 			  info.hostmem_usage_limit / 0x100000);
-	co_terminal_print("colinux: current memory used by running VMs: %ld MB\n",
+	co_terminal_print("colinux: current memory used by running VMs: %llu MB\n",
 			  info.hostmem_used / 0x100000);
 }
 

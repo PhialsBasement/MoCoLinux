@@ -23,7 +23,7 @@
 typedef unsigned long long co_pa_t;
 
 extern co_pa_t co_os_virt_to_phys(void *addr);
-extern co_rc_t co_os_physical_memory_pages(unsigned long *pages);
+extern co_rc_t co_os_physical_memory_pages(unsigned long long *pages);
 extern co_id_t co_os_current_id(void);
 
 /*

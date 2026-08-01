@@ -1,38 +1,36 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5, at the point where the
-world switch stopped being interruptible.
+Authoritative cumulative snapshot of ref/linux-7.1.5, with the crossing made
+uninterruptible in the right place.
 
 Generated against download/linux-7.1.5.tar.xz on 2026-08-01. Verified on the
-M92p by the thing that found the bug: switching a USB KVM away from the box and
-back, twice, with the guest idling at a shell prompt. Before this change that
-was a reliable reset.
+M92p: a USB KVM switched away and back with the guest idling at a prompt, and
+ctrl-C pressed repeatedly in the guest's terminal -- the two triggers that
+produced, respectively, a reset and a freeze.
 
-The one change over the terminal snapshot is in co_colinux_switch()
-(arch/x86/kernel/process.c): real interrupts are saved and cleared across the
-crossing, and restored after.
+Over the terminal snapshot, co_colinux_switch() changes twice.
 
-The switch writes CR3 several instructions before it loads the entering side's
-IDTR. In that gap the processor is already in the other address space while
-IDTR still points at the table the leaving side was using. That was harmless
-for the whole of bring-up because the guest's IDT lived in the passage page,
-which is mapped at the same address in both address spaces -- so the stale
-IDTR still resolved. It stopped being harmless the moment the guest adopted its
-own IDT: idt_table is ordinary guest kernel memory and the host does not map
-it. An interrupt in that gap makes the CPU fetch a gate from an unmapped page,
-and the handler for that fault is equally unreachable: page fault, double
-fault, triple fault. The machine resets with no bugcheck, no dump, and nothing
-in the log, because the records still in the driver's ring die with it.
+The cli that was briefly wrapped around the call is gone. The call does not
+merely cross: the host runs an entire monitor-loop iteration inside it and
+re-enters the guest before it returns, so a cli there was held across all of
+that -- and any path leaving the switch without returning through the matching
+popfq put the guest back on the processor with interrupts off. The guest then
+ran deaf until something happened to call local_irq_enable(). Delivering a
+signal and respawning a shell is long enough for the host to miss its clock,
+which is a freeze rather than a reset. The window that needs covering is five
+instructions wide and lives inside the switch, where it is now closed with a
+bare cli (see arch/x86_64/switch.c in the host tree).
 
-Two of the three ways into the switch were already covered. The monitor loop
-clears IF before it enters the guest, and the fault stubs are reached through
-interrupt gates, which clear IF on delivery. The voluntary yield was the one
-crossing with interrupts enabled -- deliberately, because real IF stays on for
-the life of a free-running guest, which is what keeps the host answering its
-clock. An idle guest takes that path thousands of times a second.
+What replaces it is an sti after the call, unconditionally. The switch clears
+IF for the crossing and does not restore it -- at that point RSP still belongs
+to the leaving side and r11 is taken, so there is nowhere to keep the value --
+so control returns here deaf. That was already true before any of this, because
+the monitor loop clears IF before entering the guest; what covered it was Linux
+calling local_irq_enable() soon afterwards, which is a coincidence of timing
+rather than a guarantee. A guest must always run with real interrupts on, so it
+now says so.
 
-The flags are saved and restored rather than unconditionally re-enabled: the
-yield is called from contexts that legitimately have real interrupts off
-already. The guest's logical interrupt state is the virtual flag and is not
-involved.
+The real flag only. The guest's logical interrupt state is the virtual flag and
+is untouched: code that yielded from inside a local_irq_disable() section still
+sees interrupts disabled.
 
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
@@ -1000,7 +998,7 @@ index 90a22e2..64afc0a 100644
   * idt_setup_early_handler - Initializes the idt table with early handlers
   */
 diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
-index 4c718f8..3a0e256 100644
+index 4c718f8..8eb4687 100644
 --- a/arch/x86/kernel/process.c
 +++ b/arch/x86/kernel/process.c
 @@ -54,6 +54,10 @@
@@ -1014,7 +1012,7 @@ index 4c718f8..3a0e256 100644
  
  #include "process.h"
  
-@@ -773,6 +777,252 @@ EXPORT_SYMBOL(default_idle);
+@@ -773,6 +777,256 @@ EXPORT_SYMBOL(default_idle);
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -1054,39 +1052,29 @@ index 4c718f8..3a0e256 100644
 +	register void *leaving  asm("rcx") = pp + CO_PP_LINUXVM_STATE;
 +	register void *entering asm("rdx") = pp + CO_PP_HOST_STATE;
 +	void *code = pp + CO_PP_CODE;
-+	unsigned long flags;
-+
 +	*(volatile unsigned long long *)(pp + CO_PP_OPERATION) = operation;
 +
 +	/*
-+	 * Real interrupts off across the crossing, and this is not the virtual
-+	 * flag -- it is the hardware one, the only place in the guest that
-+	 * touches it deliberately.
++	 * The crossing itself is made uninterruptible inside the switch (the
++	 * cli/sti pair around the CR3 write in arch/x86_64/switch.c), and
++	 * deliberately not here.
 +	 *
-+	 * The switch changes CR3 several instructions before it loads the
-+	 * entering side's IDTR. In that gap the processor is already in the
-+	 * other address space while IDTR still points at the table this side
-+	 * was using. That was harmless for as long as the guest's IDT lived in
-+	 * the passage page, which is mapped at the same address in both
-+	 * spaces. It stopped being harmless when the guest adopted its own
-+	 * IDT: idt_table is ordinary guest kernel memory, and the host does not
-+	 * map it. An interrupt arriving in that gap makes the CPU read a gate
-+	 * from an unmapped page, whose fault handler is equally unreachable --
-+	 * page fault, double fault, triple fault, and the machine resets with
-+	 * no bugcheck and nothing in the log.
++	 * Wrapping this call was the obvious-looking fix and was wrong. The
++	 * call does not merely cross: the host runs a whole monitor-loop
++	 * iteration inside it and re-enters the guest before it returns. So a
++	 * cli here is held across all of that, and any path that leaves the
++	 * switch without coming back through the matching popfq -- a resume
++	 * after a fault, an interrupt replayed and the guest restarted at its
++	 * saved frame -- puts the guest back on the processor with real
++	 * interrupts off. The guest then runs free and deaf until something
++	 * happens to call local_irq_enable(), and if that stretch is long
++	 * enough the host misses its clock and the machine freezes. Delivering
++	 * a signal and respawning a shell is long enough.
 +	 *
-+	 * The other two ways into the switch are already covered: the monitor
-+	 * loop clears IF before it enters the guest, and the fault stubs are
-+	 * reached through interrupt gates, which clear IF on delivery. This
-+	 * voluntary path was the one left running with interrupts enabled, and
-+	 * an idle guest takes it thousands of times a second.
-+	 *
-+	 * It was found by hitting a USB KVM switch, which sprays the pinned
-+	 * core with device interrupts and turns a window of a few instructions
-+	 * into a reproducible reset.
++	 * The window that actually needs covering is five instructions wide
++	 * and lives on the other side of this call, which is where it is now
++	 * closed.
 +	 */
-+	asm volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
-+
 +	asm volatile(
 +		"call *%[code]\n"
 +		: "+r"(leaving), "+r"(entering)
@@ -1094,11 +1082,25 @@ index 4c718f8..3a0e256 100644
 +		: "rax", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory", "cc");
 +
 +	/*
-+	 * Restored rather than unconditionally set: this is called from
-+	 * contexts that legitimately have real interrupts off already, and the
-+	 * guest's own logical state lives in the virtual flag regardless.
++	 * Real interrupts back on, unconditionally, because the guest must
++	 * always run with them on and nothing else here will do it.
++	 *
++	 * The switch clears IF for the crossing and does not restore it -- it
++	 * has nowhere to keep the value at that point -- so control arrives
++	 * back here deaf. That was already true before the crossing was made
++	 * uninterruptible, because the monitor loop clears IF before it enters
++	 * the guest; what saved it was that Linux calls local_irq_enable()
++	 * often, and that now puts the hardware flag back too (asm/irqflags.h).
++	 * Relying on that is relying on a coincidence of timing: the window
++	 * between here and the next enable is a window in which the host is not
++	 * answering its clock.
++	 *
++	 * This is the real flag only. The guest's logical interrupt state is
++	 * the virtual one and is not touched: code that yielded from inside a
++	 * local_irq_disable() section still believes interrupts are off, and
++	 * still has them off as far as anything in the guest can observe.
 +	 */
-+	asm volatile("pushq %0; popfq" : : "r"(flags) : "memory", "cc");
++	asm volatile("sti" : : : "memory");
 +}
 +
 +/*
@@ -1267,7 +1269,7 @@ index 4c718f8..3a0e256 100644
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +1186,18 @@ out:
+@@ -936,6 +1190,18 @@ out:
  
  void __init select_idle_routine(void)
  {

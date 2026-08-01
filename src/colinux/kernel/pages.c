@@ -31,8 +31,8 @@ co_rc_t co_manager_get_page(struct co_manager *manager, co_pfn_t *pfn)
 	if (*pfn >= manager->hostmem_pages) {
 		/* Surprise! We have a bug! */
 
-		co_debug_error("PFN too high! %ld >= %ld",
-			 *pfn, manager->hostmem_pages);
+		co_debug_error("PFN too high! %llu >= %llu",
+			 (unsigned long long)*pfn, manager->hostmem_pages);
 
 		return CO_RC(ERROR);
 	}

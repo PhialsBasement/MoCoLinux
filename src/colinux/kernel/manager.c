@@ -49,7 +49,7 @@ static void set_hostmem_usage_limit(co_manager_t* manager)
 		manager->hostmem_usage_limit = manager->hostmem_amount*3/4;
 	}
 
-	co_debug("machine RAM use limit: %ld MB" , manager->hostmem_usage_limit);
+	co_debug("machine RAM use limit: %llu MB", manager->hostmem_usage_limit);
 
 	manager->hostmem_usage_limit <<= 20; /* Megify */
 }
@@ -90,15 +90,25 @@ co_rc_t co_manager_load(co_manager_t *manager)
 	if (!CO_OK(rc))
 		goto out_err_mutex;
 
-	/* Calculate amount in mega bytes, not overruns the 4GB limit of unsigned long integer */
 	manager->hostmem_amount = manager->hostmem_pages >> (20-CO_ARCH_PAGE_SHIFT);
-	co_debug("machine has %ld MB of RAM", manager->hostmem_amount);
+	co_debug("machine has %llu MB of RAM", manager->hostmem_amount);
 
-	if (manager->hostmem_pages > 0x100000) {
-		co_debug_error("error, machines with more than 4GB are not currently supported");
-		rc = CO_RC(ERROR);
-		goto out_err_mutex;
-	}
+	/*
+	 * There used to be a refusal here for machines with more than 4 GB.
+	 *
+	 * It was an i386 inheritance and it was load-time fatal: the driver
+	 * would not start at all. Nothing in the x86-64 path needs it. Physical
+	 * addresses are already 64-bit (co_pa_t, and co_pfn_t in
+	 * arch/x86_64/mmu.h), guest RAM is allocated with no ceiling
+	 * (MmAllocateContiguousMemory against ~0ULL), guest physical equals
+	 * host physical, and the guest's tables are four-level -- so a block
+	 * above 4 GB needs no special handling anywhere.
+	 *
+	 * What did need fixing before the check could go were the accounting
+	 * fields themselves, which were "unsigned long" and therefore 32-bit
+	 * on Windows x64: hostmem_usage_limit is a byte count and shifting
+	 * megabytes into it overflowed above 4 GB.
+	 */
 
 	set_hostmem_usage_limit(manager);
 
@@ -1208,8 +1218,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		*return_size = sizeof(*params);
 
 		if (in_size < sizeof(*params)) {
-			co_debug_error("monitor ioctl too small! (%ld < %d)",
-			               in_size, sizeof(*params));
+			co_debug_error("monitor ioctl too small! (%lu < %llu)",
+			               in_size, (unsigned long long)sizeof(*params));
 			params->rc = CO_RC(MONITOR_NOT_LOADED);
 			break;
 		}
