@@ -1451,7 +1451,16 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 				  b.switches, b.run_yields, b.idle_yields);
 		co_terminal_print("  %lu instructions stepped, %lu captured interrupts%s\n",
 				  b.steps, b.interrupts,
-				  b.hit_limit ? "  (hit the limit)" : "");
+				  b.hit_deadline ? "  (hit the time limit)"
+				  : b.hit_limit ? "  (hit the limit)" : "");
+		/*
+		 * The two numbers apart, because they measure different things and
+		 * only one of them is the guest. A run that is almost entirely
+		 * replayed host interrupts is a run where the guest barely executed,
+		 * and that used to be invisible behind a single switch count.
+		 */
+		co_terminal_print("  %lu of those switches were the guest's own\n",
+				  b.guest_switches);
 		if (b.block_requests || b.block_errors)
 			co_terminal_print("  %lu block transfers, %lu of them failed\n",
 					  b.block_requests, b.block_errors);
@@ -1591,7 +1600,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		} else if (b.returned_voluntarily && b.stop_operation) {
 			co_terminal_print("  the guest yielded operation %llu, which the host\n"
 					  "  does not handle yet\n", b.stop_operation);
-		} else if (b.hit_limit) {
+		} else if (b.hit_limit || b.hit_deadline) {
 			static const char* const rn[15] = {
 				"r15","r14","r13","r12","r11","r10","r9","r8",
 				"rbp","rdi","rsi","rdx","rcx","rbx","rax"

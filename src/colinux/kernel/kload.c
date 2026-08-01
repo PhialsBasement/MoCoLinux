@@ -556,6 +556,51 @@ co_rc_t co_kload_read(co_manager_t* manager, unsigned long long va,
 }
 
 /*
+ * Write guest memory through the guest's own page tables -- co_kload_read in
+ * the other direction, and it exists for the same reason the reader does: a
+ * guest virtual address is not a host pointer.
+ *
+ * The monitor loop is the customer. Once the guest owns its descriptor tables,
+ * an interrupt lands on whatever stack the kernel was using -- the init task's
+ * boot stack, a vmalloc'd thread stack -- and the frame the stub records is at
+ * an address only the guest's CR3 can resolve. Dereferencing it from the host
+ * was fine exactly as long as every frame lived on the passage page's IST
+ * stack, and became bugcheck 0x50 the first crossing after it did not.
+ */
+co_rc_t co_kload_write(co_manager_t* manager, unsigned long long va,
+		       const unsigned char* buf, unsigned long size)
+{
+	if (kload_space == NULL)
+		return CO_RC(ERROR);
+
+	while (size) {
+		unsigned long offset = (unsigned long)(va & ~CO_ARCH_PAGE_MASK);
+		unsigned long part   = CO_ARCH_PAGE_SIZE - offset;
+		co_pa_t pa = 0;
+		int level = -1;
+		unsigned char* p;
+
+		if (part > size)
+			part = size;
+
+		if (!CO_OK(co_arch_guest_lookup(manager, kload_space, va, &pa, &level)) || !pa)
+			return CO_RC(NOT_FOUND);
+
+		p = co_kload_frame_va((co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT));
+		if (p == NULL)
+			return CO_RC(ERROR);
+
+		co_memcpy(p + offset, buf, part);
+
+		buf  += part;
+		va   += part;
+		size -= part;
+	}
+
+	return CO_RC(OK);
+}
+
+/*
  * A checksum of what is actually in guest memory, read back through the guest's
  * own page tables.
  *
