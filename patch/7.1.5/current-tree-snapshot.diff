@@ -1,36 +1,33 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5, with the crossing made
-uninterruptible in the right place.
+Authoritative cumulative snapshot of ref/linux-7.1.5 with an orderly shutdown.
 
 Generated against download/linux-7.1.5.tar.xz on 2026-08-01. Verified on the
-M92p: a USB KVM switched away and back with the guest idling at a prompt, and
-ctrl-C pressed repeatedly in the guest's terminal -- the two triggers that
-produced, respectively, a reset and a freeze.
+M92p from both entrances -- "poweroff" under BusyBox init, and
+"echo o > /proc/sysrq-trigger" under an Arch root -- each ending with the
+daemon exiting cleanly and the host still running.
 
-Over the terminal snapshot, co_colinux_switch() changes twice.
+Over the terminal snapshot:
 
-The cli that was briefly wrapped around the call is gone. The call does not
-merely cross: the host runs an entire monitor-loop iteration inside it and
-re-enters the guest before it returns, so a cli there was held across all of
-that -- and any path leaving the switch without returning through the matching
-popfq put the guest back on the processor with interrupts off. The guest then
-ran deaf until something happened to call local_irq_enable(). Delivering a
-signal and respawning a shell is long enough for the host to miss its clock,
-which is a freeze rather than a reset. The window that needs covering is five
-instructions wide and lives inside the switch, where it is now closed with a
-bare cli (see arch/x86_64/switch.c in the host tree).
+  * co_colinux_terminate() (process.c) sends CO_OPERATION_TERMINATE with a
+    reason, and machine_halt, machine_power_off and machine_restart call it.
+    The protocol always had the message and the host always handled it; the
+    guest simply never sent one. Its only way of saying "I am finished" was
+    native_halt()'s ud2; ud2, which the host recognises by reading the
+    instruction stream to tell it from a WARN's single ud2. That stays for the
+    paths that arrive at halt without planning to -- a panic, a BUG -- and is
+    the wrong way to report an orderly poweroff.
 
-What replaces it is an sti after the call, unconditionally. The switch clears
-IF for the crossing and does not restore it -- at that point RSP still belongs
-to the leaving side and r11 is taken, so there is nowhere to keep the value --
-so control returns here deaf. That was already true before any of this, because
-the monitor loop clears IF before entering the guest; what covered it was Linux
-calling local_irq_enable() soon afterwards, which is a coincidence of timing
-rather than a guarantee. A guest must always run with real interrupts on, so it
-now says so.
+  * native_machine_shutdown() returns immediately for a cooperative guest, and
+    this is the one that mattered. It calls clear_IO_APIC(), lapic_shutdown()
+    and restore_boot_irq_mode(): IOAPIC registers, the local APIC, and outb to
+    the 8259 and the IMCR. None of it is virtualised, because this kernel runs
+    at ring 0 on the real processor -- so the guest's last act was reprogramming
+    the interrupt controller the host was using, and the host went deaf
+    immediately afterwards. No crash, nothing to bugcheck, just a freeze.
+    Shutting down had never been reachable before, which is why a rule already
+    applied to the boot-time APIC setup had a hole here.
 
-The real flag only. The guest's logical interrupt state is the virtual flag and
-is untouched: code that yielded from inside a local_irq_disable() section still
-sees interrupts disabled.
+The terminate call is placed before machine_shutdown() in each path, so the
+orderly route never reaches any of that hardware even with the guard in place.
 
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
@@ -998,7 +995,7 @@ index 90a22e2..64afc0a 100644
   * idt_setup_early_handler - Initializes the idt table with early handlers
   */
 diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
-index 4c718f8..8eb4687 100644
+index 4c718f8..c1ec66c 100644
 --- a/arch/x86/kernel/process.c
 +++ b/arch/x86/kernel/process.c
 @@ -54,6 +54,10 @@
@@ -1012,7 +1009,7 @@ index 4c718f8..8eb4687 100644
  
  #include "process.h"
  
-@@ -773,6 +777,256 @@ EXPORT_SYMBOL(default_idle);
+@@ -773,6 +777,295 @@ EXPORT_SYMBOL(default_idle);
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -1039,11 +1036,13 @@ index 4c718f8..8eb4687 100644
 +#define CO_PP_HOST_STATE	0x740
 +#define CO_PP_LINUXVM_STATE	0x880
 +#define CO_PP_OPERATION		0x9c0
++#define CO_PP_PARAMS		0x9c8	/* params[0]: 0xb50 - 49*8, see below */
 +#define CO_PP_HOST_MONO		0xb50	/* params[49]: host monotonic clock, 100 ns units */
 +#define CO_PP_HOST_WALL		0xb58	/* params[50]: host wall clock, UTC time_t seconds */
 +
 +/* co_operation_t values, from include/linux/cooperative.h in the coLinux tree */
 +#define CO_OPERATION_IDLE	2
++#define CO_OPERATION_TERMINATE	3
 +#define CO_OPERATION_YIELD	16
 +
 +static __always_inline void co_colinux_switch(unsigned long long operation)
@@ -1102,6 +1101,43 @@ index 4c718f8..8eb4687 100644
 +	 */
 +	asm volatile("sti" : : : "memory");
 +}
++
++/*
++ * Tell the host the guest is finished, and why.
++ *
++ * A cooperative guest cannot power anything off: there is no hardware to write
++ * to, and the processor belongs to a Windows kernel that is still using it.
++ * What "shutting down" means here is telling the host that this guest is done
++ * so that it can end the monitor loop, free the guest's memory and close the
++ * files backing its disks -- which is the whole of the shutdown that exists to
++ * be performed.
++ *
++ * This is the cooperative protocol's own message, and it replaces a signature
++ * the host had to recognise by sniffing opcodes. native_halt() emits ud2; ud2
++ * and the host reads the instruction stream to tell that apart from a WARN's
++ * single ud2. That works, and it is a reasonable thing to keep for the paths
++ * where nothing better is possible -- a panic, a BUG, anything that arrives at
++ * halt without having planned to. It is the wrong way to say "the operator
++ * typed poweroff", which is an orderly event the guest can announce properly:
++ * with a reason, after the filesystems have been flushed and unmounted, at a
++ * point where the host can distinguish a clean exit from a crash.
++ *
++ * Does not return. If the host re-enters us anyway, spin on the halt so we do
++ * not run on with the state teardown already done.
++ */
++void co_colinux_terminate(unsigned long reason)
++{
++	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
++
++	if (pp) {
++		*(volatile unsigned long long *)(pp + CO_PP_PARAMS) = reason;
++		co_colinux_switch(CO_OPERATION_TERMINATE);
++	}
++
++	for (;;)
++		native_halt();
++}
++EXPORT_SYMBOL(co_colinux_terminate);
 +
 +/*
 + * Give the processor back at a safe guest boundary. This is intentionally a
@@ -1269,7 +1305,7 @@ index 4c718f8..8eb4687 100644
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +1190,18 @@ out:
+@@ -936,6 +1229,18 @@ out:
  
  void __init select_idle_routine(void)
  {
@@ -1288,6 +1324,91 @@ index 4c718f8..8eb4687 100644
  	if (boot_option_idle_override == IDLE_POLL) {
  		if (IS_ENABLED(CONFIG_SMP) && __max_threads_per_core > 1)
  			pr_warn_once("WARNING: polling idle and HT enabled, performance may degrade\n");
+diff --git a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
+index 0fed6d0..c584f5c 100644
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/console.h>	/* co_colinux_guest, co_colinux_terminate */
+ #include <linux/export.h>
+ #include <linux/reboot.h>
+ #include <linux/init.h>
+@@ -669,6 +670,27 @@ static void native_machine_emergency_restart(void)
+ 
+ void native_machine_shutdown(void)
+ {
++	/*
++	 * A cooperative guest has no hardware to shut down, and everything
++	 * below belongs to somebody else.
++	 *
++	 * clear_IO_APIC() writes IOAPIC registers, lapic_shutdown() disables
++	 * the local APIC, and restore_boot_irq_mode() puts the 8259 and the
++	 * IMCR back the way a firmware left them -- through outb, to real
++	 * ports. None of that is virtualised: this kernel runs at ring 0 on
++	 * the actual processor, so those writes land on the interrupt
++	 * controller the host is using. Reprogramming it is the last thing
++	 * this guest ever does, and the host stops receiving interrupts
++	 * immediately afterwards. The machine freezes with no bugcheck, since
++	 * nothing has crashed -- it has simply gone deaf.
++	 *
++	 * Shutting down is a new path, which is why this survived: the guest
++	 * had never previously reached any of it. The same rule was already
++	 * applied to the boot-time APIC setup.
++	 */
++	if (co_colinux_guest)
++		return;
++
+ 	/*
+ 	 * Call enc_kexec_begin() while all CPUs are still active and
+ 	 * interrupts are enabled. This will allow all in-flight memory
+@@ -724,10 +746,24 @@ static void __machine_emergency_restart(int emergency)
+ 	machine_ops.emergency_restart();
+ }
+ 
++/*
++ * A cooperative guest shuts down by telling the host, not by touching
++ * hardware. See co_colinux_terminate() in process.c; the reasons are its
++ * argument and exist so the host's log distinguishes an orderly exit from a
++ * crash.
++ */
++#define CO_TERMINATE_POWER_OFF	0
++#define CO_TERMINATE_HALT	1
++#define CO_TERMINATE_RESTART	2
++#define CO_TERMINATE_EMERGENCY	3
++
+ static void native_machine_restart(char *command)
+ {
+ 	pr_notice("machine restart\n");
+ 
++	if (co_colinux_guest)
++		co_colinux_terminate(CO_TERMINATE_RESTART);
++
+ 	if (!reboot_force)
+ 		machine_shutdown();
+ 
+@@ -738,6 +774,9 @@ static void native_machine_restart(char *command)
+ 
+ static void native_machine_halt(void)
+ {
++	if (co_colinux_guest)
++		co_colinux_terminate(CO_TERMINATE_HALT);
++
+ 	/* Stop other cpus and apics */
+ 	machine_shutdown();
+ 
+@@ -748,6 +787,9 @@ static void native_machine_halt(void)
+ 
+ static void native_machine_power_off(void)
+ {
++	if (co_colinux_guest)
++		co_colinux_terminate(CO_TERMINATE_POWER_OFF);
++
+ 	if (kernel_can_power_off()) {
+ 		if (!reboot_force)
+ 			machine_shutdown();
 diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
 index 46882ce..528e41f 100644
 --- a/arch/x86/kernel/setup.c
@@ -1996,10 +2117,10 @@ index 0000000..242ec2c
 +}
 +device_initcall(hvc_co_init);
 diff --git a/include/linux/console.h b/include/linux/console.h
-index 5520e44..08b07d0 100644
+index 5520e44..5974468 100644
 --- a/include/linux/console.h
 +++ b/include/linux/console.h
-@@ -741,4 +741,22 @@ extern void console_init(void);
+@@ -741,4 +741,24 @@ extern void console_init(void);
  void dummycon_register_output_notifier(struct notifier_block *nb);
  void dummycon_unregister_output_notifier(struct notifier_block *nb);
  
@@ -2012,6 +2133,7 @@ index 5520e44..08b07d0 100644
 +void co_colinux_timer_init(void);
 +void co_colinux_drain_time(void);
 +void co_colinux_get_wallclock(struct timespec64 *now);
++void co_colinux_terminate(unsigned long reason);
 +#else
 +static inline void co_colinux_console_init(void) { }
 +extern int co_colinux_guest;
@@ -2019,6 +2141,7 @@ index 5520e44..08b07d0 100644
 +void co_colinux_timer_init(void);
 +void co_colinux_drain_time(void);
 +void co_colinux_get_wallclock(struct timespec64 *now);
++void co_colinux_terminate(unsigned long reason);
 +#endif
 +
  #endif /* _LINUX_CONSOLE_H */

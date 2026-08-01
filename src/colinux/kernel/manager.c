@@ -859,6 +859,31 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		trc = co_arch_boot_loaded(manager, co_kload_space(), &in, &result);
 		co_os_unpin_cpu();
 
+		/*
+		 * The guest said it was finished, so let go of what it was
+		 * using -- as much of it as can be let go of here.
+		 *
+		 * Not its memory: the daemon reads the kernel's printk ring
+		 * out of it after this call returns, and that log is the most
+		 * useful thing a run produces. That waits for KLOAD_END.
+		 *
+		 * But the backing files can go now, and should. They were
+		 * being held until the driver unloaded, which meant a finished
+		 * guest still had its disk image open: the next deploy could
+		 * not overwrite root.img, and the fix was to reload the driver
+		 * for no other reason. A shut-down guest is not using its
+		 * disks. Neither is it using its console, so that is retired
+		 * too, which also stops a terminal client walking page tables
+		 * belonging to a guest that has stopped.
+		 */
+		if (result.terminated) {
+			co_debug("boot: the guest shut down (reason %llu) -- "
+				 "closing its disks and retiring its console",
+				 result.terminate_reason);
+			co_console_set_address(0);
+			co_cobd_detach_all();
+		}
+
 		params->rc		 = trc;
 		params->supported	 = result.supported;
 		params->entry_va	 = result.entry_va;
@@ -927,6 +952,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		 * driver, so it bugchecks rather than fails.
 		 */
 		co_console_set_address(0);
+		co_cobd_detach_all();
 		co_kload_free(manager);
 		*return_size = 0;
 		return CO_RC(OK);

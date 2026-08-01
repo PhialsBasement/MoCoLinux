@@ -360,7 +360,19 @@ co_rc_t co_elf_dump(const char *filename)
 #define CO_KLOAD_CHUNK	0x8000
 
 /* How much physical memory the guest is told it has. */
-#define CO_GUEST_RAM	(128ULL << 20)
+/*
+ * 512 MB, up from 128.
+ *
+ * 128 was chosen when the guest was a kernel with no userspace and then a
+ * BusyBox root, where it was generous. An Arch userspace with systemd is a
+ * different proposition: the init system alone maps more than the old guest
+ * had in total, and a package manager wants room to unpack into.
+ *
+ * It is not contiguous -- co_kload_build_ram takes what the host will give in
+ * several blocks and describes each at its true physical address in the e820,
+ * so this is a target rather than a demand.
+ */
+#define CO_GUEST_RAM	(512ULL << 20)
 
 /* One e820 entry: 8-byte address, 8-byte size, 4-byte type, packed to 20. */
 static void co_e820_entry(unsigned char* p, unsigned long long addr,
@@ -647,7 +659,7 @@ static void co_report_bug_at(co_elf_data_t* pl, unsigned long long rip)
 
 co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			       unsigned long max_switches, unsigned long batch,
-			       const char* cobd0)
+			       const char* cobd0, const char* init_path)
 {
 	co_elf_data_t* pl;
 	co_manager_handle_t handle;
@@ -1244,9 +1256,19 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 * disk, and is exactly where the boot stopped before cobd
 		 * existed.
 		 */
-		if (cobd0)
-			strcat(cmdline, " root=/dev/cobd0 rootfstype=ext4 rw"
-					" init=/sbin/init");
+		if (cobd0) {
+			strcat(cmdline, " root=/dev/cobd0 rootfstype=ext4 rw init=");
+			/*
+			 * Overridable, because the first thing worth knowing
+			 * about an unfamiliar root filesystem is whether it
+			 * can run anything at all. Booting straight into an
+			 * init system conflates "the userspace works" with
+			 * "the init system works", and when it stops there is
+			 * no way to tell which failed. --init /bin/sh answers
+			 * the first question on its own.
+			 */
+			strcat(cmdline, init_path ? init_path : "/sbin/init");
+		}
 
 		/*
 		 * Refuse rather than truncate. A command line that is silently
@@ -1623,8 +1645,32 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			co_terminal_print("  yield: the cooperative idle did not take.\n");
 			co_terminal_print("  ========================================================\n");
 		} else if (b.terminated) {
-			co_terminal_print("  the guest terminated itself, reason %llu\n",
-					  b.terminate_reason);
+			/*
+			 * The orderly ending, and the only one that means the
+			 * guest chose to stop. Everything else here is the run
+			 * being cut short -- a fault, a limit, an operation the
+			 * host does not implement.
+			 *
+			 * The reasons come from the guest's reboot paths
+			 * (arch/x86/kernel/reboot.c), so "poweroff" and "halt"
+			 * are distinguishable, and both are distinguishable
+			 * from a panic that reached halt without planning to --
+			 * which still arrives as ud2 and is reported above.
+			 */
+			static const char* const why[] = {
+				"powered off", "halted", "restarted",
+				"stopped in an emergency"
+			};
+
+			co_terminal_print("\n  ========================================================\n");
+			co_terminal_print("  THE GUEST SHUT ITSELF DOWN -- %s.\n",
+					  b.terminate_reason < 4
+						? why[b.terminate_reason]
+						: "reason unknown");
+			co_terminal_print("  Filesystems were flushed and unmounted by init before\n");
+			co_terminal_print("  this point; the host is now free to release the guest's\n");
+			co_terminal_print("  memory and close the files behind its disks.\n");
+			co_terminal_print("  ========================================================\n");
 		} else if (b.returned_voluntarily && b.stop_operation) {
 			co_terminal_print("  the guest yielded operation %llu, which the host\n"
 					  "  does not handle yet\n", b.stop_operation);

@@ -55,6 +55,10 @@ typedef struct co_winnt_parameters {
 	 * Serve the guest's console on this TCP port and nothing else. A second
 	 * process alongside the one running the guest; see console.c.
 	 */
+	/* Which init the guest runs; empty means /sbin/init. */
+	bool_t init;
+	char   init_arg[0x100];
+
 	bool_t console;
 	char   console_arg[0x20];
 	bool_t cobd0;
