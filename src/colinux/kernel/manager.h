@@ -31,8 +31,23 @@ struct co_manager_open_desc_os;
 
 typedef struct co_manager_open_desc_os *co_manager_open_desc_os_t;
 
+/*
+ * Stamped at open, cleared immediately before the descriptor is freed.
+ *
+ * A descriptor that reaches a close path without this is one that has already
+ * been released -- and the evidence that this happens is a bugcheck, not a
+ * theory: 0x50 four times in one day, every one of them ExFreePool faulting
+ * on the pointer at offset 0x48 of a descriptor whose memory had already been
+ * recycled, reached from co_os_manager_userspace_close. Handing a recycled
+ * field to the pool allocator destroys the evidence along with the machine;
+ * refusing and saying so leaves both intact.
+ */
+#define CO_MANAGER_OPEN_MAGIC 0x4f50454e444f4353ULL	/* "OPENDOCS" */
+
 typedef struct co_manager_open_desc {
 	co_list_t node;
+
+	unsigned long long magic;
 
 	bool_t active;
 	int ref_count;

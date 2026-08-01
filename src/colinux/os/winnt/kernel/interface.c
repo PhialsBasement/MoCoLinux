@@ -33,8 +33,19 @@ static NTAPI void manager_irp_cancel(
 	if (manager) {
 		opened = (typeof(opened))(Irp->Tail.Overlay.DriverContext[0]);
 		if (opened) {
+			/*
+			 * Clear the slot only if it still holds *this* IRP.
+			 * Nulling it unconditionally, which is what this did,
+			 * drops a different pending IRP on the floor: nothing
+			 * can find it afterwards, so the read never completes
+			 * and the handle close that would have cancelled it
+			 * sees an empty slot. This runs with the cancel spin
+			 * lock held, so the compare and the clear are atomic
+			 * against the consumers that claim it.
+			 */
 			myIRP = opened->os->irp == Irp;
-			opened->os->irp = NULL;
+			if (myIRP)
+				opened->os->irp = NULL;
 		}
 	}
 
