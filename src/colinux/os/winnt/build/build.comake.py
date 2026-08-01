@@ -52,7 +52,28 @@ def generate_options(compiler_def_type, libs=None, lflags=None):
         ),
         appenders = dict(
         compiler_flags = [ '-mno-cygwin' ],
-        linker_flags = lflags,
+        #
+        # The GCC runtime goes in the binary, not beside it.
+        #
+        # mingw-w64 links libgcc dynamically by default, and for x86-64 that is
+        # libgcc_s_seh-1.dll -- the SEH unwinder. Every daemon that needs it
+        # then refuses to start on a machine that does not have it, which is
+        # any Windows that has not had a mingw runtime installed on it. The
+        # test box is exactly that machine, and the failure is a dialog about a
+        # missing DLL rather than anything to do with coLinux.
+        #
+        # libstdc++ for the same reason one target over: colinux-console-nt is
+        # C++, so it would want libstdc++-6.dll beside it as well.
+        #
+        # These are shipped as single files that get copied onto a box by hand;
+        # a binary that needs a runtime next to it is a binary that will
+        # eventually be copied without it.
+        #
+        # -static rather than the two narrower flags, because those left
+        # libwinpthread-1.dll behind on the two targets that pull in the C++
+        # runtime, and a second missing-DLL dialog is no better than the first.
+        #
+        linker_flags = lflags + [ '-static' ],
         compiler_libs = libs + [
             'user32', 'gdi32', 'ws2_32', 'ntdll', 'kernel32', 'ole32', 'uuid', 'gdi32',
         ] + crt + ['shlwapi']),
