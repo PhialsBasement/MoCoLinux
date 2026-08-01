@@ -39,6 +39,8 @@
 
 #include "manager.h"
 #include "kload.h"
+#include "console.h"
+#include "net.h"
 
 static co_arch_guest_space_t* kload_space;
 static unsigned long long     kload_min_va;
@@ -292,8 +294,43 @@ static void kload_release_pages(co_manager_t* manager)
 
 void co_kload_free(co_manager_t* manager)
 {
-	if (kload_space == NULL && kload_block_count == 0)
+	co_arch_guest_space_t* space = kload_space;
+
+	if (space == NULL && kload_block_count == 0)
 		return;
+
+	/*
+	 * Retire the cross-process readers here, not at the call sites.
+	 *
+	 * The console pump and the network bridge are separate processes that
+	 * reach guest memory by walking these tables, so the address they walk
+	 * from has to be taken away -- under their own locks, which is what
+	 * makes an in-flight walk finish before anything is freed -- before this
+	 * function touches anything.
+	 *
+	 * It was done at the call sites, and that was wrong. Four of them in
+	 * manager.c retired first and were audited as if they were all of them;
+	 * the fifth is co_kload_begin below, which frees the previous run's
+	 * space at the start of a new one and retired nothing. A bridge polling
+	 * across a re-run therefore walked freed tables: bugcheck 0xD5 under
+	 * Driver Verifier, at co_arch_guest_lookup, reached through
+	 * co_net_dump -> co_kload_read. Putting it here means a caller cannot
+	 * forget, including one added later.
+	 */
+	co_console_set_address(0);
+	co_net_set_address(0);
+
+	/*
+	 * Clear the global before destroying what it points at.
+	 *
+	 * Every reader guards with `if (kload_space == NULL) return`, and that
+	 * check is worth nothing while the pointer still names freed memory:
+	 * the reader passes the test and hands the dangling space to
+	 * co_arch_guest_lookup. Publishing NULL first closes the window to
+	 * nothing, because the retirement above has already stopped the only
+	 * callers that could be inside a walk.
+	 */
+	kload_space = NULL;
 
 	/*
 	 * The space first, then the memory it lives in.
@@ -304,12 +341,11 @@ void co_kload_free(co_manager_t* manager)
 	 * of the allocation, so Driver Verifier caught it every single time at
 	 * exactly that frame.
 	 */
-	if (kload_space != NULL)
-		co_arch_guest_space_destroy(manager, kload_space);
+	if (space != NULL)
+		co_arch_guest_space_destroy(manager, space);
 	co_arch_guest_space_set_frame_source(NULL, NULL);
 	kload_release_pages(manager);
 
-	kload_space     = NULL;
 	kload_pages     = 0;
 	kload_chunks    = 0;
 	kload_ram_bytes = 0;
