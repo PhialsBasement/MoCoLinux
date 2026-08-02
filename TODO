@@ -111,26 +111,28 @@
      reads like a security finding to whoever sees it next. Either mark the map
      NX where the guest never executes, or write down why it is not worth doing.
 
- * The Arch root filesystem is not reproducible:
-   * tools/mkrootfs.sh builds the busybox root (root.img) and nothing builds
-     root-arch.img. That image is a bootstrap tarball plus a pile of changes
-     made by hand through the terminal: the pacman keyring initialised and
-     populated (pacman-key --init && --populate archlinux, without which every
-     package fails signature verification as TRUST_UNDEFINED even though the
-     signature is good), a Server line in /etc/pacman.d/mirrorlist, the systemd
-     OSC-context symlink removed and its tmpfiles snippet masked,
-     /etc/systemd/network/10-eth0.network, and systemd-networkd enabled. None of
-     that survives losing the image.
-   * So: a mkarchrootfs.sh that goes from download/archlinux-bootstrap to a
-     bootable image with all of the above applied. Note while writing it that
-     the image cannot be pushed to the box afterwards -- 1.2 GB through the
-     transfer agent OOMs a 4 GB machine, because the agent buffers and deploy.sh
-     then reads it back to verify. Build it there or accept a reboot.
+ * The root filesystem is reproducible now, but only in one direction:
+   * DONE: tools/mkmanjarorootfs.sh builds a bootable Manjaro image from
+     nothing -- skeleton, packages, keyring (pacman-key --init && --populate,
+     without which every package fails verification as TRUST_UNDEFINED while
+     its signature is perfectly good), mirrors, ldconfig, fstab, autologin,
+     10-eth0.network with systemd-networkd, IPv6 off, DISPLAY, and a user.
+     It takes an image file or a block device.
+   * What is NOT done is running it anywhere except inside the guest. That is
+     the case that does not matter for shipping, and it is the only one that
+     has ever been exercised: a 6 GB image cannot be pushed to the test box
+     (the agent buffers it and deploy.sh reads it back to verify, which is
+     12 GB of churn on a 4 GB machine), so the guest builds the next guest's
+     disk in place on a second cobd unit. On a build host it should just work
+     -- pacman and e2fsprogs are all it needs -- and until someone runs it
+     there, "reproducible by someone else" is a claim rather than a fact.
+   * The image also has to get smaller before it can ship. 6 GB with about a
+     gigabyte used is mostly zeroes, so zstd takes it to a few hundred
+     megabytes; something then has to expand it on first run.
    * And a rule that cost an evening: changes made inside a running guest are
      only on disk after a clean poweroff. stop.bat and the run deadline do not
      unmount, so a file written seconds earlier comes back as a journaled inode
      with no data -- zero bytes, which looks like the write never happened.
-
  * The box-side scripts are not in the tree:
    * deploy.sh, run-arch.bat, run-linux.bat, console.bat, net.bat, stop.bat,
      reboot.bat, dbg-start.bat, verifier-on/off.bat and getdumps.bat all live in
@@ -215,30 +217,29 @@
      fix.
 
  * One-click bring-up:
-   * Starting a networked guest currently takes three windows on the box and
-     four commands inside it: run-arch.bat, console.bat, net.bat, and then
-     ip link / ip addr / ip route / resolv.conf by hand. Every one of those is
-     a step that can be forgotten or done in the wrong order, and the failure
-     when the guest has no address is "cannot resolve host", which reads as a
-     DNS or a slirp problem rather than a missing step.
-   * The guest half is done: /etc/systemd/network/10-eth0.network plus
-     systemd-networkd enabled, so a booted guest addresses itself. That lives
-     in root-arch.img, which means it is not reproducible from the tree --
-     tools/mkrootfs.sh should write it when it builds an image, or there should
-     be a documented way to reapply it.
-   * The host half wants one script that installs the driver if it is not
-     installed, refuses if a guest is already running (run-boot.sh has that
-     guard; run-arch.bat does not, and going around it cost a box), starts the
-     debug stream, then launches the boot, the console and the net bridge in
-     their own windows. `start /min` per daemon, in the order that does not
-     wedge the transfer agent -- see dbg-start.bat's notes on why the stream
-     must be launched detached and never waited on.
-   * And the two things that still need a flag or an edit before pacman works:
-     CONFIG_SECURITY_LANDLOCK in the guest kernel (pacman 7 sandboxes downloads
-     and refuses without it), and a Server line in
-     /etc/pacman.d/mirrorlist, which the Arch bootstrap ships entirely
-     commented out.
-
+   * Most of the prerequisites landed while chasing other things, so what is
+     left is the launcher itself rather than the reasons it could not exist.
+   * DONE, and each was a blocker: the guest configures its own network at boot
+     (10-eth0.network + systemd-networkd, written by tools/mkmanjarorootfs.sh,
+     so it is in the tree rather than in one image); CONFIG_SECURITY_LANDLOCK
+     and a real mirrorlist, without which pacman refuses to fetch anything; the
+     console and the slirp bridge exit on their own when the guest ends, so a
+     launcher can wait for its children instead of being unable to stop them;
+     every daemon refuses to start twice, so a retry or a second launch cannot
+     produce two bridges competing for one guest's rings; and xstart.bat
+     returns instead of wedging its caller, which `start` cannot do because it
+     hands its console handles to the child whatever you do -- WScript.Shell's
+     Run does not.
+   * What remains: colinux-daemon.exe --run, which installs the driver if it is
+     not installed, refuses if a guest is already running, and spawns the
+     console, the slirp bridge and the X server as children, reaping them on
+     exit. os/winnt/user/exec.c is the spawn path; a Job Object with
+     KILL_ON_JOB_CLOSE is the backstop, not the mechanism -- the children are
+     asked to leave and now know how.
+   * And the artifacts have to be premade for it to mean anything: a release is
+     the driver, the daemons, vmlinux and a compressed root image, so that
+     somebody on XP x64 downloads a zip and runs one executable with no cross
+     toolchain, no pacman and no Linux machine anywhere.
  * 32-bit userspace triple faults the host under load:
    * Restoring vector 0x80 in co_colinux_adopt_traps() made 32-bit binaries run
      for the first time in this port -- ldd resolves, the loader no longer dies
