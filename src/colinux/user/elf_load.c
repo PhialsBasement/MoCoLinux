@@ -729,6 +729,7 @@ co_rc_t co_elf_net_peer_live(const char* seconds_arg)
 			unsigned int record = 4 + ((flen + 3) & ~3u);
 			unsigned char frame[CO_NETIO_MAX_FRAME];
 			unsigned char reply[CO_NETIO_MAX_FRAME];
+			unsigned char one_record[4 + CO_NETIO_MAX_FRAME + 3];
 			unsigned int first, rlen;
 
 			if (flen == 0 || flen > CO_NETIO_MAX_FRAME ||
@@ -753,7 +754,26 @@ co_rc_t co_elf_net_peer_live(const char* seconds_arg)
 			if (!rlen)
 				continue;
 
-			rc = co_manager_conet_put(handle, reply, rlen);
+			/*
+			 * One frame, in the batch format the ioctl now takes:
+			 * a length word, the frame, padding to four bytes.
+			 * --net-peer answers a packet at a time by design --
+			 * it stands in for the far end of a wire, not for a
+			 * bulk sender -- so there is nothing here to coalesce.
+			 */
+			{
+				unsigned int rec = 4 + ((rlen + 3) & ~3u);
+				unsigned int put = 0;
+
+				memset(one_record, 0, rec);
+				memcpy(one_record, &rlen, 4);
+				memcpy(one_record + 4, reply, rlen);
+
+				rc = co_manager_conet_put(handle, one_record,
+							  rec, 1, &put);
+				if (CO_OK(rc) && put != 1)
+					rc = CO_RC(OUT_OF_MEMORY);
+			}
 			if (CO_OK(rc)) {
 				replied++;
 			} else {
@@ -881,36 +901,44 @@ out:
  */
 #define CO_KLOAD_CHUNK	0x8000
 
-/* How much physical memory the guest is told it has. */
 /*
- * 2 GB, half of the test box, up from 1 GB, up from 512 MB, up from 128.
+ * How much physical memory the guest is told it has, in megabytes, when --mem
+ * does not say otherwise.
  *
- * 128 was chosen when the guest was a kernel with no userspace and then a
- * BusyBox root, where it was generous. An Arch userspace with systemd is a
- * different proposition: the init system alone maps more than the old guest
- * had in total, and a package manager wants room to unpack into. 1 GB is for
- * what comes after that -- a desktop's worth of X clients, and a distro
- * install that unpacks several hundred megabytes while its own package cache
- * is open.
+ * 1 GB, and the way the 2 GB attempt failed is the reason this is a flag now
+ * rather than a constant.
  *
- * It is not contiguous -- co_kload_build_ram takes what the host will give in
- * several blocks and describes each at its true physical address in the e820,
- * so this is a target rather than a demand.
+ * The host had 2.4 GB free and the box still became unresponsive the instant
+ * the daemon started, before the guest executed an instruction -- because free
+ * memory is not the resource being asked for. co_kload_build_ram wants unbroken
+ * 32 MB physical runs from MmAllocateContiguousMemory, and after a session with
+ * a browser and a package manager, free memory is holes. Windows then trims
+ * working sets and repurposes standby pages trying to manufacture runs that do
+ * not exist, with the memory manager's locks held, and the machine stops
+ * answering while it tries. Task Manager shows memory available throughout,
+ * which is what makes this so easy to misdiagnose -- and I misdiagnosed it as
+ * a total-memory problem first.
  *
- * It is bounded by the block count rather than by this number, and the two
- * have to move together. Block 0 is image + tables and every later block is
- * at most CO_KLOAD_CHUNK_BYTES, so the ceiling is 44 + 32 * 126 MB, about
- * 4 GB. At the original cap of 16 blocks it was 524 MB, and asking for more
- * quietly produced half of it and said so in a line nobody reads.
+ * The allocation is also non-pageable, so whatever the guest gets is taken out
+ * of the host's working set permanently for the life of the run, not shared
+ * with it.
  *
- * Falling short is still reported rather than fatal, and at half the host's
- * memory that matters: this is a target, not a reservation. The host is a 4 GB
- * machine running its own desktop, so whether two gigabytes of it can be found
- * in unbroken 32 MB runs depends on what else is resident. The e820 describes
- * exactly what was obtained, so a guest that gets less boots with less and says
- * so, which is the only honest behaviour when the answer is not up to us.
+ * 1 GB has booted this box repeatedly. Whether more works depends on how
+ * fragmented that particular machine is at that particular moment, which is
+ * exactly the sort of thing that should be tried from a command line rather
+ * than discovered after a cross-compile. Falling short remains reported and
+ * non-fatal: the e820 describes what was obtained, so a guest that gets less
+ * boots with less and says so.
+ *
+ * The ceiling is the block count rather than this number. Block 0 is image plus
+ * page tables and every later block is at most CO_KLOAD_CHUNK_BYTES, so it is
+ * 44 + 32 * (CO_KLOAD_MAX_BLOCKS - 1) MB, near 4 GB. None of that helps if the
+ * host cannot produce the runs.
+ *
+ * The real fix is not a better number: it is pseudo-physical memory, which
+ * removes the contiguity requirement altogether. See TODO.
  */
-#define CO_GUEST_RAM	(2048ULL << 20)
+#define CO_GUEST_RAM_DEFAULT_MB	1024
 
 /* One e820 entry: 8-byte address, 8-byte size, 4-byte type, packed to 20. */
 static void co_e820_entry(unsigned char* p, unsigned long long addr,
@@ -1197,7 +1225,8 @@ static void co_report_bug_at(co_elf_data_t* pl, unsigned long long rip)
 
 co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			       unsigned long max_switches, unsigned long batch,
-			       const char* const* cobd, const char* init_path)
+			       const char* const* cobd, const char* init_path,
+			       unsigned long mem_mb)
 {
 	const char* cobd0 = cobd ? cobd[0] : NULL;
 	co_elf_data_t* pl;
@@ -1505,7 +1534,8 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		co_elf_symbol_t* s_cl;
 		co_elf_symbol_t* s_text;
 		co_elf_symbol_t* s_end;
-		unsigned long long ram = CO_GUEST_RAM;
+		unsigned long long ram = ((unsigned long long)
+			(mem_mb ? mem_mb : CO_GUEST_RAM_DEFAULT_MB)) << 20;
 		static const char* want[] = { "co_arch_start_kernel", "initial_code",
 					      "start_kernel", "early_console",
 					      "early_colinux_console",

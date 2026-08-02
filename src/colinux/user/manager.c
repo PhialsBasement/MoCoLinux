@@ -194,26 +194,43 @@ co_rc_t co_manager_conet_dump(co_manager_handle_t handle,
 	return rc;
 }
 
+/*
+ * Hand a batch of length-prefixed records to the driver in one call.
+ *
+ * `data` is already in the ring's record format -- a 32-bit length, the frame,
+ * padding to four bytes -- so the driver copies it in without reformatting and
+ * there is one description of a record in the tree rather than two.
+ *
+ * `taken` reports how many were appended. Fewer than asked means the guest's
+ * RX ring filled, which is back-pressure rather than an error: the caller keeps
+ * the remainder and offers it again.
+ */
 co_rc_t co_manager_conet_put(co_manager_handle_t handle,
-			     const unsigned char* data, unsigned int size)
+			     const unsigned char* data, unsigned int size,
+			     unsigned int frames, unsigned int* taken)
 {
 	co_manager_ioctl_conet_put_t* params;
 	unsigned long returned = 0;
 	unsigned long total = sizeof(*params) + size;
 	co_rc_t rc;
 
+	*taken = 0;
+
 	params = co_os_malloc(total);
 	if (!params)
 		return CO_RC(OUT_OF_MEMORY);
 
 	co_memset(params, 0, sizeof(*params));
-	params->size = size;
+	params->size   = size;
+	params->frames = frames;
 	co_memcpy(params->data, data, size);
 
 	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_CONET_PUT,
 				 params, total, params, sizeof(*params), &returned);
 	if (CO_OK(rc))
 		rc = params->rc;
+	if (CO_OK(rc))
+		*taken = params->taken;
 
 	co_os_free(params);
 	return rc;

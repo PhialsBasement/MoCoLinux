@@ -50,8 +50,10 @@ extern co_rc_t co_manager_kload_verify(co_manager_handle_t handle,
 extern co_rc_t co_manager_kstop(co_manager_handle_t handle, int* was_running);
 
 /* Deliver one frame to the guest via the RX ring. */
+/* Batch of length-prefixed records; taken reports how many the ring accepted. */
 extern co_rc_t co_manager_conet_put(co_manager_handle_t handle,
-				    const unsigned char* data, unsigned int size);
+				    const unsigned char* data, unsigned int size,
+				    unsigned int frames, unsigned int* taken);
 
 /* Consume the TX ring: advance tx_tail (forward only, at most to head). */
 extern co_rc_t co_manager_conet_take(co_manager_handle_t handle, unsigned int new_tail,

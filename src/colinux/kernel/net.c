@@ -23,6 +23,7 @@
  */
 
 #include <colinux/common/common.h>
+#include <colinux/common/libc.h>
 #include <colinux/kernel/manager.h>
 #include <colinux/kernel/kload.h>
 #include <colinux/os/kernel/mutex.h>
@@ -144,32 +145,46 @@ out:
 }
 
 /*
- * Deliver a frame to the guest: append a record to the RX ring and publish it.
+ * Deliver frames to the guest: append records to the RX ring and publish them.
  *
  * The mirror of the guest's own transmit, and it obeys the same two rules.
- * The record is a 32-bit length, the frame, and padding to a four-byte
- * boundary, so every record starts aligned and the length word never
- * straddles the wrap. And the bytes are written before rx_head announces
- * them -- on x86 stores are not reordered with each other, so the ordinary
- * store order here is the barrier the guest's smp_rmb pairs with.
+ * A record is a 32-bit length, the frame, and padding to a four-byte boundary,
+ * so every record starts aligned and the length word never straddles the wrap.
+ * And the bytes are written before rx_head announces them -- on x86 stores are
+ * not reordered with each other, so the ordinary store order here is the
+ * barrier the guest's smp_rmb pairs with.
  *
- * A full ring is refused rather than overwritten. The guest owns rx_tail and
- * may be part-way through reading the record at it; overwriting from this
- * side would hand it a frame that changes underneath it. The caller can
- * retry, which is what a host-side queue is for -- and dropping is legal
- * ethernet besides.
+ * Many frames per call, one lock hold, one publish.
+ *
+ * The cost of getting here is per call, not per byte: a METHOD_BUFFERED round
+ * trip, a non-paged staging buffer from the I/O manager, this mutex, and a walk
+ * of the guest's page tables for every co_kload_write below. Measured at about
+ * a millisecond, which is why a caller doing one frame per call could not get
+ * past roughly 925 frames a second however fast the network was -- a guest
+ * download measured 1.39 MB/s from a mirror 5 ms away and 1.64 MB/s from
+ * another continent, which is the give-away that the wire was never the limit.
+ *
+ * rx_head is written once, at the end, so the guest sees the whole batch appear
+ * at once rather than a frame at a time. That is not just cheaper, it is the
+ * same rule as before: every byte of every record is in the ring before the
+ * index that announces any of them moves.
+ *
+ * A full ring stops the batch where it ran out rather than failing it. The
+ * frames already copied are real and are published; `taken` tells the caller
+ * how many, and it keeps the rest. Refusing the lot would throw away work
+ * already done, and overwriting from this side is what must never happen --
+ * the guest owns rx_tail and may be reading the record there.
  */
 co_rc_t co_net_put(co_manager_t* manager, const unsigned char* data,
-		   unsigned int len)
+		   unsigned int size, unsigned int frames, unsigned int* taken)
 {
-	unsigned int head, tail, record, off, first;
+	unsigned int head, tail, pos = 0, n = 0;
 	co_rc_t rc = CO_RC(OK);
+
+	*taken = 0;
 
 	if (!net_lock)
 		return CO_RC(NOT_FOUND);
-
-	if (len == 0 || len > CO_NIO_MAX_FRAME)
-		return CO_RC(INVALID_PARAMETER);
 
 	co_os_mutex_acquire(net_lock);
 
@@ -184,48 +199,121 @@ co_rc_t co_net_put(co_manager_t* manager, const unsigned char* data,
 		goto out;
 	}
 
-	record = 4 + ((len + 3) & ~3u);
-
 	if (head - tail > CO_NIO_RX_SIZE) {
 		rc = CO_RC(ERROR);		/* not a ring state */
 		goto out;
 	}
 
-	if ((head - tail) + record > CO_NIO_RX_SIZE) {
-		rc = CO_RC(OUT_OF_MEMORY);	/* full; the caller keeps it */
-		goto out;
+	while (n < frames) {
+		unsigned int len, record, off, first;
+
+		/*
+		 * Every record is validated against the buffer before a byte of
+		 * it is believed. This data came from userspace: a length that
+		 * runs past the end, or one that cannot be a frame, is a
+		 * malformed request and not something to copy into the guest's
+		 * memory and hope.
+		 */
+		if (pos + 4 > size) {
+			rc = CO_RC(INVALID_PARAMETER);
+			goto out;
+		}
+
+		co_memcpy(&len, data + pos, 4);
+
+		if (len == 0 || len > CO_NIO_MAX_FRAME) {
+			rc = CO_RC(INVALID_PARAMETER);
+			goto out;
+		}
+
+		record = 4 + ((len + 3) & ~3u);
+		if (pos + record > size) {
+			rc = CO_RC(INVALID_PARAMETER);
+			goto out;
+		}
+
+		if ((head - tail) + record > CO_NIO_RX_SIZE)
+			break;			/* full: keep what is left */
+
+		off = head & (CO_NIO_RX_SIZE - 1);
+		if (!CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX + off,
+					  (const unsigned char*)&len, 4))) {
+			rc = CO_RC(ERROR);
+			goto out;
+		}
+
+		off   = (off + 4) & (CO_NIO_RX_SIZE - 1);
+		first = len < CO_NIO_RX_SIZE - off ? len : CO_NIO_RX_SIZE - off;
+
+		if (!CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX + off,
+					  data + pos + 4, first))) {
+			rc = CO_RC(ERROR);
+			goto out;
+		}
+		if (first < len &&
+		    !CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX,
+					  data + pos + 4 + first, len - first))) {
+			rc = CO_RC(ERROR);
+			goto out;
+		}
+
+		head += record;
+		pos  += record;
+		n++;
 	}
 
-	off = head & (CO_NIO_RX_SIZE - 1);
-	if (!CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX + off,
-				  (const unsigned char*)&len, 4))) {
+	/*
+	 * Publish once. If nothing fit, rx_head is not touched at all -- there
+	 * is nothing to announce and no reason to write to the guest.
+	 */
+	if (n && !CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX_HEAD,
+				       (const unsigned char*)&head, 4)))
 		rc = CO_RC(ERROR);
-		goto out;
-	}
 
-	off   = (off + 4) & (CO_NIO_RX_SIZE - 1);
-	first = len < CO_NIO_RX_SIZE - off ? len : CO_NIO_RX_SIZE - off;
-
-	if (!CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX + off,
-				  data, first))) {
-		rc = CO_RC(ERROR);
-		goto out;
+	if (CO_OK(rc)) {
+		*taken = n;
+		if (n == 0)
+			rc = CO_RC(OUT_OF_MEMORY);
 	}
-	if (first < len &&
-	    !CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX,
-				  data + first, len - first))) {
-		rc = CO_RC(ERROR);
-		goto out;
-	}
-
-	head += record;
-	if (!CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX_HEAD,
-				  (const unsigned char*)&head, 4)))
-		rc = CO_RC(ERROR);
 
 out:
 	co_os_mutex_release(net_lock);
 	return rc;
+}
+
+/*
+ * Does the guest have frames waiting that it has not taken yet?
+ *
+ * Asked by the monitor loop before it sleeps on an idle yield. A guest waiting
+ * for a reply is idle, so the loop sleeps -- and if the reply is already
+ * sitting in the RX ring, that sleep is dead time added to every round trip.
+ * The guest's receive kthread spins while there is work and only sleeps when
+ * the ring is empty, so the whole latency is the host not giving it the
+ * processor.
+ *
+ * Cheap enough to ask on every idle: two u32 reads through the guest's tables,
+ * against a sleep of at least a millisecond.
+ *
+ * Returns false on any doubt -- no lock, no address, an unreadable index --
+ * because the fallback is the sleep that has always happened.
+ */
+bool_t co_net_rx_pending(co_manager_t* manager)
+{
+	unsigned int head, tail;
+	bool_t pending = PFALSE;
+
+	if (!net_lock)
+		return PFALSE;
+
+	co_os_mutex_acquire(net_lock);
+
+	if (net_io_va &&
+	    CO_OK(co_net_read_u32(manager, CO_NIO_RX_HEAD, &head)) &&
+	    CO_OK(co_net_read_u32(manager, CO_NIO_RX_TAIL, &tail)))
+		pending = (head != tail);
+
+	co_os_mutex_release(net_lock);
+	return pending;
 }
 
 co_rc_t co_net_dump(co_manager_t* manager,

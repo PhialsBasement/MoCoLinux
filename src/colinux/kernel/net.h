@@ -36,8 +36,22 @@ extern co_rc_t co_net_take(co_manager_t* manager, unsigned int new_tail,
  * OUT_OF_MEMORY when the ring is full, so the caller can keep the frame and
  * retry rather than have it silently dropped here.
  */
+/*
+ * Append `frames` length-prefixed records from `data` to the guest's RX ring
+ * and publish them with one write of rx_head. `taken` reports how many fitted;
+ * a full ring stops the batch rather than failing it. Batching is what keeps
+ * throughput off the per-ioctl floor -- see the comment in net.c.
+ */
+/*
+ * True if the guest's RX ring holds frames it has not consumed. The monitor
+ * loop uses this to skip its idle sleep when there is already work waiting --
+ * see the comment in net.c.
+ */
+extern bool_t co_net_rx_pending(co_manager_t* manager);
+
 extern co_rc_t co_net_put(co_manager_t* manager, const unsigned char* data,
-			  unsigned int len);
+			  unsigned int size, unsigned int frames,
+			  unsigned int* taken);
 
 extern co_rc_t co_net_dump(co_manager_t* manager,
 			   unsigned int* tx_head, unsigned int* tx_tail,

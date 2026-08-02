@@ -47,6 +47,14 @@ typedef struct co_winnt_parameters {
 	bool_t batch;
 	char   batch_arg[0x20];
 	/*
+	 * Guest RAM in megabytes. A flag rather than a constant because whether
+	 * a given size can be found depends on how fragmented the host's
+	 * physical memory is at that moment, and finding out should not require
+	 * a cross-compile -- see the note on CO_GUEST_RAM_DEFAULT_MB.
+	 */
+	bool_t mem;
+	char   mem_arg[0x20];
+	/*
 	 * Backing store for each cobd unit. Unit 0 is the guest's root device
 	 * and is the one root= names; the rest are ordinary disks. An NT object
 	 * path: an image file as \??\F:\xfer\root.img, or a raw partition as
