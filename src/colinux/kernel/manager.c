@@ -139,6 +139,15 @@ co_rc_t co_manager_load(co_manager_t *manager)
 	if (!CO_OK(rc))
 		goto out_err_os;
 
+	/*
+	 * The guest-memory teardown lock, before anything can allocate guest
+	 * memory. co_kload_free is reachable from three threads and its frees
+	 * must happen once; see kload.c.
+	 */
+	rc = co_kload_init();
+	if (!CO_OK(rc))
+		goto out_err_os;
+
 	rc = co_manager_alloc_reversed_pfns(manager);
 	if (!CO_OK(rc))
 		goto out_err_os;
@@ -259,6 +268,8 @@ void co_manager_unload(co_manager_t* manager)
 
 	co_net_free();
 	co_console_free();
+	/* Last, because everything above may still call co_kload_free. */
+	co_kload_fini();
 
 	manager->state = CO_MANAGER_STATE_NOT_INITIALIZED;
 }

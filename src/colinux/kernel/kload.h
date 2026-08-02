@@ -87,6 +87,14 @@ extern co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_
 extern unsigned long co_kload_ram_pages(void);
 extern void    co_kload_free(co_manager_t* manager);
 
+/*
+ * The teardown lock. co_kload_free is reachable from the KLOAD_END ioctl, from
+ * co_kload_begin, and from the manager's unload path, so it has to be safe to
+ * call twice at once -- see the comment on kload_lock in kload.c.
+ */
+extern co_rc_t co_kload_init(void);
+extern void    co_kload_fini(void);
+
 extern co_arch_guest_space_t* co_kload_space(void);
 extern unsigned long	      co_kload_pages(void);
 extern unsigned long	      co_kload_chunks(void);

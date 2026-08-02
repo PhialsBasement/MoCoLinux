@@ -34,6 +34,7 @@
 #include <colinux/common/ioctl.h>
 #include <colinux/os/kernel/alloc.h>
 #include <colinux/os/kernel/misc.h>
+#include <colinux/os/kernel/mutex.h>
 #include <colinux/arch/mmu.h>
 #include <colinux/arch/space.h>
 
@@ -92,6 +93,27 @@ typedef struct {
 
 static co_kload_block_t	      kload_block[CO_KLOAD_MAX_BLOCKS];
 static int		      kload_block_count;
+
+/*
+ * Teardown is serialised, because three unrelated threads can ask for it.
+ *
+ * co_kload_free has always been reachable from the KLOAD_END ioctl, from
+ * co_kload_begin at the start of a new run, and from the manager's unload path
+ * when the last handle closes. Its only guard was the early return below, which
+ * two threads can both fall through before either has cleared anything: they
+ * then both walk kload_block[] and hand the same pointer to
+ * MmFreeContiguousMemory twice. The second call is bugcheck 0xC2 with parameter
+ * one 0x60 -- "invalid contiguous memory address" -- which is what a
+ * successfully freed address looks like the second time.
+ *
+ * It went unhit for as long as it did because the window is the length of the
+ * free loop. At sixteen blocks that was sixteen frees; a 1 GB guest in 8 MB
+ * pieces makes it a hundred and twenty four, and it took one evening.
+ *
+ * Idempotence rather than exclusion is the requirement: every one of those
+ * callers is entitled to ask, and all but the first must find nothing to do.
+ */
+static co_os_mutex_t	      kload_lock;
 static unsigned long long     kload_phys_base;	/* what the guest's __pa() adds */
 static unsigned long long     kload_table_top;	/* block 0 offset; tables grow down */
 
@@ -272,32 +294,60 @@ static void kload_release_pages(co_manager_t* manager)
 	 * and then handed to something else by the host.
 	 */
 	int i;
+	int count = kload_block_count;
 
-	for (i = 0; i < kload_block_count; i++) {
-		if (kload_block[i].raw == NULL)
+	/*
+	 * The count goes to zero before the first free, not after the last.
+	 *
+	 * Between reading it and clearing it this loop hands a hundred and
+	 * twenty four pointers to MmFreeContiguousMemory, and anything that
+	 * reaches co_kload_free in that window used to see a non-zero count and
+	 * free them all a second time. The lock in co_kload_free is what
+	 * actually closes that, but a torn-down block array should not be
+	 * re-freeable even if the lock is ever lost again, so the loop works
+	 * from a local count and leaves the global at zero throughout.
+	 */
+	kload_block_count = 0;
+
+	for (i = 0; i < count; i++) {
+		void*		   raw   = kload_block[i].raw;
+		unsigned long long bytes = kload_block[i].bytes;
+
+		if (raw == NULL)
 			continue;
 
-		co_os_free_contiguous_pages(kload_block[i].raw,
-					    (unsigned int)((kload_block[i].bytes
-							    + CO_ARCH_PMD_SIZE)
-							   >> CO_ARCH_PAGE_SHIFT));
+		/*
+		 * Clear the slot before the free, for the same reason.
+		 *
+		 * MmFreeContiguousMemory is not instantaneous and this pointer
+		 * must not be visible to anything after it has been handed over.
+		 */
 		kload_block[i].raw   = NULL;
 		kload_block[i].va    = NULL;
 		kload_block[i].pa    = 0;
 		kload_block[i].bytes = 0;
+
+		co_os_free_contiguous_pages(raw,
+					    (unsigned int)((bytes + CO_ARCH_PMD_SIZE)
+							   >> CO_ARCH_PAGE_SHIFT));
 	}
 
-	kload_block_count = 0;
 	kload_phys_base	  = 0;
 	kload_table_top	  = 0;
 }
 
 void co_kload_free(co_manager_t* manager)
 {
-	co_arch_guest_space_t* space = kload_space;
+	co_arch_guest_space_t* space;
 
-	if (space == NULL && kload_block_count == 0)
+	co_os_mutex_acquire(kload_lock);
+
+	space = kload_space;
+
+	if (space == NULL && kload_block_count == 0) {
+		co_os_mutex_release(kload_lock);
 		return;
+	}
 
 	/*
 	 * Retire the cross-process readers here, not at the call sites.
@@ -350,6 +400,21 @@ void co_kload_free(co_manager_t* manager)
 	kload_chunks    = 0;
 	kload_ram_bytes = 0;
 	kload_ram_pages = 0;
+
+	co_os_mutex_release(kload_lock);
+}
+
+co_rc_t co_kload_init(void)
+{
+	return co_os_mutex_create(&kload_lock);
+}
+
+void co_kload_fini(void)
+{
+	if (kload_lock != NULL) {
+		co_os_mutex_destroy(kload_lock);
+		kload_lock = NULL;
+	}
 }
 
 co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
