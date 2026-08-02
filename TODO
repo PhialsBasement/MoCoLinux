@@ -288,6 +288,58 @@
      omission and prove the negative on every host this ever runs on, which is
      the weaker position.
 
+ * The 32-bit execve triple fault -- reproducer known, cause not:
+   * It kills the whole machine: instant reset, no bugcheck, no minidump, nothing
+     in the log after it. Windows bugchecks here DO produce dumps and several
+     unrelated ones have been collected, so the absence is evidence -- this is a
+     triple fault, not a bugcheck.
+   * THE REPRODUCER. With the guest booted and a concurrent workload live (KDE
+     Konsole as an X client over rootless X, plus the slirp bridge), one command:
+         for i in $(seq 5000); do /usr/bin/gio-querymodules-32 /tmp >/dev/null 2>&1; done
+     gio-querymodules-32 is an ELF 32-bit i386 executable, so this is 5000
+     execve()s of a 32-bit process. Dies within about thirty seconds.
+   * What that replaced: "install Steam and wait twenty minutes". Steam was never
+     special -- it was simply the first thing that did enough 32-bit process churn
+     alongside enough other work. Hours went into chasing Steam, the block layer
+     and the cooperative timer before the conjunction became visible.
+   * ELIMINATED, each by experiment. Do not re-test these; three separate rounds
+     were spent re-answering questions the evidence had already settled:
+       - 12,000 of the same executions on a BARE guest (no X, no slirp, no
+         Konsole): SURVIVES. So 32-bit exec volume alone is not sufficient.
+       - 500 executions with the desktop live: SURVIVES. Threshold is somewhere
+         between 500 and 5000.
+       - 5000 as the FIRST 32-bit code on a clean boot: DIES. Not cumulative.
+       - 791-package, 5.7 GB Manjaro install, pure 64-bit: SURVIVES.
+       - Installing lib32 packages: SURVIVES. A single 32-bit execution: SURVIVES.
+       - Block I/O: instrumented -- no request over 130560 bytes, none past the
+         end of the device, none rejected, and zero blkio crossings in the dying
+         second of one crash.
+       - The cooperative timer: the same failure predates it existing.
+       - PTI: not configured. Compat entry IF handling: verified correct
+         (do_SYSENTER_32 sets X86_EFLAGS_IF, the SYSRET path loads r11 from
+         EFLAGS(%rsp)).
+   * So the condition is 32-bit execve churn AND a second runnable process, and it
+     is threshold-dependent within that. The conjunction is the whole clue: with
+     one runnable task there are far fewer context switches, so look at what
+     happens per context switch and per 32-bit execve.
+   * Where to look first, in order of how well each explains the conjunction:
+     - 32-bit TLS. set_thread_area writes GDT entries and load_TLS REWRITES them
+       on every context switch, while the world switch saves and restores GDTR on
+       every crossing and the guest runs on the kernel's own per-CPU GDT. A
+       descriptor changing under a loaded selector, or a crossing landing mid
+       rewrite, is the shape of thing that kills a machine outright.
+     - The passage page must be mapped at the same virtual address in every
+       address space, because the switch executes with CR3 already changed.
+       Thousands of execve()s create thousands of address spaces. Verify the
+       graft survives into every one of them, and which PML4 slot it needs.
+     - The LDT, if a 32-bit process installs one, against whatever the switch does
+       with LDTR.
+     - The resume path when the interrupted context was compatibility mode
+       (__USER32_CS) rather than 64-bit.
+   * Telemetry at death, from the streamed heartbeat: the guest goes from deeply
+     idle to busy and dies inside that same second. Normal operation runs
+     3,000-14,000 crossings/s, a third to a half of them replayed host interrupts.
+
  * An unexplained #GP in trap_init, seen once:
    * A Manjaro boot stopped with vector 13 at co_colinux_adopt_traps+0x150,
      error code 0x40. The error code is a selector, not an address: index 8 in
