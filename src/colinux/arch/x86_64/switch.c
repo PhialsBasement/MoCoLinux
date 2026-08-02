@@ -40,6 +40,7 @@
 #include <colinux/os/kernel/alloc.h>
 #include <colinux/os/kernel/misc.h>
 #include <colinux/os/kernel/time.h>
+#include <colinux/kernel/net.h>
 #include <colinux/os/timer.h>
 #include <colinux/arch/switch.h>
 #include <colinux/arch/state.h>
@@ -3374,10 +3375,33 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			? co_os_monotonic_100ns() + deadline_secs * 10000000ULL
 			: 0;
 		unsigned long guest_crossings = 0;
+		unsigned long idle_run = 0;
+		unsigned long rx_spins = 0;
+		unsigned long granted;
 		int i;
 
 		boot_loop_abort  = 0;
 		boot_loop_active = 1;
+
+		/*
+		 * A finer host clock for the duration of the run.
+		 *
+		 * Every sleep this loop takes is rounded up to the host's clock
+		 * tick, and the loop sleeps whenever the guest is idle -- which
+		 * a guest waiting for a reply is. So the tick is the floor on
+		 * the guest's round-trip time, and at XP's default 15.6 ms that
+		 * is the whole story of the network's speed: a ping to slirp's
+		 * gateway, answered by a process on this same machine, measured
+		 * 10 ms, and a download ran at the same rate from a mirror 5 ms
+		 * away as from one on another continent.
+		 *
+		 * Claimed here and released below rather than left on, because
+		 * it is a system-wide setting and a faster clock costs the whole
+		 * machine power and interrupts.
+		 */
+		granted = co_os_timer_resolution_acquire();
+		co_debug("boot: timer resolution %lu.%01lu ms",
+			 granted / 10000, (granted / 1000) % 10);
 
 		for (i = 0; ; i++) {
 			unsigned long long batch;
@@ -3639,6 +3663,17 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				 * after the crossing rather than being
 				 * attempted from inside the guest.
 				 */
+				/*
+				 * Anything that is not IDLE is the guest doing
+				 * work, so the next idle is a pause inside a
+				 * busy period rather than the guest having
+				 * nothing to do. See the sleep below.
+				 */
+				if (op != CO_OPERATION_IDLE) {
+					idle_run = 0;
+					rx_spins = 0;
+				}
+
 				if (op == CO_OPERATION_BLOCK_IO) {
 					co_rc_t brc;
 
@@ -3711,7 +3746,81 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 					 * unread, and jiffies not advancing is
 					 * the next piece of work, not a hazard.
 					 */
-					co_os_msleep(10);
+					/*
+					 * How long to sleep, and why it is not
+					 * always ten milliseconds.
+					 *
+					 * Ten was chosen when the only question
+					 * was whether an idle guest could stop
+					 * pinning the core, and for a guest with
+					 * nothing to do it is still right. But
+					 * it is also the floor on every round
+					 * trip the guest makes, because a guest
+					 * waiting for a reply is, by definition,
+					 * idle. A ping to 10.0.2.2 -- slirp's
+					 * gateway, answered by a process on this
+					 * same machine, with no network involved
+					 * at all -- measured 10 ms. So did every
+					 * TCP round trip, which put a hard
+					 * ceiling on throughput of window over
+					 * ten milliseconds, and a download sat
+					 * at 1.39 MB/s from a mirror 5 ms away
+					 * and 1.64 MB/s from another continent:
+					 * the give-away that the wire was never
+					 * the limit.
+					 *
+					 * So the sleep now follows what the
+					 * guest is actually doing. While it is
+					 * working -- any crossing that is not an
+					 * idle yield resets this -- pauses are
+					 * one millisecond, because a guest that
+					 * just did I/O is very likely about to
+					 * do more. After a hundred consecutive
+					 * idle yields, which is a tenth of a
+					 * second of genuinely nothing, it backs
+					 * off to the original ten and stays
+					 * there.
+					 *
+					 * The hazard the ten was protecting
+					 * against is not reintroduced: the host
+					 * still gets the core, with its own
+					 * flags restored, on every one of these.
+					 * What changes is how long it keeps it
+					 * before offering the guest another
+					 * turn.
+					 */
+					/*
+					 * Do not sleep on top of work already
+					 * waiting.
+					 *
+					 * If the RX ring holds frames the guest
+					 * has not taken, the reply it is idle
+					 * waiting for is already here and the
+					 * only thing between the two is this
+					 * sleep. The guest's receive thread
+					 * spins while there is work, so giving
+					 * it the processor now costs one
+					 * crossing and saves a whole tick.
+					 *
+					 * Bounded, because "the guest has not
+					 * drained yet" and "the guest is never
+					 * going to drain" look identical from
+					 * here, and the second one spinning
+					 * without a sleep is how the host loses
+					 * its clock. After sixty-four
+					 * consecutive re-entries -- far more
+					 * than a draining guest needs -- it
+					 * sleeps regardless.
+					 */
+					if (rx_spins < 64 &&
+					    co_net_rx_pending(manager)) {
+						rx_spins++;
+						continue;
+					}
+					rx_spins = 0;
+
+					idle_run++;
+					co_os_msleep(idle_run > 100 ? 10 : 1);
 					pp->params[48] += 1;
 
 					/*
@@ -4149,6 +4258,13 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 
 		out->guest_switches = guest_crossings;
 		boot_loop_active    = 0;
+
+		/*
+		 * Give the clock back. Paired with the acquire above: the host
+		 * reference counts it, and leaving it claimed would keep the
+		 * whole machine on a fast tick after the guest has gone.
+		 */
+		co_os_timer_resolution_release();
 
 		/*
 		 * The stub's ring, which is where the fine-grained trace lives

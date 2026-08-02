@@ -25,5 +25,23 @@ extern unsigned long co_os_get_time(void);
  */
 extern unsigned long long co_os_monotonic_100ns(void);
 
+/*
+ * Ask the host for a finer clock for the duration of a run, and give it back.
+ *
+ * Sleeps are rounded up to the host's clock tick, so that tick is the floor on
+ * every round trip a guest makes: the monitor loop sleeps when the guest is
+ * idle, and a guest waiting for a reply is idle. On XP the default tick is
+ * 15.6 ms, which is why a ping to slirp's own gateway -- answered on this same
+ * machine, no network involved -- measures 10 ms, and why a download stalls at
+ * the same rate whether the mirror is 5 ms away or on another continent.
+ *
+ * acquire() returns the resolution actually granted in 100 ns units, which is
+ * not necessarily the one asked for; the caller reports what it got. Release
+ * is reference counted by the host and must be paired, because a faster clock
+ * costs the whole machine power and interrupts.
+ */
+extern unsigned long co_os_timer_resolution_acquire(void);
+extern void	     co_os_timer_resolution_release(void);
+
 #endif
 

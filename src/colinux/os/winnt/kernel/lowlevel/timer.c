@@ -87,3 +87,42 @@ void co_os_msleep(unsigned int msecs)
 	DueTime.QuadPart = (long long)msecs * 10000 * (-1);
 	KeDelayExecutionThread(KernelMode, FALSE, &DueTime);
 }
+
+/*
+ * Ask Windows for a finer clock while a guest is running.
+ *
+ * co_os_msleep above is KeDelayExecutionThread with a relative interval, and
+ * Windows rounds that up to the next clock tick. On XP the default tick is
+ * 15.6 ms, so every sleep the monitor loop asks for -- one millisecond or ten
+ * -- waits for the same tick boundary. That tick is therefore the floor on
+ * every round trip the guest makes, because a guest waiting for a reply is
+ * idle and the monitor loop sleeps when the guest is idle.
+ *
+ * It is measurable and it is not subtle: a ping to 10.0.2.2, slirp's gateway,
+ * answered by a process on this same machine with no network involved at all,
+ * takes 10 ms. So does every TCP round trip, which caps throughput at window
+ * over one tick -- a download sat at 1.39 MB/s from a mirror 5 ms away and
+ * 1.64 MB/s from one on another continent, which is what a limit inside the
+ * host looks like from outside.
+ *
+ * ExSetTimerResolution is the documented way to ask for better, and it is what
+ * multimedia timers use. It is system-wide and reference counted, so it is
+ * claimed when a run starts and released when it ends rather than left on: a
+ * faster clock costs the whole machine power and interrupts, and a driver that
+ * quietly keeps it forever is a bad neighbour on a laptop.
+ *
+ * Requesting is not getting. The kernel returns the resolution it actually
+ * adopted, which is its own tick if it will not go finer, so the caller logs
+ * what it got rather than assuming.
+ */
+#define CO_TIMER_WANT_100NS	10000	/* 1 ms */
+
+unsigned long co_os_timer_resolution_acquire(void)
+{
+	return ExSetTimerResolution(CO_TIMER_WANT_100NS, TRUE);
+}
+
+void co_os_timer_resolution_release(void)
+{
+	ExSetTimerResolution(0, FALSE);
+}
