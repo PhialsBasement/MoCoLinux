@@ -89,6 +89,49 @@ static unsigned long co_console_strip_iac(char* buf, unsigned long len)
 }
 
 /*
+ * Has a guest been here and then left?
+ *
+ * The probe is a console pump with no input and no output buffer.
+ * co_console_pump guards both directions with `if (in_size)` and
+ * `if (out_size)`, so with both zero it takes the lock, checks that the guest's
+ * ring address is still published, and returns -- touching neither ring. That
+ * matters: draining output to find out whether a guest exists would throw away
+ * whatever it had printed for the next client to read.
+ *
+ * "Not yet" and "finished" are the same return code and are not the same
+ * situation. Waiting indefinitely is correct before the first guest, because
+ * this is meant to be startable before the boot. After one has been served,
+ * the same answer means the run is over and this process is now only in the
+ * way, so it leaves.
+ */
+static bool_t co_console_guest_gone(co_manager_handle_t handle)
+{
+	static bool_t	     seen_guest = PFALSE;
+	static unsigned long gone_polls = 0;
+	unsigned long taken = 0, produced = 0;
+	co_rc_t rc;
+
+	rc = co_manager_console(handle, NULL, 0, &taken, NULL, 0, &produced);
+
+	if (CO_OK(rc)) {
+		seen_guest = PTRUE;
+		gone_polls = 0;
+		return PFALSE;
+	}
+
+	if (!seen_guest)
+		return PFALSE;
+
+	/* Two seconds at the 200 ms accept timeout, same bound as the bridge. */
+	if (++gone_polls < 10)
+		return PFALSE;
+
+	co_terminal_print("console: the guest is gone -- exiting so the driver can\n"
+			  "  be unloaded and the binaries replaced\n");
+	return PTRUE;
+}
+
+/*
  * Serve one client at a time, forever.
  *
  * A poll loop rather than blocking reads, because both directions have to make
@@ -146,6 +189,33 @@ co_rc_t co_winnt_console_server(unsigned short port)
 		char netbuf[512];
 		char outbuf[2048];
 		unsigned long pending = 0;
+		bool_t leaving = PFALSE;
+
+		/*
+		 * Wait for a client with a deadline rather than in accept(),
+		 * so that a console with nobody attached still notices the
+		 * guest going away. Blocking in accept() forever is why one of
+		 * these was still sitting on the box holding a driver handle
+		 * hours after its guest had finished -- which locks
+		 * colinux-daemon.exe against being overwritten, keeps `sc stop`
+		 * in STOP_PENDING, and cannot be cleared by taskkill because
+		 * this process has an open handle to the driver.
+		 */
+		{
+			fd_set afds;
+			struct timeval atv;
+
+			FD_ZERO(&afds);
+			FD_SET(listener, &afds);
+			atv.tv_sec  = 0;
+			atv.tv_usec = 200000;
+
+			if (select(0, &afds, NULL, NULL, &atv) <= 0) {
+				if (co_console_guest_gone(handle))
+					break;
+				continue;
+			}
+		}
 
 		client = accept(listener, NULL, NULL);
 		if (client == INVALID_SOCKET)
@@ -183,10 +253,15 @@ co_rc_t co_winnt_console_server(unsigned short port)
 						outbuf, sizeof(outbuf), &produced);
 			if (!CO_OK(rc)) {
 				/*
-				 * No guest yet, or it has finished. Not fatal:
-				 * the client stays connected and picks up the
-				 * next one.
+				 * No guest yet, or it has finished. The first is
+				 * worth waiting through with the client still
+				 * connected; the second means there is nothing
+				 * left to serve.
 				 */
+				if (co_console_guest_gone(handle)) {
+					leaving = PTRUE;
+					break;
+				}
 				Sleep(200);
 				continue;
 			}
@@ -219,5 +294,14 @@ co_rc_t co_winnt_console_server(unsigned short port)
 
 		co_terminal_print("console: client gone\n");
 		closesocket(client);
+
+		if (leaving)
+			break;
 	}
+
+	closesocket(listener);
+	co_os_manager_close(handle);
+	WSACleanup();
+
+	return CO_RC(OK);
 }

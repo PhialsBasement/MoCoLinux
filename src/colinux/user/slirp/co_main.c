@@ -378,10 +378,37 @@ static bool_t ring_frame(void *data, const unsigned char *frame, unsigned int le
 	return ring_rx_full ? PFALSE : PTRUE;
 }
 
+/*
+ * How long a vanished guest has to stay vanished before this daemon leaves.
+ *
+ * The poll is 20 ms, so this is two seconds -- long enough to ride out the gap
+ * between one run ending and the next beginning if somebody is restarting a
+ * guest by hand, short enough that a launcher can wait for the process to go.
+ */
+#define RING_GONE_POLLS	100
+
 static co_rc_t ring_loop(void)
 {
 	unsigned char *ring;
 	unsigned long quiet = 0;
+	/*
+	 * Whether a guest was ever here, which is what separates "not yet" from
+	 * "finished".
+	 *
+	 * Before this, neither case ended the process: it waited for a guest
+	 * forever. Waiting forever is right on the way in -- the bridge is
+	 * meant to be startable before the boot -- and wrong on the way out,
+	 * and being wrong on the way out is expensive. Every one of these left
+	 * behind holds a handle on the driver, which is what makes `sc stop`
+	 * park in STOP_PENDING and what makes a new colinux-daemon.exe
+	 * undeployable because the old image is still locked. It cannot be
+	 * killed either: taskkill on a thread inside the driver closes its
+	 * handles underneath kernel-mode code, which is the recurring 0x50.
+	 *
+	 * So the only way out was rebooting the box, and that is what happened
+	 * four times in one evening.
+	 */
+	bool_t seen_guest = PFALSE;
 
 	ring = co_os_malloc(CO_NETIO_TX_SIZE);
 	if (!ring)
@@ -405,17 +432,27 @@ static co_rc_t ring_loop(void)
 		if (!CO_OK(rc)) {
 			/*
 			 * The guest is gone, or has not booted far enough to
-			 * have registered its rings. Neither is an error worth
-			 * exiting for on a first attempt, but a run that never
-			 * finds them should say so rather than spin silently.
+			 * have registered its rings. Which of those it is
+			 * depends entirely on whether one was ever here.
 			 */
 			if (++quiet == 1 || quiet % 500 == 0)
 				co_terminal_print("conet-slirp-daemon: no guest rings"
 						  " (rc %x)\n", (int)rc);
+
+			if (seen_guest && quiet >= RING_GONE_POLLS) {
+				co_terminal_print("conet-slirp-daemon: the guest has been"
+						  " gone for %u polls -- exiting so the\n"
+						  "  driver can be unloaded and the binaries"
+						  " replaced\n", (unsigned)quiet);
+				co_os_free(ring);
+				return CO_RC(OK);
+			}
+
 			co_os_user_msleep(20);
 			continue;
 		}
 		quiet = 0;
+		seen_guest = PTRUE;
 
 		frames = co_net_walk(ring, tx_head, tx_tail, ring_frame, NULL,
 				     &consumed);
