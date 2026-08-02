@@ -393,8 +393,26 @@ EOF
 # connection to it into a connection to the host's own loopback -- so this
 # reaches an X server listening on 127.0.0.1:6000 on the Windows machine, with
 # no port redirection and nothing new in the driver.
+#
+# LIBGL_ALWAYS_INDIRECT is what decides where OpenGL actually runs, and the
+# default is the wrong end. The guest has no GPU and no DRI device, so its Mesa
+# falls back to llvmpipe and renders in its own CPU -- one core, shared with the
+# host -- then ships finished pixels over the wire. The X server never sees a
+# GL command and cannot accelerate anything, however good the card behind it is.
+#
+# Set, the guest sends GLX protocol instead and the server executes it on the
+# host's own OpenGL, which is the machine's real graphics card. The server side
+# of that is `-wgl +iglx`; indirect GLX has been disabled by default since
+# xorg 1.17, so both halves are required and either one alone does nothing.
+#
+# The trade is the GL version. Indirect contexts are limited to what the GLX
+# protocol can encode, so an application demanding a modern core profile will
+# refuse rather than run slowly, and for those `unset LIBGL_ALWAYS_INDIRECT`
+# gets llvmpipe back. glxinfo reports which one is in force: the card's name
+# means the protocol path, "llvmpipe" means the guest's CPU.
 cat > "$MNT/etc/environment" <<'EOF'
 DISPLAY=10.0.2.2:0
+LIBGL_ALWAYS_INDIRECT=1
 EOF
 
 # A user, because running a desktop as root is how people learn not to -- and
@@ -407,8 +425,10 @@ EOF
 # the variable is simply absent.
 inside "useradd -m -G wheel -s /bin/bash mocolinux" >/dev/null 2>&1 || true
 inside "echo 'mocolinux:mocolinux' | chpasswd" >/dev/null 2>&1 || true
-echo 'export DISPLAY=10.0.2.2:0' >> "$MNT/home/mocolinux/.bashrc"
-echo 'export DISPLAY=10.0.2.2:0' >> "$MNT/root/.bashrc"
+for rc in "$MNT/home/mocolinux/.bashrc" "$MNT/root/.bashrc"; do
+	echo 'export DISPLAY=10.0.2.2:0' >> "$rc"
+	echo 'export LIBGL_ALWAYS_INDIRECT=1' >> "$rc"
+done
 echo "%wheel ALL=(ALL:ALL) ALL" > "$MNT/etc/sudoers.d/10-wheel"
 chmod 0440 "$MNT/etc/sudoers.d/10-wheel"
 
