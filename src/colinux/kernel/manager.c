@@ -866,7 +866,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 
 	case CO_MANAGER_IOCTL_CONSOLE: {
 		co_manager_ioctl_console_t* params = (typeof(params))(io_buffer);
-		unsigned long offered;
+		unsigned long offered, wanted;
 
 		if (in_size < sizeof(*params) || out_size < sizeof(*params))
 			return CO_RC(INVALID_PARAMETER);
@@ -877,9 +877,32 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		if (offered > sizeof(params->in))
 			offered = sizeof(params->in);
 
+		/*
+		 * The caller's output size is honoured, clamped to the buffer.
+		 *
+		 * It used to pass sizeof(params->out) unconditionally, which
+		 * throws away what the caller asked for -- and a caller asking
+		 * for nothing means it. The console server probes for a live
+		 * guest with a zero-length call precisely so it can find out
+		 * whether a run has ended without consuming anything, because
+		 * console output pulled out of the ring is gone: it is not
+		 * buffered anywhere else and the next client never sees it.
+		 *
+		 * Ignoring the zero turned that probe into a drain. The server
+		 * runs it every 200 ms whenever no client is attached, so
+		 * between one terminal session and the next it was quietly
+		 * eating everything the guest printed. What that looks like
+		 * from outside is a guest that has gone unresponsive -- output
+		 * missing, commands apparently ignored -- when the guest is
+		 * perfectly healthy and the console is deleting its words.
+		 */
+		wanted = params->out_size;
+		if (wanted > sizeof(params->out))
+			wanted = sizeof(params->out);
+
 		params->rc = co_console_pump(manager,
 					     params->in, offered, &params->in_taken,
-					     params->out, sizeof(params->out),
+					     params->out, wanted,
 					     &params->out_len);
 		return CO_RC(OK);
 	}
@@ -1035,13 +1058,26 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 
 		if (in_size < sizeof(*params))
 			return CO_RC(INVALID_PARAMETER);
-		if (params->size > CO_CONET_PUT_MAX ||
+		/*
+		 * The batch is bounded here, before anything reads it: the
+		 * declared byte count must fit in the buffer the I/O manager
+		 * actually copied, and the frame count must be possible for
+		 * that many bytes -- the smallest record is eight bytes, a
+		 * length word plus a padded minimum frame. Both come from
+		 * userspace, and co_net_put walks the records itself, so a
+		 * count that outruns the data would have it reading past the
+		 * end of the staging buffer.
+		 */
+		if (params->size > CO_CONET_PUT_BATCH ||
 		    in_size < sizeof(*params) + params->size)
+			return CO_RC(INVALID_PARAMETER);
+		if (params->frames == 0 || params->frames > params->size / 8)
 			return CO_RC(INVALID_PARAMETER);
 		if (out_size < sizeof(*params))
 			return CO_RC(INVALID_PARAMETER);
 
-		params->rc = co_net_put(manager, params->data, params->size);
+		params->rc = co_net_put(manager, params->data, params->size,
+					params->frames, &params->taken);
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}

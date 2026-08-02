@@ -341,23 +341,115 @@ static co_rc_t co_slirp_selftest(void)
  */
 static bool_t		   ring_rx_full;
 static unsigned long	   ring_in, ring_out, ring_deferred;
+/*
+ * Instrumentation for the throughput question, because two explanations fit
+ * the same number and only counting tells them apart.
+ *
+ * A guest download sat at 1.39 MB/s -- about 925 frames a second -- both before
+ * and after the RX path was changed to carry many frames per ioctl. Either the
+ * batches are not filling (so the change did nothing and the ioctl count is
+ * unchanged), or the ioctl was never the limit and the loop itself is (so the
+ * cost is per turn of the loop, not per call). frames-per-put separates them:
+ * near 1 means the first, well above 1 means the second.
+ */
+static unsigned long	   ring_puts, ring_loops;
+
+/*
+ * Frames waiting to go into the guest's RX ring, in the ring's own record
+ * format: a 32-bit length, the frame, padding to four bytes.
+ *
+ * They are accumulated rather than sent one at a time because the cost of
+ * reaching the driver is per call and not per byte -- an ioctl, a non-paged
+ * staging buffer, the net lock, and a walk of the guest's page tables, about a
+ * millisecond in total. One frame per call therefore capped the guest at
+ * roughly 925 frames a second, which is 1.4 MB/s, and it measured the same from
+ * a mirror 5 ms away as from one on another continent. That is what a
+ * bottleneck in our own code looks like from outside: a network that is exactly
+ * as fast as the worst network you tried.
+ */
+static unsigned char ring_batch[CO_CONET_PUT_BATCH];
+static unsigned int  ring_batch_used;
+static unsigned int  ring_batch_frames;
+
+/*
+ * Push what has accumulated. Called after slirp has been polled, and whenever
+ * another frame would not fit.
+ *
+ * A short write is back-pressure, not failure: the guest has not drained its
+ * ring. The frames that did not fit stay at the front of the batch for the next
+ * attempt, and ring_rx_full tells the TX walk to stop consuming so slirp is not
+ * handed more work while the return path is blocked.
+ */
+static void ring_flush(void)
+{
+	unsigned int taken = 0, pos = 0, i;
+	co_rc_t rc;
+
+	if (!ring_batch_frames)
+		return;
+
+	rc = co_manager_conet_put(ring_handle, ring_batch, ring_batch_used,
+				  ring_batch_frames, &taken);
+	ring_puts++;
+
+	if (!CO_OK(rc) || taken < ring_batch_frames)
+		ring_rx_full = PTRUE;
+
+	if (!CO_OK(rc))
+		taken = 0;
+
+	ring_out += taken;
+
+	/* Walk over what was accepted; keep the rest for the next flush. */
+	for (i = 0; i < taken; i++) {
+		unsigned int len;
+
+		memcpy(&len, ring_batch + pos, 4);
+		pos += 4 + ((len + 3) & ~3u);
+	}
+
+	if (pos >= ring_batch_used) {
+		ring_batch_used   = 0;
+		ring_batch_frames = 0;
+	} else {
+		memmove(ring_batch, ring_batch + pos, ring_batch_used - pos);
+		ring_batch_used   -= pos;
+		ring_batch_frames -= taken;
+	}
+}
 
 static void slirp_output_to_ring(const uint8_t *pkt, int pkt_len)
 {
-	co_rc_t rc = co_manager_conet_put(ring_handle, pkt, pkt_len);
+	unsigned int len    = (unsigned int)pkt_len;
+	unsigned int record = 4 + ((len + 3) & ~3u);
 
-	if (CO_OK(rc)) {
-		ring_out++;
+	if (pkt_len <= 0 || len > CO_NETIO_MAX_FRAME)
+		return;
+
+	/* No room for this one: send what is queued and start again. */
+	if (ring_batch_used + record > sizeof(ring_batch))
+		ring_flush();
+
+
+	/*
+	 * Still no room means the flush could not place them either, so the
+	 * guest's ring is full. Drop this frame rather than grow without bound:
+	 * this is ethernet, the protocols above recover, and slirp will resend
+	 * on its own timers.
+	 */
+	if (ring_batch_used + record > sizeof(ring_batch)) {
+		ring_rx_full = PTRUE;
 		return;
 	}
 
-	/*
-	 * OUT_OF_MEMORY here means the guest has not drained its RX ring, not
-	 * that anything failed. Remember it so the frame being processed is
-	 * left in the TX ring and offered again; slirp will resend on its own
-	 * timers regardless.
-	 */
-	ring_rx_full = PTRUE;
+	memcpy(ring_batch + ring_batch_used, &len, 4);
+	memcpy(ring_batch + ring_batch_used + 4, pkt, len);
+	if (record > 4 + len)
+		memset(ring_batch + ring_batch_used + 4 + len, 0,
+		       record - 4 - len);
+
+	ring_batch_used += record;
+	ring_batch_frames++;
 }
 
 static bool_t ring_frame(void *data, const unsigned char *frame, unsigned int len)
@@ -426,6 +518,7 @@ static co_rc_t ring_loop(void)
 		co_rc_t rc;
 
 		ring_rx_full = PFALSE;
+		ring_loops++;
 
 		rc = co_net_fetch(ring_handle, &tx_head, &tx_tail,
 				  &rx_head, &rx_tail, ring);
@@ -491,13 +584,34 @@ static co_rc_t ring_loop(void)
 		co_slirp_mutex_unlock();
 
 		tv.tv_sec  = 0;
-		tv.tv_usec = frames ? 0 : 2000;
+		/*
+		 * Half a millisecond when the guest had nothing to send, not
+		 * two. This is one of three polling intervals in series on
+		 * every round trip -- the guest's receive kthread and the
+		 * monitor loop's idle sleep are the others -- and their sum is
+		 * the latency floor that decides throughput. Inbound data does
+		 * not wait for this timeout anyway, because slirp's sockets are
+		 * in the select set and make it return early; the timeout only
+		 * bounds how long we ignore the guest's TX ring.
+		 */
+		tv.tv_usec = frames ? 0 : 500;
 
 		if (select(nfds + 1, &rfds, &wfds, &xfds, &tv) >= 0) {
 			co_slirp_mutex_lock();
 			slirp_select_poll(&rfds, &wfds, &xfds);
 			co_slirp_mutex_unlock();
 		}
+
+		/*
+		 * Everything slirp produced during that poll goes to the guest
+		 * in one call. slirp hands frames over one at a time through
+		 * slirp_output(), so without a flush here they would sit in the
+		 * batch until it filled -- which for a trickle of packets is
+		 * never, and latency would be unbounded. Flushing once per turn
+		 * of the loop keeps a single ping as prompt as it ever was
+		 * while letting a download coalesce into whole batches.
+		 */
+		ring_flush();
 
 		if (ring_rx_full) {
 			ring_deferred++;
@@ -768,6 +882,11 @@ co_rc_t co_slirp_main(int argc, char *argv[])
 		co_terminal_print("conet-slirp-daemon: %lu frames in, %lu out,"
 				  " %lu rounds deferred on a full rx ring\n",
 				  ring_in, ring_out, ring_deferred);
+		co_terminal_print("conet-slirp-daemon: %lu loops, %lu put ioctls,"
+				  " %lu.%02lu frames per put\n",
+				  ring_loops, ring_puts,
+				  ring_puts ? ring_out / ring_puts : 0,
+				  ring_puts ? (ring_out * 100 / ring_puts) % 100 : 0);
 		co_os_manager_close(ring_handle);
 		ring_handle = NULL;
 		goto out_mutex;

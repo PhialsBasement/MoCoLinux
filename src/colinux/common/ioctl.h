@@ -399,18 +399,51 @@ typedef struct {
 } co_manager_ioctl_conet_take_t;
 
 /*
- * interface for CO_MANAGER_IOCTL_CONET_PUT: deliver one frame to the guest.
+ * interface for CO_MANAGER_IOCTL_CONET_PUT: deliver frames to the guest.
  *
- * The frame is appended to the RX ring and published by advancing rx_head.
- * A full ring answers OUT_OF_MEMORY with nothing written, because the guest
- * may be reading the record at rx_tail and must never have it rewritten
- * underneath it -- the caller keeps the frame and retries.
+ * Frames are appended to the RX ring and published by advancing rx_head once,
+ * at the end. A full ring stops the batch where it ran out and reports how many
+ * were taken, because the guest may be reading the record at rx_tail and must
+ * never have it rewritten underneath it -- the caller keeps the rest and
+ * retries.
+ *
+ * Many frames per call, and that is the whole point of the shape.
+ *
+ * This used to carry exactly one frame, which was right when the only writer
+ * was --net-peer answering a ping at a time. Under a real download it is the
+ * thing that decides throughput, because the cost is per call rather than per
+ * byte: a METHOD_BUFFERED round trip, a non-paged staging buffer allocated and
+ * freed by the I/O manager, net_lock taken and dropped, and a walk of the
+ * guest's page tables. Measured at roughly a millisecond, which put a hard
+ * ceiling near 925 frames a second:
+ *
+ *     1.39 MB/s / 1500 bytes = ~925 frames/s = ~925 ioctls/s
+ *
+ * and that is exactly what a guest download measured, from a mirror 5 ms away
+ * and from one on another continent alike -- the give-away that the network was
+ * never the limit. The TX direction never had this problem because co_net_fetch
+ * has always pulled a window of the ring in one call.
+ *
+ * The layout is the ring's own: a 32-bit length, the frame, then padding to a
+ * four-byte boundary, repeated `frames` times. Reusing it means the driver can
+ * copy records into the ring without reformatting them, and there is one
+ * description of a record in the tree rather than two that drift.
  */
-#define CO_CONET_PUT_MAX 1514
+#define CO_CONET_PUT_MAX	1514
+/*
+ * How much frame data one call may carry. 32 KB is about twenty-one full-sized
+ * frames -- enough that the per-call cost stops dominating, and small enough
+ * that the I/O manager's staging allocation stays modest. It is a
+ * METHOD_BUFFERED buffer, so every byte of this is allocated and freed from
+ * non-paged pool on every call that uses it.
+ */
+#define CO_CONET_PUT_BATCH	0x8000
 typedef struct {
 	co_rc_t		   rc;
-	unsigned int	   size;	/* in: frame length */
-	unsigned char	   data[0];	/* in */
+	unsigned int	   frames;	/* in: records present in data */
+	unsigned int	   size;	/* in: bytes of data used */
+	unsigned int	   taken;	/* out: records actually appended */
+	unsigned char	   data[0];	/* in: length-prefixed records */
 } co_manager_ioctl_conet_put_t;
 
 /*

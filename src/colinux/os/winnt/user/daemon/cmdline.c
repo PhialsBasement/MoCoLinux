@@ -55,6 +55,10 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("      --boot-kernel FILE           Enter co_arch_start_kernel and report\n");
 	co_terminal_print("                                   what the kernel printed before stopping\n");
 	co_terminal_print("      --batch N                    Instructions the guest steps per crossing\n");
+	co_terminal_print("      --mem MB                     Guest RAM in megabytes (default 1024). Taken\n");
+	co_terminal_print("                                   as unbroken 32 MB physical runs, so a large\n");
+	co_terminal_print("                                   value on a fragmented host stalls it; short\n");
+	co_terminal_print("                                   is reported, not fatal.\n");
 	co_terminal_print("      --cobd0 PATH                 Backing store for the guest's root device\n");
 	co_terminal_print("      --cobd1..3 PATH              Further disks, /dev/cobd1 and up. A blank\n");
 	co_terminal_print("                                   image here is how a running guest builds a\n");
@@ -377,6 +381,15 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 				return rc;
 		}
 	}
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--mem",
+		&winnt_parameters->mem,
+		winnt_parameters->mem_arg,
+		sizeof(winnt_parameters->mem_arg));
+
+	if (!CO_OK(rc))
+		return rc;
 
 	rc = co_cmdline_params_one_optional_arugment_parameter(
 		cmdline, "--call-kernel",

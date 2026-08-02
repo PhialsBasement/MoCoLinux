@@ -318,7 +318,14 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 
 		{
 			const char* cobd[CO_COBD_MAX_UNITS];
+			unsigned long mem_mb = 0;
 			int unit;
+
+			if (winnt_parameters.mem &&
+			    !co_parse_count(winnt_parameters.mem_arg, &mem_mb)) {
+				co_terminal_print("--mem wants a positive count of megabytes\n");
+				return CO_RC(INVALID_PARAMETER);
+			}
 
 			for (unit = 0; unit < CO_COBD_MAX_UNITS; unit++)
 				cobd[unit] = winnt_parameters.cobd[unit] ?
@@ -327,20 +334,21 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 			return co_elf_load_into_guest(winnt_parameters.boot_kernel_arg, 3,
 						      limit, batch, cobd,
 						      winnt_parameters.init ?
-							winnt_parameters.init_arg : NULL);
+							winnt_parameters.init_arg : NULL,
+						      mem_mb);
 		}
 	}
 
 	if (winnt_parameters.call_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0, 0, NULL, NULL);
+		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0, 0, NULL, NULL, 0);
 	}
 
 	if (winnt_parameters.enter_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0, 0, NULL, NULL);
+		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0, 0, NULL, NULL, 0);
 	}
 
 	if (winnt_parameters.load_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0, NULL, NULL);
+		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0, NULL, NULL, 0);
 	}
 
 	if (winnt_parameters.net_dump) {
