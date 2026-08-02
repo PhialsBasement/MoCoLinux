@@ -240,105 +240,58 @@
      the driver, the daemons, vmlinux and a compressed root image, so that
      somebody on XP x64 downloads a zip and runs one executable with no cross
      toolchain, no pacman and no Linux machine anywhere.
- * 32-bit userspace triple faults the host under load:
-   * Restoring vector 0x80 in co_colinux_adopt_traps() made 32-bit binaries run
-     for the first time in this port -- ldd resolves, the loader no longer dies
-     -- and it also made an entire subsystem reachable that has never executed
-     here: entry_INT80_compat, the whole compat syscall path, and processes
-     running in compatibility mode with __USER32_CS. Steam got as far as
-     downloading its update and then triple faulted the box.
-   * A triple fault resets the processor before anything can be written, so
-     there is no bugcheck, no minidump, and nothing to decode. The only
-     instrument that can say anything is the debug daemon, whose records are
-     drained continuously to the other machine: the last record before the reset
-     says how far the guest got -- mid-crossing, mid-resume, or inside
-     co_arch_forward_host_interrupt. Run it before reproducing, or the next
-     attempt costs a reset and buys nothing.
-   * What is genuinely new, and therefore where to look first. The world switch
-     now saves and resumes interrupt frames whose CS is a 32-bit segment, which
-     it has never done: co_switch_guest_fault pushes the register set and
-     co_guest_resume iretq's it back, and every frame until now had a 64-bit CS.
-     The stubs run on IST1 in the passage page, but entry_INT80_compat is a
-     DPL 3 gate with no IST, so it takes its stack from the guest TSS's RSP0 --
-     that part is shared with page faults from ring 3, which already work, so it
-     is probably not the difference. The difference is a 32-bit CS crossing the
-     switch, and the guest being at DISPATCH_LEVEL with CR8 masking while it
-     happens.
-   * Until it is understood, the vector-0x80 exception is the thing to disable
-     if a stable guest matters more than 32-bit support: without it the guest
-     runs Manjaro, X and a 194-package install without incident, and every
-     32-bit binary reports its libraries missing.
-
- * The SYSENTER MSRs are not carried across the world switch:
-   * MSR_IA32_SYSENTER_CS/ESP/EIP are deliberately absent from the state block.
-     The reasoning is recorded and was measured: XP x64 leaves all three zero
-     and does not use sysenter even for WOW64, which enters through CSTAR, so
-     the i386 port's save/restore of them is dead weight here.
-   * What that reasoning does not cover is the other direction. A 32-bit Linux
-     process enters the kernel through the vDSO, which prefers sysenter when the
-     CPU has it, so the guest's syscall_init() programs SYSENTER_CS to its own
-     __KERNEL_CS and SYSENTER_EIP to a guest kernel address. Nothing restores
-     the host's values on the way out, because they are not in the state block
-     at all -- so those guest values stay in the MSRs while Windows runs.
-   * Harmless exactly as long as nothing on the host ever executes sysenter. If
-     anything does, it enters guest kernel text with the host's CR3, which is
-     not a fault, a bugcheck, or anything else that leaves a diagnosis.
-   * It is cheap to close: three more MSRs in co_arch_state_stack_t, saved and
-     restored beside FS_BASE and the rest. The alternative is to keep the
-     omission and prove the negative on every host this ever runs on, which is
-     the weaker position.
-
- * The 32-bit execve triple fault -- reproducer known, cause not:
-   * It kills the whole machine: instant reset, no bugcheck, no minidump, nothing
-     in the log after it. Windows bugchecks here DO produce dumps and several
-     unrelated ones have been collected, so the absence is evidence -- this is a
-     triple fault, not a bugcheck.
-   * THE REPRODUCER. With the guest booted and a concurrent workload live (KDE
-     Konsole as an X client over rootless X, plus the slirp bridge), one command:
+ * SOLVED, kept only so it is not re-opened: the 32-bit triple fault.
+   * A selector load is a descriptor load. The world switch restored the guest's
+     saved FS/GS by `mov %ax,%gs`, and a 32-bit task runs with GS = 0x63, which
+     is TLS entry 12 -- an entry Linux rewrites on every context switch.
+     __switch_to zeroes entries 12-14 (process_64.c:632) some distance before it
+     replaces the outgoing selector (:663), a window it is entitled to because
+     it runs under local_irq_disable() -- which in this guest is virtual only.
+     A host interrupt landing there produced a re-entry that loaded an all-zero
+     descriptor: #GP with no IST, frame pushed on the host's stack which is
+     unmapped in the guest CR3, #PF, #DF, whose IST needs the host's TSS through
+     a TR not yet loaded. Triple fault, no dump, nothing logged.
+   * Fixed by validating the descriptor before loading FS or GS and substituting
+     null otherwise; the FS_BASE/GS_BASE restore carries the state. See the
+     commit for the full reasoning.
+   * The reproducer, if anything in this area is ever touched again:
          for i in $(seq 5000); do /usr/bin/gio-querymodules-32 /tmp >/dev/null 2>&1; done
-     gio-querymodules-32 is an ELF 32-bit i386 executable, so this is 5000
-     execve()s of a 32-bit process. Dies within about thirty seconds.
-   * What that replaced: "install Steam and wait twenty minutes". Steam was never
-     special -- it was simply the first thing that did enough 32-bit process churn
-     alongside enough other work. Hours went into chasing Steam, the block layer
-     and the cooperative timer before the conjunction became visible.
-   * ELIMINATED, each by experiment. Do not re-test these; three separate rounds
-     were spent re-answering questions the evidence had already settled:
-       - 12,000 of the same executions on a BARE guest (no X, no slirp, no
-         Konsole): SURVIVES. So 32-bit exec volume alone is not sufficient.
-       - 500 executions with the desktop live: SURVIVES. Threshold is somewhere
-         between 500 and 5000.
-       - 5000 as the FIRST 32-bit code on a clean boot: DIES. Not cumulative.
-       - 791-package, 5.7 GB Manjaro install, pure 64-bit: SURVIVES.
-       - Installing lib32 packages: SURVIVES. A single 32-bit execution: SURVIVES.
-       - Block I/O: instrumented -- no request over 130560 bytes, none past the
-         end of the device, none rejected, and zero blkio crossings in the dying
-         second of one crash.
-       - The cooperative timer: the same failure predates it existing.
-       - PTI: not configured. Compat entry IF handling: verified correct
-         (do_SYSENTER_32 sets X86_EFLAGS_IF, the SYSRET path loads r11 from
-         EFLAGS(%rsp)).
-   * So the condition is 32-bit execve churn AND a second runnable process, and it
-     is threshold-dependent within that. The conjunction is the whole clue: with
-     one runnable task there are far fewer context switches, so look at what
-     happens per context switch and per 32-bit execve.
-   * Where to look first, in order of how well each explains the conjunction:
-     - 32-bit TLS. set_thread_area writes GDT entries and load_TLS REWRITES them
-       on every context switch, while the world switch saves and restores GDTR on
-       every crossing and the guest runs on the kernel's own per-CPU GDT. A
-       descriptor changing under a loaded selector, or a crossing landing mid
-       rewrite, is the shape of thing that kills a machine outright.
-     - The passage page must be mapped at the same virtual address in every
-       address space, because the switch executes with CR3 already changed.
-       Thousands of execve()s create thousands of address spaces. Verify the
-       graft survives into every one of them, and which PML4 slot it needs.
-     - The LDT, if a 32-bit process installs one, against whatever the switch does
-       with LDTR.
-     - The resume path when the interrupted context was compatibility mode
-       (__USER32_CS) rather than 64-bit.
-   * Telemetry at death, from the streamed heartbeat: the guest goes from deeply
-     idle to busy and dies inside that same second. Normal operation runs
-     3,000-14,000 crossings/s, a third to a half of them replayed host interrupts.
+     with a desktop workload live. Thirty seconds to a reset before the fix,
+     nine seconds and healthy after. 12,000 of the same on an idle guest never
+     failed -- the second runnable process is what makes the window frequent
+     enough to hit, so any test without one proves nothing.
+ * The guest has no swap, and it shows as 97% system time:
+   * Measured with Steam running: load average 6 on one vCPU, 877 MB of 929 used,
+     13 MB free, 52 MB available, no swap at all -- and %Cpu(s) 2.7 us, 97.3 sy.
+     Ninety-seven per cent of the guest's CPU is kernel time and three per cent
+     is the application.
+   * With no swap the kernel cannot page anything out, so it sits in permanent
+     direct reclaim, scanning and evicting on nearly every allocation. That is
+     where the system time goes. It is not rendering and it is not X latency,
+     which is what everyone assumes when a remote desktop feels slow.
+   * tools/mkmanjarorootfs.sh should create a swapfile and an fstab entry for it.
+     The disk has room and it converts relentless reclaim into occasional
+     paging, which is the difference between unusable and merely slow.
+   * The other half is real and not fixable this way: load 6 on one processor.
+     Four Steam processes plus the kernel's own work, six-times oversubscribed.
+     That is the SMP entry, not this one.
+   * Worth trying --mem 1536 alongside. 2048 failed on contiguous allocation, but
+     that was on a host that had already run a guest; on a fresh boot it may be
+     available.
+
+ * co_debug_read has a use-after-free:
+   * bugcheck 0xD5 DRIVER_PAGE_FAULT_IN_FREED_SPECIAL_POOL, p3 resolving to
+     linux.sys+0x2334 = co_debug_read+0x44. Caught only because Driver Verifier's
+     special pool is enabled; without it this is a silent read of freed memory.
+   * It fired during startup, not under any guest load, so it is unrelated to
+     anything the guest does. What makes it worth fixing promptly is what it is:
+     the debug daemon's own drain path. That daemon is the one instrument whose
+     records survive a host reset, which is how the guest-RAM allocation freeze
+     and the 32-bit triple fault were both localised -- an instrument that can
+     itself bugcheck the machine is worse than no instrument, because it makes
+     every result it produces suspect.
+   * Likely the same family as the disabled resize_section (see the 0x4E entry):
+     a section freed while a reader still holds a pointer into it.
 
  * An unexplained #GP in trap_init, seen once:
    * A Manjaro boot stopped with vector 13 at co_colinux_adopt_traps+0x150,
@@ -519,14 +472,8 @@
      into them, which also stops the walk touching host page tables with
      MmMapIoSpace at all.
 
- * Nothing can ask the console or the network bridge to stop:
-   * Same shape as the debug daemon entry above and worth solving together. The
-     bridge is documented to keep waiting when there is no guest, and the
-     console is another colinux-daemon.exe, so after a guest powers off both
-     are still there and "is a colinux-daemon running" cannot tell them from a
-     boot. That ambiguity is what made an automated repro loop reach for
-     taskkill, and taskkill is what OOMed the box.
-   * colinux-daemon.exe --install-driver reports "driver already installed /
+ * colinux-daemon.exe --install-driver does not start the driver:
+   * It reports "driver already installed /
      daemon: driver installed" and exits 0 when the service exists but is
      STOPPED, which is its state after every reboot. It does not start it.
      Anything that treats that success as "the driver is loaded" then fails
