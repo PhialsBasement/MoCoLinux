@@ -90,6 +90,37 @@ static void resize_section(co_manager_debug_t *debug, co_debug_section_t *sectio
 	long new_size = 0, old_size = 0;
 	char *new_buffer, *old_buffer;
 
+	/*
+	 * Disabled again, deliberately, and this is not the inverted comparison
+	 * coming back.
+	 *
+	 * Repairing the comparison made this function allocate and free for the
+	 * first time since 2004. With a debug daemon draining hard enough for
+	 * sections to grow, the machine took a bugcheck 0x4E, PFN_LIST_CORRUPT,
+	 * parameter one 0x99 -- the host's page-frame database, corrupt -- and
+	 * the stack was co_debug_ -> co_debug_buf -> co_debug_writev ->
+	 * put_section, freeing a section whose pool header was already wrong.
+	 * Every other allocation in the debug path is twenty years old and
+	 * unchanged; this is the only new one.
+	 *
+	 * That is not proof, and the code above reads correctly to me: both
+	 * branches produce a new_size no smaller than `filled`, the copy is
+	 * bounded by `filled`, and callers re-read section->buffer afterwards.
+	 * Which is exactly why it stays off rather than being tweaked -- an
+	 * allocation path that corrupts the PFN list is not something to iterate
+	 * on against a machine that has to keep working, and the only thing it
+	 * buys is a debug buffer that grows under load.
+	 *
+	 * What it costs while off is what it cost for twenty-two years: a burst
+	 * of logging that outruns the reader fills the 4 KB section and
+	 * append_to_buffer drops the rest. Lossy, silent, and survivable.
+	 *
+	 * To re-enable: delete this return, and reproduce with Driver Verifier's
+	 * special pool on linux.sys so an overrun is caught at the moment it
+	 * happens rather than at the next free.
+	 */
+	return;
+
 	if (section->filled >= section->buffer_size / 2) {
 		/*
 		 * If the buffer is half full, increase it's size by a factor

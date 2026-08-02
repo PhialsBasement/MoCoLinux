@@ -1731,6 +1731,15 @@ tcp_mss(tp, offer)
 	if (mss < tp->t_maxseg || offer != 0)
 	   tp->t_maxseg = mss;
 
+	/*
+	 * Congestion control stays. It was removed here on the reasoning that
+	 * the far end is a ring buffer on the same machine and cannot congest,
+	 * and that is wrong: the ring is 128 KB and the guest drains it in
+	 * scheduled turns, so an unpaced sender fills it, loses frames, and
+	 * collapses into retransmission. Transfers stalled outright. The ring is
+	 * not a network but it is still a bottleneck, and this is what paces
+	 * against it.
+	 */
 	tp->snd_cwnd = mss;
 
 	sbreserve(&so->so_snd, tcp_sndspace+((tcp_sndspace%mss)?(mss-(tcp_sndspace%mss)):0));

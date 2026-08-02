@@ -239,6 +239,54 @@
      /etc/pacman.d/mirrorlist, which the Arch bootstrap ships entirely
      commented out.
 
+ * 32-bit userspace triple faults the host under load:
+   * Restoring vector 0x80 in co_colinux_adopt_traps() made 32-bit binaries run
+     for the first time in this port -- ldd resolves, the loader no longer dies
+     -- and it also made an entire subsystem reachable that has never executed
+     here: entry_INT80_compat, the whole compat syscall path, and processes
+     running in compatibility mode with __USER32_CS. Steam got as far as
+     downloading its update and then triple faulted the box.
+   * A triple fault resets the processor before anything can be written, so
+     there is no bugcheck, no minidump, and nothing to decode. The only
+     instrument that can say anything is the debug daemon, whose records are
+     drained continuously to the other machine: the last record before the reset
+     says how far the guest got -- mid-crossing, mid-resume, or inside
+     co_arch_forward_host_interrupt. Run it before reproducing, or the next
+     attempt costs a reset and buys nothing.
+   * What is genuinely new, and therefore where to look first. The world switch
+     now saves and resumes interrupt frames whose CS is a 32-bit segment, which
+     it has never done: co_switch_guest_fault pushes the register set and
+     co_guest_resume iretq's it back, and every frame until now had a 64-bit CS.
+     The stubs run on IST1 in the passage page, but entry_INT80_compat is a
+     DPL 3 gate with no IST, so it takes its stack from the guest TSS's RSP0 --
+     that part is shared with page faults from ring 3, which already work, so it
+     is probably not the difference. The difference is a 32-bit CS crossing the
+     switch, and the guest being at DISPATCH_LEVEL with CR8 masking while it
+     happens.
+   * Until it is understood, the vector-0x80 exception is the thing to disable
+     if a stable guest matters more than 32-bit support: without it the guest
+     runs Manjaro, X and a 194-package install without incident, and every
+     32-bit binary reports its libraries missing.
+
+ * The SYSENTER MSRs are not carried across the world switch:
+   * MSR_IA32_SYSENTER_CS/ESP/EIP are deliberately absent from the state block.
+     The reasoning is recorded and was measured: XP x64 leaves all three zero
+     and does not use sysenter even for WOW64, which enters through CSTAR, so
+     the i386 port's save/restore of them is dead weight here.
+   * What that reasoning does not cover is the other direction. A 32-bit Linux
+     process enters the kernel through the vDSO, which prefers sysenter when the
+     CPU has it, so the guest's syscall_init() programs SYSENTER_CS to its own
+     __KERNEL_CS and SYSENTER_EIP to a guest kernel address. Nothing restores
+     the host's values on the way out, because they are not in the state block
+     at all -- so those guest values stay in the MSRs while Windows runs.
+   * Harmless exactly as long as nothing on the host ever executes sysenter. If
+     anything does, it enters guest kernel text with the host's CR3, which is
+     not a fault, a bugcheck, or anything else that leaves a diagnosis.
+   * It is cheap to close: three more MSRs in co_arch_state_stack_t, saved and
+     restored beside FS_BASE and the rest. The alternative is to keep the
+     omission and prove the negative on every host this ever runs on, which is
+     the weaker position.
+
  * An unexplained #GP in trap_init, seen once:
    * A Manjaro boot stopped with vector 13 at co_colinux_adopt_traps+0x150,
      error code 0x40. The error code is a selector, not an address: index 8 in

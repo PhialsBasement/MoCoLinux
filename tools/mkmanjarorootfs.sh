@@ -40,8 +40,25 @@ SIZE=${2:-6G}
 # script runs inside the guest over a serial console, and a literal dollar sign
 # is the first thing to be eaten. pacman-mirrors replaces all of this with a
 # real ranked mirrorlist once the keyring exists.
-MIRROR1=https://ftp.halifax.rwth-aachen.de/manjaro/stable
-MIRROR2=https://mirror.alpix.eu/manjaro/stable
+#
+# Pick a mirror near the machine that is building, and measure rather than
+# assume. These two were European because they were the first that answered
+# when the script was written, and from Australia that cost a factor of
+# twenty-five:
+#
+#     mirror.aarnet.edu.au        42.6 MB/s
+#     ftp.halifax.rwth-aachen.de   1.7 MB/s
+#     mirror.datacenter.by         0.8 MB/s
+#
+# It also produced a wall of TLS handshake failures and curl "transfer too
+# slow" aborts on the first large install, which is what a saturated
+# trans-continental link does to several concurrent streams -- and which reads
+# as a broken NAT rather than a badly chosen server.
+#
+# pacman-mirrors replaces all of this with a ranked list once the keyring
+# exists; these two only have to get that far.
+MIRROR1=https://mirror.aarnet.edu.au/pub/manjaro/stable
+MIRROR2=https://ftp.halifax.rwth-aachen.de/manjaro/stable
 
 # base pulls systemd, both keyrings, pacman, iproute2 and iputils. It does not
 # pull a kernel -- `linux` is an optdepend of base, not a depend -- which is
@@ -63,11 +80,12 @@ MIRROR2=https://mirror.alpix.eu/manjaro/stable
 # this size cannot add later without the multilib repository, and the first
 # thing anybody tries is a 32-bit program.
 PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
-	  gnupg sudo nano inetutils curl \
-	  xorg-xauth xorg-xhost xorg-xrandr xterm \
+	  gnupg sudo nano inetutils curl networkmanager \
+	  manjaro-kde-settings plasma-meta \
+	  konsole kate dolphin firefox ark okular gwenview kcalc \
 	  ttf-liberation ttf-dejavu \
-	  thunar mousepad \
-	  mesa lib32-glibc lib32-gcc-libs lib32-mesa"
+	  xorg-xauth xorg-xhost xorg-xrandr xterm \
+	  lib32-glibc lib32-gcc-libs"
 
 MNT=$(mktemp -d)
 CONF=$(mktemp)
@@ -153,10 +171,25 @@ chmod 1777 "$MNT/tmp"
 # populated, signature checking goes to the distribution default and a full
 # -Syu re-verifies everything that was laid down here.
 say "installing $(echo $PACKAGES | wc -w) package groups (trust-on-first-use)"
+#
+# ParallelDownloads = 1, and this is not a preference.
+#
+# Manjaro's own pacman.conf ships 5, and five concurrent TLS streams through
+# slirp is what produced a wall of handshake failures and "transfer too slow"
+# aborts on the first large install. slirp is a single-threaded 2004 NAT with a
+# fixed socket table; curl gives up when a stream drops below its low-speed
+# floor, and with five of them competing for one ring pair several always do.
+# One at a time is slower in theory and finishes in practice.
+#
+# multilib is here because lib32 packages live in it, and the bootstrap config
+# is the only pacman.conf that exists until manjaro-release installs a real one.
+# Without it a 32-bit userland cannot be laid down at all, and pacman aborts the
+# whole transaction on the first lib32 target it cannot find.
 cat > "$CONF" <<EOF
 [options]
 HoldPkg = pacman glibc
 Architecture = x86_64
+ParallelDownloads = 1
 SigLevel = Never
 LocalFileSigLevel = Never
 [core]
@@ -165,6 +198,9 @@ Server = $MIRROR2/core/x86_64
 [extra]
 Server = $MIRROR1/extra/x86_64
 Server = $MIRROR2/extra/x86_64
+[multilib]
+Server = $MIRROR1/multilib/x86_64
+Server = $MIRROR2/multilib/x86_64
 EOF
 
 pacman --root "$MNT" --config "$CONF" \
@@ -216,6 +252,20 @@ inside "pacman -Syu --noconfirm" || \
 # ---------------------------------------------------------------- the system
 
 say "configuring the system"
+
+# The installed system inherits the same download limit, for the same reason.
+#
+# manjaro-release drops in a real pacman.conf with ParallelDownloads = 5, so
+# every pacman run inside the booted guest goes back to five concurrent TLS
+# streams through slirp -- which is exactly what filled the screen with
+# handshake errors and "transfer too slow" aborts the first time somebody
+# installed a package by hand. Fixing it only in the bootstrap config would
+# leave the trap set for the user rather than the builder.
+if grep -q "^ParallelDownloads" "$MNT/etc/pacman.conf" 2>/dev/null; then
+	sed -i 's/^ParallelDownloads.*/ParallelDownloads = 1/' "$MNT/etc/pacman.conf"
+else
+	sed -i 's/^\[options\]/[options]\nParallelDownloads = 1/' "$MNT/etc/pacman.conf"
+fi
 
 # The dynamic linker cache, which a --root install never builds.
 #
