@@ -883,7 +883,7 @@ out:
 
 /* How much physical memory the guest is told it has. */
 /*
- * 1 GB, up from 512 MB, up from 128.
+ * 2 GB, half of the test box, up from 1 GB, up from 512 MB, up from 128.
  *
  * 128 was chosen when the guest was a kernel with no userspace and then a
  * BusyBox root, where it was generous. An Arch userspace with systemd is a
@@ -899,12 +899,18 @@ out:
  *
  * It is bounded by the block count rather than by this number, and the two
  * have to move together. Block 0 is image + tables and every later block is
- * at most 32 MB, so the ceiling is 44 + 32 * (CO_KLOAD_MAX_BLOCKS - 1) MB.
- * At the old cap of 16 that was about 524 MB: asking for 1 GB would have
- * quietly produced half of it and said so in a line nobody reads. Both caps
- * are 40 now, which puts the ceiling near 1.3 GB.
+ * at most CO_KLOAD_CHUNK_BYTES, so the ceiling is 44 + 32 * 126 MB, about
+ * 4 GB. At the original cap of 16 blocks it was 524 MB, and asking for more
+ * quietly produced half of it and said so in a line nobody reads.
+ *
+ * Falling short is still reported rather than fatal, and at half the host's
+ * memory that matters: this is a target, not a reservation. The host is a 4 GB
+ * machine running its own desktop, so whether two gigabytes of it can be found
+ * in unbroken 32 MB runs depends on what else is resident. The e820 describes
+ * exactly what was obtained, so a guest that gets less boots with less and says
+ * so, which is the only honest behaviour when the answer is not up to us.
  */
-#define CO_GUEST_RAM	(1024ULL << 20)
+#define CO_GUEST_RAM	(2048ULL << 20)
 
 /* One e820 entry: 8-byte address, 8-byte size, 4-byte type, packed to 20. */
 static void co_e820_entry(unsigned char* p, unsigned long long addr,
