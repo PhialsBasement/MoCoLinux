@@ -94,6 +94,7 @@ MIRROR2=https://ftp.halifax.rwth-aachen.de/manjaro/stable
 # thing anybody tries is a 32-bit program.
 PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 	  gnupg sudo nano inetutils curl networkmanager \
+	  zsh zsh-completions \
 	  manjaro-kde-settings plasma-meta \
 	  konsole kate dolphin firefox ark okular gwenview kcalc \
 	  ttf-liberation ttf-dejavu \
@@ -429,6 +430,87 @@ DISPLAY=10.0.2.2:0
 # hardware accelerated but limited to GL 1.4 by the GLX wire protocol.
 EOF
 
+# zsh, and the four files it reads.
+#
+# Into /etc/skel before the user exists, so useradd -m copies them in with the
+# right ownership; root gets its own copy further down.
+#
+# The first reason is defensive. A zsh that finds no .zshrc runs
+# zsh-newuser-install, which asks questions. On a console that autologs in over
+# a serial line with nobody watching, that is not a prompt, it is a hang -- and
+# it would hang the one way into this guest.
+#
+# The second is that the four are not interchangeable, and which file a thing
+# belongs in is the part people get wrong:
+#
+#   .zshenv    every zsh, always: interactive or not, login or not. The only one
+#              a non-interactive `zsh -c` reads, so anything a script needs goes
+#              here -- and nothing slow does, because it runs every time.
+#   .zprofile  login shells, after .zshenv.
+#   .zshrc     interactive shells. Prompt, history, completion, keys.
+#   .zlogin    login shells, after .zshrc, so it runs last of the four.
+mkdir -p "$MNT/etc/skel"
+
+cat > "$MNT/etc/skel/.zshenv" <<'SKEL'
+# Read by every zsh, including non-interactive ones. Environment only.
+
+# The X server is on the Windows side. slirp rewrites this address to the host's
+# own loopback, so the connection never leaves the machine. /etc/environment
+# carries it too, but only reaches sessions that go through PAM, and `su -` here
+# does not.
+export DISPLAY=10.0.2.2:0
+
+export EDITOR=nano
+export PATH="$HOME/.local/bin:$PATH"
+
+# OpenGL renders in this guest's CPU by default -- complete, and slow, because
+# there is no GPU here. Run a single program through `glhw` to use the host's
+# graphics card instead; it is capped at GL 1.4 by the GLX protocol.
+SKEL
+
+cat > "$MNT/etc/skel/.zprofile" <<'SKEL'
+# Login shells, between .zshenv and .zshrc. Deliberately near-empty: environment
+# belongs in .zshenv, where non-interactive shells see it too.
+SKEL
+
+cat > "$MNT/etc/skel/.zshrc" <<'SKEL'
+# Interactive shells only.
+
+HISTFILE=~/.zsh_history
+HISTSIZE=10000
+SAVEHIST=10000
+setopt HIST_IGNORE_DUPS SHARE_HISTORY EXTENDED_HISTORY
+setopt AUTO_CD INTERACTIVE_COMMENTS
+
+autoload -Uz compinit && compinit -d ~/.cache/zcompdump
+zstyle ':completion:*' menu select
+zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}'
+autoload -Uz colors && colors
+
+# The machine is named in the prompt deliberately. This shell is reached over a
+# console from another computer, usually sitting next to a shell on that
+# computer, and two identical prompts is how you run the wrong command.
+PROMPT='%F{cyan}%n@mocolinux%f %F{yellow}%~%f %# '
+
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+alias ll='ls -lh'
+alias la='ls -lha'
+
+# Emacs bindings and the keys a serial console does not bind for itself.
+bindkey -e
+bindkey '^[[A' up-line-or-search
+bindkey '^[[B' down-line-or-search
+bindkey '^[[H' beginning-of-line
+bindkey '^[[F' end-of-line
+bindkey '^[[3~' delete-char
+SKEL
+
+cat > "$MNT/etc/skel/.zlogin" <<'SKEL'
+# Login shells, after .zshrc -- the last of the four, so the shell is fully set
+# up by the time anything here runs.
+SKEL
+
 # A user, because running a desktop as root is how people learn not to -- and
 # because a lot of software simply refuses. Steam checks `id -u` and exits.
 #
@@ -437,10 +519,19 @@ EOF
 # an X client started after `su - mocolinux` fails with "cannot open display" --
 # which reads like the X server is unreachable when the connection is fine and
 # the variable is simply absent.
-inside "useradd -m -G wheel -s /bin/bash mocolinux" >/dev/null 2>&1 || true
+inside "useradd -m -G wheel -s /bin/zsh mocolinux" >/dev/null 2>&1 || true
 inside "echo 'mocolinux:mocolinux' | chpasswd" >/dev/null 2>&1 || true
+# bash stays installed and still works, so it gets DISPLAY too: `bash -lc`
+# should not find a different environment from the login shell.
 for rc in "$MNT/home/mocolinux/.bashrc" "$MNT/root/.bashrc"; do
 	echo 'export DISPLAY=10.0.2.2:0' >> "$rc"
+done
+
+# root reads the same zsh files but keeps bash as its login shell. A broken
+# interactive config must never be the thing standing between an operator and a
+# root prompt.
+for f in .zshenv .zprofile .zshrc .zlogin; do
+	cp "$MNT/etc/skel/$f" "$MNT/root/$f"
 done
 #
 # No password prompt for wheel.
