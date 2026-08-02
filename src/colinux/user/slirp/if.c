@@ -116,7 +116,8 @@ if_input(ttyp)
 	DEBUG_MISC((dfd, " read %d bytes\n", if_n));
 
 	if (if_n <= 0) {
-		if (if_n == 0 || (errno != EINTR && errno != EAGAIN)) {
+		if (if_n == 0 || (errno != EINTR && errno != EAGAIN &&
+				  errno != EWOULDBLOCK)) {
 			if (ttyp->up)
 			   link_up--;
 			tty_detached(ttyp, 0);

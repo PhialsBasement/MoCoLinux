@@ -155,7 +155,27 @@ soread(so)
 	nn = recv(so->s, iov[0].iov_base, iov[0].iov_len,0);
 #endif
 	if (nn <= 0) {
-		if (nn < 0 && (errno == EINTR || errno == EAGAIN))
+		/*
+		 * EWOULDBLOCK as well as EAGAIN, and on Windows that is the
+		 * only one that ever appears.
+		 *
+		 * slirp.h maps errno to WSAGetLastError(), which reports
+		 * WSAEWOULDBLOCK (10035) for a read that would block. EAGAIN is
+		 * 11. So this test never matched on Windows and a would-block
+		 * read fell through to the disconnect path below --
+		 * sofcantrcvmore() and tcp_sockclosed() -- tearing down a
+		 * perfectly healthy connection.
+		 *
+		 * Latent only because soread() is normally called just after
+		 * select() reported the socket readable. select() is allowed to
+		 * be wrong about that, so this could already kill a connection
+		 * at random; and it made reading more than once per poll
+		 * impossible, which is what held throughput to one buffer-fill
+		 * per poll cycle. The other two call sites in slirp.c already
+		 * test both, so this one was simply missed.
+		 */
+		if (nn < 0 && (errno == EINTR || errno == EAGAIN ||
+			       errno == EWOULDBLOCK))
 			return 0;
 		else {
 			DEBUG_MISC((dfd, " --- soread() disconnected, nn = %d, errno = %d-%s\n", nn, errno,strerror(errno)));
@@ -342,7 +362,8 @@ sowrite(so)
 	nn = send(so->s, iov[0].iov_base, iov[0].iov_len,0);
 #endif
 	/* This should never happen, but people tell me it does *shrug* */
-	if (nn < 0 && (errno == EAGAIN || errno == EINTR))
+	if (nn < 0 && (errno == EAGAIN || errno == EINTR ||
+		       errno == EWOULDBLOCK))
 		return 0;
 
 	if (nn <= 0) {
