@@ -595,10 +595,73 @@ asm(".text                                                          \n"
     "    mov %ax, %ds                                               \n"
     "    mov " CO_ARCH_STATE_STACK_ES "(%rdx), %eax                  \n"
     "    mov %ax, %es                                               \n"
+    /*
+     * FS and GS are loaded only if their descriptors are still loadable, and
+     * this is the difference between a working 32-bit userland and a machine
+     * that resets.
+     *
+     * A selector load is a descriptor load: `mov %ax,%gs` reads GDT[index] and
+     * faults if that entry is not present or not a data segment. Every other
+     * selector this switch restores names a fixed entry -- null, __KERNEL_DS,
+     * __USER_DS, __USER32_DS -- and those never change. FS and GS are the
+     * exception: a 32-bit process runs with GS = 0x63, which is TLS entry 12,
+     * and Linux rewrites entries 12-14 out from under it on every context
+     * switch.
+     *
+     * __switch_to loads the next task's TLS (process_64.c, load_TLS) some
+     * distance before it replaces the outgoing GS selector
+     * (x86_fsgsbase_load). In between, the GDT holds the next task's
+     * descriptors -- all zero for a 64-bit task or a kernel thread -- while the
+     * live GS register still holds the outgoing 32-bit task's 0x63. Linux is
+     * entitled to that window because __switch_to runs under
+     * local_irq_disable(); in this guest that is virtual only (asm/irqflags.h),
+     * real interrupts stay on by design, and a host interrupt lands there.
+     *
+     * The crossing then saves GS = 0x63 faithfully, and re-entry tries to load
+     * it against an all-zero descriptor. That #GP cannot be delivered: its gate
+     * has no IST, so the frame goes on whatever RSP is current -- and at this
+     * point in the switch that is still the host's kernel stack, unmapped in
+     * the guest CR3 we have already entered. The resulting #PF escalates to #DF,
+     * whose IST lookup needs the TSS through TR, which is still the host's and
+     * equally unmapped, because ltr is below. Triple fault: reset, no bugcheck,
+     * no dump, nothing in any log.
+     *
+     * So: null selector, index zero, or a present data descriptor -- load it.
+     * Anything else, load null and let the FS_BASE/GS_BASE restore below carry
+     * the state. Substituting null is safe precisely in the case that triggers
+     * it: the guest is inside __switch_to and is about to load the incoming
+     * task's selector itself a few instructions later. An LDT selector is
+     * treated the same way rather than validated, because nothing here installs
+     * an LDT and a table we do not own is not one to go reading.
+     */
     "    mov " CO_ARCH_STATE_STACK_FS "(%rdx), %eax                  \n"
-    "    mov %ax, %fs                                               \n"
+    "    test $0xfff8, %eax                                         \n"
+    "    jz 8f                                                      \n"
+    "    test $4, %al                  /* TI: an LDT selector */    \n"
+    "    jnz 7f                                                     \n"
+    "    movzwl %ax, %r11d                                          \n"
+    "    and $0xfff8, %r11d                                         \n"
+    "    add " CO_PP_GDT_BASE "(%rdx), %r11                         \n"
+    "    movzbl 5(%r11), %r11d         /* P, S and type byte */     \n"
+    "    and $0x90, %r11d              /* present, non-system */    \n"
+    "    cmp $0x90, %r11d                                           \n"
+    "    je 8f                                                      \n"
+    "7:  xor %eax, %eax                                             \n"
+    "8:  mov %ax, %fs                                               \n"
     "    mov " CO_ARCH_STATE_STACK_GS "(%rdx), %eax                  \n"
-    "    mov %ax, %gs                                               \n"
+    "    test $0xfff8, %eax                                         \n"
+    "    jz 8f                                                      \n"
+    "    test $4, %al                                               \n"
+    "    jnz 7f                                                     \n"
+    "    movzwl %ax, %r11d                                          \n"
+    "    and $0xfff8, %r11d                                         \n"
+    "    add " CO_PP_GDT_BASE "(%rdx), %r11                         \n"
+    "    movzbl 5(%r11), %r11d                                      \n"
+    "    and $0x90, %r11d                                           \n"
+    "    cmp $0x90, %r11d                                           \n"
+    "    je 8f                                                      \n"
+    "7:  xor %eax, %eax                                             \n"
+    "8:  mov %ax, %gs                                               \n"
     /*
      * And the task register, so the entering side has a TSS -- which is what
      * makes IST work, and IST is what lets a fault be handled when the current
