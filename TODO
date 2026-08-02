@@ -336,17 +336,29 @@
      an OpenGL from 2002. Anything wanting a modern core profile -- Chromium
      and therefore Steam's client, most compositors, most games -- refuses
      rather than degrades.
-   * What would actually fix it, in increasing order of work:
-     - A GLX/EGL passthrough of the kind virtio-gpu/virgl does for VMs: the
-       guest gets a Mesa driver whose backend is a command stream over a ring
-       to the host, and a host process replays it against real OpenGL. This is
-       the honest answer and it is a project, not a patch. The transport
-       already exists here in the shape the network rings use.
-     - VirtualGL's arrangement, which is the same idea with the split in a
-       different place: intercept at libGL in the guest, render on a machine
-       that has a card, ship images back. It normally assumes the rendering
-       host runs the X server for a real GPU, which is true here -- the host
-       does -- so it may be less work than virgl for the same result.
+   * What would actually fix it. Note first what the constraint is NOT: the
+     card and its driver are not the limit, and neither is translation. The
+     340.x driver on XP gives this GT730 OpenGL 4.4, and wined3d maps D3D onto
+     that well enough to run GTA V. A translation layer on this hardware is a
+     solved problem.
+     The limit is the address-space boundary. wined3d translates inside the
+     application's own process -- a call is a call, nothing is marshalled --
+     while anything here has to cross. Per-call round trips are fatal at any
+     frequency however good the renderer at the far end, and that, rather than
+     rendering quality, is what makes virgl-style designs disappointing.
+     So the design question is not which renderer but where to cut, and the
+     answer is: as coarsely as possible.
+     - Serialise at a submit boundary, not a call boundary. Ship whole command
+       buffers and let the host replay them against real OpenGL. The transport
+       is the least of it -- these rings already carry 140 MB/s on the block
+       path and a crossing costs microseconds (the 16 MB/s network figure is
+       TCP through NAT, not the ring's ceiling). The work is the guest-side
+       Mesa backend, and it is a project rather than a patch.
+     - VirtualGL's arrangement is the same idea with the split at libGL and
+       images coming back instead of pixels going forward. It normally assumes
+       the rendering host owns a real GPU and an X server, which is an
+       assumption that is usually false and happens to be exactly true here,
+       so it may reach a working state far sooner for the same result.
      - Actual passthrough of the card to the guest. Not credible: there is no
        IOMMU in play, the guest deliberately touches no host hardware, and
        Windows is still driving the GT730 while the guest runs.
