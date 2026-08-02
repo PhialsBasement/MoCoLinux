@@ -1181,8 +1181,9 @@ static void co_report_bug_at(co_elf_data_t* pl, unsigned long long rip)
 
 co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			       unsigned long max_switches, unsigned long batch,
-			       const char* cobd0, const char* init_path)
+			       const char* const* cobd, const char* init_path)
 {
+	const char* cobd0 = cobd ? cobd[0] : NULL;
 	co_elf_data_t* pl;
 	co_manager_handle_t handle;
 	co_manager_ioctl_kload_verify_t v = {0, };
@@ -1551,20 +1552,26 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 * and panic about the root filesystem, which says nothing about
 		 * the file that is actually missing or locked.
 		 */
-		if (cobd0) {
+		for (i = 0; cobd && i < CO_COBD_MAX_UNITS; i++) {
 			unsigned long long dsize = 0;
 
-			rc = co_manager_cobd(handle, 0, cobd0, &dsize);
+			if (!cobd[i])
+				continue;
+
+			rc = co_manager_cobd(handle, i, cobd[i], &dsize);
 			if (!CO_OK(rc)) {
-				co_terminal_print("\n  cannot attach cobd0 to '%s' (rc %x)\n",
-						  cobd0, (int)rc);
+				co_terminal_print("\n  cannot attach cobd%d to '%s' (rc %x)\n",
+						  i, cobd[i], (int)rc);
 				co_terminal_print("  the driver opens this path itself, so it is an NT\n");
 				co_terminal_print("  object path, and it must not be a volume Windows has mounted\n");
 				goto out_end;
 			}
 
-			co_terminal_print("    cobd0 -> %s\n", cobd0);
-			co_terminal_print("          %llu MB, root=/dev/cobd0\n", dsize >> 20);
+			co_terminal_print("    cobd%d -> %s\n", i, cobd[i]);
+			if (i == 0)
+				co_terminal_print("          %llu MB, root=/dev/cobd0\n", dsize >> 20);
+			else
+				co_terminal_print("          %llu MB, /dev/cobd%d\n", dsize >> 20, i);
 		}
 
 		/*

@@ -56,6 +56,9 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("                                   what the kernel printed before stopping\n");
 	co_terminal_print("      --batch N                    Instructions the guest steps per crossing\n");
 	co_terminal_print("      --cobd0 PATH                 Backing store for the guest's root device\n");
+	co_terminal_print("      --cobd1..3 PATH              Further disks, /dev/cobd1 and up. A blank\n");
+	co_terminal_print("                                   image here is how a running guest builds a\n");
+	co_terminal_print("                                   root filesystem for the next one.\n");
 	co_terminal_print("      --init PATH                  What the guest runs as pid 1\n");
 	co_terminal_print("                                   (default /sbin/init). /bin/sh answers\n");
 	co_terminal_print("                                   \"does this root work\" on its own.\n");
@@ -350,14 +353,30 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 	if (!CO_OK(rc))
 		return rc;
 
-	rc = co_cmdline_params_one_optional_arugment_parameter(
-		cmdline, "--cobd0",
-		&winnt_parameters->cobd0,
-		winnt_parameters->cobd0_arg,
-		sizeof(winnt_parameters->cobd0_arg));
+	/*
+	 * --cobd0 .. --cobd3. The option name is built rather than written out
+	 * four times, so adding a unit is a change to CO_COBD_MAX_UNITS and
+	 * nothing else -- the driver and the guest already take their bound
+	 * from the same constant.
+	 */
+	{
+		int unit;
 
-	if (!CO_OK(rc))
-		return rc;
+		for (unit = 0; unit < CO_COBD_MAX_UNITS; unit++) {
+			char opt[16];
+
+			co_snprintf(opt, sizeof(opt), "--cobd%d", unit);
+
+			rc = co_cmdline_params_one_optional_arugment_parameter(
+				cmdline, opt,
+				&winnt_parameters->cobd[unit],
+				winnt_parameters->cobd_arg[unit],
+				sizeof(winnt_parameters->cobd_arg[unit]));
+
+			if (!CO_OK(rc))
+				return rc;
+		}
+	}
 
 	rc = co_cmdline_params_one_optional_arugment_parameter(
 		cmdline, "--call-kernel",

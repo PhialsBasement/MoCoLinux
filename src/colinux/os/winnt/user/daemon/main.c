@@ -295,12 +295,19 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 			return CO_RC(INVALID_PARAMETER);
 		}
 
-		return co_elf_load_into_guest(winnt_parameters.boot_kernel_arg, 3,
-					      limit, batch,
-					      winnt_parameters.cobd0 ?
-						winnt_parameters.cobd0_arg : NULL,
-					      winnt_parameters.init ?
-						winnt_parameters.init_arg : NULL);
+		{
+			const char* cobd[CO_COBD_MAX_UNITS];
+			int unit;
+
+			for (unit = 0; unit < CO_COBD_MAX_UNITS; unit++)
+				cobd[unit] = winnt_parameters.cobd[unit] ?
+					winnt_parameters.cobd_arg[unit] : NULL;
+
+			return co_elf_load_into_guest(winnt_parameters.boot_kernel_arg, 3,
+						      limit, batch, cobd,
+						      winnt_parameters.init ?
+							winnt_parameters.init_arg : NULL);
+		}
 	}
 
 	if (winnt_parameters.call_kernel) {
