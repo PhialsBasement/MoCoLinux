@@ -58,6 +58,33 @@ static co_rc_t create_section(co_debug_section_t **section_out)
 	return CO_RC(OK);
 }
 
+/*
+ * Grow a section that is filling up, shrink one that has gone quiet.
+ *
+ * This function did nothing at all for twenty-two years, and the way it did
+ * nothing is worth keeping in front of whoever reads it next. It computed
+ * new_size as either buffer_size * 2 or peak_size / 2 -- both different from
+ * buffer_size by construction -- and then returned on `old_size != new_size`.
+ * So it returned on every path where a resize had been asked for, and the only
+ * way to reach the allocation was for the new size to equal the old one, which
+ * would have made it pointless anyway. The test wanted to be `==`: there is
+ * nothing to do when the size would not change.
+ *
+ * The consequence was not "logs are a bit lossy". Every section stayed at
+ * 4 KB forever, so any burst that outran the daemon's drain filled it and
+ * every record after that was refused by append_to_buffer and dropped with no
+ * diagnostic. That is why the debug stream went silent seven minutes before a
+ * bugcheck and left nothing from the teardown that caused it -- the log stops
+ * exactly when the driver becomes interesting.
+ *
+ * The shrink path needs the clamp below before it may be enabled. It sets
+ * new_size to peak_size / 2 and then copies `filled` bytes into it, and its own
+ * branch condition only guarantees filled < START_SIZE. With peak still at
+ * START_SIZE that is a 2 KB buffer receiving up to 4095 bytes: a pool overrun
+ * out of the logging path. It never fired only because the comparison above
+ * disabled the entire function, so repairing that one line without this one
+ * would have armed it.
+ */
 static void resize_section(co_manager_debug_t *debug, co_debug_section_t *section)
 {
 	long new_size = 0, old_size = 0;
@@ -76,16 +103,28 @@ static void resize_section(co_manager_debug_t *debug, co_debug_section_t *sectio
 	} else if (section->filled < CO_DEBUG_SECTION_BUFFER_START_SIZE) {
 		/*
 		 * Reduce to half the size of the peak size if the buffer is
-		 * quite empty.
+		 * quite empty. Never below the starting size, which is also
+		 * what keeps this larger than `filled` -- this branch is only
+		 * taken when filled is below START_SIZE, so a floor of
+		 * START_SIZE makes the copy below safe by construction.
 		 */
 		new_size = section->peak_size / 2;
+		if (new_size < CO_DEBUG_SECTION_BUFFER_START_SIZE)
+			new_size = CO_DEBUG_SECTION_BUFFER_START_SIZE;
 	}
 
 	if (new_size == 0)
 		return;
 
 	old_size = section->buffer_size;
-	if (old_size != new_size)
+	if (old_size == new_size)
+		return;
+
+	/*
+	 * Belt and braces, because the cost of being wrong here is a pool
+	 * overrun in the one code path every other diagnosis depends on.
+	 */
+	if (new_size < section->filled)
 		return;
 
 	new_buffer = co_os_malloc(new_size);
