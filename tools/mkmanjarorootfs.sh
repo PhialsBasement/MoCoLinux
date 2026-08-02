@@ -67,6 +67,19 @@ MIRROR2=https://ftp.halifax.rwth-aachen.de/manjaro/stable
 #
 # gnupg is explicit: pacman links gpgme, but `pacman-key` is a shell script that
 # drives the gpg binary, and without it the keyring cannot be populated at all.
+# xcb-util-cursor is not optional and is not pulled in for you.
+#
+# Since Qt 6.5 the xcb platform plugin refuses to load without it, and nothing
+# depends on it, so a package set that installs all of Plasma still misses it.
+# What that looks like is not a missing-library message from the loader: the
+# plugin is found, fails to initialise, and Qt aborts --
+#
+#   qt.qpa.plugin: From 6.5.0, xcb-cursor0 or libxcb-cursor0 is needed
+#   qt.qpa.plugin: Could not load the Qt platform plugin "xcb"
+#
+# -- so every Qt application in the image dies on startup, and the abort is what
+# then triggers the coredump handling disabled below.
+#
 # The X clients are the point of this image, not an X server -- there is none in
 # the guest and none is wanted. Applications appear as native Windows windows
 # through the server on the host, which is also the window manager, so a desktop
@@ -85,6 +98,7 @@ PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 	  konsole kate dolphin firefox ark okular gwenview kcalc \
 	  ttf-liberation ttf-dejavu \
 	  xorg-xauth xorg-xhost xorg-xrandr xterm \
+	  xcb-util-cursor \
 	  lib32-glibc lib32-gcc-libs"
 
 MNT=$(mktemp -d)
@@ -242,6 +256,22 @@ inside "pacman-mirrors --api --set-branch stable" >/dev/null 2>&1 || true
 inside "pacman-mirrors --fasttrack 5" >/dev/null 2>&1 || \
 	say "  pacman-mirrors could not rank mirrors; keeping the bootstrap servers"
 
+# Put the mirror we measured back at the top of whatever pacman-mirrors chose.
+#
+# Ranking produced 125 servers, several of which do not resolve at all --
+# mirror.bouwhuis.network and mirror.23m.com among them -- and pacman tried
+# enough dead ones in a row to abandon the sync entirely, so the final
+# re-verification never ran. pacman skips a failed mirror and moves on, but only
+# if it reaches a working one before it gives up.
+#
+# The ranked list is still worth having: it is closer to right for whoever ends
+# up running the image than one hardcoded server. This just guarantees the first
+# entry is one that answered here.
+if [ -f "$MNT/etc/pacman.d/mirrorlist" ]; then
+	sed -i "1i Server = $MIRROR1/\$repo/\$arch" \
+		"$MNT/etc/pacman.d/mirrorlist"
+fi
+
 say "re-verifying every installed package against the populated keyring"
 # The other half of the trust-on-first-use bargain. Signature checking is back
 # at the distribution default by now, because manjaro-release installed a real
@@ -266,6 +296,35 @@ if grep -q "^ParallelDownloads" "$MNT/etc/pacman.conf" 2>/dev/null; then
 else
 	sed -i 's/^\[options\]/[options]\nParallelDownloads = 1/' "$MNT/etc/pacman.conf"
 fi
+
+# No core dumps, and this is not tidiness.
+#
+# A crash here does not cost one process, it costs the machine. systemd-coredump
+# reads the whole address space of the dying program and writes a compressed
+# core -- for a Qt application that is a couple of hundred megabytes in and out,
+# through cobd, on a guest that has exactly one CPU because cooperative
+# virtualisation gives it one. Nothing else runs while that happens. The first
+# time it did, the guest looked frozen for minutes and every diagnosis pointed
+# somewhere else: the X server, the network, the block layer, the timers.
+#
+# Storage=none stops the writing, ProcessSizeMax=0 stops the reading, and the
+# sysctl covers the window before systemd has claimed the pattern. A guest that
+# crashes should lose the program and keep the session.
+mkdir -p "$MNT/etc/systemd/coredump.conf.d"
+cat > "$MNT/etc/systemd/coredump.conf.d/10-no-coredump.conf" <<'EOF'
+[Coredump]
+Storage=none
+ProcessSizeMax=0
+EOF
+
+cat > "$MNT/etc/sysctl.d/50-no-coredump.conf" <<'EOF'
+kernel.core_pattern = |/bin/false
+EOF
+
+mkdir -p "$MNT/etc/security/limits.d"
+cat > "$MNT/etc/security/limits.d/10-no-core.conf" <<'EOF'
+*	hard	core	0
+EOF
 
 # The dynamic linker cache, which a --root install never builds.
 #

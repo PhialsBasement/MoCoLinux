@@ -3377,6 +3377,16 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		unsigned long guest_crossings = 0;
 		unsigned long idle_run = 0;
 		unsigned long rx_spins = 0;
+		/*
+		 * Heartbeat: one debug record per second of wall time, streamed
+		 * over UDP by the debug daemon as it is produced, so it survives
+		 * the host dying. Everything else written tonight -- the boot
+		 * daemon's report, the guest's console -- is buffered somewhere
+		 * that dies with the machine, which is why five freezes have
+		 * produced zero evidence. This is the flight recorder.
+		 */
+		unsigned long long hb_last = co_os_monotonic_100ns();
+		unsigned long hb_iter = 0, hb_vol = 0, hb_idle = 0, hb_blk = 0;
 		unsigned long granted;
 		int i;
 
@@ -3627,6 +3637,21 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			}
 	host_repaired:
 
+			hb_iter++;
+			if ((i & 0xff) == 0) {
+				unsigned long long hb_now = co_os_monotonic_100ns();
+
+				if (hb_now - hb_last >= 10000000ULL) {
+					co_debug("hb: %lu crossings/s (%lu voluntary,"
+						 " %lu idle, %lu blkio), rx_spins %lu,"
+						 " idle_run %lu",
+						 hb_iter, hb_vol, hb_idle, hb_blk,
+						 rx_spins, idle_run);
+					hb_last = hb_now;
+					hb_iter = hb_vol = hb_idle = hb_blk = 0;
+				}
+			}
+
 			if (!pp->params[4]) {
 				/*
 				 * A voluntary crossing: the guest called the
@@ -3640,6 +3665,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				unsigned long long op = pp->operation;
 
 				guest_crossings++;	/* the guest's own doing */
+				hb_vol++;
 
 				pp->operation = 0;
 
@@ -3677,14 +3703,22 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				if (op == CO_OPERATION_BLOCK_IO) {
 					co_rc_t brc;
 
-					brc = co_cobd_request(manager,
+					/*
+					 * params[54] is the guest physical
+					 * address of a descriptor list and
+					 * params[53] is how many descriptors it
+					 * holds -- a whole request in one
+					 * crossing rather than one per page.
+					 */
+					brc = co_cobd_request_sg(manager,
 							      (int)pp->params[51],
 							      pp->params[52],
 							      pp->params[54],
-							      (unsigned long)pp->params[53],
+							      (unsigned int)pp->params[53],
 							      pp->params[55] ? PTRUE : PFALSE);
 
 					pp->params[56] = CO_OK(brc) ? 0 : 1;
+					hb_blk++;
 					out->block_requests++;
 					if (!CO_OK(brc))
 						out->block_errors++;
@@ -3708,6 +3742,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				}
 
 				if (op == CO_OPERATION_IDLE) {
+					hb_idle++;
 					out->idle_yields++;
 					if (out->idle_yields == 1) {
 						out->reached_idle = PTRUE;
