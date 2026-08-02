@@ -47,6 +47,17 @@ extern unsigned long long co_cobd_size(int unit);
 #define CO_COBD_MAX_SG	128
 
 /*
+ * The largest a single scatter-gather segment may claim to be.
+ *
+ * Matches max_segment_size in the guest's queue limits, so no honest request
+ * ever approaches it. It exists because the length is read out of guest memory
+ * and then used as a loop bound: a wrong one writes file contents across the
+ * guest until it runs out of RAM, which is silent corruption when it lands on
+ * data and a triple fault when it lands on kernel text.
+ */
+#define CO_COBD_MAX_SEGMENT	(1024 * 1024)
+
+/*
  * A whole request in one crossing: `count` descriptors at guest physical
  * address `sg_pa`, each a physical run and a length, written or read in order
  * from `offset`. See the comment in cobd.c.
