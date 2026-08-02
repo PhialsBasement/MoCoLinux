@@ -3087,8 +3087,8 @@ static void co_arch_inject_tick(co_manager_t* manager,
 	 * so this flag -- not the real one -- is the answer, and it is the
 	 * whole of the contract being honoured.
 	 */
-	if (!CO_OK(co_kload_read(manager, in->virtual_if_va,
-				 (unsigned char*)&vif, sizeof(vif))) ||
+	if (!CO_OK(co_kload_read_cr3(manager, cr3, in->virtual_if_va,
+				     (unsigned char*)&vif, sizeof(vif))) ||
 	    (vif & 0x200) == 0)
 		return;
 
@@ -4087,11 +4087,29 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 * frame == NULL means unrecorded or unreadable, and
 			 * every user below already handles that.
 			 */
+			/*
+			 * Through the root the guest was running on, not the
+			 * host's load-time space.
+			 *
+			 * The frame lives wherever the interrupt or fault put
+			 * it, and with CONFIG_VMAP_STACK that is usually a
+			 * vmalloc'd task stack -- or, for an entry from ring 3,
+			 * the cpu_entry_area entry stack. Both are top-level
+			 * entries Linux created for itself after boot handoff,
+			 * so neither exists in the PML4 the host built at load
+			 * time. Read through that one the lookup simply returns
+			 * NOT_FOUND, frame stays NULL, and every diagnostic
+			 * below silently reports nothing -- which is how a
+			 * fault on a vmap stack came to produce an empty
+			 * report rather than a wrong one.
+			 */
 			frame = NULL;
 			if (pp->params[28] &&
-			    CO_OK(co_kload_read(manager, pp->params[28],
-						(unsigned char*)frame_buf,
-						sizeof(frame_buf))))
+			    CO_OK(co_kload_read_cr3(manager,
+						    pp->linuxvm_state.cr3,
+						    pp->params[28],
+						    (unsigned char*)frame_buf,
+						    sizeof(frame_buf))))
 				frame = frame_buf;
 
 			if (frame) {
@@ -4186,9 +4204,11 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				if (frame) {
 					frame[0x98 / 8] |= 0x100ULL;
 					frame[0x98 / 8] &= ~0x200ULL;
-					co_kload_write(manager, pp->params[28],
-						       (const unsigned char*)frame_buf,
-						       sizeof(frame_buf));
+					co_kload_write_cr3(manager,
+							   pp->linuxvm_state.cr3,
+							   pp->params[28],
+							   (const unsigned char*)frame_buf,
+							   sizeof(frame_buf));
 				}
 
 				pp->linuxvm_state.return_rip = resume_rip;
@@ -4241,7 +4261,10 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				int warn_len = 0;
 				int is_halt = 0;
 
-				if (CO_OK(co_kload_read(manager, out->fault_rip, op, sizeof(op)))) {
+				if (CO_OK(co_kload_read_cr3(manager,
+							    pp->linuxvm_state.cr3,
+							    out->fault_rip, op,
+							    sizeof(op)))) {
 					/*
 					 * ud2; ud2 is the cooperative halt, not a
 					 * warning. native_halt and native_safe_halt
@@ -4313,9 +4336,11 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 						 */
 						frame[0x98 / 8] &= ~0x100ULL;	/* no TF */
 					}
-					co_kload_write(manager, pp->params[28],
-						       (const unsigned char*)frame_buf,
-						       sizeof(frame_buf));
+					co_kload_write_cr3(manager,
+							   pp->linuxvm_state.cr3,
+							   pp->params[28],
+							   (const unsigned char*)frame_buf,
+							   sizeof(frame_buf));
 
 					pp->linuxvm_state.return_rip = resume_rip;
 					pp->linuxvm_state.rsp        = ist_top - 0x200;
@@ -4358,9 +4383,11 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 						 * step-over above. */
 						frame[0x98 / 8] &= ~0x100ULL;
 					}
-					co_kload_write(manager, pp->params[28],
-						       (const unsigned char*)frame_buf,
-						       sizeof(frame_buf));
+					co_kload_write_cr3(manager,
+							   pp->linuxvm_state.cr3,
+							   pp->params[28],
+							   (const unsigned char*)frame_buf,
+							   sizeof(frame_buf));
 
 					pp->linuxvm_state.return_rip = resume_rip;
 					pp->linuxvm_state.rsp        = ist_top - 0x200;
