@@ -46,8 +46,42 @@ extern int tcp_rcvspace;
 extern int tcp_sndspace;
 extern struct socket *tcp_last_so;
 
-#define TCP_SNDSPACE 8192
-#define TCP_RCVSPACE 8192
+/*
+ * The socket buffers, and therefore the TCP window -- which is what actually
+ * limited this guest's download speed.
+ *
+ * tcp_rcvspace is the window slirp advertises to the far end, so throughput on
+ * any single connection is window / round-trip-time and nothing else. The round
+ * trip here is 11 ms, and it is not the network: it is the monitor loop's 10 ms
+ * sleep per idle yield, so a guest gets an answer at roughly the host's idle
+ * re-entry cadence no matter how good the link is.
+ *
+ * At the inherited 8192 -- which tcp_input.c rounds up to a whole number of MSS,
+ * 8760 for a 1500-byte MTU -- that arithmetic gives
+ *
+ *     8760 bytes / 0.011 s = 796 KB/s
+ *
+ * and the measured rate over the rings was 790 KB/s. The 2.4 GHz wifi behind it
+ * does about three times that, and the ring pair could carry eighty times it;
+ * the sender was simply never allowed more than 8760 bytes in flight.
+ *
+ * 64240 is 44 * 1460, so the MSS round-up in tcp_input.c is a no-op at the
+ * standard MTU and the buffer cannot be pushed past what the window field can
+ * describe. That is the ceiling worth having, because this slirp does not
+ * implement window scaling -- the TCPOPT_WINDOW case in tcp_input.c and the
+ * snd_scale/rcv_scale assignments around it are all commented out, so rcv_scale
+ * is permanently 0 and TCP_MAXWIN (65535) is a hard limit. Predicted rate at the
+ * same 11 ms: 5.8 MB/s, which puts the link back in charge instead of us.
+ *
+ * Cost is per connection and lives in the slirp process, not the driver:
+ * sbreserve() mallocs each direction, so about 125 KB per TCP connection in a
+ * daemon deliberately confined to 2 GB. Turning on window scaling would be the
+ * next step and is deliberately not taken here -- that code has never executed
+ * in this port, and there is no reason to run it while the link is slower than
+ * the window we can already advertise without it.
+ */
+#define TCP_SNDSPACE 64240
+#define TCP_RCVSPACE 64240
 
 /*
  * TCP header.
