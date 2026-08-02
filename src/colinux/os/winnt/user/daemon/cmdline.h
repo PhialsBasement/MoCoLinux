@@ -12,6 +12,7 @@
 #define __CO_OS_USER_WINNT_DAEMON_CMDLINE_H__
 
 #include <colinux/common/common.h>
+#include <colinux/common/ioctl.h>
 #include <colinux/user/cmdline.h>
 
 typedef struct co_winnt_parameters {
@@ -46,10 +47,17 @@ typedef struct co_winnt_parameters {
 	bool_t batch;
 	char   batch_arg[0x20];
 	/*
-	 * Backing store for cobd0, the guest's root device. An NT object path:
-	 * an image file as \??\F:\xfer\root.img, or a raw partition as
+	 * Backing store for each cobd unit. Unit 0 is the guest's root device
+	 * and is the one root= names; the rest are ordinary disks. An NT object
+	 * path: an image file as \??\F:\xfer\root.img, or a raw partition as
 	 * \??\\PhysicalDrive0\Partition3. The driver opens it, so it is the
 	 * driver's idea of the path that matters, not the daemon's.
+	 *
+	 * Four of them, because the driver (CO_COBD_MAX_UNITS) and the guest
+	 * (COBD_MAX_UNITS) have both carried four since cobd was written and
+	 * only the daemon ever knew about one. A second disk is what lets a
+	 * running guest build a root filesystem for the next one, which beats
+	 * pushing a multi-gigabyte image to a box that cannot buffer it.
 	 */
 	/*
 	 * Serve the guest's console on this TCP port and nothing else. A second
@@ -61,8 +69,8 @@ typedef struct co_winnt_parameters {
 
 	bool_t console;
 	char   console_arg[0x20];
-	bool_t cobd0;
-	char   cobd0_arg[0x200];
+	bool_t cobd[CO_COBD_MAX_UNITS];
+	char   cobd_arg[CO_COBD_MAX_UNITS][0x200];
 	bool_t call_kernel;
 	char   call_kernel_arg[0x100];
 	bool_t enter_kernel;

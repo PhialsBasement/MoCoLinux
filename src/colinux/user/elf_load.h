@@ -64,10 +64,14 @@ extern co_rc_t co_elf_net_peer_live(const char *seconds_arg);
  * default. It exists so a run that would take the host down hard can be made
  * to stop first and report, which is the only diagnostic that survives a reset.
  */
+/*
+ * cobd is CO_COBD_MAX_UNITS entries or NULL; entry N is unit N's backing store,
+ * NULL for a unit that is not attached. Unit 0 is what root= names.
+ */
 extern co_rc_t co_elf_load_into_guest(const char *filename, int enter,
 				      unsigned long max_switches,
 				      unsigned long batch,
-				      const char *cobd0,
+				      const char *const *cobd,
 				      const char *init_path);
 extern co_elf_symbol_t *co_get_symbol_by_name(co_elf_data_t *pl, const char *name);
 extern void *co_elf_get_symbol_data(co_elf_data_t *pl, co_elf_symbol_t *symbol);

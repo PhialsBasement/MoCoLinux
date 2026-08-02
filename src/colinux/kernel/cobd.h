@@ -9,15 +9,17 @@
 #define __COLINUX_KERNEL_COBD_H__
 
 #include <colinux/common/common.h>
+#include <colinux/common/ioctl.h>
 #include <colinux/kernel/manager.h>
 
 /*
  * The cooperative block device, host side.
  *
  * Four units is what the bring-up needs -- a root filesystem and somewhere to
- * put the results -- not a limit anything depends on.
+ * put the results -- not a limit anything depends on. CO_COBD_MAX_UNITS is
+ * defined in common/ioctl.h, because the daemon sizes its own --cobdN argument
+ * list from it and the two must agree.
  */
-#define CO_COBD_MAX_UNITS	4
 
 extern co_rc_t co_cobd_attach(int unit, const char* path,
 			      unsigned long long* size_out);

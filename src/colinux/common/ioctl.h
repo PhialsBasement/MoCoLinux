@@ -320,7 +320,17 @@ typedef struct {
  * handle opened by the daemon belongs to a user-mode process and would go away
  * when it exits -- while the guest is still running inside the driver, holding
  * a filesystem mounted on it.
+ *
+ * How many units there are is part of this contract rather than the driver's
+ * private business, because the daemon has to size its own argument list to
+ * match: the driver refuses a unit past its array and the guest simply never
+ * probes one, so a daemon that offered a fifth disk would fail in two places
+ * that both look like the disk is missing. kernel/cobd.h and the guest's
+ * drivers/block/cobd.c both take their bound from this number.
  */
+#define CO_COBD_MAX_UNITS	4
+
+
 typedef struct {
 	co_rc_t		   rc;
 	unsigned long	   unit;	/* in */
