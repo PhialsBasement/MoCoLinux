@@ -335,20 +335,21 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 						      limit, batch, cobd,
 						      winnt_parameters.init ?
 							winnt_parameters.init_arg : NULL,
-						      mem_mb);
+						      mem_mb,
+						      winnt_parameters.no_copic);
 		}
 	}
 
 	if (winnt_parameters.call_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0, 0, NULL, NULL, 0);
+		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0, 0, NULL, NULL, 0, 0);
 	}
 
 	if (winnt_parameters.enter_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0, 0, NULL, NULL, 0);
+		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0, 0, NULL, NULL, 0, 0);
 	}
 
 	if (winnt_parameters.load_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0, NULL, NULL, 0);
+		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0, NULL, NULL, 0, 0);
 	}
 
 	if (winnt_parameters.net_dump) {

@@ -73,7 +73,8 @@ extern co_rc_t co_elf_load_into_guest(const char *filename, int enter,
 				      unsigned long batch,
 				      const char *const *cobd,
 				      const char *init_path,
-				      unsigned long mem_mb);
+				      unsigned long mem_mb,
+				      int no_copic);
 extern co_elf_symbol_t *co_get_symbol_by_name(co_elf_data_t *pl, const char *name);
 extern void *co_elf_get_symbol_data(co_elf_data_t *pl, co_elf_symbol_t *symbol);
 extern co_elf_addr_t co_elf_get_symbol_value(co_elf_symbol_t *symbol);

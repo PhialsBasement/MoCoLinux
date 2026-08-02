@@ -55,6 +55,14 @@ typedef struct co_winnt_parameters {
 	bool_t mem;
 	char   mem_arg[0x20];
 	/*
+	 * Turn the cooperative timer off, so the host never interrupts a running
+	 * guest. Exists to answer one question without a rebuild: is a failure
+	 * the injection, or something else? Without it the guest reverts to
+	 * ticks at the idle boundary and the exit-to-user drain -- preemption of
+	 * a userspace spinner goes away, everything else keeps working.
+	 */
+	bool_t no_copic;
+	/*
 	 * Backing store for each cobd unit. Unit 0 is the guest's root device
 	 * and is the one root= names; the rest are ordinary disks. An NT object
 	 * path: an image file as \??\F:\xfer\root.img, or a raw partition as
