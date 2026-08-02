@@ -18,8 +18,40 @@
  * plus the page-table region and is the only sizeable contiguous run required;
  * see kload.c for why the memory cannot be scattered pages.
  */
+/*
+ * Many small blocks rather than a few large ones.
+ *
+ * Nothing about this design needs a large contiguous run except block 0, and
+ * asking for one anyway is what kept taking the host down. The chunk size was
+ * 32 MB with a cap of 16 blocks, so 512 MB was already at the ceiling and 1 GB
+ * could not be reached at all; worse, a 32 MB contiguous request is among the
+ * first things a machine that has been up for a while cannot satisfy, and on a
+ * 4 GB box with a browser running, asking for thirty-two of them in a row
+ * exhausts it. Falling short is reported rather than fatal, so the symptom was
+ * a guest with half its configured memory, or a host that died trying.
+ *
+ * 8 MB is small enough to be readily available out of a fragmented free pool
+ * and large enough that 1 GB still fits inside the e820 the guest can hold.
+ * That last part is the real bound and it belongs to the guest, not to us:
+ * E820_MAX_ENTRIES is 128 + 3 * MAX_NUMNODES, and with NUMA off in this config
+ * MAX_NUMNODES is 1, so the guest can hold 131 ranges and nothing we do on this
+ * side changes that. 126 chunks of 8 MB plus block 0 is a little over a
+ * gigabyte, which is why the two numbers below are what they are.
+ *
+ * Going smaller than 8 MB means more ranges than boot_params can carry, which
+ * needs the SETUP_E820_EXT setup_data node written into guest memory *and* a
+ * guest patch raising E820_MAX_ENTRIES. Worth doing; not done here.
+ *
+ * What none of this removes is block 0, which holds the image and the page
+ * tables and must be one unbroken run of about 44 MB, because __pa() is linear
+ * across the image while guest physical equals host physical. Only
+ * pseudo-physical memory -- a p2m/machine-frame layer, which coLinux's i386
+ * port and Xen both have and this port deferred -- removes that, and with it
+ * the last contiguous allocation in the design.
+ */
 #define CO_KLOAD_RAM_BYTES	(128ULL << 20)
-#define CO_KLOAD_MAX_BLOCKS	16
+#define CO_KLOAD_CHUNK_BYTES	(8ULL << 20)
+#define CO_KLOAD_MAX_BLOCKS	127
 
 extern unsigned long long co_kload_phys_base(void);
 extern int		  co_kload_range_count(void);

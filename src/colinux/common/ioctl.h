@@ -432,7 +432,13 @@ typedef struct {
 } co_manager_ioctl_kstop_t;
 
 /* interface for CO_MANAGER_IOCTL_KRAM: give the guest physical memory */
-#define CO_KRAM_MAX_RANGES 16
+/*
+ * Must equal CO_KLOAD_MAX_BLOCKS. The driver fills one entry per block it
+ * actually allocated and the daemon turns each into an e820 range, so a value
+ * below the driver's block cap would describe a guest smaller than the one that
+ * exists -- memory allocated, mapped, and never mentioned to the kernel.
+ */
+#define CO_KRAM_MAX_RANGES 127
 typedef struct {
 	co_rc_t		   rc;
 	unsigned long long ram_bytes;	/* in: total RAM target */

@@ -769,15 +769,15 @@ co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_bytes,
 		unsigned long long try_bytes;
 
 		want = (want + CO_ARCH_PMD_SIZE - 1) & ~(CO_ARCH_PMD_SIZE - 1);
-		if (want > (32ULL << 20))
-			want = 32ULL << 20;
+		if (want > CO_KLOAD_CHUNK_BYTES)
+			want = CO_KLOAD_CHUNK_BYTES;
 
-		for (try_bytes = want; try_bytes >= (4ULL << 20); try_bytes >>= 1) {
+		for (try_bytes = want; try_bytes >= (2ULL << 20); try_bytes >>= 1) {
 			if (kload_block_alloc(try_bytes))
 				break;
 		}
-		if (try_bytes < (4ULL << 20)) {
-			co_debug("kload: host has no contiguous 4 MB left,"
+		if (try_bytes < (2ULL << 20)) {
+			co_debug("kload: host has no contiguous 2 MB left,"
 				 " stopping at %lld MB of %lld MB",
 				 have >> 20, ram_bytes >> 20);
 			break;

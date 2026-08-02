@@ -883,18 +883,28 @@ out:
 
 /* How much physical memory the guest is told it has. */
 /*
- * 512 MB, up from 128.
+ * 1 GB, up from 512 MB, up from 128.
  *
  * 128 was chosen when the guest was a kernel with no userspace and then a
  * BusyBox root, where it was generous. An Arch userspace with systemd is a
  * different proposition: the init system alone maps more than the old guest
- * had in total, and a package manager wants room to unpack into.
+ * had in total, and a package manager wants room to unpack into. 1 GB is for
+ * what comes after that -- a desktop's worth of X clients, and a distro
+ * install that unpacks several hundred megabytes while its own package cache
+ * is open.
  *
  * It is not contiguous -- co_kload_build_ram takes what the host will give in
  * several blocks and describes each at its true physical address in the e820,
  * so this is a target rather than a demand.
+ *
+ * It is bounded by the block count rather than by this number, and the two
+ * have to move together. Block 0 is image + tables and every later block is
+ * at most 32 MB, so the ceiling is 44 + 32 * (CO_KLOAD_MAX_BLOCKS - 1) MB.
+ * At the old cap of 16 that was about 524 MB: asking for 1 GB would have
+ * quietly produced half of it and said so in a line nobody reads. Both caps
+ * are 40 now, which puts the ceiling near 1.3 GB.
  */
-#define CO_GUEST_RAM	(512ULL << 20)
+#define CO_GUEST_RAM	(1024ULL << 20)
 
 /* One e820 entry: 8-byte address, 8-byte size, 4-byte type, packed to 20. */
 static void co_e820_entry(unsigned char* p, unsigned long long addr,
@@ -1623,8 +1633,26 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		memset(bp, 0, sizeof(bp));
 		{
 			int n = 0;
+			/*
+			 * E820_MAX_ENTRIES_ZEROPAGE. The kernel reads exactly
+			 * this many out of boot_params and the count is a
+			 * single byte at 0x1e8, so writing past it would both
+			 * overrun this buffer and wrap the count -- a guest
+			 * told it has four ranges when it was given 260.
+			 * Refuse instead: the block cap is 40, so this cannot
+			 * fire today, which is precisely when a bound is worth
+			 * writing rather than after it has.
+			 */
+			const int max_entries = 128;
 
 			for (i = 0; i < m.range_count; i++) {
+				if (n + 2 > max_entries) {
+					co_terminal_print("\n  e820 needs more than %d entries for %d"
+							  " ranges -- refusing to describe a guest\n"
+							  "  differently from the one that was built\n",
+							  max_entries, m.range_count);
+					goto out_end;
+				}
 				co_e820_entry(bp + 0x2d0 + n * 20,
 					      m.range[i].pa, m.range[i].usable, 1);
 				n++;
