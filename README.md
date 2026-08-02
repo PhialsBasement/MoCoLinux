@@ -7,20 +7,21 @@ emulation, no virtualisation extensions.
 ```
 [root@mocolinux ~]# systemctl is-system-running
 running
-[root@mocolinux ~]# ping -c 3 10.0.2.2
-64 bytes from 10.0.2.2: icmp_seq=2 ttl=255 time=10.0 ms
-3 packets transmitted, 3 received, 0% packet loss
-[root@mocolinux ~]# pacman -Sy
-:: Synchronizing package databases...
- core downloading...
- extra downloading...
+[root@mocolinux ~]# fastfetch
+  OS: Manjaro Linux x86_64
+  Host: 3209AV5 (ThinkCentre M92p)
+  Kernel: Linux 7.1.5
+  Packages: 792 (pacman)[stable]
+  Memory: 201.96 MiB / 929.75 MiB (22%)
+  Disk (/): 5.76 GiB / 29.36 GiB (20%) - ext4
+  Local IP (eth0): 10.0.2.15/24
 ```
 
-That is Arch Linux with systemd, an ext4 root and a working network connection,
-on a Lenovo M92p whose actual operating system is Windows XP x64 — both kernels
-resident on the same processor at the same time, taking turns. The package
-databases came down over HTTPS, through two ring buffers in the guest's own
-memory and a NAT running as a Windows process.
+That is Manjaro with systemd, an ext4 root and a working network connection, on
+a Lenovo M92p whose actual operating system is Windows XP x64 — both kernels
+resident on the same processor at the same time, taking turns. Those 792
+packages were installed by `pacman` over HTTPS, through two ring buffers in the
+guest's own memory and a NAT running as a Windows process.
 
 And since a terminal only proves so much:
 
@@ -57,7 +58,8 @@ kernel, on the last Windows that will run the original.
 
 Working, on hardware:
 
-- Boots **Arch Linux with systemd** to a multi-user target, no failed units
+- Boots **Manjaro with systemd** to a multi-user target, no failed units, from
+  an image the tree builds (`tools/mkmanjarorootfs.sh`)
 - Mounts an **ext4 root** over a cooperative block device
 - Runs **processes in ring 3** — systemd, a login shell, the lot
 - Serves an **interactive terminal** over TCP (hvc console, `/dev/hvc0`)
@@ -67,8 +69,13 @@ Working, on hardware:
 - **Preempts a running task.** A bare `while :; do :; done` in userspace used
   to freeze the guest permanently; the host now interrupts it, and time
   advances across it at real speed
-- **Networking**: an ethernet device in the guest, NAT on the host, and
-  `pacman -Sy` fetching package databases over HTTPS
+- **Networking**: an ethernet device in the guest, NAT on the host, a static
+  address configured by `systemd-networkd` at boot, and `pacman` installing a
+  791-package desktop over HTTPS at 16 MB/s
+- Runs **32-bit binaries** — the guest keeps its own `int $0x80` gate, so the
+  IA32 syscall path works and `ldd` resolves
+- **Landlock** and **user namespaces**, which pacman 7 and every modern sandbox
+  refuse to run without
 - Takes the host's clock as virtual time, so `jiffies` advance and sleeps wake
 - Shuts down cleanly, and a run can be ended on demand from another process
 - Survives interrupt storms: hardware interrupts cross back and are replayed
@@ -77,11 +84,21 @@ Working, on hardware:
 Not yet: SMP, the coLinux message layer (`co_monitor_t`, queues, reactor) that
 upstream's `cocon`/`conet` consoles and devices expect — which is why
 `colinux-console-nt` cannot attach to a guest here — a DHCP client in the guest
-rather than a static address, inbound port redirects, `CONFIG_SECURITY_LANDLOCK`
-(pacman sandboxes its downloads and refuses without it), and a repaired
-incremental patch series: `patch/7.1.5/current-tree-snapshot.diff` is the
-authoritative guest-side diff and is deliberately not in `series`. `TODO` is
-current and specific about the rest.
+rather than a static address, inbound port redirects, a single-executable
+launcher, and a repaired incremental patch series:
+`patch/7.1.5/current-tree-snapshot.diff` is the authoritative guest-side diff
+and is deliberately not in `series`. `TODO` is current and specific about the
+rest.
+
+One caveat worth knowing before you run it, because it will look like a bug in
+your machine rather than in this one: **the first boot after a host reboot is
+reliable and the second is not.** Guest RAM is freed and re-allocated every run,
+and it has to come from `MmAllocateContiguousMemory` in unbroken 32 MB runs, so
+a run's worth of churn leaves the host's physical memory holed and the next
+boot's sixty-odd allocations grind the whole machine while Windows tries to
+manufacture runs that no longer exist. Task Manager shows memory available
+throughout. Allocating once per driver load and reusing is the fix; pseudo-
+physical memory is the real one, and both are in `TODO`.
 
 ## How it fits together
 
@@ -143,6 +160,10 @@ a pointer at all.
 | `src/colinux/user/slirp/` | vendored slirp, with its Win64 repairs |
 | `src/colinux/user/elf_load.c` | the daemon: ELF loading, symbol resolution, boot |
 | `patch/7.1.5/` | the guest-side kernel changes, including `drivers/net/conet_colinux.c` |
+| `tools/mkmanjarorootfs.sh` | builds the Manjaro desktop image, from nothing |
+| `tools/mkrootfs.sh` | builds the minimal BusyBox image used for bring-up |
+| `tools/coterm.py` | a client for the guest's console port |
+| `tools/shot.cs` | screenshots the XP desktop, compiled and run on the box |
 | `tools/decode-minidump.py` | attribute a bugcheck's stack to this driver |
 | `tools/pe-clear-laa.py` | confine the slirp daemon to 2 GB of address space |
 | `doc/porting-x86_64` | design notes for the port |
@@ -183,27 +204,32 @@ colinux-daemon.exe --console 2323          (a second process: a terminal)
 colinux-slirp-net-daemon.exe -R            (a third: NAT for the guest)
 ```
 
-Then, in the guest, an address from slirp's fixed layout:
+`--mem MB` sets the guest's RAM; the default is 1024. It is a target rather than
+a demand — what the host can actually produce in unbroken 32 MB runs is what the
+e820 describes, and falling short is reported rather than fatal.
 
-```sh
-ip link set eth0 up
-ip addr add 10.0.2.15/24 dev eth0
-ip route add default via 10.0.2.2
-echo nameserver 10.0.2.3 > /etc/resolv.conf
-```
+The guest configures its own network at boot, so there is nothing to type: the
+image ships `10-eth0.network` with slirp's fixed layout and `systemd-networkd`
+enabled. `tools/coterm.py` is a client for the console port.
 
-`tools/coterm.py` is a client for the console port.
+For a desktop, start an X server on the Windows side in multiwindow mode
+(`vcxsrv :0 -multiwindow -ac`, or `dist-x64/xstart.bat`) and run X clients in
+the guest. `DISPLAY=10.0.2.2:0` is already in the image's environment, and slirp
+rewrites that address to the host's own loopback, so the connection never leaves
+the machine and no port redirect is involved. There is no X server in the guest
+and none is wanted — the Windows server is also the window manager, which is
+what makes the windows native.
 
-On root filesystems, plainly: `tools/mkrootfs.sh` builds the **minimal BusyBox**
-image, which is what the early bring-up used and what `--init /bin/sh` is for.
-The **Arch root in the transcript above was built by hand** from
-`download/archlinux-bootstrap-x86_64.tar.zst` — unpacked into an image with
-`mke2fs -d`, then given a populated pacman keyring, a mirror, a network unit and
-`systemd-networkd` enabled, all through the guest's own terminal. Nothing in the
-tree reproduces that yet, which is the first entry under "The Arch root
-filesystem is not reproducible" in `TODO`; the keyring in particular is not
-optional, since without `pacman-key --populate archlinux` every package fails
-verification as untrusted even though its signature is good.
+On root filesystems: `tools/mkrootfs.sh` builds the **minimal BusyBox** image,
+which is what the early bring-up used and what `--init /bin/sh` is for.
+`tools/mkmanjarorootfs.sh` builds the **Manjaro desktop** image in the
+screenshot — it wants a Linux host with `pacman` and `e2fsprogs`, takes either
+an image file or a block device, and does the whole job: the directory skeleton
+alpm needs before it will initialise, the package install, the keyring
+(`pacman-key --populate`, which is not optional — without it every package fails
+verification as untrusted while its signature is perfectly good), `ldconfig`,
+the network unit, and the fonts and `lib32` packages a desktop turns out to
+need.
 
 The processes are separate on purpose: the one running the guest is inside a
 single `ioctl` for as long as the guest lives, so it cannot also service a
@@ -256,6 +282,37 @@ A few things that cost real time and are recorded in the commit messages:
   to 4 as well, and *both* of its values are wrong here — one breaks the
   overlays, the other truncates the pointers stored in their 32-bit queue
   links. Six `_Static_assert`s now pin those structure sizes.
+- **A guest with no asynchronous entry cannot be preempted, and nothing says
+  so.** Ticks were synthesised only at the idle boundary, and hardware
+  interrupts are replayed into Windows without one guest instruction running —
+  so a task that stayed runnable without entering the kernel owned the
+  processor forever, and the idle task that would have advanced time was
+  exactly what it prevented from running. A bare `while :; do :; done` froze
+  the whole guest permanently. Nothing faulted, so there was no oops; and the
+  softlockup, RCU-stall and hung-task detectors that exist to catch this all
+  run on the tick it had stopped. The source had said it plainly for months —
+  *"while the guest is busy computing, time is not delivered"* — filed as a
+  note about clock accuracy rather than the hazard it was.
+- **Vectors 32-255 belong to the host, except the one that does not.**
+  Vector `0x80` sits inside that range and is not a machine interrupt: it is
+  Linux's 32-bit syscall gate, installed DPL 3. Handing it to the host's stubs
+  with the rest made `int $0x80` from ring 3 a #GP with error code
+  `(0x80 << 3) | 2`. Every 32-bit binary in the port's life died there, and
+  none could say so — `ld-linux.so.2` faults before it can report, so `ldd`
+  lists every library as "not found" and installers conclude `libc.so.6` is
+  missing while it sits in `/usr/lib32` in perfect health.
+- **The host's page tables stop being the guest's the moment the guest gets
+  its own.** After boot handoff the guest runs on `init_top_pgt`, and the graft
+  is one way, so `cpu_entry_area` and the whole vmalloc region — with
+  `CONFIG_VMAP_STACK`, most task stacks — exist only over there. Reading an
+  interrupt frame through the host's load-time PML4 returns NOT_FOUND, and a
+  caller that treats that as "nothing to do" does nothing, silently, forever.
+  That is what made the first working cooperative timer look completely dead.
+- **`errno` is not `errno` on Windows.** slirp defines it as
+  `WSAGetLastError()`, so its `EAGAIN` check could never match the
+  `WSAEWOULDBLOCK` that winsock actually returns, and every would-block read was
+  treated as the peer hanging up. That one comparison was the entire network:
+  1.68 MB/s before, 16.4 MB/s after.
 - **An instrument that lies is worse than none.** `%p` in this tree's own
   `snprintf` fetched pointers through `unsigned long`, four bytes under LLP64,
   so every pointer the driver ever logged printed with its top half missing —
