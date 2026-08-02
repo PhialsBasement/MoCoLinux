@@ -36,6 +36,26 @@ extern void co_process_high_priority_set(void);
  * server is in the winnt tree and reaches straight for Sleep().
  */
 extern void co_os_user_msleep(unsigned long msec);
+/*
+ * Refuse to be the second copy of yourself, machine-wide.
+ *
+ * Every long-lived daemon here holds a handle on the driver, and a second copy
+ * is not a harmless duplicate but a competitor: two slirp bridges both consume
+ * the guest's TX ring and both inject into its RX ring with nothing arbitrating
+ * between them, two consoles fight over one port while the loser keeps its
+ * handle, two debug daemons split the debug ring so the log silently receives
+ * half of what the driver said. Each extra handle also blocks DriverUnload, so
+ * the only way to clear one has been to reboot.
+ *
+ * It cannot be left to whoever starts them. The transfer agent retries a
+ * command it believes timed out, which launches a daemon up to three times on
+ * its own, and a launcher that never returns invites a second attempt by hand.
+ * The guard belongs in the process, where neither mistake reaches it.
+ *
+ * Returns PFALSE if another instance already holds the name; the caller should
+ * say so and exit without opening the driver.
+ */
+extern bool_t co_os_claim_single_instance(const char* name);
 extern int co_udp_socket_connect(const char* addr, unsigned short int port);
 extern int co_udp_socket_send(int sock, const char* buffer, unsigned long size);
 extern void co_udp_socket_close(int sock);

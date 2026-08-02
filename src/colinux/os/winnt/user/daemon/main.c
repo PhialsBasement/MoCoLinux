@@ -266,11 +266,32 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 			return CO_RC(INVALID_PARAMETER);
 		}
 
+		if (!co_os_claim_single_instance("console")) {
+			co_terminal_print("console: another console server is already"
+					  " running -- exiting\n");
+			return CO_RC(OK);
+		}
+
 		return co_winnt_console_server((unsigned short)port);
 	}
 
 	if (winnt_parameters.boot_kernel) {
 		unsigned long limit = 0, batch = 0;
+
+		/*
+		 * One guest at a time, refused here rather than discovered
+		 * later. Two monitor loops on one machine means two passage
+		 * pages, two guests and two lots of contiguous RAM, and it has
+		 * taken this box down every time it has happened. run-boot.sh
+		 * has carried a guard for exactly this since the early
+		 * milestones; run-arch.bat never did, and going around it cost
+		 * a box.
+		 */
+		if (!co_os_claim_single_instance("boot")) {
+			co_terminal_print("boot: a guest is already running --"
+					  " refusing to start a second one\n");
+			return CO_RC(ERROR);
+		}
 
 		if (winnt_parameters.max_switches) {
 			/*

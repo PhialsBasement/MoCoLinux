@@ -133,3 +133,17 @@ void co_udp_socket_close(int sock)
 {
 	close(sock);
 }
+
+bool_t co_os_claim_single_instance(const char* name)
+{
+	/*
+	 * Not implemented on the Linux host, and it says so rather than
+	 * pretending to guard. The daemons that need this -- the slirp bridge,
+	 * the console and the debug reader -- are the Windows ones, where a
+	 * second copy competes for a guest and holds a driver handle open. If
+	 * the Linux host ever grows the same problem, this wants an flock on a
+	 * file under /run rather than a silent PTRUE.
+	 */
+	(void)name;
+	return PTRUE;
+}
