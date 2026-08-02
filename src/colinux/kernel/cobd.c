@@ -102,6 +102,18 @@ co_rc_t co_cobd_request_sg(co_manager_t* manager, int unit,
 			   unsigned long long sg_pa, unsigned int count,
 			   bool_t write)
 {
+	/*
+	 * The largest request seen so far, reported only when it grows.
+	 *
+	 * blkio in the heartbeat counts requests and cannot tell an honest
+	 * megabyte from a runaway, which is exactly the distinction wanted when
+	 * a run dies with every crossing being block I/O. A real workload
+	 * settles on its largest request within seconds, so this is a handful of
+	 * lines over a whole run -- and it goes loud the moment something asks
+	 * for more than the guest's own queue limit should ever produce.
+	 */
+	static unsigned long long sg_seen_max;
+	unsigned long long total = 0;
 	unsigned int i;
 
 	if (unit < 0 || unit >= CO_COBD_MAX_UNITS || !cobd_unit[unit].dev)
@@ -185,6 +197,13 @@ co_rc_t co_cobd_request_sg(co_manager_t* manager, int unit,
 			return rc;
 
 		offset += d.len;
+		total  += d.len;
+	}
+
+	if (total > sg_seen_max) {
+		sg_seen_max = total;
+		co_debug("cobd%d: largest request so far %llu bytes in %u"
+			 " descriptors", unit, total, count);
 	}
 
 	return CO_RC(OK);
@@ -199,6 +218,31 @@ co_rc_t co_cobd_request(co_manager_t* manager, int unit,
 
 	if (size == 0)
 		return CO_RC(OK);
+
+	/*
+	 * Inside the disk, which nothing checked until now.
+	 *
+	 * Both numbers come from the guest -- offset from blk_rq_pos, size from a
+	 * scatter-gather descriptor read out of guest memory -- and neither was
+	 * ever compared against the thing they address. A wrong offset does not
+	 * corrupt the host, because the transfer is confined to one guest page at
+	 * a time below and ZwWriteFile simply extends the file, but it is the
+	 * cheapest possible signal that the request itself is wrong: a real
+	 * filesystem never asks past the end of its own device.
+	 *
+	 * So this is refused and reported rather than performed. If the numbers
+	 * arriving here are corrupt, this is where it becomes visible, instead of
+	 * further along where the only symptom is a guest that has stopped
+	 * existing.
+	 */
+	if (offset > cobd_unit[unit].size ||
+	    size > cobd_unit[unit].size - offset) {
+		co_debug_error("cobd%d: request past the end of the device --"
+			       " offset 0x%llx size %lu, device is 0x%llx",
+			       unit, offset, size,
+			       (unsigned long long)cobd_unit[unit].size);
+		return CO_RC(INVALID_PARAMETER);
+	}
 
 	/*
 	 * Walked one page at a time rather than handed over whole.
