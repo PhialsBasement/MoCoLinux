@@ -1226,7 +1226,7 @@ static void co_report_bug_at(co_elf_data_t* pl, unsigned long long rip)
 co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			       unsigned long max_switches, unsigned long batch,
 			       const char* const* cobd, const char* init_path,
-			       unsigned long mem_mb)
+			       unsigned long mem_mb, int no_copic)
 {
 	const char* cobd0 = cobd ? cobd[0] : NULL;
 	co_elf_data_t* pl;
@@ -1962,8 +1962,17 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		b.colinux_console_va = addr[4];
 		b.ring_symbol_va     = addr[5];
 		b.guest_flag_va      = addr[6];
-		b.tick_entry_va      = addr[7];
+		/*
+		 * Withholding the entry address is how --no-copic works: the
+		 * host refuses to inject when it has nowhere to inject to, so
+		 * one flag turns the whole mechanism off with no second code
+		 * path to keep correct.
+		 */
+		b.tick_entry_va      = no_copic ? 0 : addr[7];
 		b.virtual_if_va      = addr[8];
+		if (no_copic)
+			co_terminal_print("    cooperative timer disabled (--no-copic):"
+					  " a running guest will not be interrupted\n");
 		/*
 		 * Free-running. The guest runs at native speed and comes back on
 		 * its own cooperative yields, warnings and recoverable faults --
