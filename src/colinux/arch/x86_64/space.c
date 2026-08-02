@@ -549,34 +549,46 @@ static void co_space_free_table(co_manager_t* manager, co_pfn_t pfn, int level,
 	int i;
 
 	if (level < CO_SPACE_LEVELS - 1) {
-		for (i = 0; i < 512; i++) {
-			unsigned long long* table;
-			unsigned long long entry;
-			co_pfn_t child;
+		unsigned long long* table = co_space_map(manager, pfn);
 
-			/*
-			 * One entry per mapping, rather than copying the table
-			 * into a local and iterating that. A 512-entry local is
-			 * 4 KB, and this recurses four deep -- 16 KB of kernel
-			 * stack, against a Windows x64 kernel stack that is not
-			 * much larger than that. Teardown is not hot, so paying
-			 * 512 map/unmap pairs per table is the right trade.
-			 */
-			table = co_space_map(manager, pfn);
-			if (table == NULL)
-				break;
+		/*
+		 * Mapped once for the whole table, not once per entry.
+		 *
+		 * The previous version took a mapping, read one entry and
+		 * dropped it, 512 times per table, to avoid copying the table
+		 * into a 4 KB local four levels deep. Avoiding the local was
+		 * right; paying 512 map/unmap pairs for it was not, and there
+		 * was never a need to do either -- the entries can be read
+		 * straight out of the mapping while it is held. Recursion then
+		 * holds at most CO_SPACE_LEVELS mappings at once, which is
+		 * four, instead of taking and dropping tens of thousands.
+		 *
+		 * It matters because half of these are not arithmetic. A page
+		 * inside one of the guest's blocks resolves through the frame
+		 * mapper and costs a pointer add, but anything outside them --
+		 * the passage page's subtree, the host's grafts -- goes to
+		 * co_os_map, which is MmMapIoSpace: a system PTE reservation,
+		 * and on the unmap a TLB flush that IPIs every other core. Tens
+		 * of thousands of those from a pinned thread is how the host
+		 * stops answering without ever bugchecking, which is a freeze
+		 * with no dump and nothing to read afterwards.
+		 */
+		if (table != NULL) {
+			for (i = 0; i < 512; i++) {
+				unsigned long long entry = table[i];
+				co_pfn_t child;
 
-			entry = table[i];
+				if (!(entry & _PAGE_PRESENT))
+					continue;
+				if (entry & _PAGE_PSE)
+					continue;	/* maps memory, not a table */
+
+				child = (co_pfn_t)((entry & CO_ARCH_PAGE_MASK & ~CO_ARCH_PAGE_NX)
+						   >> CO_ARCH_PAGE_SHIFT);
+				co_space_free_table(manager, child, level + 1, freed);
+			}
+
 			co_space_unmap(manager, table, pfn);
-
-			if (!(entry & _PAGE_PRESENT))
-				continue;
-			if (entry & _PAGE_PSE)
-				continue;	/* maps memory, not a table */
-
-			child = (co_pfn_t)((entry & CO_ARCH_PAGE_MASK & ~CO_ARCH_PAGE_NX)
-					   >> CO_ARCH_PAGE_SHIFT);
-			co_space_free_table(manager, child, level + 1, freed);
 		}
 	}
 
