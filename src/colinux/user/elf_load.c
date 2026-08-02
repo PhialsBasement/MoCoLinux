@@ -1646,7 +1646,22 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			const int max_entries = 128;
 
 			for (i = 0; i < m.range_count; i++) {
-				if (n + 2 > max_entries) {
+				/*
+				 * What this range actually costs: one entry, and
+				 * a second only if it carries the reserved
+				 * page-table region, which is block 0 alone.
+				 *
+				 * Asking for two every time was wrong by exactly
+				 * one, and it rejected the case the block cap was
+				 * chosen to permit: CO_KLOAD_MAX_BLOCKS is 127
+				 * because 1 block at two entries plus 126 at one
+				 * is 128 on the nose. A 127-block guest -- which
+				 * is what a fragmented host hands back for a 1 GB
+				 * target -- refused to boot at all.
+				 */
+				int need = m.range[i].reserved ? 2 : 1;
+
+				if (n + need > max_entries) {
 					co_terminal_print("\n  e820 needs more than %d entries for %d"
 							  " ranges -- refusing to describe a guest\n"
 							  "  differently from the one that was built\n",
