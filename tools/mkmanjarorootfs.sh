@@ -50,9 +50,24 @@ MIRROR2=https://mirror.alpix.eu/manjaro/stable
 #
 # gnupg is explicit: pacman links gpgme, but `pacman-key` is a shell script that
 # drives the gpg binary, and without it the keyring cannot be populated at all.
+# The X clients are the point of this image, not an X server -- there is none in
+# the guest and none is wanted. Applications appear as native Windows windows
+# through the server on the host, which is also the window manager, so a desktop
+# shell would only fight it: no xfwm4, no compositor, no session manager.
+#
+# ttf-liberation is not optional decoration. Anything Chromium-based, and most
+# GTK, exits or renders empty boxes when fontconfig finds no font at all, and a
+# package set this small ships none.
+#
+# lib32 is here because a 32-bit userland is the one thing a stock install of
+# this size cannot add later without the multilib repository, and the first
+# thing anybody tries is a 32-bit program.
 PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 	  gnupg sudo nano inetutils curl \
-	  xorg-xauth xorg-xhost xterm"
+	  xorg-xauth xorg-xhost xorg-xrandr xterm \
+	  ttf-liberation ttf-dejavu \
+	  thunar mousepad \
+	  mesa lib32-glibc lib32-gcc-libs lib32-mesa"
 
 MNT=$(mktemp -d)
 CONF=$(mktemp)
@@ -202,6 +217,16 @@ inside "pacman -Syu --noconfirm" || \
 
 say "configuring the system"
 
+# The dynamic linker cache, which a --root install never builds.
+#
+# Packages drop fragments into /etc/ld.so.conf.d and rely on their own scriptlet
+# running ldconfig; in a chroot that is assembled rather than booted, the last
+# word never happens. Nothing complains until something needs a library outside
+# the default path -- most visibly /usr/lib32, where a 32-bit program reports
+# "you are missing libc.so.6" while lib32-glibc is plainly installed, which
+# sends you looking for a missing package that is right there.
+inside "ldconfig"
+
 echo "mocolinux" > "$MNT/etc/hostname"
 echo "en_US.UTF-8 UTF-8" >> "$MNT/etc/locale.gen"
 echo "LANG=en_US.UTF-8" > "$MNT/etc/locale.conf"
@@ -263,9 +288,18 @@ cat > "$MNT/etc/environment" <<'EOF'
 DISPLAY=10.0.2.2:0
 EOF
 
-# A user, because running a desktop as root is how people learn not to.
+# A user, because running a desktop as root is how people learn not to -- and
+# because a lot of software simply refuses. Steam checks `id -u` and exits.
+#
+# DISPLAY has to be set here as well as in /etc/environment. `su -` on Manjaro
+# does not run pam_env, so /etc/environment is never read for that session and
+# an X client started after `su - mocolinux` fails with "cannot open display" --
+# which reads like the X server is unreachable when the connection is fine and
+# the variable is simply absent.
 inside "useradd -m -G wheel -s /bin/bash mocolinux" >/dev/null 2>&1 || true
 inside "echo 'mocolinux:mocolinux' | chpasswd" >/dev/null 2>&1 || true
+echo 'export DISPLAY=10.0.2.2:0' >> "$MNT/home/mocolinux/.bashrc"
+echo 'export DISPLAY=10.0.2.2:0' >> "$MNT/root/.bashrc"
 echo "%wheel ALL=(ALL:ALL) ALL" > "$MNT/etc/sudoers.d/10-wheel"
 chmod 0440 "$MNT/etc/sudoers.d/10-wheel"
 
