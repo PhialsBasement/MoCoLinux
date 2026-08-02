@@ -6,6 +6,38 @@ Generated against download/linux-7.1.5.tar.xz on 2026-08-02.
 
 Over the previous snapshot:
 
+  * The cooperative timer -- the guest's only asynchronous entry, and the end
+    of a design gap this tree's own comment had been describing as future work.
+
+    Ticks used to be synthesised only in co_cpu_idle(), so while the guest was
+    busy no time passed at all: no tick, no scheduler preemption, and therefore
+    no way to take the processor from a task that stayed runnable. One
+    userspace loop froze the entire guest permanently. Everything downstream
+    then looked broken instead -- the receive kthread asleep on a timer that
+    could never fire, the console silent, the host's monitor loop at full speed
+    because no idle yield ever came.
+
+    Two deliveries. co_colinux_drain_time() is now also called from
+    __exit_to_user_mode_prepare(), the funnel every syscall and exception
+    returns through, which covers anything that enters the kernel and is what
+    made Qt applications work. And sysvec_co_timer, declared over
+    CO_TIMER_VECTOR, is what the host vectors a running guest to when it wants
+    to preempt one that does not.
+
+    No IDT gate is installed for that vector. The host synthesises the entry by
+    pointing its resume at asm_sysvec_co_timer over a frame it builds from the
+    one the interrupt stub already saved -- so what runs is the stock idtentry
+    body, with error_entry making the swapgs decision from the interrupted CS
+    and irqentry_exit doing the scheduling. Reusing that path rather than
+    writing one is the point: every part of taking an interrupt that is easy to
+    get wrong is already correct here.
+
+    co_colinux_take_ticks() exists so both deliveries share one baseline;
+    separate ones would let whichever ran hide elapsed time from the other.
+
+    Verified: a bare `while :; do :; done` in userspace is now preempted, the
+    guest stays responsive, and time advances across it at real speed.
+
   * co_colinux_adopt_traps() no longer overwrites vector 0x80.
 
     The loop hands vectors 32-255 to the host's stubs, because those are the
@@ -132,6 +164,30 @@ diff -urN a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
  	native_store_gdt(&gdt);
  	fixmap_gdt = get_cpu_gdt_ro(cpu);
  
+diff -urN a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
+--- a/arch/x86/include/asm/idtentry.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/idtentry.h	2026-08-02 21:20:21.233964400 +1000
+@@ -736,6 +736,20 @@
+ # endif
+ #endif
+ 
++/*
++ * The cooperative timer, and the only asynchronous entry this guest has.
++ *
++ * Declared unconditionally: a cooperative kernel is one built from this tree,
++ * and the entry costs nothing when co_colinux_guest is false because nothing
++ * ever jumps to it. There is no IDT gate -- the host synthesises the entry by
++ * pointing its resume at asm_sysvec_co_timer over a frame it builds itself, so
++ * what runs afterwards is the stock idtentry body: error_entry decides swapgs
++ * from the interrupted CS, and irqentry_exit does the preemption and the
++ * return-to-user work. That reuse is the point. Every part of delivering an
++ * interrupt that is easy to get wrong is already written and tested here.
++ */
++DECLARE_IDTENTRY_SYSVEC(CO_TIMER_VECTOR,		sysvec_co_timer);
++
+ #if IS_ENABLED(CONFIG_KVM)
+ DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_VECTOR,		sysvec_kvm_posted_intr_ipi);
+ DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_WAKEUP_VECTOR,	sysvec_kvm_posted_intr_wakeup_ipi);
 diff -urN a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
 --- a/arch/x86/include/asm/io.h	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/include/asm/io.h	2026-08-01 07:24:30.152830000 +1000
@@ -377,6 +433,34 @@ diff -urN a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
  	x86_idle_clear_cpu_buffers();
  	asm volatile("hlt": : :"memory");
  }
+diff -urN a/arch/x86/include/asm/irq_vectors.h b/arch/x86/include/asm/irq_vectors.h
+--- a/arch/x86/include/asm/irq_vectors.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/irq_vectors.h	2026-08-02 21:20:07.541203800 +1000
+@@ -105,6 +105,24 @@
+  */
+ #define POSTED_MSI_NOTIFICATION_VECTOR	0xeb
+ 
++/*
++ * The cooperative timer: the host's way of interrupting a running guest.
++ *
++ * This guest has no timer hardware and takes no asynchronous entry of its own
++ * -- hardware interrupts vector through its IDT into the host's stubs and are
++ * replayed into Windows, so not one guest instruction runs for them. Without
++ * something like this there is no preemption at all: a task that stays runnable
++ * without entering the kernel owns the processor forever, and the idle task
++ * that would have advanced time is precisely what it prevents from running.
++ *
++ * No gate is ever installed for this vector. The host does not raise it; it
++ * synthesises the entry directly, by pointing the resume at asm_sysvec_co_timer
++ * with a hand-built frame. The number exists because DECLARE_IDTENTRY_SYSVEC
++ * wants one, and it is kept out of the allocatable range so nothing else can
++ * claim it.
++ */
++#define CO_TIMER_VECTOR			0xea
++
+ #define NR_VECTORS			 256
+ 
+ #ifdef CONFIG_X86_LOCAL_APIC
 diff -urN a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
 --- a/arch/x86/include/asm/special_insns.h	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/include/asm/special_insns.h	2026-08-01 10:28:04.395788700 +1000
@@ -1012,8 +1096,14 @@ diff -urN a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
   */
 diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 --- a/arch/x86/kernel/process.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/process.c	2026-08-01 15:23:31.841519800 +1000
-@@ -54,6 +54,10 @@
++++ b/arch/x86/kernel/process.c	2026-08-02 21:24:10.011964500 +1000
+@@ -50,10 +50,16 @@
+ #include <asm/proto.h>
+ #include <asm/frame.h>
+ #include <asm/unwind.h>
++/* DEFINE_IDTENTRY_SYSVEC, for the cooperative timer entry below. */
++#include <asm/idtentry.h>
+ #include <asm/tdx.h>
  #include <asm/mmu_context.h>
  #include <asm/msr.h>
  #include <asm/shstk.h>
@@ -1024,7 +1114,7 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
  
  #include "process.h"
  
-@@ -773,6 +777,295 @@
+@@ -773,6 +779,342 @@
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -1207,40 +1297,87 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 +	pr_info("cotimer: cooperative tick device registered, HZ=%d\n", HZ);
 +}
 +
-+void co_colinux_drain_time(void)
++/*
++ * How many ticks the host's clock says have gone by since the last time anyone
++ * asked, consuming them from the running total.
++ *
++ * Split out because there are now two ways time gets delivered and they must
++ * share one accounting. co_cpu_idle drains at the idle boundary as it always
++ * has; sysvec_co_timer drains from a real interrupt the host synthesised. If
++ * each kept its own idea of when it last looked, whichever ran would hide the
++ * elapsed time from the other and the guest's clock would run at some fraction
++ * of the host's, differently depending on how busy it was.
++ */
++static unsigned int co_colinux_take_ticks(void)
 +{
 +	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
 +	const u64 per_tick = 10000000 / HZ;	/* 100 ns units */
 +	static u64 last_mono;
-+	struct pt_regs *old, regs;
 +	u64 now;
 +	unsigned int n;
 +
 +	if (!pp || !co_colinux_clockevent.event_handler)
-+		return;
++		return 0;
 +
 +	now = *(volatile u64 *)(pp + CO_PP_HOST_MONO);
 +	if (!last_mono)
 +		last_mono = now;
 +	if (now <= last_mono)
-+		return;
++		return 0;
 +
 +	n = (now - last_mono) / per_tick;
 +	if (!n)
-+		return;
++		return 0;
 +
 +	/*
-+	 * Clamped, and the clamp forgets rather than owes. After a long busy
-+	 * stretch or a host that slept, delivering the whole backlog would
-+	 * spend seconds inside tick handlers to replay time nobody experienced;
-+	 * wall-clock accuracy comes from the host's wall clock below, not from
-+	 * counting every tick.
++	 * Clamped, and the clamp forgets rather than owes -- see the note in
++	 * co_colinux_drain_time below, which this used to be part of.
 +	 */
 +	if (n > HZ) {
 +		n = HZ;
 +		last_mono = now - (u64)n * per_tick;
 +	}
 +	last_mono += (u64)n * per_tick;
++
++	return n;
++}
++
++/*
++ * The cooperative timer interrupt: the guest's only asynchronous entry.
++ *
++ * Reached because the host decided a tick was due and pointed its resume at
++ * asm_sysvec_co_timer over a frame it built from the one the interrupt stub had
++ * already saved. By the time this runs, the stock entry path has done
++ * everything a real interrupt would: the swapgs decision from the interrupted
++ * CS, the switch to the interrupt stack, irq_enter. And on the way out,
++ * irqentry_exit does the part that matters most -- it is what actually
++ * preempts, either by scheduling a kernel-mode return or by running the
++ * exit-to-user work loop.
++ *
++ * That is the whole reason this is a sysvec and not a function the host calls.
++ * Delivering ticks by calling into the guest would advance the clock and wake
++ * the sleepers, and still never take the processor away from the task that was
++ * running -- which is the thing that had to be fixed.
++ */
++DEFINE_IDTENTRY_SYSVEC(sysvec_co_timer)
++{
++	struct pt_regs *old = set_irq_regs(regs);
++	unsigned int n = co_colinux_take_ticks();
++
++	while (n--)
++		co_colinux_clockevent.event_handler(&co_colinux_clockevent);
++
++	set_irq_regs(old);
++}
++
++void co_colinux_drain_time(void)
++{
++	struct pt_regs *old, regs;
++	unsigned int n;
++
++	n = co_colinux_take_ticks();
++	if (!n)
++		return;
 +
 +	/*
 +	 * A register frame for the tick to look at.
@@ -1320,7 +1457,7 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +1229,18 @@
+@@ -936,6 +1278,18 @@
  
  void __init select_idle_routine(void)
  {
@@ -2599,8 +2736,63 @@ diff -urN a/include/linux/console.h b/include/linux/console.h
  #endif /* _LINUX_CONSOLE_H */
 diff -urN a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
 --- a/include/linux/irq-entry-common.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/include/linux/irq-entry-common.h	2026-08-01 11:39:14.732992600 +1000
-@@ -266,6 +266,9 @@
++++ b/include/linux/irq-entry-common.h	2026-08-02 21:02:20.641854400 +1000
+@@ -194,10 +194,54 @@
+ static __always_inline void __exit_to_user_mode_prepare(struct pt_regs *regs,
+ 							const unsigned long work_mask)
+ {
++	extern int co_colinux_guest;
++	extern void co_colinux_drain_time(void);
+ 	unsigned long ti_work;
+ 
+ 	lockdep_assert_irqs_disabled();
+ 
++	/*
++	 * Deliver the guest's time here as well as at idle, because idle is not
++	 * reached often enough to be the only place.
++	 *
++	 * This guest has no timer hardware and no asynchronous entry: hardware
++	 * interrupts vector through its IDT into the host's stubs and are
++	 * replayed into Windows, so they never enter this kernel. Ticks are
++	 * synthesised instead, and until now the only place that happened was
++	 * co_cpu_idle() -- which runs only when the run queue empties. The
++	 * consequence, written down honestly in the comment at the top of
++	 * co_colinux_drain_time(), is that while the guest is busy, time does
++	 * not pass at all: no tick, therefore no scheduler preemption, therefore
++	 * no way for a task that stays runnable to ever be taken off the
++	 * processor. One such task freezes the whole guest permanently, and
++	 * everything downstream looks broken instead -- the receive kthread's
++	 * schedule_timeout(1) never expires, so the network ring stops draining
++	 * and the bridge idles at zero; nothing reaches the console; and the
++	 * host's monitor loop, never offered an idle yield, spins at full speed.
++	 * No oops, because nothing is faulting: the kernel is simply never
++	 * scheduled.
++	 *
++	 * Every return to userspace passes through here -- syscalls and
++	 * exceptions both, and page faults are exceptions this guest still
++	 * handles itself -- with interrupts disabled and no locks held. That
++	 * makes it the same kind of boundary a hardware timer would have used,
++	 * and it is the point at which Linux already reschedules, so a tick
++	 * delivered before the flags are read is acted on in this very pass.
++	 *
++	 * Cheap when there is nothing to do: drain_time returns after one read
++	 * of the host's clock out of the passage page when less than a tick has
++	 * elapsed.
++	 *
++	 * This does not restore true asynchronous preemption and is not claimed
++	 * to. A task that spins in userspace without ever entering the kernel,
++	 * or a kernel thread that never returns to user mode, still cannot be
++	 * interrupted. Fixing that needs the host to re-enter the guest through
++	 * an injected interrupt frame rather than transparently -- the COPIC the
++	 * port's own notes describe as future work.
++	 */
++	if (co_colinux_guest)
++		co_colinux_drain_time();
++
+ 	/* Flush pending rcuog wakeup before the last need_resched() check */
+ 	tick_nohz_user_enter_prepare();
+ 
+@@ -266,6 +310,9 @@
   */
  static __always_inline void exit_to_user_mode(void)
  {
@@ -2610,7 +2802,7 @@ diff -urN a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
  	instrumentation_begin();
  	unwind_reset_info();
  	trace_hardirqs_on_prepare();
-@@ -275,6 +278,26 @@
+@@ -275,6 +322,26 @@
  	user_enter_irqoff();
  	arch_exit_to_user_mode();
  	lockdep_hardirqs_on(CALLER_ADDR0);
@@ -2637,7 +2829,7 @@ diff -urN a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
  }
  
  /**
-@@ -338,6 +361,18 @@
+@@ -338,6 +405,18 @@
  		bool	exit_rcu;
  		bool	lockdep;
  	};
