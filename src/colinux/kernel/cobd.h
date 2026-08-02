@@ -39,6 +39,23 @@ extern unsigned long long co_cobd_size(int unit);
  * page-table builder uses, which is also what confines the transfer to memory
  * belonging to the guest.
  */
+/*
+ * The most descriptors one request may carry, matching BLK_MAX_SEGMENTS in the
+ * guest's block layer. Bounded here because the count arrives from the guest
+ * and is used to walk its memory.
+ */
+#define CO_COBD_MAX_SG	128
+
+/*
+ * A whole request in one crossing: `count` descriptors at guest physical
+ * address `sg_pa`, each a physical run and a length, written or read in order
+ * from `offset`. See the comment in cobd.c.
+ */
+extern co_rc_t co_cobd_request_sg(co_manager_t* manager, int unit,
+				  unsigned long long offset,
+				  unsigned long long sg_pa,
+				  unsigned int count, bool_t write);
+
 extern co_rc_t co_cobd_request(co_manager_t* manager, int unit,
 			       unsigned long long offset,
 			       unsigned long long guest_pa,
