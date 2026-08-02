@@ -923,6 +923,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.colinux_console_va = params->colinux_console_va;
 		in.ring_symbol_va     = params->ring_symbol_va;
 		in.guest_flag_va      = params->guest_flag_va;
+		in.tick_entry_va      = params->tick_entry_va;
+		in.virtual_if_va      = params->virtual_if_va;
 		in.step               = params->step;
 		in.batch              = params->batch;
 		in.kernel_table_count = params->kernel_table_count;
@@ -994,6 +996,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->vmx_present	 = result.vmx_present;
 		params->switches	 = result.switches;
 		params->interrupts	 = result.interrupts;
+		params->ticks_injected	 = result.ticks_injected;
 		params->steps		 = result.steps;
 		params->trace_next	 = result.trace_next;
 		co_memcpy(params->trace, result.trace, sizeof(params->trace));

@@ -137,6 +137,19 @@ static co_rc_t co_space_new_table(co_manager_t* manager, co_pfn_t* pfn_out)
 	return CO_RC(OK);
 }
 
+/*
+ * The load-time root, which is what almost every caller wants.
+ */
+co_rc_t co_arch_guest_lookup(co_manager_t* manager,
+			     co_arch_guest_space_t* space,
+			     unsigned long long va,
+			     co_pa_t* pa_out,
+			     int* level_out)
+{
+	return co_arch_guest_lookup_root(manager, space->pml4_pfn, va,
+					 pa_out, level_out);
+}
+
 co_rc_t co_arch_guest_space_create(co_manager_t* manager,
 				   co_arch_guest_space_t** space_out)
 {
@@ -356,13 +369,31 @@ co_rc_t co_arch_guest_map_large(co_manager_t* manager,
 	return CO_RC(ERROR);
 }
 
-co_rc_t co_arch_guest_lookup(co_manager_t* manager,
-			     co_arch_guest_space_t* space,
-			     unsigned long long va,
-			     co_pa_t* pa_out,
-			     int* level_out)
+/*
+ * The same walk, from a root the caller names.
+ *
+ * co_arch_guest_lookup below walks the space the host built at load time, and
+ * that is the right root for anything the host mapped. It is the wrong root for
+ * anything the guest mapped afterwards, and the difference is not academic: at
+ * boot handoff the guest is switched into the kernel's own init_top_pgt, the
+ * graft is one way, and every top-level entry Linux creates from then on --
+ * cpu_entry_area, the whole vmalloc region, and with CONFIG_VMAP_STACK every
+ * task stack in it -- exists only over there.
+ *
+ * So a frame pushed by an interrupt from userspace, which lands on the
+ * cpu_entry_area entry stack at 0xfffffe00..., is simply not present through
+ * the load-time root. The lookup returns NOT_FOUND and the caller quietly does
+ * nothing -- which is how the cooperative timer came to be refused on every
+ * single attempt against a ring 3 task while appearing to work perfectly
+ * against the handful of kernel contexts still living on the direct map.
+ */
+co_rc_t co_arch_guest_lookup_root(co_manager_t* manager,
+				  co_pfn_t root_pfn,
+				  unsigned long long va,
+				  co_pa_t* pa_out,
+				  int* level_out)
 {
-	co_pfn_t pfn = space->pml4_pfn;
+	co_pfn_t pfn = root_pfn;
 	int level;
 
 	*pa_out    = 0;

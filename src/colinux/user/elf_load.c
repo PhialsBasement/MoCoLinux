@@ -1540,8 +1540,20 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 					      "start_kernel", "early_console",
 					      "early_colinux_console",
 					      "co_colinux_console_ring",
-					      "co_colinux_guest", NULL };
-		unsigned long long addr[7];
+					      "co_colinux_guest",
+					      /*
+					       * The cooperative timer: where to
+					       * vector a running guest, and the
+					       * flag that says whether it may be
+					       * vectored at all. Both are needed
+					       * for the host to be able to
+					       * interrupt a guest that is not
+					       * cooperating -- see the injection
+					       * in arch/x86_64/switch.c.
+					       */
+					      "asm_sysvec_co_timer",
+					      "co_colinux_virtual_if", NULL };
+		unsigned long long addr[9];
 		int i;
 
 		for (i = 0; want[i]; i++) {
@@ -1950,6 +1962,8 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		b.colinux_console_va = addr[4];
 		b.ring_symbol_va     = addr[5];
 		b.guest_flag_va      = addr[6];
+		b.tick_entry_va      = addr[7];
+		b.virtual_if_va      = addr[8];
 		/*
 		 * Free-running. The guest runs at native speed and comes back on
 		 * its own cooperative yields, warnings and recoverable faults --
@@ -2128,6 +2142,15 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 * replayed host interrupts is a run where the guest barely executed,
 		 * and that used to be invisible behind a single switch count.
 		 */
+		/*
+		 * Cooperative timer interrupts injected into a running guest.
+		 * Zero means the guest was never preempted by the host -- either
+		 * it always reached its idle boundary on its own, or the
+		 * injection refused every time, and those two look identical
+		 * from outside unless this is printed.
+		 */
+		co_terminal_print("  %lu cooperative ticks injected into a running guest\n",
+				  b.ticks_injected);
 		co_terminal_print("  %lu of those switches were the guest's own\n",
 				  b.guest_switches);
 		if (b.block_requests || b.block_errors)

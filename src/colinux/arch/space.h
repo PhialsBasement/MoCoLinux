@@ -66,6 +66,17 @@ extern co_rc_t co_arch_guest_map_large(co_manager_t* manager,
  * (0 = PML4, 3 = PT), which is the difference between "nothing here at all" and
  * "the tables exist but this page is not present".
  */
+/*
+ * The same walk from a root the caller names, for frames that live in mappings
+ * only the guest's own CR3 resolves -- cpu_entry_area, vmalloc, VMAP task
+ * stacks. See the note on the definition.
+ */
+extern co_rc_t co_arch_guest_lookup_root(co_manager_t* manager,
+					 co_pfn_t root_pfn,
+					 unsigned long long va,
+					 co_pa_t* pa_out,
+					 int* level_out);
+
 extern co_rc_t co_arch_guest_lookup(co_manager_t* manager,
 				    co_arch_guest_space_t* space,
 				    unsigned long long va,

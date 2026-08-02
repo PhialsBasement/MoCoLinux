@@ -702,6 +702,75 @@ co_rc_t co_kload_chunk(co_manager_t* manager, unsigned long long va,
  * fed silently zeroed gaps produces plausible garbage, which is worse than an
  * error.
  */
+/*
+ * Read and write guest memory through a root the caller names, for the frames
+ * the load-time space cannot see.
+ *
+ * The pair below walk kload_space, which is the host's own load-time PML4. That
+ * resolves everything the host mapped and nothing the guest mapped afterwards
+ * -- and after boot handoff the guest runs on the kernel's init_top_pgt, where
+ * cpu_entry_area and the whole vmalloc region (with CONFIG_VMAP_STACK, that is
+ * most task stacks) live. An interrupt taken from ring 3 pushes its frame on
+ * the cpu_entry_area entry stack, so reading it through the load-time root
+ * returns NOT_FOUND every single time.
+ *
+ * The right root is the one the guest was actually running on, and the crossing
+ * already captured it: linuxvm_state.cr3.
+ */
+static co_rc_t kload_xfer_cr3(co_manager_t* manager, unsigned long long cr3,
+			      unsigned long long va, unsigned char* buf,
+			      unsigned long size, bool_t write)
+{
+	co_pfn_t root = (co_pfn_t)((cr3 & CO_ARCH_PAGE_MASK) >> CO_ARCH_PAGE_SHIFT);
+
+	if (!cr3)
+		return CO_RC(ERROR);
+
+	while (size) {
+		unsigned long offset = (unsigned long)(va & ~CO_ARCH_PAGE_MASK);
+		unsigned long part   = CO_ARCH_PAGE_SIZE - offset;
+		co_pa_t pa = 0;
+		int level = -1;
+		unsigned char* p;
+
+		if (part > size)
+			part = size;
+
+		if (!CO_OK(co_arch_guest_lookup_root(manager, root, va, &pa, &level))
+		    || !pa)
+			return CO_RC(NOT_FOUND);
+
+		p = co_kload_frame_va((co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT));
+		if (p == NULL)
+			return CO_RC(ERROR);
+
+		if (write)
+			co_memcpy(p + offset, buf, part);
+		else
+			co_memcpy(buf, p + offset, part);
+
+		buf  += part;
+		va   += part;
+		size -= part;
+	}
+
+	return CO_RC(OK);
+}
+
+co_rc_t co_kload_read_cr3(co_manager_t* manager, unsigned long long cr3,
+			  unsigned long long va, unsigned char* buf,
+			  unsigned long size)
+{
+	return kload_xfer_cr3(manager, cr3, va, buf, size, PFALSE);
+}
+
+co_rc_t co_kload_write_cr3(co_manager_t* manager, unsigned long long cr3,
+			   unsigned long long va, const unsigned char* buf,
+			   unsigned long size)
+{
+	return kload_xfer_cr3(manager, cr3, va, (unsigned char*)buf, size, PTRUE);
+}
+
 co_rc_t co_kload_read(co_manager_t* manager, unsigned long long va,
 		      unsigned char* buf, unsigned long size)
 {
