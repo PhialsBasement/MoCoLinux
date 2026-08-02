@@ -22,6 +22,24 @@ resident on the same processor at the same time, taking turns. The package
 databases came down over HTTPS, through two ring buffers in the guest's own
 memory and a NAT running as a Windows process.
 
+And since a terminal only proves so much:
+
+![Manjaro with KDE running as native windows on Windows XP x64](doc/img/mocolinux-desktop.png)
+
+Everything in that screenshot is one machine. On the left, `fastfetch` in an
+xterm: Manjaro Linux, kernel 7.1.5, 792 packages. In the middle, KDE's own
+Info Centre — Plasma 6.7.3, Qt 6.11.1, graphics platform X11. At the bottom,
+`cmd.exe` answering `ver` with **Microsoft Windows [Version 5.2.3790]**. Both
+systems report the same Intel i5-3470, because there is only one, and both
+Linux applications have entries in the XP taskbar, because to Windows they are
+ordinary windows.
+
+No X server runs in the guest. The applications are X clients talking to a
+server on the Windows side in multiwindow mode, reached at `DISPLAY=10.0.2.2:0`
+— slirp rewrites that address to the host's own loopback, so the connection
+never leaves the machine it started on. It is the arrangement coLinux-i386
+used, and it needs no code in the driver at all.
+
 ## What cooperative virtualisation is
 
 Not a virtual machine. There is no guest-physical address space, no shadow page
@@ -43,6 +61,12 @@ Working, on hardware:
 - Mounts an **ext4 root** over a cooperative block device
 - Runs **processes in ring 3** — systemd, a login shell, the lot
 - Serves an **interactive terminal** over TCP (hvc console, `/dev/hvc0`)
+- Runs a **KDE desktop's applications as native Windows windows**, rootless,
+  over an X server on the host — no X server, framebuffer or desktop shell in
+  the guest
+- **Preempts a running task.** A bare `while :; do :; done` in userspace used
+  to freeze the guest permanently; the host now interrupts it, and time
+  advances across it at real speed
 - **Networking**: an ethernet device in the guest, NAT on the host, and
   `pacman -Sy` fetching package databases over HTTPS
 - Takes the host's clock as virtual time, so `jiffies` advance and sleeps wake
