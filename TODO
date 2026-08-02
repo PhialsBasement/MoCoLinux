@@ -321,6 +321,44 @@
      megabytes; the launcher then has to expand it on first run, which is
      another thing the single exe should own.
 
+ * Real OpenGL in the guest, which nothing here can currently deliver:
+   * Where it stands. The guest has no GPU, no DRI device and pci=off, so its
+     Mesa falls back to llvmpipe and renders in its single core -- see
+     "GPU: Mesa llvmpipe" in the README screenshot. LIBGL_ALWAYS_INDIRECT=1
+     with `-wgl +iglx` on the X server moves the work to the host's real card
+     instead, and that is worth having, but it is capped at roughly OpenGL 1.4:
+     indirect GLX is a wire protocol and nobody ever defined encodings for 3.x
+     or 4.x core profiles. The card's own capability is irrelevant to that
+     ceiling -- a GT730 doing 4.6 for Windows applications still cannot be
+     reached past 1.4 by a client speaking GLX.
+   * So there are exactly two things a guest application can have today: a
+     complete-but-slow software renderer, or hardware acceleration limited to
+     an OpenGL from 2002. Anything wanting a modern core profile -- Chromium
+     and therefore Steam's client, most compositors, most games -- refuses
+     rather than degrades.
+   * What would actually fix it, in increasing order of work:
+     - A GLX/EGL passthrough of the kind virtio-gpu/virgl does for VMs: the
+       guest gets a Mesa driver whose backend is a command stream over a ring
+       to the host, and a host process replays it against real OpenGL. This is
+       the honest answer and it is a project, not a patch. The transport
+       already exists here in the shape the network rings use.
+     - VirtualGL's arrangement, which is the same idea with the split in a
+       different place: intercept at libGL in the guest, render on a machine
+       that has a card, ship images back. It normally assumes the rendering
+       host runs the X server for a real GPU, which is true here -- the host
+       does -- so it may be less work than virgl for the same result.
+     - Actual passthrough of the card to the guest. Not credible: there is no
+       IOMMU in play, the guest deliberately touches no host hardware, and
+       Windows is still driving the GT730 while the guest runs.
+   * Before any of that, measure. glxinfo -B in the guest reports the renderer
+     and the maximum GL version actually offered over the indirect path with
+     the real card behind it; that number decides whether this is worth doing
+     at all or whether 1.4-with-acceleration covers what anyone runs.
+   * And note the two settings are useless apart. LIBGL_ALWAYS_INDIRECT without
+     `+iglx` gets refused by the server; `-wgl` without LIBGL_ALWAYS_INDIRECT
+     accelerates nothing, because the guest has already finished drawing before
+     the server sees a pixel. Both are set now, and neither has been tested.
+
  * The guest kernel configuration is not in the tree:
    * Nothing records which options this port needs, so a vmlinux built from
      patch/7.1.5/current-tree-snapshot.diff and x86_64_defconfig is missing
