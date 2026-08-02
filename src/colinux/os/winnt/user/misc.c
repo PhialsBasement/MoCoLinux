@@ -127,3 +127,34 @@ void co_terminal_print_last_error(const char *message)
 		co_terminal_print("%s: success\n", message);
 	}
 }
+
+bool_t co_os_claim_single_instance(const char* name)
+{
+	static HANDLE held;
+	char full[0x100];
+
+	/*
+	 * Global\ so the name is machine-wide rather than per session. These
+	 * daemons get started from a console, from a batch file, and from the
+	 * transfer agent's service, and two of those are not the same session.
+	 */
+	co_snprintf(full, sizeof(full), "Global\\mocolinux-%s", name);
+
+	held = CreateMutex(NULL, TRUE, full);
+	if (held == NULL)
+		return PTRUE;	/* cannot tell; do not refuse to run */
+
+	if (GetLastError() == ERROR_ALREADY_EXISTS) {
+		CloseHandle(held);
+		held = NULL;
+		return PFALSE;
+	}
+
+	/*
+	 * Deliberately never released. The handle is closed by the kernel when
+	 * this process ends, however it ends -- including a taskkill or a
+	 * bugcheck -- which is the whole reason for using a mutex rather than
+	 * anything this code would have to clean up itself.
+	 */
+	return PTRUE;
+}

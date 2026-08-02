@@ -732,6 +732,25 @@ co_rc_t co_slirp_main(int argc, char *argv[])
 	}
 
 	if (g_daemon_parameters.ring) {
+		/*
+		 * One bridge, checked before the driver is opened.
+		 *
+		 * Two of these is not a duplicate, it is a conflict: both poll
+		 * the guest's TX ring and both inject into its RX ring, with
+		 * nothing arbitrating between them, and both hold a driver
+		 * handle that keeps the driver from unloading. It has happened
+		 * three times in one evening -- twice because `xpc exec`
+		 * silently retries a command it thinks timed out, once because
+		 * a launcher gave no way to tell whether the first had started.
+		 */
+		if (!co_os_claim_single_instance("slirp-bridge")) {
+			co_terminal_print("conet-slirp-daemon: another bridge is already"
+					  " running -- exiting rather than competing"
+					  " for the guest's rings\n");
+			rc = CO_RC(OK);
+			goto out_params;
+		}
+
 		rc = co_slirp_mutex_init();
 		if (!CO_OK(rc))
 			goto out_params;
