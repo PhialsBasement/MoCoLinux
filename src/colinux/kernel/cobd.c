@@ -74,6 +74,75 @@ unsigned long long co_cobd_size(int unit)
 	return cobd_unit[unit].size;
 }
 
+/*
+ * One descriptor of the guest's scatter-gather list: a physical run and its
+ * length. Must match struct cobd_sg in the guest's drivers/block/cobd.c.
+ */
+typedef struct {
+	unsigned long long pa;
+	unsigned int	   len;
+	unsigned int	   pad;
+} co_cobd_sg_t;
+
+/*
+ * A whole request in one crossing: the descriptors say where the scattered
+ * pages are, and the file offset advances across them.
+ *
+ * The guest used to cross once per page, because page-cache pages are not
+ * physically contiguous and the block layer therefore hands over one segment
+ * per page. The crossing is what costs, so a 128 KB readahead cost thirty-two
+ * of them with a synchronous host read inside each.
+ *
+ * Every descriptor is read out of guest memory through the frame lookup, and
+ * every transfer it describes goes through the same per-page resolution as
+ * before -- so an address the guest invents still cannot reach host memory.
+ */
+co_rc_t co_cobd_request_sg(co_manager_t* manager, int unit,
+			   unsigned long long offset,
+			   unsigned long long sg_pa, unsigned int count,
+			   bool_t write)
+{
+	unsigned int i;
+
+	if (unit < 0 || unit >= CO_COBD_MAX_UNITS || !cobd_unit[unit].dev)
+		return CO_RC(INVALID_PARAMETER);
+
+	if (count == 0 || count > CO_COBD_MAX_SG)
+		return CO_RC(INVALID_PARAMETER);
+
+	for (i = 0; i < count; i++) {
+		unsigned long long dpa = sg_pa + (unsigned long long)i
+					       * sizeof(co_cobd_sg_t);
+		unsigned long	   dof = (unsigned long)(dpa & (CO_ARCH_PAGE_SIZE - 1));
+		co_cobd_sg_t*	   d;
+		unsigned char*	   dva;
+		co_rc_t		   rc;
+
+		/*
+		 * A descriptor is sixteen bytes and the array is naturally
+		 * aligned, so one never straddles a page and a single frame
+		 * lookup resolves it.
+		 */
+		dva = (unsigned char*)co_kload_frame_va(
+			(co_pfn_t)(dpa >> CO_ARCH_PAGE_SHIFT));
+		if (!dva) {
+			co_debug_error("cobd%d: sg list pa 0x%llx is not guest memory",
+				       unit, dpa);
+			return CO_RC(ERROR);
+		}
+
+		d = (co_cobd_sg_t*)(dva + dof);
+
+		rc = co_cobd_request(manager, unit, offset, d->pa, d->len, write);
+		if (!CO_OK(rc))
+			return rc;
+
+		offset += d->len;
+	}
+
+	return CO_RC(OK);
+}
+
 co_rc_t co_cobd_request(co_manager_t* manager, int unit,
 			unsigned long long offset, unsigned long long guest_pa,
 			unsigned long size, bool_t write)
