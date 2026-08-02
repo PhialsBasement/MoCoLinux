@@ -113,31 +113,78 @@ co_rc_t co_cobd_request_sg(co_manager_t* manager, int unit,
 	for (i = 0; i < count; i++) {
 		unsigned long long dpa = sg_pa + (unsigned long long)i
 					       * sizeof(co_cobd_sg_t);
-		unsigned long	   dof = (unsigned long)(dpa & (CO_ARCH_PAGE_SIZE - 1));
-		co_cobd_sg_t*	   d;
-		unsigned char*	   dva;
+		co_cobd_sg_t	   d;
+		unsigned long	   got = 0;
 		co_rc_t		   rc;
 
 		/*
-		 * A descriptor is sixteen bytes and the array is naturally
-		 * aligned, so one never straddles a page and a single frame
-		 * lookup resolves it.
+		 * Copied a page at a time, because a descriptor CAN straddle
+		 * one -- and the comment that used to sit here saying it could
+		 * not was the single most expensive line in this file.
+		 *
+		 * The array is sixteen-byte objects but it is only eight-byte
+		 * aligned: blk_mq_rq_to_pdu puts it at rq + sizeof(struct
+		 * request), and that is 248 bytes in this build. So roughly one
+		 * descriptor in every 256 lands at page offset 4088, with its
+		 * pa in this page and its len in the next one.
+		 *
+		 * Reading it as one struct through a single frame lookup is
+		 * right for as long as those two pages are adjacent in the
+		 * host's address space, which they are within one allocation
+		 * block and are not across a boundary between two -- guest RAM
+		 * is a set of separate 32 MB host allocations. At a boundary
+		 * the second half of the descriptor is read out of whatever the
+		 * host put next to that block.
+		 *
+		 * What that produces is the worst possible combination: a
+		 * correct destination address with a garbage length. It is not
+		 * rejected -- the address is real guest memory -- so
+		 * co_cobd_request below walks that length writing file contents
+		 * across the guest until it runs off the end of its RAM. Under
+		 * a heavy install that means files that come back as binary
+		 * noise (pacman reporting "unknown key" for entries in its own
+		 * database, hooks with unreadable option lines) and, when what
+		 * it lands on is kernel text or a page table, a triple fault
+		 * with no bugcheck and nothing to read.
 		 */
-		dva = (unsigned char*)co_kload_frame_va(
-			(co_pfn_t)(dpa >> CO_ARCH_PAGE_SHIFT));
-		if (!dva) {
-			co_debug_error("cobd%d: sg list pa 0x%llx is not guest memory",
-				       unit, dpa);
-			return CO_RC(ERROR);
+		while (got < sizeof(d)) {
+			unsigned long long at  = dpa + got;
+			unsigned long	   off = (unsigned long)(at & (CO_ARCH_PAGE_SIZE - 1));
+			unsigned long	   part = CO_ARCH_PAGE_SIZE - off;
+			unsigned char*	   dva;
+
+			if (part > sizeof(d) - got)
+				part = sizeof(d) - got;
+
+			dva = (unsigned char*)co_kload_frame_va(
+				(co_pfn_t)(at >> CO_ARCH_PAGE_SHIFT));
+			if (!dva) {
+				co_debug_error("cobd%d: sg list pa 0x%llx is not"
+					       " guest memory", unit, at);
+				return CO_RC(ERROR);
+			}
+
+			co_memcpy((unsigned char*)&d + got, dva + off, part);
+			got += part;
 		}
 
-		d = (co_cobd_sg_t*)(dva + dof);
+		/*
+		 * And believe nothing about the length. Even read correctly it
+		 * comes from guest memory, and the loop it feeds writes for as
+		 * long as it says. One segment cannot exceed what the guest's
+		 * own queue limit allows.
+		 */
+		if (d.len == 0 || d.len > CO_COBD_MAX_SEGMENT) {
+			co_debug_error("cobd%d: sg descriptor %u has length %u,"
+				       " refusing the request", unit, i, d.len);
+			return CO_RC(INVALID_PARAMETER);
+		}
 
-		rc = co_cobd_request(manager, unit, offset, d->pa, d->len, write);
+		rc = co_cobd_request(manager, unit, offset, d.pa, d.len, write);
 		if (!CO_OK(rc))
 			return rc;
 
-		offset += d->len;
+		offset += d.len;
 	}
 
 	return CO_RC(OK);
