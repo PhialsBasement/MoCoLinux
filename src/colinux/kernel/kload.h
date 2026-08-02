@@ -84,6 +84,21 @@ extern co_rc_t		  co_kload_table_frame(co_manager_t* manager, co_pfn_t* pfn_out)
 extern void*		  co_kload_frame_va(co_pfn_t pfn);
 
 /*
+ * Guest memory through the root the guest was running on, rather than the
+ * host's load-time space. Needed for anything on cpu_entry_area or a vmalloc'd
+ * task stack, which the load-time root does not map at all.
+ */
+extern co_rc_t		  co_kload_read_cr3(co_manager_t* manager,
+					    unsigned long long cr3,
+					    unsigned long long va,
+					    unsigned char* buf, unsigned long size);
+extern co_rc_t		  co_kload_write_cr3(co_manager_t* manager,
+					     unsigned long long cr3,
+					     unsigned long long va,
+					     const unsigned char* buf,
+					     unsigned long size);
+
+/*
  * Relocate the kernel's statically linked page tables to where the image
  * actually is, graft the host's own mappings into the top level, and return the
  * CR3 that puts the guest into the address space it was built to expect.

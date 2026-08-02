@@ -512,6 +512,15 @@ typedef struct {
 	unsigned long long colinux_console_va;
 	unsigned long long ring_symbol_va;
 	unsigned long long guest_flag_va;
+	/*
+	 * The cooperative timer. tick_entry_va is asm_sysvec_co_timer, the
+	 * stock idtentry the host vectors a running guest to; virtual_if_va is
+	 * the guest's virtual interrupt flag, which says whether it may be
+	 * vectored there at all. Without these the guest has no asynchronous
+	 * entry and nothing can ever preempt a task that stays runnable.
+	 */
+	unsigned long long tick_entry_va;
+	unsigned long long virtual_if_va;
 	int		   max_switches;
 	int		   step;
 	int		   batch;
@@ -553,6 +562,8 @@ typedef struct {
 	int		   vmx_present;
 	unsigned long	   switches;
 	unsigned long	   interrupts;
+	/* Cooperative timer interrupts the host injected into a running guest. */
+	unsigned long	   ticks_injected;
 	unsigned long	   steps;
 	unsigned long	   trace_next;
 	unsigned long long trace[16];

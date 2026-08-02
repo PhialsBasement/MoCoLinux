@@ -166,6 +166,9 @@ typedef struct {
 	unsigned long long colinux_console_va;
 	unsigned long long ring_symbol_va;
 	unsigned long long guest_flag_va;
+	/* asm_sysvec_co_timer, and the guest's virtual interrupt flag. */
+	unsigned long long tick_entry_va;
+	unsigned long long virtual_if_va;
 	int		   max_switches;
 	int		   step;
 	/*
@@ -206,6 +209,13 @@ typedef struct {
 	int		   vmx_present;
 	unsigned long	   switches;
 	unsigned long	   interrupts;
+	/*
+	 * Cooperative timer interrupts injected into a running guest. Zero on a
+	 * guest that always reaches its idle boundary; the number that matters
+	 * is whether it is non-zero at all, because that is the difference
+	 * between a guest that can be preempted and one that cannot.
+	 */
+	unsigned long	   ticks_injected;
 	unsigned long	   steps;
 	unsigned long	   trace_next;
 	unsigned long long trace[CO_BOOT_TRACE];

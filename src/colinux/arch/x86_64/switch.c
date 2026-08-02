@@ -3018,6 +3018,136 @@ asm(".text                                                        \n"
 
 extern char co_host_interrupt_replay_stubs;
 
+/*
+ * Vector a running guest to its timer entry, or decide not to.
+ *
+ * Called only from the interrupt-replay path, where the guest is stopped with a
+ * complete interrupt frame already on its stack -- the one its own IDT stub
+ * saved before crossing. That frame is what makes this possible without any new
+ * assembly: the hard parts of taking an interrupt (finding a kernel stack,
+ * having somewhere to put the interrupted registers) are already done.
+ *
+ * The stub's frame, from CO_PP_GUEST_FRAME:
+ *
+ *   0x00..0x70  the fifteen saved general registers
+ *   0x78 vector    0x80 error code
+ *   0x88 RIP  0x90 CS  0x98 RFLAGS  0xa0 RSP  0xa8 SS   (pushed by the CPU)
+ *
+ * The five words at 0x88 are what co_guest_resume's iretq consumes. So: copy
+ * them somewhere the timer entry can iretq from later, then overwrite them to
+ * point at the timer entry instead. The guest resumes into a stock idtentry
+ * with a valid interrupt frame beneath it and cannot tell the difference
+ * between this and a real interrupt -- which is the whole design. In
+ * particular error_entry reads the *saved* CS to decide whether to swapgs, so a
+ * guest interrupted in userspace gets its GS base swapped exactly as hardware
+ * would have arranged, and this code does not have to know about GS at all.
+ *
+ * Refuses in three cases, each of which would be worse than a late tick:
+ *
+ *   - no addresses, so the guest predates this and has no timer entry;
+ *   - the guest's virtual interrupt flag is clear, meaning it believes
+ *     interrupts are off. Hardware would not have delivered one either, and
+ *     delivering anyway lands a tick handler in the middle of a critical
+ *     section;
+ *   - the guest's saved RFLAGS has IF clear, which is the same statement from
+ *     the other side and costs one read to check.
+ *
+ * The new frame goes forty bytes below the stub's, which is stack the guest is
+ * already using and has room for -- an interrupt arriving one instruction later
+ * would have consumed several times as much.
+ */
+static void co_arch_inject_tick(co_manager_t* manager,
+				co_arch_passage_page_t* pp,
+				co_arch_boot_t* in,
+				unsigned long long* last,
+				co_arch_boot_result_t* out)
+{
+	const unsigned long long period = 10000000ULL / 1000;	/* HZ=1000, 100ns */
+	unsigned long long frame_va, now, vif = 0;
+	unsigned long long f[5], newsp;
+	unsigned long long cr3 = pp->linuxvm_state.cr3;
+
+	if (!in->tick_entry_va || !in->virtual_if_va)
+		return;
+
+	frame_va = pp->params[28];		/* CO_PP_GUEST_FRAME */
+	if (!frame_va)
+		return;
+
+	now = co_os_monotonic_100ns();
+	if (*last == 0) {
+		*last = now;
+		return;
+	}
+	if (now - *last < period)
+		return;
+
+	/*
+	 * Would hardware have delivered here? The guest's cli/sti are virtual,
+	 * so this flag -- not the real one -- is the answer, and it is the
+	 * whole of the contract being honoured.
+	 */
+	if (!CO_OK(co_kload_read(manager, in->virtual_if_va,
+				 (unsigned char*)&vif, sizeof(vif))) ||
+	    (vif & 0x200) == 0)
+		return;
+
+	/*
+	 * The frame the stub saved, read through the root the guest was
+	 * actually running on -- not the host's load-time space.
+	 *
+	 * This distinction is the whole difference between a cooperative timer
+	 * that works and one that silently never fires. An interrupt from ring
+	 * 3 takes TSS.RSP0, which is the cpu_entry_area entry stack at
+	 * 0xfffffe00...; cpu_entry_area is a top-level entry Linux created for
+	 * itself after boot handoff and it exists only in the guest's own
+	 * tables. Read through kload_space it is simply not present, the lookup
+	 * returns NOT_FOUND, and this function quietly declines -- on every
+	 * attempt against a userspace task, forever, while appearing to work
+	 * against the few kernel contexts still on the direct map. With
+	 * CONFIG_VMAP_STACK most kernel stacks are invisible that way too.
+	 */
+	if (!CO_OK(co_kload_read_cr3(manager, cr3, frame_va + 0x88,
+				     (unsigned char*)f, sizeof(f))))
+		return;
+
+	if ((f[2] & 0x200) == 0)		/* saved RFLAGS: IF clear */
+		return;
+
+	newsp = (frame_va - 0x40) & ~0xfULL;
+
+	if (!CO_OK(co_kload_write_cr3(manager, cr3, newsp,
+				      (const unsigned char*)f, sizeof(f))))
+		return;
+
+	/*
+	 * Enter the handler the way a gate would: kernel CS, interrupts off,
+	 * the stack pointing at the frame that returns to the interrupted
+	 * context -- and the kernel's SS, which is the part that is easy to get
+	 * wrong and fatal when it is.
+	 *
+	 * iretq in long mode reloads SS whatever the privilege change, and it
+	 * requires the selector's RPL to match the CPL being returned to. The
+	 * interrupted context here is usually userspace, so the SS the stub
+	 * saved has RPL 3; pairing it with a ring-0 CS is a general protection
+	 * fault on the iretq itself, before a single instruction of the handler
+	 * runs. Both selectors have to come from the same place, and the
+	 * crossing already recorded the guest kernel's pair.
+	 */
+	f[0] = in->tick_entry_va;	/* RIP   */
+	f[1] = pp->linuxvm_state.cs;	/* CS    -- the guest's kernel selector */
+	f[2] &= ~0x200ULL;		/* FLAGS -- IF off, as a gate leaves it */
+	f[3] = newsp;			/* RSP   */
+	f[4] = pp->linuxvm_state.ss;	/* SS    -- must match CS's privilege */
+
+	if (!CO_OK(co_kload_write_cr3(manager, cr3, frame_va + 0x88,
+				      (const unsigned char*)f, sizeof(f))))
+		return;
+
+	*last = now;
+	out->ticks_injected++;
+}
+
 bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long vector)
 {
 	struct co_x86_64_gate* gate;
@@ -3377,6 +3507,14 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		unsigned long guest_crossings = 0;
 		unsigned long idle_run = 0;
 		unsigned long rx_spins = 0;
+		/*
+		 * When a cooperative tick was last delivered, in host monotonic
+		 * 100 ns units. Zero until the first interrupt crossing, which
+		 * arms it rather than firing -- there is no sensible "last" on
+		 * the first pass and injecting against an unset baseline would
+		 * deliver a tick immediately at every boot.
+		 */
+		unsigned long long tick_last = 0;
 		/*
 		 * Heartbeat: one debug record per second of wall time, streamed
 		 * over UDP by the debug daemon as it is produced, so it survives
@@ -4287,6 +4425,34 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 * guest would have come back subtly wrong rather than
 			 * obviously broken.
 			 */
+			/*
+			 * The cooperative timer, delivered here because this is
+			 * the only moment the host holds a running guest still.
+			 *
+			 * The guest takes no asynchronous entry of its own: this
+			 * interrupt vectored through its IDT into our stub and has
+			 * just been replayed into Windows, and not one guest
+			 * instruction ran for it. Left alone the guest resumes
+			 * exactly where it was -- which is why a task that stays
+			 * runnable without entering the kernel could never be taken
+			 * off the processor, and why one such task froze the whole
+			 * guest permanently, with its clock stopped, its receive
+			 * thread asleep on a timer that would never fire, and this
+			 * loop spinning at full speed because no idle yield ever
+			 * came.
+			 *
+			 * So when a tick is due, resume the guest's timer entry
+			 * over a frame built to return where it was afterwards.
+			 * What makes this safe is that it is not a hand-written
+			 * entry: asm_sysvec_co_timer is a stock idtentry, so
+			 * error_entry makes the swapgs decision from the
+			 * interrupted CS and irqentry_exit does the scheduling and
+			 * the return-to-user work. Every part of delivering an
+			 * interrupt that is easy to get wrong is already written
+			 * and tested in the guest.
+			 */
+			co_arch_inject_tick(manager, pp, in, &tick_last, out);
+
 			pp->linuxvm_state.return_rip = resume_rip;
 			pp->linuxvm_state.rsp        = ist_top - 0x200;
 		}
