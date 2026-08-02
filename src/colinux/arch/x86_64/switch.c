@@ -3070,6 +3070,31 @@ static void co_arch_inject_tick(co_manager_t* manager,
 	if (!in->tick_entry_va || !in->virtual_if_va)
 		return;
 
+	/*
+	 * Not until the guest has idled at least once.
+	 *
+	 * Reaching the idle loop is proof the kernel finished starting: the
+	 * clock event device is registered, trap_init has run, per-CPU state
+	 * exists, and there is a scheduler to preempt. Before that there is
+	 * nothing this interrupt can usefully do and a great deal it can break.
+	 *
+	 * This was found the hard way and only became reachable when the frame
+	 * read was fixed. While that read went through the host's load-time
+	 * root it failed on almost every frame, so injection quietly did
+	 * nothing until the guest was well up -- the readiness gate was an
+	 * accident of a bug. Reading through the guest's own CR3 made injection
+	 * work everywhere, including twenty milliseconds into boot, and the
+	 * first tick delivered landed in sysvec_co_timer before trap_init: page
+	 * fault at sysvec_co_timer+0x61, guest dead, one tick injected.
+	 *
+	 * out->idle_yields is the signal because it costs nothing and cannot be
+	 * faked: the guest only performs a cooperative idle yield from
+	 * co_cpu_idle, which is the idle task, which runs when the run queue
+	 * empties.
+	 */
+	if (out->idle_yields == 0)
+		return;
+
 	frame_va = pp->params[28];		/* CO_PP_GUEST_FRAME */
 	if (!frame_va)
 		return;
@@ -3112,6 +3137,47 @@ static void co_arch_inject_tick(co_manager_t* manager,
 		return;
 
 	if ((f[2] & 0x200) == 0)		/* saved RFLAGS: IF clear */
+		return;
+
+	/*
+	 * Userspace only. This is the difference between a preemptible guest and
+	 * a triple fault, and the reason is GS.
+	 *
+	 * asm_sysvec_co_timer is a stock idtentry, and error_entry decides
+	 * whether to swapgs by looking at the interrupted CS: ring 3 means the
+	 * user's GS base is loaded and must be swapped, ring 0 means the
+	 * kernel's already is. That inference is true for the frames hardware
+	 * delivers and false for some of the instants this host can choose,
+	 * because the guest runs with real interrupts enabled everywhere --
+	 * including inside its own entry sequences.
+	 *
+	 * The fatal one is SYSCALL. It loads a kernel CS but does not touch GS;
+	 * entry_SYSCALL_64 swaps it a few instructions later. Nothing on the
+	 * syscall path clears co_colinux_virtual_if either -- it is handled in
+	 * irqentry_enter/exit and exit_to_user_mode, and a syscall goes through
+	 * none of them -- so the flag still reads 0x200 from userspace and the
+	 * gate above says yes. Inject there and error_entry sees ring 0, does
+	 * not swap, and the kernel runs on the user's GS base: every per-CPU
+	 * access lands somewhere arbitrary, it faults, the fault handler needs
+	 * GS as well, and the machine is gone with no bugcheck and nothing to
+	 * read.
+	 *
+	 * On real hardware that window is covered because the entry asm runs
+	 * with interrupts off. Here it cannot be, so the window is covered from
+	 * this side instead: over a ring 3 frame the answer is never ambiguous.
+	 *
+	 * Nothing is really lost. Preemption is needed for a task that will not
+	 * yield, and that task is in userspace by definition -- a kernel path
+	 * that never returns to user and never yields is a bug of its own.
+	 * Kernel-mode time still arrives through the exit-to-user drain and the
+	 * cooperative yields, as it always did.
+	 *
+	 * Found by Steam: thousands of syscalls a second across several threads
+	 * against a thousand injections a second, and it triple faulted while
+	 * installing. The single-threaded spinner that validated this makes no
+	 * syscalls at all and never touched the window.
+	 */
+	if ((f[1] & 3) != 3)			/* saved CS: not ring 3 */
 		return;
 
 	newsp = (frame_va - 0x40) & ~0xfULL;
@@ -3662,6 +3728,35 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 */
 			pp->params[49] = co_os_monotonic_100ns();
 			pp->params[50] = co_os_get_time();
+
+			/*
+			 * Asked now, not once at the top, because at the top the
+			 * answer is always no.
+			 *
+			 * co_console_get_address() is the address the *guest*
+			 * publishes when its console driver initialises, which
+			 * happens some way into the boot -- long after this loop
+			 * starts. Choosing the deadline from it at loop entry
+			 * therefore always chose the headless one, and every
+			 * interactive session has been getting the bring-up
+			 * bound of CO_BOOT_MAX_SECONDS regardless of the
+			 * CO_BOOT_CONSOLE_SECONDS 0 that was supposed to mean
+			 * "no deadline". A guest with somebody at a prompt was
+			 * killed by a timer two minutes in, which is exactly
+			 * what that zero exists to prevent.
+			 *
+			 * The headless bound stays and stays useful: a bring-up
+			 * run with nobody attached still has to stop by itself
+			 * and report. What changes is that attaching a console
+			 * lifts it, at whatever point the guest gets far enough
+			 * to have one.
+			 */
+			if (deadline && co_console_get_address() != 0) {
+				co_debug("boot: console attached after %ld "
+					 "switches -- lifting the %ld second "
+					 "deadline", out->switches, deadline_secs);
+				deadline = 0;
+			}
 
 			if (deadline && pp->params[49] >= deadline) {
 				out->hit_deadline = PTRUE;
