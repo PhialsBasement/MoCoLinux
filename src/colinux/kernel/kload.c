@@ -95,6 +95,16 @@ static co_kload_block_t	      kload_block[CO_KLOAD_MAX_BLOCKS];
 static int		      kload_block_count;
 
 /*
+ * Block indices ordered by physical address, and the last one that answered a
+ * lookup. Both exist solely to keep co_kload_frame_va off a linear scan; see
+ * the comment there for why that is an interrupt-latency question rather than a
+ * performance one. The blocks themselves are allocated in whatever order the
+ * host could satisfy, which is not address order.
+ */
+static int		      kload_sorted[CO_KLOAD_MAX_BLOCKS];
+static int		      kload_last_hit;
+
+/*
  * Teardown is serialised, because three unrelated threads can ask for it.
  *
  * co_kload_free has always been reachable from the KLOAD_END ioctl, from
@@ -139,17 +149,65 @@ static unsigned long long     kload_table_top;	/* block 0 offset; tables grow do
  * right to: aliased cache attributes on RAM are architecturally undefined.
  *
  * There is nothing to map. The address is arithmetic.
+ *
+ * This is on the deaf path, which is why it is not a loop over every block.
+ *
+ * It is the frame mapper for every host touch of guest memory: each page-table
+ * page in co_space_map, each page of each co_cobd_request transfer, and each
+ * console and network ring access through co_kload_read/co_kload_write. The
+ * block transfers are the ones that matter, because they run inside a crossing
+ * with the host's real interrupt flag clear -- so the time spent here is time
+ * the host is deaf, tens of thousands of times per boot.
+ *
+ * It was a linear scan, which was survivable at sixteen blocks and is not at a
+ * hundred and twenty seven. Raising CO_KLOAD_MAX_BLOCKS to fit a gigabyte made
+ * every one of those lookups up to eight times longer without anything saying
+ * so, and a miss walked the whole array before falling through to
+ * MmMapIoSpace, whose unmap flushes the TLB with an IPI to every core. A host
+ * kept deaf long enough misses its clock and stops acknowledging other cores'
+ * shootdowns, and that is a freeze with no bugcheck and no dump -- which is
+ * exactly what it produced, and exactly what leaves nothing behind to read.
+ *
+ * So: an ordered index and a binary search, plus a one-entry cache of the last
+ * block that answered. Both callers that matter are sequential -- a block
+ * transfer walks consecutive pages, a table walk stays within a subtree -- so
+ * the cache turns the common case into a single comparison and the search
+ * bounds the worst case at seven instead of a hundred and twenty seven.
  */
 void* co_kload_frame_va(co_pfn_t pfn)
 {
 	co_pa_t pa = ((co_pa_t)pfn) << CO_ARCH_PAGE_SHIFT;
-	int i;
+	int lo, hi, last;
 
-	for (i = 0; i < kload_block_count; i++) {
-		if (pa >= kload_block[i].pa &&
-		    pa < kload_block[i].pa + kload_block[i].bytes)
-			return (void*)((char*)kload_block[i].va
-				       + (unsigned long)(pa - kload_block[i].pa));
+	/*
+	 * The previous answer, unvalidated against anything but its own bounds.
+	 * kload_last_hit is only ever set to an index that was in range, and is
+	 * reset to 0 when the blocks are released, so a stale value can at worst
+	 * cost one failed comparison.
+	 */
+	last = kload_last_hit;
+	if (last < kload_block_count &&
+	    kload_block[last].raw != NULL &&
+	    pa >= kload_block[last].pa &&
+	    pa <  kload_block[last].pa + kload_block[last].bytes)
+		return (void*)((char*)kload_block[last].va
+			       + (unsigned long)(pa - kload_block[last].pa));
+
+	lo = 0;
+	hi = kload_block_count - 1;
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+		int b	= kload_sorted[mid];
+
+		if (pa < kload_block[b].pa) {
+			hi = mid - 1;
+		} else if (pa >= kload_block[b].pa + kload_block[b].bytes) {
+			lo = mid + 1;
+		} else {
+			kload_last_hit = b;
+			return (void*)((char*)kload_block[b].va
+				       + (unsigned long)(pa - kload_block[b].pa));
+		}
 	}
 
 	return NULL;
@@ -243,6 +301,22 @@ static co_kload_block_t* kload_block_alloc(unsigned long long bytes)
 		b->pa = raw_pa + adjust;
 	}
 
+	/*
+	 * Insert into the address-ordered index. This runs at load time, at
+	 * most CO_KLOAD_MAX_BLOCKS times, so an insertion sort costs nothing
+	 * that matters and keeps the lookup's binary search honest.
+	 */
+	{
+		int idx = kload_block_count - 1;	/* this block's index */
+		int i	= idx;
+
+		while (i > 0 && kload_block[kload_sorted[i - 1]].pa > b->pa) {
+			kload_sorted[i] = kload_sorted[i - 1];
+			i--;
+		}
+		kload_sorted[i] = idx;
+	}
+
 	return b;
 }
 
@@ -308,6 +382,11 @@ static void kload_release_pages(co_manager_t* manager)
 	 * from a local count and leaves the global at zero throughout.
 	 */
 	kload_block_count = 0;
+	/*
+	 * Before the frees, so no lookup racing this can be handed an index
+	 * into a block that is on its way out.
+	 */
+	kload_last_hit	  = 0;
 
 	for (i = 0; i < count; i++) {
 		void*		   raw   = kload_block[i].raw;

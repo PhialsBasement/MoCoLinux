@@ -50,7 +50,29 @@
  * the last contiguous allocation in the design.
  */
 #define CO_KLOAD_RAM_BYTES	(128ULL << 20)
-#define CO_KLOAD_CHUNK_BYTES	(8ULL << 20)
+/*
+ * How large a piece to ask the host for at a time.
+ *
+ * Every one of these is an MmAllocateContiguousMemory call, and that is not a
+ * cheap allocation: it searches the PFN database for an unbroken physical run,
+ * with the memory manager's locks held, and on a machine that is already full
+ * it will trim working sets to find one. The cost is per call, not per byte.
+ *
+ * This was dropped to 8 MB when the block cap went up, on the theory that
+ * smaller pieces are easier to find. They are, but a gigabyte then takes a
+ * hundred and twenty seven of these searches instead of thirty two, and the
+ * host is unusable for the whole sequence -- the machine went sluggish the
+ * instant the daemon was started, before the guest had executed an
+ * instruction. Four times the calls for the same total is a bad trade for
+ * memory that only has to be contiguous per block.
+ *
+ * 32 MB again, and the fallback below already halves on refusal, down to 2 MB,
+ * so a fragmented host still gets served -- it simply starts by asking for
+ * something worth the search. The high block cap stays, because that is what
+ * lets those halvings accumulate to a full gigabyte; it was never the cap that
+ * was expensive.
+ */
+#define CO_KLOAD_CHUNK_BYTES	(32ULL << 20)
 #define CO_KLOAD_MAX_BLOCKS	127
 
 extern unsigned long long co_kload_phys_base(void);
