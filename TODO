@@ -88,11 +88,21 @@
    * Spurious 'Floating Point Exception' with an athlon optimised vmlinux.
 
  * Guest kernel config:
-   * CONFIG_SECURITY_LANDLOCK is off, so pacman 7 refuses to download anything:
-     it sandboxes downloads with Landlock and an alpm user, and without the
-     kernel support it fails before fetching. --disable-sandbox works around it
-     and should not have to. Turning it on is a config change and a vmlinux
-     rebuild, with no host risk.
+   * CONFIG_SECURITY_LANDLOCK is on as of 2026-08-02 and pacman no longer needs
+     --disable-sandbox. It cost two symbols -- SECURITY_LANDLOCK and the
+     SECURITY_PATH it depends on -- and CONFIG_LSM already listed landlock
+     first, so nothing else had to change. The guest says "landlock: Up and
+     running." at boot and `pacman -Sy` returns 0 with the alpm sandbox active.
+     Note that /sys/kernel/security does not exist in this guest, so the usual
+     way of checking (cat /sys/kernel/security/lsm) reports nothing and looks
+     like failure; securityfs is simply not mounted. The dmesg line is the
+     check.
+   * The guest .config is not in the tree and nothing reproduces it. Every
+     option this port depends on -- KASAN off because the host's allocation
+     lands in Linux's shadow region, RANDOMIZE_MEMORY off because the KASLR
+     span encloses our window, DEBUG_ENTRY off because it ud2's on the real IF
+     this design keeps set, and now SECURITY_LANDLOCK on -- is a decision made
+     once and recorded nowhere a rebuild would find it.
    * "x86/mm: Checked W+X mappings: FAILED, 125045 W+X pages found" on every
      boot, from the kernel's own page-table auditor. The host builds the direct
      map with _PAGE_RW and no NX, so every page of it is writable and
@@ -206,11 +216,55 @@
      reload-driver.sh stops needing to kill anything, and `sc stop` means what
      it says.
 
+ * A 0x50 in ExFreePool at end-of-run, not root-caused:
+   * On 2026-08-02 a teardown bugchecked 0x50 with the faulting instruction at
+     ntoskrnl+0xaf8a3, reached through dispatch_wrapper -> co_manager_ioctl ->
+     co_arch_boot_loaded -> co_arch_extable_free. That is ExFreePool reading
+     pool metadata for the 18 KB exception table, so the block's header was
+     already corrupt when it was freed -- something wrote into pool near it.
+     co_arch_extable_free nulls after freeing, so a double free of that pointer
+     is not the mechanism, and the table itself is unchanged at 1516 entries in
+     every run before and after.
+   * It has not reproduced since, and the previous 0x50 series in this port was
+     explicitly intermittent. Special pool does not cover it: Driver Verifier
+     only special-pools allocations of a page or less, and this is 18 KB, so an
+     overrun into it is invisible until the header is read at free time. Some
+     way of catching the write rather than the free is what this needs.
+   * logs/repro.sh drives boot / pacman -Sy / poweroff cycles looking for it. It
+     must never kill a process to clean up between cycles -- see the note at the
+     top of it, which cost a box.
+
+ * co_arch_guest_space_destroy walks tables it does not own:
+   * It reports "guest space: freed N tables, owned M" whenever the two
+     disagree, and they have disagreed on every teardown in the history of this
+     port: 33/32, 35/32, 42/32, 46/34, and 62/64 and 63/65 where it freed fewer
+     than it owns. Nobody read the line.
+   * freed > owned because the walk descends into subtrees the space did not
+     create -- the kernel's own level3_kernel_pgt, and the three host grafts at
+     PML4 slots 273, 289 and 501. freed < owned because tables the space did
+     create are no longer reachable from the top by the time it walks, the
+     guest having replaced entries with its own. Neither is fatal today: with a
+     frame source set nothing is actually put back, and the pages all live
+     inside the blocks that kload_release_pages frees wholesale.
+   * The fix is to record which top-level entries were grafted and not descend
+     into them, which also stops the walk touching host page tables with
+     MmMapIoSpace at all.
+
+ * Nothing can ask the console or the network bridge to stop:
+   * Same shape as the debug daemon entry above and worth solving together. The
+     bridge is documented to keep waiting when there is no guest, and the
+     console is another colinux-daemon.exe, so after a guest powers off both
+     are still there and "is a colinux-daemon running" cannot tell them from a
+     boot. That ambiguity is what made an automated repro loop reach for
+     taskkill, and taskkill is what OOMed the box.
+   * colinux-daemon.exe --install-driver reports "driver already installed /
+     daemon: driver installed" and exits 0 when the service exists but is
+     STOPPED, which is its state after every reboot. It does not start it.
+     Anything that treats that success as "the driver is loaded" then fails
+     with "manager open: The system cannot find the file specified" on every
+     subsequent run. It should start the service, or say that it did not.
+
  * Cleanups:
-   * debug.c resize_section() cannot grow a buffer: it computes new_size, then
-     returns early on `old_size != new_size`, which is true in exactly the
-     cases where a resize was wanted. So a burst of logging drops records
-     instead of doubling the buffer, silently.
    * Merge console into console-base.
    * Clear out some function naming brain damage and make more use
      of the 'static' keyword :).
