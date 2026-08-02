@@ -25,6 +25,24 @@ Over the previous snapshot:
     int 0x2e and syscall, so leaving 0x80 to Linux costs it nothing and is what
     makes a 32-bit userland work at all.
 
+  * drivers/block/cobd.c: scatter-gather, and the passage page held across the
+    parameters and the crossing.
+
+    The descriptor form is the performance half: the block layer produces one
+    segment per page, so a readahead used to cost a world crossing per page.
+    The guest now describes the scattered runs once and crosses once.
+
+    preempt_disable() around the parameter writes is the correctness half.
+    There is one passage page and one set of parameters; queue_rq runs in fully
+    preemptible process context (BLK_MQ_F_BLOCKING, and blk_mq_submit_bio
+    issues directly in the submitting task's own context), so two tasks reach
+    it independently and CONFIG_PREEMPTION lets one displace the other between
+    the last store and the call. Interleaved, the second task's parameters are
+    the ones that cross, and the first is told its transfer succeeded when the
+    host never performed it -- pages marked uptodate holding whatever was in
+    them, which is program text on its way in. Nothing is logged when it fires:
+    both crossings succeed and the corruption arrives as data.
+
   * text-poke-direct is gone, because both of its premises died on Aug 1.
     It bypassed __text_poke()'s temporary-mm machinery on the grounds that
     native_write_cr3() was a no-op (stale since the ring-3 commit made CR3
@@ -1652,8 +1670,8 @@ diff -urN a/arch/x86/pci/legacy.c b/arch/x86/pci/legacy.c
  	 * pci_legacy_init should be invoked.
 diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 --- a/drivers/block/cobd.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/block/cobd.c	2026-08-01 09:34:18.028618500 +1000
-@@ -0,0 +1,277 @@
++++ b/drivers/block/cobd.c	2026-08-02 20:06:49.804809900 +1000
+@@ -0,0 +1,422 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * cobd -- the cooperative block device.
@@ -1709,6 +1727,28 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +	int			unit;
 +};
 +
++/*
++ * One descriptor per physically contiguous run of a request, handed to the host
++ * as an array so a whole request costs one world crossing.
++ *
++ * Sixteen bytes and naturally aligned, so a descriptor never straddles a page
++ * and the host resolves each with one frame lookup.
++ */
++struct cobd_sg {
++	__u64	pa;
++	__u32	len;
++	__u32	pad;
++};
++
++/*
++ * Per-request through blk-mq's cmd_size rather than a shared buffer: the queue
++ * is sixteen deep, so a static array could be handed to the host while another
++ * request was still filling it.
++ */
++struct cobd_cmd {
++	struct cobd_sg	sg[BLK_MAX_SEGMENTS];
++};
++
 +static struct cobd_dev cobd_devs[COBD_MAX_UNITS];
 +static int cobd_major;
 +
@@ -1736,32 +1776,108 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +		: "rax", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory", "cc");
 +}
 +
-+static int cobd_io(int unit, u64 offset, phys_addr_t pa, u32 len, bool write)
++/*
++ * Hand the host a whole request: a start offset and a list of scattered
++ * physical runs, transferred in one crossing.
++ *
++ * It used to be one call per segment, and the block layer produces one segment
++ * per page because page-cache pages are not physically contiguous. A 128 KB
++ * readahead was therefore thirty-two world crossings, each with its own
++ * synchronous host file read, and the crossing is the expensive part.
++ *
++ * Asking for larger segments was tried first and did nothing, for that same
++ * reason: rq_for_each_bvec only yields a multi-page run when the pages happen
++ * to be adjacent in physical memory, which for readahead they are not. The fix
++ * is not to ask for contiguity but to stop needing it -- describe the scattered
++ * pages once, cross once.
++ *
++ * Why it matters for a desktop and did not for the install: bulk streaming
++ * amortised the crossing over a lot of bytes, while an application paging in Qt
++ * and the KDE frameworks is thousands of small scattered reads that each paid
++ * in full.
++ */
++static int cobd_io_sg(int unit, u64 offset, phys_addr_t sg_pa, u32 count,
++		      bool write)
 +{
 +	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
++	int ret;
++
++	/*
++	 * The parameters and the crossing are one operation and must not be
++	 * split by the scheduler.
++	 *
++	 * There is exactly one passage page. These six words are not this
++	 * request's -- they are the machine's only set, and they stay meaningful
++	 * for precisely as long as it takes to get from the last store to the
++	 * call below. queue_rq runs in fully preemptible process context:
++	 * BLK_MQ_F_BLOCKING says it may sleep, and blk_mq_submit_bio issues
++	 * directly in the submitting task's own context, so two tasks reach here
++	 * independently and CONFIG_PREEMPTION lets one displace the other
++	 * mid-sequence.
++	 *
++	 * Interleaved, that is: A writes its six words, is preempted, B writes
++	 * its own over the top and crosses, the host performs B's transfer, B
++	 * reads success and returns. A is then rescheduled and crosses with B's
++	 * parameters still in the page. The host obligingly performs B's
++	 * transfer a second time; A reads params[56], finds the zero B's
++	 * transfer left there, and reports success for a read that never
++	 * happened. The block layer marks those pages uptodate holding whatever
++	 * was in them, and they are program text and page tables on their way
++	 * in.
++	 *
++	 * The result was a guest that died within a second of starting anything
++	 * that pages in a lot from several threads at once -- every Qt
++	 * application -- while xterm, which is one thread touching a handful of
++	 * small libraries, ran fine. Sequential dd measured 140 MB/s and was
++	 * never once wrong, because one thread issuing one request at a time
++	 * cannot race itself. Nothing is logged when this fires: both crossings
++	 * succeed and the corruption is delivered as data.
++	 *
++	 * preempt_disable is the whole fix and the right size of it. It is not
++	 * an SMP question -- the guest has one processor -- and interrupts do
++	 * not need masking either, because vectors 32-255 belong to the host and
++	 * never run guest code. What has to be prevented is the guest's own
++	 * scheduler putting another task on the processor in the middle, and
++	 * that is exactly what the preemption count prevents.
++	 */
++	preempt_disable();
 +
 +	*(volatile u64 *)(pp + CO_PP_PARAM(51)) = unit;
 +	*(volatile u64 *)(pp + CO_PP_PARAM(52)) = offset;
-+	*(volatile u64 *)(pp + CO_PP_PARAM(53)) = len;
-+	*(volatile u64 *)(pp + CO_PP_PARAM(54)) = pa;
++	*(volatile u64 *)(pp + CO_PP_PARAM(53)) = count;
++	*(volatile u64 *)(pp + CO_PP_PARAM(54)) = sg_pa;
 +	*(volatile u64 *)(pp + CO_PP_PARAM(55)) = write ? 1 : 0;
 +	*(volatile u64 *)(pp + CO_PP_PARAM(56)) = ~0ULL;
 +
 +	cobd_switch(CO_OPERATION_BLOCK_IO);
 +
-+	return *(volatile u64 *)(pp + CO_PP_PARAM(56)) ? -EIO : 0;
++	ret = *(volatile u64 *)(pp + CO_PP_PARAM(56)) ? -EIO : 0;
++
++	preempt_enable();
++
++	return ret;
 +}
 +
 +static u64 cobd_probe(int unit)
 +{
 +	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
++	u64 size;
++
++	/* Same page, same rule -- see cobd_io_sg(). This one runs at init with
++	 * nothing else to race, which is a fact about today rather than a
++	 * property of the code. */
++	preempt_disable();
 +
 +	*(volatile u64 *)(pp + CO_PP_PARAM(51)) = unit;
 +	*(volatile u64 *)(pp + CO_PP_PARAM(52)) = 0;
 +
 +	cobd_switch(CO_OPERATION_BLOCK_PROBE);
 +
-+	return *(volatile u64 *)(pp + CO_PP_PARAM(52));
++	size = *(volatile u64 *)(pp + CO_PP_PARAM(52));
++
++	preempt_enable();
++
++	return size;
 +}
 +
 +static blk_status_t cobd_queue_rq(struct blk_mq_hw_ctx *hctx,
@@ -1771,7 +1887,9 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +	struct cobd_dev *dev = req->q->queuedata;
 +	blk_status_t status = BLK_STS_OK;
 +	struct req_iterator iter;
++	struct cobd_cmd *cmd;
 +	struct bio_vec bvec;
++	unsigned int n;
 +	u64 pos;
 +
 +	blk_mq_start_request(req);
@@ -1781,18 +1899,55 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +	case REQ_OP_WRITE:
 +		pos = (u64)blk_rq_pos(req) << SECTOR_SHIFT;
 +
-+		rq_for_each_segment(bvec, req, iter) {
-+			phys_addr_t pa = page_to_phys(bvec.bv_page) +
-+					 bvec.bv_offset;
++		/*
++		 * rq_for_each_bvec, not rq_for_each_segment.
++		 *
++		 * The segment form splits at every page, so a 128 KB readahead
++		 * became thirty-two calls to cobd_io() and therefore thirty-two
++		 * world crossings, each with its own synchronous host file read.
++		 * The crossing is the expensive part and it was being paid per
++		 * page. The bvec form yields whole physically contiguous runs,
++		 * so the same readahead is one crossing.
++		 *
++		 * This is safe because the host resolves the buffer itself: see
++		 * co_cobd_request() in kernel/cobd.c, which walks the transfer a
++		 * page at a time, looks each frame up separately, and refuses an
++		 * address that is not guest memory. The per-page limits below
++		 * existed for a version of that function which resolved one
++		 * frame per call, and are what this comment used to say.
++		 *
++		 * It matters most for exactly the workload that was unusable:
++		 * bulk streaming amortised the crossing over a lot of bytes and
++		 * ran fine, while a desktop application paging in Qt and the KDE
++		 * frameworks is thousands of small scattered reads and paid the
++		 * full cost on every one.
++		 */
++		cmd = blk_mq_rq_to_pdu(req);
++		n = 0;
 +
-+			if (cobd_io(dev->unit, pos, pa, bvec.bv_len,
-+				    op_is_write(req_op(req)))) {
++		rq_for_each_bvec(bvec, req, iter) {
++			if (n == BLK_MAX_SEGMENTS) {
++				/*
++				 * Cannot happen -- max_segments is the same
++				 * bound the block layer builds to -- but the
++				 * alternative to checking is writing past the
++				 * array into the request's own private data.
++				 */
 +				status = BLK_STS_IOERR;
 +				break;
 +			}
 +
-+			pos += bvec.bv_len;
++			cmd->sg[n].pa  = page_to_phys(bvec.bv_page) +
++					 bvec.bv_offset;
++			cmd->sg[n].len = bvec.bv_len;
++			cmd->sg[n].pad = 0;
++			n++;
 +		}
++
++		if (status == BLK_STS_OK && n &&
++		    cobd_io_sg(dev->unit, pos, virt_to_phys(cmd->sg), n,
++			       op_is_write(req_op(req))))
++			status = BLK_STS_IOERR;
 +		break;
 +
 +	/*
@@ -1829,13 +1984,21 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +		.logical_block_size	= COBD_SECTOR_SIZE,
 +		.physical_block_size	= COBD_SECTOR_SIZE,
 +		/*
-+		 * One page per segment and no merging across pages: every
-+		 * segment becomes one host transfer resolved through one
-+		 * guest frame, so a segment that spanned pages could span two
-+		 * host allocations that are not adjacent.
++		 * Large segments, and merging across pages.
++		 *
++		 * These were one page and no merging, on the grounds that a
++		 * segment spanning pages could span two host allocations that
++		 * are not adjacent -- guest memory is several separate
++		 * contiguous blocks, so guest-physical adjacency does not imply
++		 * host-virtual adjacency. That is still true, and it is handled
++		 * where it belongs: co_cobd_request() walks the transfer a page
++		 * at a time and resolves each frame on its own.
++		 *
++		 * Keeping the limit here as well cost a world crossing per page.
++		 * A megabyte lets the block layer build runs worth crossing for
++		 * while staying well inside what one request can describe.
 +		 */
-+		.max_segment_size	= PAGE_SIZE,
-+		.seg_boundary_mask	= PAGE_SIZE - 1,
++		.max_segment_size	= 1024 * 1024,
 +		.max_segments		= BLK_MAX_SEGMENTS,
 +	};
 +	struct gendisk *disk;
@@ -1848,7 +2011,7 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +	dev->tag_set.nr_hw_queues	= 1;
 +	dev->tag_set.queue_depth	= 16;
 +	dev->tag_set.numa_node		= NUMA_NO_NODE;
-+	dev->tag_set.cmd_size		= 0;
++	dev->tag_set.cmd_size		= sizeof(struct cobd_cmd);
 +	dev->tag_set.flags		= BLK_MQ_F_BLOCKING;
 +	dev->tag_set.driver_data	= dev;
 +
@@ -1946,8 +2109,8 @@ diff -urN a/drivers/block/Makefile b/drivers/block/Makefile
  obj-$(CONFIG_BLK_DEV_NBD)	+= nbd.o
 diff -urN a/drivers/net/conet_colinux.c b/drivers/net/conet_colinux.c
 --- a/drivers/net/conet_colinux.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/net/conet_colinux.c	2026-08-01 19:11:51.120065500 +1000
-@@ -0,0 +1,276 @@
++++ b/drivers/net/conet_colinux.c	2026-08-02 17:08:57.432206200 +1000
+@@ -0,0 +1,289 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * A cooperative ethernet device for a coLinux guest.
@@ -2155,7 +2318,20 @@ diff -urN a/drivers/net/conet_colinux.c b/drivers/net/conet_colinux.c
 +		if (co_net_rx_drain(dev) == 0) {
 +			set_current_state(TASK_INTERRUPTIBLE);
 +			if (!kthread_should_stop())
-+				schedule_timeout(max(1ul, msecs_to_jiffies(2)));
++				/*
++			 * One jiffy, not two.
++			 *
++			 * This sleep is one of three polling intervals in
++			 * series on every round trip the guest makes -- this
++			 * one, the host monitor loop's idle sleep, and the
++			 * slirp bridge's select timeout -- and their sum is the
++			 * latency floor. A ping to slirp's own gateway,
++			 * answered by a process on the same machine with no
++			 * network involved, measured 4 ms against a predicted
++			 * 2 + 1 + 2. Throughput is window over round trip, so
++			 * this interval is worth as much as any buffer size.
++			 */
++			schedule_timeout(1);
 +			__set_current_state(TASK_RUNNING);
 +		}
 +	}
