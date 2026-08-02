@@ -354,7 +354,7 @@ mkdir -p "$MNT/etc/systemd/system/serial-getty@hvc0.service.d"
 cat > "$MNT/etc/systemd/system/serial-getty@hvc0.service.d/autologin.conf" <<'EOF'
 [Service]
 ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear %I 115200 linux
+ExecStart=-/sbin/agetty --autologin mocolinux --noclear %I 115200 linux
 EOF
 ln -sf /usr/lib/systemd/system/serial-getty@.service \
        "$MNT/etc/systemd/system/getty.target.wants/serial-getty@hvc0.service" \
@@ -394,25 +394,39 @@ EOF
 # reaches an X server listening on 127.0.0.1:6000 on the Windows machine, with
 # no port redirection and nothing new in the driver.
 #
-# LIBGL_ALWAYS_INDIRECT is what decides where OpenGL actually runs, and the
-# default is the wrong end. The guest has no GPU and no DRI device, so its Mesa
-# falls back to llvmpipe and renders in its own CPU -- one core, shared with the
-# host -- then ships finished pixels over the wire. The X server never sees a
-# GL command and cannot accelerate anything, however good the card behind it is.
+# OpenGL, and why the faster-sounding option is not the default.
 #
-# Set, the guest sends GLX protocol instead and the server executes it on the
-# host's own OpenGL, which is the machine's real graphics card. The server side
-# of that is `-wgl +iglx`; indirect GLX has been disabled by default since
-# xorg 1.17, so both halves are required and either one alone does nothing.
+# The guest has no GPU and no DRI device, so Mesa falls back to llvmpipe and
+# renders in the guest's single core. Setting LIBGL_ALWAYS_INDIRECT=1 sends GLX
+# protocol to the X server instead, which executes it on the host's real card --
+# and measured on this hardware that is a GeForce GT 730 reporting OpenGL 1.4,
+# against llvmpipe's 4.6. The card's own driver does 4.5; the 1.4 is the GLX
+# wire protocol, which has no encodings for modern core profiles.
 #
-# The trade is the GL version. Indirect contexts are limited to what the GLX
-# protocol can encode, so an application demanding a modern core profile will
-# refuse rather than run slowly, and for those `unset LIBGL_ALWAYS_INDIRECT`
-# gets llvmpipe back. glxinfo reports which one is in force: the card's name
-# means the protocol path, "llvmpipe" means the guest's CPU.
+# So the choice is a complete-but-slow renderer or a fast one stuck in 2002, and
+# as a system-wide default the second breaks more than it helps: anything
+# wanting a modern context -- Chromium, and therefore Steam -- refuses outright
+# rather than running slowly. glxinfo also reports GLXBadCurrentWindow on the
+# indirect path, so it is not entirely healthy either.
+#
+# Default is therefore llvmpipe, with the hardware path one word away:
+#
+#     glhw glxgears        instead of        glxgears
+mkdir -p "$MNT/usr/local/bin"
+cat > "$MNT/usr/local/bin/glhw" <<'EOF'
+#!/bin/sh
+# Run one program with OpenGL on the host's graphics card instead of in this
+# guest's CPU. Needs the X server started with -wgl +iglx. Capped at GL 1.4 by
+# the GLX protocol regardless of what the card can do -- see /etc/environment.
+exec env LIBGL_ALWAYS_INDIRECT=1 "$@"
+EOF
+chmod 0755 "$MNT/usr/local/bin/glhw"
+
 cat > "$MNT/etc/environment" <<'EOF'
 DISPLAY=10.0.2.2:0
-LIBGL_ALWAYS_INDIRECT=1
+# OpenGL renders in this guest's CPU (llvmpipe, GL 4.6, complete but slow).
+# For the host's graphics card instead, run one program through `glhw` --
+# hardware accelerated but limited to GL 1.4 by the GLX wire protocol.
 EOF
 
 # A user, because running a desktop as root is how people learn not to -- and
@@ -427,9 +441,15 @@ inside "useradd -m -G wheel -s /bin/bash mocolinux" >/dev/null 2>&1 || true
 inside "echo 'mocolinux:mocolinux' | chpasswd" >/dev/null 2>&1 || true
 for rc in "$MNT/home/mocolinux/.bashrc" "$MNT/root/.bashrc"; do
 	echo 'export DISPLAY=10.0.2.2:0' >> "$rc"
-	echo 'export LIBGL_ALWAYS_INDIRECT=1' >> "$rc"
 done
-echo "%wheel ALL=(ALL:ALL) ALL" > "$MNT/etc/sudoers.d/10-wheel"
+#
+# No password prompt for wheel.
+#
+# The console autologs in as this user, so a prompt means every administrative
+# command on a single-user development guest stops to ask for a password that is
+# set three lines above in this same script. It buys nothing, and it breaks
+# unattended use of the serial console.
+echo "%wheel ALL=(ALL:ALL) NOPASSWD: ALL" > "$MNT/etc/sudoers.d/10-wheel"
 chmod 0440 "$MNT/etc/sudoers.d/10-wheel"
 
 # ---------------------------------------------------------------- done
