@@ -354,6 +354,31 @@
        path and a crossing costs microseconds (the 16 MB/s network figure is
        TCP through NAT, not the ring's ceiling). The work is the guest-side
        Mesa backend, and it is a project rather than a patch.
+
+       Worth being explicit about why this is more tractable here than the
+       equivalent in a virtual machine, because it is the argument for
+       attempting it at all: guest physical IS host physical. There is no
+       second address space to marshal resources into. A vertex buffer or a
+       texture the guest application writes sits in memory the host can already
+       address by arithmetic (co_kload_frame_va on the page), so the replay
+       reads those buffers in place, where the application put them. Zero copy
+       is not an optimisation to add later, it is what happens if nothing is
+       done to prevent it -- and eliminating that copy is most of what virtio
+       designs spend their complexity on.
+
+       Presentation lands the same way. An X client here already owns a real
+       Windows window, created by the server in multiwindow mode. If the
+       host-side GL context is a native WGL context on that HWND, the finished
+       frame never moves: no readback, no image shipped anywhere, and
+       SwapBuffers is the ordinary one. That is the step VirtualGL cannot skip
+       and the reason its ceiling is lower than this design's.
+
+       What would still separate it from native, so nobody is surprised later:
+       synchronisation points -- glFinish, glReadPixels, fences, occlusion
+       queries -- are real round trips and no transport speed removes them; and
+       the guest has one processor, so for anything substantial the application
+       is CPU-bound in the guest long before GL is the limit. That second one
+       is the SMP entry, not this one.
      - VirtualGL's arrangement is the same idea with the split at libGL and
        images coming back instead of pixels going forward. It normally assumes
        the rendering host owns a real GPU and an X server, which is an
