@@ -109,15 +109,21 @@ def read_until(sock, pattern, timeout, echo=True):
     return joined, None
 
 
-def sync(sock):
+def sync(sock, timeout):
     """Get to a known state: a prompt, with nothing of the past still in flight.
 
     Whatever a previous session left in the ring arrives first, so it is read
     and discarded up to our own sentinel rather than being mistaken for the
     output of the first command.
+
+    Bounded by the caller's timeout, not by a constant. It used to wait a fixed
+    thirty seconds here, so `-t 8` could take thirty-eight -- every short
+    deadline set on this tool was silently ignored, and a guest that had gone
+    unresponsive still cost half a minute to find out about. A sync that cannot
+    complete inside the caller's own deadline is itself the answer.
     """
     sock.sendall(b'\n' + SENTINEL_SEND.encode() + b'\n')
-    read_until(sock, SENTINEL_RE, 30, echo=False)
+    return read_until(sock, SENTINEL_RE, timeout, echo=False)[1] is not None
 
 
 def main():
@@ -132,7 +138,7 @@ def main():
     sock.setblocking(False)
 
     if not args:
-        sync(sock)
+        sync(sock, timeout)
         print('--- interactive; ctrl-c to quit ---')
         while True:
             r, _, _ = select.select([sock, sys.stdin], [], [], 0.2)
@@ -149,7 +155,11 @@ def main():
                 sock.sendall(line.encode())
         return 0
 
-    sync(sock)
+    if not sync(sock, timeout):
+        print('--- coterm: no prompt within %gs; the guest is not answering'
+              % timeout)
+        sock.close()
+        return 124
 
     status = 0
     for command in args:
