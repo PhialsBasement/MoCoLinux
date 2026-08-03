@@ -12,41 +12,48 @@ speaks to the guest over a TCP console. NSIS can do none of that well, and the
 launcher has to contain all of it anyway.
 
 
-1. The seed is the system
---------------------------
+1. The target builds its own system
+------------------------------------
 
-doc/runbook section B builds the root filesystem onto a second cobd unit from
-inside a running guest. That exists for one reason, stated in the runbook: a
-6 GB image cannot be pushed to the test box, so the guest builds the next
-guest's disk in place. No user of a release has that constraint, and carrying
-the workaround across costs them:
+The release does not ship the installed system. It ships a seed that can build
+one, and the machine being installed onto runs tools/mkmanjarorootfs.sh
+exactly as doc/runbook section B does today -- the seed on cobd0, a blank
+image on cobd1, and the script building the second from the first.
 
-  * two images on disk at once, one of them thrown away afterwards;
-  * mke2fs, the alpm directory skeleton, and `pacman-key --init && --populate`
-    run on a stranger's machine -- and the keyring is the step whose failure
-    presents as every package being untrusted while its signature is perfectly
-    good, which cost an evening here with someone watching who knew the code;
-  * a bootstrap guest that must be shipped anyway, so the seed exists either
-    way and is then used only as scaffolding.
+Two things force the shape, and it is worth being clear which is which.
 
-So the seed is the system. The release ships a small bootable Manjaro -- what
-tools/mkmanjarorootfs.sh already builds, with the desktop package set left out
--- and the target machine does two things to it:
+Something pacman-capable has to ship no matter what. mkmanjarorootfs.sh needs
+a Linux with pacman and e2fsprogs already running, so it reproduces an image
+and cannot create the first one; the runbook states that as its own bootstrap
+problem. So there is no version of this where the download is only a kernel
+and a driver. The seed is the floor.
 
-    resize2fs /dev/cobd0        grow the filesystem to the file it was given
-    pacman -S <desktop set>     install the rest
+Given that floor, the question is only what the target does with it, and the
+answer is: the thing that has actually run. Growing the seed in place and
+installing the desktop into it would be less work on the target -- no mke2fs,
+no second image, no keyring populate -- but it introduces a step, an online
+resize2fs of a live cobd0, that has never executed here. Running the script is
+the path that has been executed end to end, on this hardware, repeatedly. That
+decides it. The extra cost is the seed's own ~700 MB sitting beside the image,
+not a second copy of it, and run-manjaro.bat already keeps the old root
+attached as cobd1 for exactly this reason: if the new system will not boot,
+the one that built it still will.
 
-Both are online, both resume, and neither can produce a half-made filesystem.
-The keyring is already populated in the seed, mke2fs never runs on the user's
-machine, and mkmanjarorootfs.sh keeps its job unchanged: it is the build-host
-script that produces the artifact. What it stops doing is running on machines
-we do not own.
+One script, two package sets, so there is a single source of truth for what a
+MoCoLinux root filesystem is:
+
+    mkmanjarorootfs.sh --seed <target>     base, pacman, populated keyring,
+                                           e2fsprogs, networkd, hvc0 getty
+    mkmanjarorootfs.sh <target>            all of the above plus the desktop
+
+The seed is built once by whoever cuts the release. Everything the user
+downloads after that comes from Manjaro's mirrors on their own machine.
 
 Sizes, to be measured rather than promised, but the shape is:
 
-    seed, raw          ~700 MB    base, pacman, keyring, networkd, hvc0 getty
+    seed, raw          ~700 MB    what --seed produces
     seed, in installer ~250 MB    NSIS LZMA over a mostly-empty ext4
-    desktop download   ~2.5 GB    plasma-meta and friends, at install time
+    package download   ~2.5 GB    at install time, on the user's connection
     installed          ~6 GB
 
 
@@ -135,37 +142,54 @@ One window, a stage list, a progress bar, a log pane that can be folded open,
 and Cancel. It is `mocolinux.exe --first-run <inifile>`, so it is re-runnable
 by hand and from the launcher's "Rebuild the Linux system".
 
-    1  create the image     copy root-seed.img to <linux>\root.img, then
-                            SetEndOfFile to the chosen size. Instant.
+    1  create the images    root-seed.img is laid down as shipped; root.img is
+                            created empty at the chosen size with
+                            SetEndOfFile, which is instant and is what
+                            `fsutil file createnew` does in the runbook. The
+                            guest makes the filesystem in it.
     2  driver               install the service if absent, start it, wait for
                             RUNNING. --install-driver reports success today
                             without starting anything, which is a TODO item
                             and a small fix; until it lands the wizard starts
                             the service itself rather than trusting that.
-    3  boot                 spawn --boot, --slirp and --console as children:
-                            own pipes, no inherited console handles, a Job
-                            Object with KILL_ON_JOB_CLOSE as backstop only.
-                            `start` hands its standard handles to the child
-                            whatever you do with them, and three launchers in
-                            this tree have wedged that way.
+    3  boot the seed        --boot with root-seed.img on cobd0 and the blank
+                            root.img on cobd1, plus --slirp and --console, as
+                            children: own pipes, no inherited console handles,
+                            a Job Object with KILL_ON_JOB_CLOSE as backstop
+                            only. `start` hands its standard handles to the
+                            child whatever you do with them, and three
+                            launchers in this tree have wedged that way.
     4  wait for the guest   connect to 127.0.0.1:2323 and read. Half a minute
                             is normal. Connection refused means the console
                             has not bound; silence means the guest has not
                             reached a prompt. Neither is a failure and neither
                             is reported as one. Ninety seconds is.
-    5  grow and install     the guest does this and says what it is doing --
-                            section 6. Console-only stops after the resize.
-    6  verify               section 6.
+    5  build                the seed runs mkmanjarorootfs.sh against /dev/cobd1
+                            and says what it is doing -- section 6. This is the
+                            twenty to forty-five minutes.
+    6  verify               section 6, against the image just built, while the
+                            guest that built it is still up to do the checking.
     7  shut down            send `systemctl poweroff` and wait for the boot
                             child to exit. Never --stop: nothing else unmounts,
                             and ext4 in data=ordered journals metadata and not
                             contents, so a file written seconds earlier comes
                             back as a correctly-named inode with no data. That
-                            exit is the flush.
+                            exit is the flush -- and here it is the flush of
+                            the filesystem that was just built, which is the
+                            whole product.
+    8  swap the disks       write the launcher's ini so root.img is cobd0 and
+                            root-seed.img is cobd1, which is what
+                            run-manjaro.bat does today: the system that built
+                            this one stays attached as the recovery disk, able
+                            to mount and repair it if it will not boot.
+
+Console-only skips nothing structurally -- the same script builds the same
+filesystem with a smaller package set, so the difference is download size and
+time rather than a different path through the code.
 
 Cancel is honest about where it is. Before stage 5 it stops and removes what
-it made. During stage 5 it offers to leave the partial install in place, since
-several gigabytes of package cache are worth keeping for a retry.
+it made. During stage 5 it offers to leave root.img in place, since several
+gigabytes of package cache are worth keeping for a retry.
 
 
 6. What the guest says
@@ -181,8 +205,8 @@ progress bar built on prompt-scraping breaks the first time a package name
 contains something interesting.
 
 So the seed carries /usr/lib/systemd/system/mocolinux-setup.service, wanted by
-multi-user.target, running a script that emits one marker per line to
-/dev/console:
+multi-user.target, which runs mkmanjarorootfs.sh against /dev/cobd1 and turns
+its output into markers, one per line, on /dev/console:
 
     MOCO:STAGE <n>/<total> <text>     a step began
     MOCO:PCT <0-100>                  progress within it, where known
@@ -193,30 +217,47 @@ multi-user.target, running a script that emits one marker per line to
 Anything not matching goes to the log pane verbatim. The wizard needs no shell
 and no sentinel, and a marker stream is greppable in a support log afterwards.
 
-    1/6  growing the filesystem      resize2fs /dev/cobd0
-    2/6  checking the network        one HTTP HEAD at the mirror, so an
+The script's own stages already exist -- it reports each with `==>` -- so the
+mapping is a table rather than new instrumentation, with an added check in
+front of it:
+
+    1/7  checking the network        one HTTP HEAD at the mirror, so an
                                      unreachable network fails here with
                                      "cannot reach the Manjaro mirror" rather
                                      than a hundred lines into pacman
-    3/6  refreshing package lists    pacman -Sy
-    4/6  downloading and installing  pacman -S, PCT from packages done
-    5/6  configuring                 ldconfig, locale, services
-    6/6  verifying                   below
+    2/7  making the filesystem       mke2fs on /dev/cobd1
+    3/7  downloading and installing  the long one; PCT from packages done
+    4/7  populating the keyring      pacman-key --init && --populate
+    5/7  ranking mirrors             pacman-mirrors
+    6/7  re-verifying every package  pacman -Syu against the real keyring
+    7/7  configuring                 ldconfig, locale, fstab, getty, network,
+                                     user, sudo
 
-The unit disables itself on MOCO:OK, so a second boot is an ordinary boot. On
-MOCO:FAIL it stays enabled and re-runs on the next boot, which is what makes
-retry work without the host having to know anything.
+The unit disables itself on MOCO:OK, so a second boot of the seed is an
+ordinary boot. On MOCO:FAIL it stays enabled and re-runs on the next boot,
+which is what makes retry work without the host having to know anything.
 
 Verification is the guest's job too, and it is not optional -- a block-layer
-bug once produced an image whose own package database was binary noise:
+bug once produced an image whose own package database was binary noise. It is
+the runbook's step 5, run before the guest that built the image shuts down:
 
-    pacman -Qk                  every installed file present
-    systemctl is-system-running running or degraded, and which units failed
-    test -x /usr/lib/systemd/systemd, /etc/fstab, the hvc0 getty override
+    mount /dev/cobd1 /mnt/new
+    pacman --root /mnt/new -Qk        every installed file present
+    test -x /mnt/new/usr/lib/systemd/systemd, /etc/fstab, the getty override
+    umount, then e2fsck -n /dev/cobd1
 
-Resume falls out of the design. The package cache lives in the image, pacman
-skips what it already has, and a dropped mirror mid-download -- the likeliest
-failure a user will meet -- costs the time already spent and nothing else.
+and then the script's own last line, which is load-bearing in a way that is
+easy to miss: success is printed by the unmount path and nowhere else, because
+ext4 in data=ordered journals metadata and not contents. "done, unmounted
+clean" is the only sentence that means the image is on the disk.
+
+Resume is the one thing this path does not get for free. mkmanjarorootfs.sh
+opens with an unconditional mke2fs -F, so a retry today throws away whatever
+was downloaded. The fix is small and belongs with the --seed work: skip the
+mke2fs when the target already holds a filesystem with a pacman cache in it,
+and let pacman pick up where it stopped. A mirror dropping mid-download is the
+likeliest failure a user will meet, and starting a 2.5 GB download again is
+the difference between a retry and an abandonment.
 
 
 7. The reboot
@@ -247,6 +288,8 @@ lands both come out.
     HKLM\...\Uninstall\MoCoLinux      the usual, with EstimatedSize
 
     <linux>\root.img                  the guest
+    <linux>\root-seed.img             the system that built it, kept as the
+                                      recovery disk on cobd1
     <linux>\mocolinux.ini             the launcher's settings, plain ini
     <linux>\logs\                     setup.log, boot.log, net.log, console.log
 
@@ -284,11 +327,13 @@ that is the recurring bugcheck 0x50 in this port's history.
 10. Still open
 ---------------
 
-  * The seed does not exist yet. tools/mkseedrootfs.sh, and the first run of
-    the family of scripts on a build host rather than inside a guest -- which
-    is also the TODO entry saying that has never been done.
-  * mocolinux-setup.service, the marker vocabulary above, and the package set
-    split between seed and desktop.
+  * The seed does not exist yet: mkmanjarorootfs.sh --seed, and the first run
+    of that script on a build host rather than inside a guest -- which is also
+    the TODO entry saying that has never been done.
+  * The mke2fs -F at the top of that script makes a retry start its 2.5 GB
+    download again. Resume wants a filesystem-and-cache check in front of it.
+  * mocolinux-setup.service, and the mapping from the script's `==>` lines to
+    the marker vocabulary above.
   * How long stage 4 really takes on a domestic connection through slirp, and
     therefore whether the number on the Welcome page is honest.
   * Whether the launcher's X option should offer to install the bundled server
