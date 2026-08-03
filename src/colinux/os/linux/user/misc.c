@@ -134,6 +134,20 @@ void co_udp_socket_close(int sock)
 	close(sock);
 }
 
+void* co_os_thread_start(co_os_thread_func_t func, void* arg)
+{
+	/* Not implemented on the Linux host; the live kernel-log stream is a
+	 * Windows-daemon feature. Returns NULL so the caller runs without it. */
+	(void)func;
+	(void)arg;
+	return NULL;
+}
+
+void co_os_thread_join(void* thread)
+{
+	(void)thread;
+}
+
 bool_t co_os_claim_single_instance(const char* name)
 {
 	/*

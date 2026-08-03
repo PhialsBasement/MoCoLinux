@@ -55,6 +55,11 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("      --boot-kernel FILE           Enter co_arch_start_kernel and report\n");
 	co_terminal_print("                                   what the kernel printed before stopping\n");
 	co_terminal_print("      --batch N                    Instructions the guest steps per crossing\n");
+	co_terminal_print("      --run CMD                    Start CMD in the running guest and return,\n");
+	co_terminal_print("                                   with DISPLAY set for the host's X server.\n");
+	co_terminal_print("                                   What the desktop shortcuts use.\n");
+	co_terminal_print("      --sync-cobd                  Perform block I/O inline (freezes the guest\n");
+	co_terminal_print("                                   for each transfer); async is the default.\n");
 	co_terminal_print("      --no-copic                   Do not interrupt a running guest. Ticks then\n");
 	co_terminal_print("                                   arrive only at idle and at exits to user mode,\n");
 	co_terminal_print("                                   so a userspace spin loop cannot be preempted.\n");
@@ -360,6 +365,15 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 	if (!CO_OK(rc))
 		return rc;
 
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--run",
+		&winnt_parameters->run,
+		winnt_parameters->run_arg,
+		sizeof(winnt_parameters->run_arg));
+
+	if (!CO_OK(rc))
+		return rc;
+
 	/*
 	 * --cobd0 .. --cobd3. The option name is built rather than written out
 	 * four times, so adding a unit is a change to CO_COBD_MAX_UNITS and
@@ -387,6 +401,12 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 
 	rc = co_cmdline_params_argumentless_parameter(
 		cmdline, "--no-copic", &winnt_parameters->no_copic);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_argumentless_parameter(
+		cmdline, "--sync-cobd", &winnt_parameters->sync_cobd);
 
 	if (!CO_OK(rc))
 		return rc;

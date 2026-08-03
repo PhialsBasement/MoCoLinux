@@ -1,0 +1,730 @@
+MoCoLinux design note: defect 3 -- asynchronous cooperative block I/O
+=====================================================================
+
+Status: design, ready to implement. No code has been written into the tree.
+Author's basis: read of the real sources listed under "Sources" at the end.
+All line numbers are as of the read on 2026-08-03.
+
+
+0. TL;DR and the two corrections to the target design
+-----------------------------------------------------
+
+The defect is real and the target shape (submit now, complete later, off the
+guest CPU) is correct. Two things in the proposed mechanism are wrong for THIS
+codebase and are corrected here; a third is simplified.
+
+  (1) Workers cannot be `co_os_thread_start`. That helper
+      (src/colinux/os/winnt/user/misc.c:240) is a user-mode `CreateThread` in
+      the DAEMON process. The block transfer is done in the KERNEL DRIVER:
+      co_cobd_request (src/colinux/kernel/cobd.c:212) -> co_os_bdev_rw
+      (src/colinux/os/winnt/kernel/lowlevel/blockio.c:136) -> ZwReadFile/
+      ZwWriteFile against a kernel handle, at PASSIVE_LEVEL, inside the KBOOT
+      ioctl thread. The workers MUST be kernel system threads
+      (PsCreateSystemThread), which do not exist yet and must be added as a
+      small os/winnt/kernel helper. This is the single most important finding.
+
+  (2) Completion delivery: choose option B (drain on the existing cooperative
+      tick / idle / exit-to-user hooks), NOT a new injected IRQ vector
+      (option A). Reasoning in section 5. Short version: the COPIC injector
+      (co_arch_inject_tick, switch.c:3161) can only deliver over a ring-3
+      frame and only after first idle -- a completion IRQ would inherit exactly
+      those constraints, so it would NOT be able to complete into a guest that
+      is busy in the kernel, which is the only case where A could theoretically
+      beat B. B already achieves <=1 ms latency with essentially zero new host
+      assembly and no new guest entry path.
+
+  (3) Simplification: do NOT put a submission ring in guest .bss. Submission is
+      already an atomic, cheap, correct handoff through the passage-page params
+      under preempt_disable (the guest does this today, cobd.c in the patch,
+      cobd_io_sg). Reuse it: the guest writes the same params plus a tag and
+      crosses; the host COPIES the request into a driver-side work queue and
+      returns immediately (no inline I/O). Only the COMPLETION path needs a ring
+      in guest memory, and it mirrors the net RX ring. This removes a whole
+      guest-side ring, its full/empty arithmetic, and a second new guest symbol,
+      for no measurable cost -- the crossing was never the freeze; the inline
+      ZwReadFile was.
+
+Net effect: submit = one cheap (~3.6 us) crossing that returns immediately;
+transfer happens on kernel worker threads; completions land in a guest .bss
+ring and are reaped on the tick the guest already takes. The guest scheduler,
+cotimer, console kthread and systemd watchdogs keep running throughout.
+
+
+1. The defect, precisely
+------------------------
+
+Guest side (patch/7.1.5/current-tree-snapshot.diff, drivers/block/cobd.c):
+  - cobd_queue_rq builds a scatter list into the request's PDU
+    (blk_mq_rq_to_pdu), then calls cobd_io_sg, then unconditionally
+    blk_mq_end_request(req, status) and returns BLK_STS_OK.
+  - cobd_io_sg does preempt_disable(); writes params[51..56]; cobd_switch(
+    CO_OPERATION_BLOCK_IO); reads params[56] as the result; preempt_enable().
+    The switch does not return until the host has finished the whole transfer.
+
+Host side (src/colinux/arch/x86_64/switch.c, monitor loop):
+  - At switch.c:4046, on op == CO_OPERATION_BLOCK_IO, the loop calls
+    co_cobd_request_sg (cobd.c:100) INLINE, which walks every descriptor and
+    every page and performs the full ZwReadFile/ZwWriteFile loop
+    (co_cobd_request, cobd.c:212 -> co_os_bdev_rw), then sets params[56] and
+    `continue`s -- i.e. re-enters the guest -- only after all I/O is done.
+
+Because the guest is single-CPU and the monitor thread is CPU-pinned
+(co_os_pin_cpu at manager.c:951), the guest makes NO progress of any kind for
+the entire duration of host disk I/O. Measured: 8.7 s of guest CPU over 5 m 14 s
+wall during mke2fs+pacman (~97% blocked), tripping systemd's 3-minute service
+watchdogs (journald, userdbd SIGABRT'd).
+
+Note this is a DIFFERENT and unrelated thing from
+co_os_file_block_async_read_write in src/colinux/os/winnt/kernel/block.c:136 --
+that is legacy coLinux message-based block I/O (co_monitor_file_block_*
+operations, CO_DEVICE_BLOCK messages) and is NOT on the cobd path. Do not
+confuse the two; the cobd path is cobd.c + blockio.c only.
+
+
+2. Facts that constrain the design (read, not assumed)
+------------------------------------------------------
+
+2a. The passage page and its params array.
+    Definition: patch/x86_64-state-struct.diff, `typedef struct
+    co_arch_passage_page`. first_page is 0x1000 bytes; within it:
+      host_state    @ 0x740  (co_arch_state_stack_t, 0x140)
+      linuxvm_state @ 0x880
+      operation     @ 0x9c0
+      params[0]     @ 0x9c8   -> params[n] at 0x9c8 + 8*n
+    So params runs to index (0x1000-0x9c8)/8 - 1 = 198. Current occupancy
+    (switch.c comments + code, and cobd.c in the patch):
+      [0..7] fault/counter/regsum; [8..15] guest GDT scratch (also aliased at
+      [64..73] for the real guest GDT, see switch.c:1679-1685);
+      [16..18] vector/errcode/cr2; [19] switch entry; [20..27] kcall;
+      [28] guest frame; [29] step; [30] batch; [31..46] trace; [47] trace idx;
+      [48] slept-ticks bank; [49] host monotonic 100ns; [50] host wallclock;
+      [51..56] block I/O (unit, offset, count, sg_pa, write, result).
+    FREE and usable immediately: [57..63] and [74..198]. We use exactly one new
+    slot, [57] = tag. No struct field is added, so NO new offset assertion is
+    strictly required (section 10 explains what to add anyway, and why).
+
+2b. How guest kernel symbols reach the host. The daemon resolves them from the
+    vmlinux ELF by name (src/colinux/user/elf_load.c, co_get_symbol_by_name)
+    and passes their VAs in the KBOOT ioctl params. See elf_load.c:2202
+    (co_colinux_passage_page), :2220-2234 (co_colinux_console_io,
+    co_colinux_net_io). manager.c:919-938 copies params into co_arch_boot_t and
+    calls co_console_set_address / co_net_set_address. This is the exact channel
+    the completion ring's address will travel through.
+
+2c. How the host reaches guest memory. co_kload_read / co_kload_write
+    (kload.h:118-121) walk the guest tables; co_kload_frame_va(pfn)
+    (kload.h:84) maps a guest physical frame to a host VA. co_cobd_request
+    already uses co_kload_frame_va per page. These are callable from any
+    PASSIVE_LEVEL thread, and the net pump ALREADY calls co_kload_write
+    concurrently with the monitor loop from a different process (net.c). Our
+    workers are threads in the SAME process (the driver), which is strictly
+    simpler.
+
+2d. The net rings are the pattern to mirror (guest:
+    drivers/net/conet_colinux.c struct co_net_io; host: src/colinux/kernel/
+    net.c). Key properties we copy for the completion ring:
+      - a plain EXPORT_SYMBOL'd .bss object, free-running masked indices,
+        full == head-tail == size;
+      - producer writes payload, then a store to the head index; on x86 store
+        order is the barrier (net.c:153-155, co_net_put); consumer reads head,
+        smp_rmb(), reads payload, then stores tail (conet co_net_rx_drain);
+      - the address is guarded by a mutex (net_lock, net.c:44) ONLY to protect
+        the address pointer against teardown, not the ring itself.
+
+2e. Injection reality (why option A buys nothing). co_arch_inject_tick
+    (switch.c:3161) refuses unless: addresses present; out->idle_yields>0
+    (guest has idled at least once, :3197); guest virtual IF set (:3217);
+    saved frame RFLAGS.IF set (:3241); AND the interrupted frame is ring 3
+    (:3282, the swapgs/SYSCALL hazard documented at :3244-3283). So the host
+    can only vector a synthetic interrupt into USERSPACE frames. A dedicated
+    completion vector would have the identical restriction and therefore could
+    not deliver into a kernel-mode-busy guest either -- the one scenario an IRQ
+    could beat polling. Meanwhile the guest already drains time on the tick
+    (HZ=1000), at idle (co_cpu_idle), and on EVERY return to userspace
+    (__exit_to_user_mode_prepare, patch line ~2835). Those are our drain points.
+
+2f. Kernel threading/sync already available in the driver:
+      - co_os_mutex (src/colinux/os/kernel/mutex.h, impl winnt/kernel/lowlevel/
+        mutex.c) -- PASSIVE_LEVEL mutex, used by net.
+      - co_os_wait (src/colinux/os/kernel/wait.h, impl winnt/kernel/lowlevel/
+        wait.c) -- a KEVENT SynchronizationEvent with sleep/wakeup.
+    MISSING: a kernel system-thread create/join. Must be added (section 9).
+
+2g. Teardown discipline. co_arch_boot_loaded runs the whole monitor loop and
+    then frees the stack and passage page (switch.c:4729-4736); guest RAM is
+    freed later at KLOAD_END / unload via co_kload_free, serialized by the
+    teardown lock (kload.h:127-133). Driver unload calls co_arch_boot_abort
+    (switch.c:3396) and waits on co_arch_boot_running (:3401). Everything the
+    workers touch (guest RAM, the passage page's guest CR3) is alive for the
+    duration of co_arch_boot_loaded and only freed after it returns. Therefore
+    joining workers INSIDE co_arch_boot_loaded, before it returns, closes the
+    race completely -- stronger than the net pump's cross-process guarantee.
+
+
+3. Mechanism
+------------
+
+3.1 Submission (guest -> host), reusing the params handoff
+----------------------------------------------------------
+
+Guest cobd_queue_rq, async branch (see 3.6 for the mode gate):
+  - blk_mq_start_request(req) as today.
+  - Build the SG list into cmd->sg[] (blk_mq_rq_to_pdu) exactly as today. The
+    PDU stays allocated and stable until we complete the request, because the
+    request stays outstanding -- this is what lets the host read the SG list
+    later from a worker.
+  - preempt_disable(); write the SAME params the sync path writes, PLUS the tag:
+        params[51] = unit
+        params[52] = offset (byte)
+        params[53] = count (num sg descriptors)
+        params[54] = sg_pa  (virt_to_phys(cmd->sg))
+        params[55] = write?1:0
+        params[57] = req->tag           (NEW: the blk-mq tag, 0..15)
+        params[56] = ~0ULL              (host overwrites: 0=accepted, 1=busy)
+    cobd_switch(CO_OPERATION_BLOCK_IO);
+    accepted = (params[56] == 0);
+    preempt_enable();
+  - if (!accepted)  ->  the driver-side host queue was full: return
+    BLK_STS_DEV_RESOURCE so blk-mq requeues and retries (backpressure, 3.7).
+    Do NOT end the request.
+  - if accepted     ->  return BLK_STS_OK WITHOUT blk_mq_end_request. The
+    request is now outstanding; it will be completed by the completion drain
+    (3.4) when its tag comes back.
+
+Host monitor loop, at switch.c:4046 (op == CO_OPERATION_BLOCK_IO), async mode:
+  - Read the six/seven words from params.
+  - Call co_cobd_async_submit(manager, unit, offset, sg_pa, count, write, tag).
+    This copies them into a driver-side work node, appends it to the submission
+    queue under a mutex, signals the worker wait channel, and returns a bool.
+  - params[56] = accepted ? 0 : 1;  out->block_requests++ (keep the heartbeat).
+  - `continue;` -- return to the guest immediately. No inline I/O.
+
+Why params handoff and not a guest submission ring: the handoff is already
+atomic and correct (preempt_disable makes the param-write + crossing
+uninterruptible on the single guest CPU; the host copies before returning, so
+param reuse by the next request is safe). It needs no ring memory, no
+full/empty arithmetic in the guest, and no second guest symbol. The crossing
+cost (~3.6 us) is three orders of magnitude below the I/O it replaces inline.
+
+3.2 The driver-side submission queue and worker pool (host, in-kernel)
+----------------------------------------------------------------------
+
+New host module, portable part: src/colinux/kernel/cobd_async.c (+ .h). It owns:
+  - a fixed array of work nodes (a slot pool), each:
+        struct co_cobd_work { int unit; unsigned long long offset;
+                              unsigned long long sg_pa; unsigned int count;
+                              bool_t write; unsigned int tag;
+                              volatile int in_use; };
+    Size the pool >= total possible outstanding = COBD_MAX_UNITS(4) *
+    queue_depth(16) = 64. Use 64 (or round to 128 for headroom). A full pool is
+    the backpressure signal (3.7).
+  - a submission FIFO (indices into the pool, or an intrusive singly-linked
+    list of nodes) protected by co_os_mutex `sub_lock`.
+  - a co_os_wait `sub_wait` the workers sleep on when the FIFO is empty.
+  - a volatile `stopping` flag.
+  - the completion-ring address + `comp_lock` (co_os_mutex), set/cleared like
+    net_io_va (3.3).
+  - N worker kernel threads (section 9 helper). Recommended N: one per attached
+    unit, created lazily, or simply a small fixed pool. See 3.8 for the count
+    rationale; ONE worker is correct and sufficient for the fix -- start there.
+
+Worker loop (each thread, PASSIVE_LEVEL):
+    for (;;) {
+        node = dequeue(sub_lock);            // NULL if empty
+        if (!node) {
+            if (stopping) return;            // exit -> thread terminates
+            co_os_wait_sleep(sub_wait);      // woken by submit or by stop
+            continue;
+        }
+        rc = co_cobd_request_sg(manager, node->unit, node->offset,
+                                node->sg_pa, node->count, node->write);
+        result = CO_OK(rc) ? 0 : 1;
+        co_cobd_complete(node->unit, node->tag, result);   // 3.3
+        free_node(node);
+    }
+
+co_cobd_request_sg / co_cobd_request are reused UNCHANGED -- they already walk
+guest memory by co_kload_frame_va and validate every descriptor and bound
+(cobd.c:100-291). They are pure functions of (manager, params) with no global
+state except cobd_unit[], which is read-only during a run. Running them on a
+worker thread instead of the monitor thread is safe: co_kload_frame_va is a
+pure arithmetic map over stable allocations, and distinct workers touch
+distinct guest pages (different requests) and distinct file offsets.
+
+3.3 The completion ring (host -> guest), a new guest .bss symbol
+----------------------------------------------------------------
+
+New guest object, drivers/block/cobd.c, EXPORT_SYMBOL'd, mirroring co_net_io:
+
+    #define CO_COBD_COMP_SLOTS   128        /* power of two, >= 64 */
+    struct co_cobd_comp {
+        __u32 unit;
+        __u32 tag;
+        __u32 result;                       /* 0 = OK, 1 = I/O error */
+        __u32 pad;
+    };                                       /* 16 bytes, fixed size */
+
+    struct co_cobd_io {
+        volatile __u32 enabled;             /* host sets 1 at boot if async on */
+        volatile __u32 comp_head;           /* host writes (producer) */
+        volatile __u32 comp_tail;           /* guest writes (consumer) */
+        volatile __u32 pad;
+        struct co_cobd_comp comp[CO_COBD_COMP_SLOTS];
+    };
+    struct co_cobd_io co_colinux_cobd_io;
+    EXPORT_SYMBOL(co_colinux_cobd_io);
+
+This is a SLOT ring (fixed-size records), not a byte ring -- simpler than net
+because completion records are fixed size. Indices free-run and are masked by
+(CO_COBD_COMP_SLOTS-1); full == head-tail == CO_COBD_COMP_SLOTS. The ring can
+never actually fill because outstanding <= 64 < 128 and each outstanding
+request yields exactly one completion, but the producer still checks and treats
+full as a hard error (it would mean the guest stopped draining, i.e. a bug).
+
+Host ABI offsets into struct co_cobd_io (declared in cobd_async.c, mirroring
+net.c's CO_NIO_* block, must match the guest struct which is declared ABI):
+    ENABLED   0x00
+    COMP_HEAD 0x04
+    COMP_TAIL 0x08
+    COMP      0x10, stride 0x10, CO_COBD_COMP_SLOTS entries
+
+Host producer, co_cobd_complete(unit, tag, result):
+    co_os_mutex_acquire(comp_lock);
+    if (!cobd_io_va) { release; return; }           // torn down
+    read comp_head, comp_tail via co_kload_read;
+    if (comp_head - comp_tail >= CO_COBD_COMP_SLOTS) { // "cannot happen"
+        co_debug_error("cobd: completion ring full"); release; return; }
+    off = comp_head & (SLOTS-1);
+    write {unit,tag,result,0} to cobd_io_va + COMP + off*0x10 via co_kload_write;
+    // payload is fully written before the index that announces it; x86 store
+    // order is the barrier, exactly as co_net_put relies on (net.c:153-155).
+    write (comp_head + 1) to cobd_io_va + COMP_HEAD via co_kload_write;
+    co_os_mutex_release(comp_lock);
+
+The mutex serializes MULTIPLE WORKERS producing into one ring (3.8). One guest
+consumer, no lock needed on the guest side.
+
+3.4 Guest completion drain (consumer)
+-------------------------------------
+
+New guest function in drivers/block/cobd.c:
+
+    void co_cobd_drain_completions(void)
+    {
+        struct co_cobd_io *io = &co_colinux_cobd_io;
+        u32 head = io->comp_head;
+        u32 tail = io->comp_tail;
+
+        while (tail != head) {
+            struct co_cobd_comp *c;
+            struct cobd_dev *dev;
+            struct request *rq;
+
+            smp_rmb();                       // pairs with host store order
+            c = &io->comp[tail & (CO_COBD_COMP_SLOTS - 1)];
+            if (c->unit < COBD_MAX_UNITS &&
+                (dev = &cobd_devs[c->unit])->disk &&
+                c->tag < dev->tag_set.queue_depth) {
+                rq = blk_mq_tag_to_rq(dev->tag_set.tags[0], c->tag);
+                if (rq && blk_mq_request_started(rq))
+                    blk_mq_end_request(rq,
+                        c->result ? BLK_STS_IOERR : BLK_STS_OK);
+            }
+            tail++;
+        }
+        io->comp_tail = tail;                // x86 store order: after the loads
+    }
+
+Notes:
+  - Use the numeric blk-mq tag as the cookie and resolve it with
+    blk_mq_tag_to_rq, NOT a raw struct request* passed through the host. A
+    corrupted completion record then cannot turn into an arbitrary kernel
+    pointer; the worst case is a NULL or a request that is not started, both
+    handled. nr_hw_queues==1, so tags[0] is the only tag map.
+  - blk_mq_end_request is legal from any context including the injected-IRQ
+    context of sysvec_co_timer and the irqs-disabled context of drain_time.
+    (Alternative, more idiomatic: set a status field in cmd->pdu and call
+    blk_mq_complete_request with a registered .complete op; equivalent here,
+    and blk_mq_end_request is fewer moving parts. Either is acceptable.)
+  - Double completion is prevented by the protocol: the host appends exactly
+    one completion per accepted submission, and blk_mq_request_started guards a
+    tag that was already ended and recycled. This directly avoids the recurring
+    0x50-class double-completion the memory notes warn about, on the guest side.
+
+Hook points (all already exist in the patch):
+  - sysvec_co_timer (patch line ~1418): after the take_ticks loop, call
+    co_cobd_drain_completions(). Fires up to HZ=1000 times/s over ring-3.
+  - co_colinux_drain_time (patch line ~1429): after its take_ticks work. This
+    is called from co_cpu_idle (idle boundary) and from
+    __exit_to_user_mode_prepare (every syscall/exception return, patch ~2835).
+  Practically: add ONE call inside co_colinux_drain_time, and one inside
+  sysvec_co_timer. To keep drivers/block/cobd.c decoupled from
+  arch/x86/kernel/process.c, expose a registered function pointer set at cobd
+  init:  process.c holds `void (*co_cobd_drain)(void)` (default NULL), calls it
+  if non-NULL; cobd_init sets it. (Mirrors how other cooperative bits are wired
+  by symbol.) A direct extern also works since cobd is obj-y and built-in.
+
+Latency: a task waiting on a read goes to sleep -> co_cpu_idle -> host sleeps
+1 ms -> re-enters -> drain_time -> co_cobd_drain_completions -> blk_mq_end ->
+waiter woken. Worst case ~1 ms; typically less because exit-to-user drains too.
+
+3.5 Passage-page params used
+----------------------------
+No new struct field. Uses existing free slot params[57] for the tag, and the
+existing params[51..56] with params[56] now meaning "accepted(0)/busy(1)"
+instead of "io result(0/1)". Guest and host both change meaning together.
+
+3.6 Mode negotiation (so the sync path survives behind a flag)
+--------------------------------------------------------------
+A single host->guest enable byte, co_colinux_cobd_io.enabled:
+  - Daemon gets a new flag, --async-cobd (default OFF during bring-up, ON once
+    proven). It sets a new KBOOT param `async_cobd` (0/1) and resolves
+    co_colinux_cobd_io -> cobd_io_va, both handed to the driver.
+  - Host: if async_cobd && cobd_io_va, before entering the guest it writes
+    enabled=1 into the ring (co_kload_write) and starts the worker pool; else
+    it leaves enabled=0 and never starts workers.
+  - Guest cobd_queue_rq reads co_colinux_cobd_io.enabled ONCE (cache in a
+    static bool at first call, or read per call -- it is one word):
+      enabled  -> async path (3.1): submit, return outstanding.
+      !enabled -> the EXISTING sync path unchanged: cobd_io_sg reads params[56]
+                  as the result and blk_mq_end_request inline.
+Both host and guest branch on the same fact, so they can never disagree. With
+the flag off the behaviour is byte-for-byte today's, which is the tested
+fallback and the A/B baseline.
+
+3.7 Backpressure
+----------------
+The only place submission can fail for flow-control reasons is the driver-side
+work-node pool being full. Because outstanding <= 64 and the pool is >= 64,
+this should never happen; if it does, the host returns "busy" (params[56]=1)
+and the guest returns BLK_STS_DEV_RESOURCE, which tells blk-mq to requeue and
+retry after a short delay -- the correct, lossless response. Never drop or
+error a request for lack of a slot. (Contrast the net TX ring, which drops,
+because ethernet tolerates loss; block I/O does not.)
+
+3.8 Worker count
+----------------
+The backing handle is opened FILE_SYNCHRONOUS_IO_NONALERT (blockio.c:112), so
+the I/O manager serializes all requests on a single file object regardless of
+how many threads call it. Consequences:
+  - More than one worker PER UNIT buys nothing: they serialize on the handle.
+  - Different units have different handles and CAN proceed in parallel.
+Recommendation:
+  - Bring-up: ONE worker thread total. It fully fixes the freeze (the point is
+    that I/O is off the guest CPU, not that it is parallel) and is the simplest
+    thing to get right.
+  - Production: a small fixed pool, ideally sized to the number of ATTACHED
+    units (co_cobd_present), giving cross-unit parallelism with no wasted
+    threads. Do NOT try to parallelize a single unit; that would require
+    reopening handles without FILE_SYNCHRONOUS_IO and an event-per-request wait,
+    a much larger change that this defect does not need.
+A single global submission FIFO feeding the pool is fine; per-unit ordering is
+not required by the block layer for correctness, and the completion ring
+carries the tag so out-of-order completion is expected and handled.
+
+
+4. Concurrency analysis
+-----------------------
+
+Threads in play during a run:
+  T0  the KBOOT/monitor thread (CPU-pinned), running co_arch_boot_loaded.
+  T1..Tn  cobd worker kernel threads (PASSIVE_LEVEL, not pinned).
+  Tx  possibly another process's thread doing KSTOP/unload -> co_arch_boot_abort.
+  (The guest itself is single-CPU and runs only while T0 is inside the switch.)
+
+4a. Submission queue: single producer (T0), multiple consumers (T1..Tn).
+    Guard the FIFO and the node pool with `sub_lock` (co_os_mutex). Signal
+    `sub_wait` on every enqueue. Standard, no lock ordering issues (sub_lock is
+    a leaf; workers never hold it across co_cobd_request_sg or co_kload_*).
+
+4b. Completion ring: multiple producers (T1..Tn), single consumer (the guest).
+    Guard the host producer with `comp_lock` so two workers cannot interleave a
+    record write with a head advance. The guest consumer needs no lock (one
+    consumer) and pairs with the producer via smp_rmb / x86 store order exactly
+    as conet does. comp_lock is a leaf held only across the co_kload_write pair.
+
+4c. Memory ordering. Host producer: write the 16-byte record, THEN write
+    comp_head. On x86 (both host and guest are x86-64) stores are not reordered
+    with other stores, so no explicit host barrier is needed beyond ordinary C
+    statement order through co_kload_write -- this is the identical argument
+    net.c:153-155 makes and it has been validated on hardware. Guest consumer:
+    read comp_head, smp_rmb(), read the record, process, then store comp_tail
+    (its store cannot pass the preceding loads on x86, so the host will not
+    overwrite a record still being read -- same as conet co_net_rx_drain).
+    The `enabled` word is written once by the host before any guest I/O and read
+    by the guest; no ordering subtlety (it gates the very first submission).
+
+4d. Teardown race (the important one). Ordering inside co_arch_boot_loaded:
+      setup:   if async: co_cobd_async_start(manager, cobd_io_va)  // create
+               locks/wait, spawn workers, they begin serving.
+      loop:    ... enqueue on BLOCK_IO ...
+      end:     (loop breaks on idle cap / TERMINATE / abort / fatal fault)
+      STOP:    co_cobd_async_stop():
+                 stopping = 1;
+                 co_os_wait_wakeup(sub_wait) for each worker (or broadcast);
+                 join every worker (KeWaitForSingleObject on the thread object);
+                 co_os_mutex_acquire(comp_lock); cobd_io_va = 0;
+                   co_os_mutex_release(comp_lock);   // no late producer
+                 drain/free the FIFO and pool; destroy sub_lock, comp_lock,
+                 sub_wait.
+      then:    existing co_os_free_exec_pages / stack free (switch.c:4729).
+    Because stop() JOINS before co_arch_boot_loaded returns, and guest RAM /
+    guest CR3 are only freed AFTER it returns (KLOAD_END / co_kload_free,
+    kload.h:127), no worker can walk freed tables. This is the discipline the
+    memory notes call KREAD teardown-gap, satisfied by construction: the readers
+    are in-process and joined on the same thread that owns the guest's lifetime.
+    A worker blocked in a synchronous ZwReadFile at stop time delays the join by
+    at most one request (bounded, low ms); it cannot be cancelled mid-call and
+    must not be (that is the "never taskkill / unload the driver first" rule --
+    here unload already waits on co_arch_boot_running, and stop() completes the
+    join before the loop clears boot_loop_active at switch.c:4693). Move the
+    boot_loop_active=0 store to AFTER co_cobd_async_stop() so unload cannot
+    proceed until workers are gone.
+
+4e. Abort path. co_arch_boot_abort (Tx) only sets boot_loop_abort; the loop
+    observes it and breaks; stop() then runs on T0 as above. Workers are never
+    torn down from Tx. No cross-thread thread-kill anywhere.
+
+
+5. Completion delivery: A vs B, decision
+-----------------------------------------
+
+Option A: host injects a new COPIC vector (say CO_COBD_VECTOR) when it appends
+completions, guest handles it in a new DEFINE_IDTENTRY_SYSVEC that drains.
+
+Option B (RECOMMENDED): guest drains the completion ring on the hooks it
+already runs -- sysvec_co_timer (HZ=1000), co_colinux_drain_time at idle, and
+__exit_to_user_mode_prepare on every return to userspace.
+
+Decision: B.
+
+  Latency: B is <=1 ms in the wait-for-I/O case (idle re-entry cadence) and
+  effectively immediate whenever the guest is returning to userspace, which
+  under any real workload is constantly. A would be "immediate" only in the
+  cases where injection is permitted -- and those are a STRICT SUBSET of "guest
+  in userspace", which B already covers via exit-to-user. A cannot deliver into
+  a kernel-busy guest (2e), so it has no latency win in the only case B is slow.
+
+  Code size / risk: A requires a new guest idtentry, a new host injector
+  mirroring co_arch_inject_tick's frame surgery (switch.c:3161-3317) with all
+  of its swapgs/SYSCALL-window hazards (the exact class of bug that triple
+  faulted under Steam, :3277-3280), a new vector constant, and per-crossing
+  injection accounting. B requires two one-line calls into an existing drain and
+  a fixed-size ring. B is a fraction of the risk and touches none of the parts
+  of the port that have historically triple-faulted.
+
+  When A would ever be worth it: only if a future workload showed real block
+  latency dominated by a guest that is CPU-bound in the KERNEL for long
+  stretches with no syscalls and no idle. That is pathological and, even then,
+  A could not help (injection is userspace-only). So A is not merely unnecessary
+  now, it is architecturally unable to beat B under the port's current injection
+  constraints. Revisit only if those constraints change (e.g. a kernel-frame
+  injection path is ever built for other reasons).
+
+
+6. Error propagation
+---------------------
+
+  - A transfer that fails in co_cobd_request_sg / co_os_bdev_rw returns
+    non-OK; the worker sets result=1 and appends {unit, tag, 1} to the
+    completion ring. The guest drain calls blk_mq_end_request(rq, BLK_STS_IOERR)
+    for that exact tag. This preserves today's semantics (out->block_errors is
+    still counted -- increment it in the worker or in co_cobd_async_complete so
+    the heartbeat/report is unchanged).
+  - A submission the host refuses for flow control (pool full) returns busy ->
+    BLK_STS_DEV_RESOURCE -> requeue (not an error).
+  - A submission that is structurally invalid (bad unit, count out of range) is
+    still caught by co_cobd_request_sg's existing validation on the worker and
+    becomes a per-tag BLK_STS_IOERR, same as a media error. The guest-side
+    param handoff itself cannot fail once accepted.
+  - Ring desync defence: if the guest drain ever reads comp_head-comp_tail >
+    CO_COBD_COMP_SLOTS, or a record with unit>=COBD_MAX_UNITS, it logs
+    (net_err_ratelimited style) and resets comp_tail=comp_head, matching conet's
+    resync stance. This is a bug tripwire, not expected weather.
+
+
+7. Incremental bring-up plan
+----------------------------
+
+Each step builds and is testable on hardware; the box auto power-cycles, so
+these are poll-and-observe, not ask.
+
+  Step 0 (no behaviour change): add the guest struct co_cobd_io + EXPORT_SYMBOL
+    with enabled defaulted 0; add co_cobd_drain_completions and wire the two
+    guest hooks (they no-op while the ring is empty and enabled==0). Add the
+    daemon symbol resolution + KBOOT param + host cobd_io_va setter, but leave
+    async_cobd default OFF. Result: identical to today; proves the plumbing
+    compiles, the symbol resolves, and the drain is harmless.
+
+  Step 1 (host worker infra, still sync): add the kernel-thread helper
+    (section 9), cobd_async.c with start/stop/submit/complete and ONE worker,
+    and co_cobd_async_start/stop calls in co_arch_boot_loaded -- but keep
+    async_cobd OFF so submit is never called and workers idle-sleep and are
+    joined cleanly at stop. Proves thread lifecycle and teardown/join under real
+    runs and under stop.bat / unload, with zero I/O behaviour change.
+
+  Step 2 (enable async behind the flag): turn on --async-cobd. Host writes
+    enabled=1, monitor loop routes BLOCK_IO to co_cobd_async_submit, guest takes
+    the async branch. Test matrix: mount, dd read/write (throughput vs the 140
+    MB/s sync baseline), mke2fs + pacman install (the workload that tripped the
+    watchdogs -- confirm guest CPU% and that journald/userdbd no longer SIGABRT),
+    and a forced I/O error (detach/bad offset) to confirm BLK_STS_IOERR reaches
+    the right tag. Flip the flag off to A/B against the known-good sync path at
+    any time.
+
+  Step 3 (scale workers): if cross-unit throughput matters, grow to one worker
+    per attached unit. Pure host-side change, no ABI impact.
+
+
+8. File-by-file change list
+---------------------------
+
+Guest (patch/7.1.5/current-tree-snapshot.diff):
+  - drivers/block/cobd.c:
+      * add struct co_cobd_comp / struct co_cobd_io + `struct co_cobd_io
+        co_colinux_cobd_io; EXPORT_SYMBOL(...)`.
+      * add co_cobd_drain_completions().
+      * cobd_queue_rq: split into sync (existing) and async branches on
+        co_colinux_cobd_io.enabled; async path returns outstanding, sets
+        params[57]=req->tag, checks accepted, no blk_mq_end_request.
+      * cobd_io_sg: async variant that returns accepted/busy instead of the I/O
+        result (or a small new co_cobd_submit()).
+      * cobd_init: register the drain pointer (or rely on extern).
+  - arch/x86/kernel/process.c (the cotimer/idle file in the patch):
+      * co_colinux_drain_time(): call co_cobd_drain (if set) after take_ticks.
+      * sysvec_co_timer: same call after the tick loop.
+      * declare `void (*co_cobd_drain)(void);` (or extern
+        co_cobd_drain_completions) as chosen in 3.4.
+
+Host (src/):
+  - src/colinux/kernel/cobd_async.c (NEW) + cobd_async.h (NEW): the submission
+    FIFO, node pool, worker loop, completion producer, start/stop/submit/
+    complete, and the cobd_io_va + comp_lock (mirror net.c's address/mutex
+    pattern and CO_NIO_* offset block).
+  - src/colinux/kernel/cobd.c: no change to co_cobd_request/_sg (reused as-is).
+  - src/colinux/arch/x86_64/switch.c:
+      * monitor loop at :4046: on BLOCK_IO, if async enabled call
+        co_cobd_async_submit and set params[56]=accepted?0:1; else keep the
+        existing inline co_cobd_request_sg. (Guard by a boolean the boot passes
+        in via co_arch_boot_t, see below.)
+      * co_arch_boot_loaded: call co_cobd_async_start after setup and
+        co_cobd_async_stop at loop end BEFORE freeing anything and before
+        clearing boot_loop_active (:4693 move).
+  - src/colinux/arch/switch.h: add `int async_cobd; unsigned long long
+    cobd_io_va;` to co_arch_boot_t (co_arch_boot_result_t may gain
+    block_async_submits / block_busy counters for the heartbeat -- optional).
+  - src/colinux/kernel/manager.c (KBOOT handler, :919-938): copy
+    params->async_cobd and params->cobd_io_va into `in`; the arch layer sets the
+    ring address into cobd_async (or call a co_cobd_set_address here, mirroring
+    co_net_set_address at :937).
+  - src/colinux/common/ioctl.h (co_manager_ioctl_kboot_t): add `async_cobd` and
+    `cobd_io_va` fields (mirror the existing net_io_va / console_io_va fields).
+  - src/colinux/user/elf_load.c (~:2220): resolve co_colinux_cobd_io by name
+    (co_get_symbol_by_name), set b.cobd_io_va; add the --async-cobd option ->
+    b.async_cobd. Print the ring address like the net/console lines.
+
+New kernel OS helper (see section 9):
+  - src/colinux/os/kernel/misc.h: declare co_os_kthread_start / co_os_kthread_join
+    (kernel-side analogues of the user co_os_thread_* in os/user/misc.h:70-72).
+  - src/colinux/os/winnt/kernel/lowlevel/thread.c (NEW) or add to an existing
+    lowlevel .c: PsCreateSystemThread + ObReferenceObjectByHandle(thread) so the
+    handle can be closed while a KTHREAD ref is kept; join =
+    KeWaitForSingleObject(thread-object, Executive, KernelMode, FALSE, NULL) then
+    ObDereferenceObject. Worker returns via PsTerminateSystemThread(STATUS_SUCCESS).
+    Build wiring: add the new .c to the winnt kernel .comake/Makefile alongside
+    mutex.c / wait.c / blockio.c.
+
+Build: cobd_async.c joins the portable kernel objects (same list as cobd.c /
+net.c in src/colinux/kernel).
+
+
+9. The kernel-thread helper (mandatory new primitive)
+-----------------------------------------------------
+
+There is no PsCreateSystemThread anywhere in the tree today (grep confirms).
+Add, in the winnt KERNEL tree (not user):
+
+    void* co_os_kthread_start(void (*func)(void*), void* arg);
+    void  co_os_kthread_join(void* thread);   // waits + drops the ref
+
+Implementation sketch (winnt kernel):
+    - trampoline: DWORD/VOID NTAPI that calls func(arg) then
+      PsTerminateSystemThread(STATUS_SUCCESS).
+    - start: PsCreateSystemThread(&h, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+      trampoline, ctx); ObReferenceObjectByHandle(h, ..., *PsThreadType, KernelMode,
+      &object, NULL); ZwClose(h); return object.
+    - join: KeWaitForSingleObject(object, Executive, KernelMode, FALSE, NULL);
+      ObDereferenceObject(object).
+Keeping the KTHREAD object reference (not the handle) is what makes the join
+race-free against the thread exiting. This mirrors the user helper's contract
+(os/user/misc.h:60-72) but with kernel primitives. All calls are PASSIVE_LEVEL,
+which the KBOOT ioctl thread and the workers are.
+
+
+10. Passage-page ABI / build-time offset assertions
+----------------------------------------------------
+
+  - NO new passage-page STRUCT FIELD and therefore NO change to the
+    co_arch_passage_page layout in patch/x86_64-state-struct.diff. We consume
+    the already-existing free slot params[57] (offset 0xb90) and reinterpret
+    params[56] (0xb88). The offset-assertion block at switch.c:1412-1429 asserts
+    specific indices against CO_PP_*_N literals; none of those indices move, so
+    that block is untouched.
+  - RECOMMENDED additions in the port's own style (defensive, cheap):
+      * In drivers/block/cobd.c add compile-time checks that
+        sizeof(struct co_cobd_comp)==16 and offsetof(struct co_cobd_io, comp)==
+        0x10 and that CO_COBD_COMP_SLOTS is a power of two -- because the host's
+        CO_COBD_* offset literals in cobd_async.c are hand-written against this
+        layout, exactly the situation net.c documents as "declared ABI" (net.c:
+        21-22). A BUILD_BUG_ON in the guest and a `typedef char [...] ? 1 : -1`
+        in the host keep the two definitions from drifting.
+      * Add a symmetry note/assert that params[57] and the [51..56] block are
+        the SAME indices the guest cobd.c hardcodes via CO_PP_PARAM(n); those
+        are literals on both sides (guest: patch cobd.c CO_PP_PARAMS 0x9c8; host:
+        params[] base 0x9c8) and there is no shared header, so a comment cross-
+        referencing both is the only guard available -- add it in both files.
+  - The completion ring's own layout is guarded by the guest/host asserts above,
+    not by the passage-page assertions (it is not in the passage page).
+
+
+11. Residual risks and things to watch
+---------------------------------------
+
+  - preempt_disable across a crossing is unchanged from today and remains
+    correct: it prevents the guest scheduler from interleaving two tasks'
+    param writes on the single guest CPU. The async path still writes params
+    under preempt_disable and the host still copies before returning.
+  - blk_mq_end_request from sysvec_co_timer runs in interrupt context; confirm
+    on first hardware run that no cobd completion path assumes process context
+    (it should not; the request's bio endio work is deferred appropriately).
+    If any lockdep/context complaint appears, switch to the blk_mq_complete_
+    request + .complete-op form (3.4) which steers completion to softirq.
+  - The FILE_SYNCHRONOUS_IO_NONALERT handle serializes per unit; this is fine
+    for the fix and is called out so no one is surprised that adding workers to
+    one unit does not speed it up (3.8).
+  - Worker joins can be delayed up to one in-flight ZwReadFile at stop; this is
+    bounded and is strictly better than the current inline behaviour (which
+    blocks the guest for the WHOLE queue). Confirm stop.bat and driver unload
+    latency remain acceptable.
+  - Keep the heartbeat honest: route block_requests/block_errors counting
+    through the worker/complete path so the "hb: ... blkio" line and
+    out->block_* still reflect reality once I/O moved off the monitor thread.
+
+
+Sources (all under src/colinux/ unless noted), read for this design
+--------------------------------------------------------------------
+  kernel/cobd.c                                  co_cobd_request(_sg), reused
+  os/winnt/kernel/lowlevel/blockio.c             co_os_bdev_rw = ZwReadFile (kernel!)
+  os/winnt/kernel/block.c                        legacy msg block path (NOT cobd)
+  arch/x86_64/switch.c                           monitor loop :4046, inject :3161,
+                                                 teardown :4686-4736, abort :3396
+  arch/switch.h                                  co_arch_boot_t / _result_t
+  patch/x86_64-state-struct.diff                 co_arch_passage_page layout, params
+  patch/7.1.5/current-tree-snapshot.diff         guest cobd.c, co_net_io, cotimer,
+                                                 co_colinux_drain_time, exit-to-user
+  kernel/net.c + drivers/net/conet_colinux.c     the ring pattern mirrored here
+  kernel/kload.h                                 co_kload_read/write/frame_va, teardown lock
+  kernel/manager.c :910-953                      KBOOT param plumbing, pin, net addr
+  user/elf_load.c :2095-2235                     symbol resolution -> boot params
+  os/user/misc.h :60-72, os/winnt/user/misc.c    user co_os_thread_* (NOT usable in driver)
+  os/kernel/wait.h, os/kernel/mutex.h            existing kernel sync primitives

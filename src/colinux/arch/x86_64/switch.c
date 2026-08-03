@@ -47,6 +47,7 @@
 #include <colinux/arch/space.h>
 #include <colinux/kernel/kload.h>
 #include <colinux/kernel/cobd.h>
+#include <colinux/kernel/cobd_async.h>
 #include <colinux/kernel/console.h>
 
 #include "mmu.h"
@@ -685,6 +686,45 @@ asm(".text                                                          \n"
     "    add %r11, %rax                                             \n"
     "    andl $0xfffffdff, 4(%rax)     /* clear the busy bit */     \n"
     "    ltr " CO_ARCH_STATE_STACK_TR "(%rdx)                       \n"
+    /*
+     * And clear it again -- but ONLY when the side being entered is the
+     * guest. Never in Windows' GDT.
+     *
+     * The window this closes is the guest's: it writes its TSS descriptor and
+     * is about to ltr when a hardware interrupt lands between the two. The
+     * crossing re-enters through this path, this ltr marks the descriptor
+     * busy, and the guest resumes at its own ltr -- which the CPU refuses with
+     * #GP(TSS selector), error code 0x40. Boot dies seconds in, only when an
+     * interrupt hits an instructions-wide window, which is why it presented as
+     * a coin-flip weighted by how busy the host was.
+     *
+     * Doing it unconditionally is what the first version did, and it left the
+     * HOST's TSS descriptor permanently marked available instead of busy --
+     * a standing modification to a live processor GDT. XP x64 is the first
+     * Windows with Kernel Patch Protection, and a modified GDT is precisely
+     * what it checks for: bugcheck 0x109 CRITICAL_STRUCTURE_CORRUPTION with
+     * parameter 4 = 3 ("a processor GDT") and parameter 3 pointing at the
+     * host's own GDT base. Because the check runs on a timer, the machine died
+     * minutes later, with the box idle and nothing of ours on the stack --
+     * which is why it read as a spontaneous, unrelated crash. This is the same
+     * reason arch/i386's antinx has no successor here: the host's structures
+     * are not ours to edit.
+     *
+     * Leaving the GUEST's descriptor available is safe and is what its own ltr
+     * needs: TR caches the descriptor on load and never re-reads memory, long
+     * mode has no hardware task switching, so the only consumer of the busy
+     * bit is ltr itself -- the one instruction that wants it clear. And the
+     * guest's GDT is the guest's to keep consistent.
+     *
+     * rdx is the entering side's state block inside the page-aligned passage
+     * page, so its low twelve bits identify the side -- the same test the
+     * extended-state save uses above.
+     */
+    "    mov %rdx, %r11                                             \n"
+    "    and $0xfff, %r11d                                          \n"
+    "    cmp $" CO_PP_LINUXVM_STATE ", %r11d                        \n"
+    "    jne 3f                                                     \n"
+    "    andl $0xfffffdff, 4(%rax)                                  \n"
     "3:                                                             \n"
     /* onto the other side's stack, then far-return to its cs:rip */
     "    mov " CO_ARCH_STATE_STACK_RSP "(%rdx), %rsp                \n"
@@ -3682,6 +3722,20 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		boot_loop_active = 1;
 
 		/*
+		 * Start the async block workers before the guest runs. If it
+		 * fails, or async is off (--sync-cobd), the monitor loop falls
+		 * back to inline transfers -- co_cobd_async_submit is simply
+		 * never called because the BLOCK_IO branch checks in->async_cobd.
+		 */
+		if (in->async_cobd && in->cobd_io_va) {
+			if (!CO_OK(co_cobd_async_start(manager, in->cobd_io_va))) {
+				co_debug("boot: async cobd unavailable -- "
+					 "falling back to inline block I/O");
+				in->async_cobd = 0;
+			}
+		}
+
+		/*
 		 * A finer host clock for the duration of the run.
 		 *
 		 * Every sleep this loop takes is rounded up to the host's clock
@@ -4034,6 +4088,38 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 					 * params[53] is how many descriptors it
 					 * holds -- a whole request in one
 					 * crossing rather than one per page.
+					 */
+					if (in->async_cobd && in->cobd_io_va) {
+						/*
+						 * Async (default): queue the
+						 * request to a worker thread and
+						 * return to the guest at once, so
+						 * the single guest CPU is not held
+						 * for the whole transfer. The
+						 * completion comes back through the
+						 * co_colinux_cobd_io ring, reaped on
+						 * the guest's tick. params[56] is
+						 * now accepted(0)/busy(1); params[57]
+						 * carries the blk-mq tag.
+						 */
+						bool_t ok = co_cobd_async_submit(
+							(int)pp->params[51],
+							pp->params[52],
+							pp->params[54],
+							(unsigned int)pp->params[53],
+							pp->params[55] ? PTRUE : PFALSE,
+							(unsigned int)pp->params[57]);
+
+						pp->params[56] = ok ? 0 : 1;
+						hb_blk++;
+						out->block_requests++;
+						continue;
+					}
+
+					/*
+					 * Sync fallback (--sync-cobd): perform the
+					 * transfer inline. Correct but freezes the
+					 * guest for its duration -- defect 3.
 					 */
 					brc = co_cobd_request_sg(manager,
 							      (int)pp->params[51],
@@ -4672,6 +4758,21 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		}
 
 		out->guest_switches = guest_crossings;
+
+		/*
+		 * Join the async workers before clearing boot_loop_active, and
+		 * before this function frees the stack and passage page below --
+		 * and well before guest RAM is freed at KLOAD_END. A worker's
+		 * page-table walk can then never outlive the memory it walks.
+		 * Clearing boot_loop_active only after the join means a driver
+		 * unload waiting on co_arch_boot_running cannot proceed until the
+		 * workers are gone either.
+		 */
+		if (in->async_cobd && in->cobd_io_va) {
+			co_cobd_async_stop();
+			out->block_errors += co_cobd_async_errors();
+		}
+
 		boot_loop_active    = 0;
 
 		/*
