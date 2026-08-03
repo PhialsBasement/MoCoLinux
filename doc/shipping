@@ -1,0 +1,267 @@
+Shipping it: an installer and a launcher
+========================================
+
+The deliverable this project has always described -- "somebody on XP x64
+downloads a release and runs one executable" -- against what is actually in the
+tree today. Two programs are missing and one assumption turned out to be false.
+
+The two programs are an installer, which lays down the files and builds the
+Linux system on the machine it is installed on, and a launcher, which is a
+window with options and a Start button in place of the six batch files
+doc/runbook currently walks people through.
+
+The false assumption is the subject of section 1, and it comes first because
+nothing else matters if the binaries do not load.
+
+
+1. The release does not run on Windows XP x64
+----------------------------------------------
+
+    colinux-daemon.exe      imports  api-ms-win-crt-{convert,environment,
+                                     filesystem,heap,locale,math,private,
+                                     runtime,stdio,string,utility}-l1-1-0.dll
+    colinux-slirp-net-daemon.exe     the same, plus -time
+    linux.sys                        ntoskrnl.exe, HAL.dll, NDIS.SYS
+
+Those api-ms-win-crt-* names are the Universal CRT's API sets. The UCRT is a
+Windows 10 component; Microsoft's redistributable of it supports Vista SP2
+through 8.1 and has never supported XP. mingw-w64 16.1 links it by default, so
+every userspace binary this port has produced requires a runtime that does not
+exist on the operating system it targets. The driver is clean -- it imports
+only kernel exports -- which is why the failure is invisible from the driver
+side.
+
+It is invisible from the test box too, and that is the part worth recording.
+The M92p has one-core-api installed: E:\WINDOWS\system32 contains
+kernelbase.dll, ucrtbase.dll and api-ms-win-core-processthreads-l1-1-0.dll,
+none of which ship with a 5.2 kernel. That backport is also why Steam, six
+CEF-based steamwebhelper processes, Supermium and the Rockstar launcher run on
+a 2005 operating system. So the one machine that could have caught this was
+the one machine constitutionally unable to.
+
+The fix is a link flag, and the toolchain already has both halves:
+
+    x86_64-w64-mingw32-gcc h.c -o h.exe -mcrtdll=msvcrt-os
+      -> DLL Name: KERNEL32.dll
+         DLL Name: msvcrt.dll
+
+gcc's own spec carries the selector -- `%{!mcrtdll=*:-lmsvcrt} %{mcrtdll=*:-l%*}`
+-- and libmsvcrt-os.a is the genuine msvcrt.dll import library sitting beside
+the UCRT-forwarding default. libmingwex.a has no references to
+__stdio_common_* at all, so it fills the gaps rather than pulling the UCRT back
+in by another route. Subsystem version is already 5.2 on all three binaries and
+stays there; _WIN32_WINNT goes to 0x0502 so the headers stop declaring things
+the target does not have.
+
+What this needs alongside it is a gate, because a silent dependency is exactly
+what it was. `make dist` refuses to package a binary that imports any
+api-ms-win-* or kernelbase.dll, or that declares a subsystem above 5.2. It is
+an objdump parse and a comparison, and it is the only mechanical check between
+"it builds" and "it loads on the target".
+
+And the consequence for testing: the M92p can no longer tell anyone whether a
+release works. Anything that would fail on a clean machine still runs there. A
+stock XP x64 VM on the development host -- no coLinux in it, only "does the
+payload load" -- is the honest reference, and it costs one qemu install.
+
+
+2. What ships
+--------------
+
+    colinux-daemon.exe    every daemon mode, including the slirp bridge
+    mocolinux.exe         the launcher and the first-run wizard
+    linux.sys             the driver
+    vmlinux               the guest kernel
+    root-seed.img         a minimal Manjaro that can build the real one
+    an X server           see section 5
+
+Seven executables become one. Six of the current seven are either dead on this
+port (colinux-console-nt cannot attach to an x86-64 guest at all), unused
+(ndis, serial, net), or diagnostic (debug-daemon, which additionally has a
+use-after-free in its drain path -- see TODO).
+
+The one that cannot simply be deleted is colinux-slirp-net-daemon.exe.  It is
+linked at 0x400000 with IMAGE_FILE_LARGE_ADDRESS_AWARE cleared, deliberately,
+because slirp stores pointers in 32-bit queue-link fields and its structure
+overlays only land on wire format when SIZEOF_CHAR_P is 8 -- the reasoning is
+in the R7 commit and in slirp_config.h. Folding the bridge into
+colinux-daemon.exe therefore means confining that binary to 2 GB as well.
+Nothing in the daemon wants a high address -- it streams vmlinux in 32 KB
+chunks and never maps guest RAM into user space, which lives in the driver's
+contiguous allocations -- so this should cost nothing, and tools/pe-clear-laa.py
+already exists to do it. It is a claim to verify, not a fact.
+
+The launcher stays a second executable rather than a mode of the first. A PE
+has one subsystem: a single binary either flashes a console when it opens the
+GUI, or needs AttachConsole for its daemon modes and hands the prompt back
+while still printing, which is precisely the behaviour doc/runbook's foreground
+invocations depend on not happening.
+
+
+3. The installer
+-----------------
+
+NSIS, and it does not drive the guest.
+
+    1. Preflight       x64, 5.2 or later, Administrators, NTFS, free space.
+    2. Extract         the payload above, uncompressed in the tree -- NSIS's
+                       LZMA takes a mostly-empty ext4 down hard, so there is no
+                       zstd step and nothing to expand at runtime.
+    3. Driver          create the service and start it. --install-driver
+                       currently reports success without starting anything,
+                       which is its state after every reboot; everything
+                       downstream then fails with "manager open: cannot find
+                       the file". That is a TODO item and a small fix.
+    4. Hand off        mocolinux.exe --first-run, and wait for it.
+    5. Finish          shortcuts, uninstaller, and a reboot prompt (section 6).
+
+Steps 2 through 5 of the request -- stand the guest up, run the build, verify
+-- are deliberately not NSIS's. That work takes twenty to forty-five minutes
+over the network, needs progress, cancel, retry and resume, and speaks to the
+guest over a TCP console. All of that already has to exist in the launcher.
+
+
+4. The first-run wizard
+------------------------
+
+This is doc/runbook section B, unattended.
+
+  * Create root-manjaro.img sparse and in place. Never transferred: the agent
+    buffers a pushed image and the deploy reads it back to verify, which is
+    tens of gigabytes of churn and has taken the box down.
+
+  * Spawn --boot with the seed on cobd0 and the target on cobd1, plus --slirp
+    and --console, as children with our own pipes and no inherited console
+    handles. That last part is not fastidiousness: `start` hands its standard
+    handles to the child whatever you do with them, the caller then waits for
+    an end-of-file that cannot come while the child lives, and three separate
+    launchers in this tree have wedged that way. A Job Object with
+    KILL_ON_JOB_CLOSE is the backstop, not the mechanism -- every daemon now
+    exits on its own when the guest goes.
+
+  * Wait for the guest. Half a minute is normal. "Connection refused" means
+    the console has not bound yet and no prompt means the guest has not reached
+    one; neither is a failure and the wizard must not report them as one.
+
+  * Let the guest drive the build. The seed carries the script and a systemd
+    unit that runs it against cobd1 and prints machine-readable markers --
+    MOCO:STAGE 4/9, MOCO:PCT 41, MOCO:OK, MOCO:FAIL <reason> -- and the wizard
+    only reads. The alternative is pushing shell through a serial console, and
+    mkmanjarorootfs.sh already carries a comment about layered quoting eating a
+    dollar sign, which is the failure that argument loses on.
+
+  * Resume rather than restart. The script mke2fs -F's unconditionally today,
+    so a run that dies at package 600 throws away three gigabytes of cache. A
+    mirror dropping mid-install is the likeliest thing a user will hit, and
+    keeping the filesystem lets pacman skip what it already has.
+
+  * Verify before believing it, because a block-layer bug once produced an
+    image whose own package database was binary noise: pacman -Qk against the
+    mounted target, the script's own clean-unmount line, e2fsck -n, and the
+    presence of systemd, fstab and the hvc0 getty override.
+
+  * Finish with poweroff and never with --stop. Nothing else unmounts, and
+    ext4 in data=ordered journals metadata and not contents, so a file written
+    seconds earlier comes back as a correctly-named inode with no data. The
+    boot child exiting is the flush.
+
+
+5. The X server
+----------------
+
+The screenshot in the README -- KDE applications in XP windows -- is what most
+people will come for, so the aim is that it works after one installer and no
+further reading.
+
+The X server on the test box cannot deliver that. It is VcXsrv 1.20.14, built
+January 2022 with linker 14.29, and its PE declares MajorSubsystemVersion 6.0;
+a 5.2 loader refuses an image that asks for Vista. It also wants vcruntime140
+and the UCRT. It runs on the M92p for the same reason our own daemons do, and
+for no other reason.
+
+Downloading one-core-api during installation does not rescue it, and the reason
+is circular: stock XP x64's schannel tops out at TLS 1.0, GitHub has required
+1.2 since 2018, and NSIS's download plugins go through WinINet. The machine
+that needs the backport is the machine that cannot fetch it. Bundling a
+self-contained TLS downloader to solve that is more work than bundling the
+thing being downloaded. And installing it unasked is the highest-liability act
+available here -- it replaces core system DLLs and requires a reboot, so a
+machine it breaks was broken by our installer.
+
+So the X server has to be one that XP x64 can load unaided. VcXsrv 1.17.x is
+the interesting range: xorg-server 1.17 is where +iglx became a flag worth
+having, -wgl predates it, and the build tooling of that era still emitted 5.0x
+subsystems. Xming 6.9.0.31 is the fallback, 32-bit through WOW64 and
+unambiguously XP-native, at the cost of being from 2007.
+
+The acceptance test is mechanical and should be run before anything is
+bundled: subsystem 5.02 or lower, every import present on a stock XP x64, and
+-multiwindow -wgl +iglx -ac -clipboard all understood. If no build passes,
+the fallback is to detect an X server rather than ship one, enable the
+launcher's X option only when one is found, and say plainly in one line what
+is missing and why.
+
+Either way the installer looks for an X server already on the machine and
+prefers it, and records in its own registry key whether the bundled one was
+installed, so the uninstaller removes only what it put there.
+
+
+6. The reboot at the end, and why it is there for now
+------------------------------------------------------
+
+The installer boots the guest once to build the image, which makes the user's
+first real launch the second boot on a loaded driver -- the case doc/runbook
+calls "the one that governs the whole day". Guest RAM is freed and re-hunted in
+unbroken 32 MB runs every run, so the second boot grinds the host with memory
+showing as available throughout.
+
+An installer that ends in a reboot is unremarkable, so that is the stopgap. The
+fix is in TODO and is worth doing afterwards rather than first: allocate the
+guest's RAM once per driver load and reuse it, with co_kload_free keeping the
+blocks and a new co_kload_release_memory dropping them from the unload path.
+It is the teardown path, which produced a bugcheck 0xC2 and a host freeze in a
+single evening, so it deserves its own change and its own audit. When it lands,
+the reboot prompt and the launcher's warning both come out.
+
+
+7. The launcher
+----------------
+
+Native Win32 through the existing mingw-w64 target: no .NET, no Python, one
+file, and a build.comake.py entry like everything else.
+
+Main: driver and guest state, uptime, memory; Start, Stop, Force stop; Open
+terminal; Launch application; a log tail.
+
+Options, persisted beside the executable: memory in MB, cobd0 through cobd3,
+init, networking, X server and its flags, console port, diagnostics, and the
+advanced pair --no-copic and --max-switches. Plus "Rebuild the Linux system",
+which is the wizard again.
+
+The rules it has to encode are the ones doc/runbook spends its length on. The
+X server must exist before any X client, because an X client with no server
+produces no error at all and simply never appears -- that cost an hour once.
+Stop means poweroff and then wait; Force stop is --stop; nothing is ever
+killed, because taskkill on a thread inside the driver closes its handles
+underneath kernel-mode code and that is the recurring 0x50. One instance, and
+one of each child. And, until section 6 is fixed, a warning on the second start
+since Windows last booted.
+
+
+8. Order
+---------
+
+  0. -mcrtdll=msvcrt-os, _WIN32_WINNT=0x0502, the import gate, a reference VM.
+  1. Fold slirp into colinux-daemon.exe and clear LAA; --install-driver starts
+     the service; the shared modules both programs need -- console client,
+     child supervision, service control, configuration.
+  2. tools/mkseedrootfs.sh, the in-guest setup unit and its progress markers,
+     and the seed built here rather than inside a guest -- which also settles
+     the TODO entry saying the script has never run on a build host, the one
+     case that matters for shipping. A swapfile goes into mkmanjarorootfs.sh
+     while it is open: the guest measures 97% system time in permanent reclaim
+     without one, and that is most of what people will call slowness.
+  3. mocolinux.exe -- the wizard first, since the launcher reuses all of it.
+  4. NSIS and a `make dist` that assembles and checks the payload, which is
+     also the answer to TODO's "the release artifacts are not built by
+     anything".

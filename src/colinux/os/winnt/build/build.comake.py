@@ -54,8 +54,35 @@ def generate_options(compiler_def_type, libs=None, lflags=None,
     # top of it is not visible from inside a function body.
     from comake.settings import settings
 
-    crt = ['msvcrt']
-    if settings.arch != 'x86_64':
+    # The C runtime, and this is the difference between a binary that loads on
+    # the target and one that does not.
+    #
+    # mingw-w64 16.1 resolves -lmsvcrt to a library that forwards to the
+    # Universal CRT, so a default link imports api-ms-win-crt-*-l1-1-0.dll.
+    # Those are Windows 10 API sets; Microsoft's own UCRT redistributable
+    # supports Vista SP2 and later and has never supported XP. Every userspace
+    # binary this port produced before this change therefore required a runtime
+    # that does not exist on the operating system it targets, and the test box
+    # could not reveal it: it has one-core-api installed, which supplies
+    # ucrtbase.dll and kernelbase.dll to a 5.2 kernel.
+    #
+    # libmsvcrt-os.a is the genuine msvcrt.dll import library, and gcc's own
+    # spec carries the selector -- %{!mcrtdll=*:-lmsvcrt} %{mcrtdll=*:-l%*}.
+    # Measured on a hello-world: -static alone imports nine api-ms-win-crt
+    # sets, -static -mcrtdll=msvcrt-os imports KERNEL32.dll and msvcrt.dll and
+    # nothing else. libmingwex.a references no __stdio_common_* at all, so it
+    # fills the gaps rather than pulling the UCRT back in by another route.
+    #
+    # The flag alone is not enough while the CRT is also named explicitly:
+    # adding -lmsvcrt back to that same command line re-imports all nine, since
+    # the forwarding library is still on the line. So the name changes too, and
+    # both have to stay in step.
+    crt_flags = []
+    if settings.arch == 'x86_64':
+        crt = ['msvcrt-os']
+        crt_flags = ['-mcrtdll=msvcrt-os']
+    else:
+        crt = ['msvcrt']
         # crtdll is the NT 3.x/4.0 C runtime. It predates Win64 entirely, so
         # mingw-w64 ships libcrtdll.a for i686 only. msvcrt is the CRT either way.
         crt.append('crtdll')
@@ -88,7 +115,7 @@ def generate_options(compiler_def_type, libs=None, lflags=None,
         # libwinpthread-1.dll behind on the two targets that pull in the C++
         # runtime, and a second missing-DLL dialog is no better than the first.
         #
-        linker_flags = lflags + [ '-static' ],
+        linker_flags = lflags + [ '-static' ] + crt_flags,
         compiler_libs = libs + winnt_daemon_libs + crt + ['shlwapi']),
     )
 
@@ -175,16 +202,20 @@ def slirp_daemon_cmdline(scripter, tool_run_inf,
 
     from comake.settings import settings
 
-    low, fixup = '', ''
+    low, fixup, crt = '', '', 'msvcrt'
     if settings.arch == 'x86_64':
-        low = '-Wl,--image-base,0x400000 '
+        low = '-Wl,--image-base,0x400000 -mcrtdll=msvcrt-os '
         fixup = ' && python3 tools/pe-clear-laa.py ' + target
+        # Same reasoning as generate_options(): the default -lmsvcrt forwards to
+        # the Universal CRT, which XP does not have. Named here as well because
+        # this link line is hand-written and does not go through that function.
+        crt = 'msvcrt-os'
 
     return ('%s -static %s-o %s %s %s%s' %
             (gcc, low, target, inputs,
              ' '.join(['-l' + l for l in
                        ['iphlpapi'] + winnt_daemon_libs +
-                       ['msvcrt', 'shlwapi']]),
+                       [crt, 'shlwapi']]),
              fixup))
 
 
@@ -297,6 +328,25 @@ targets['linux.sys'] = Target(
                 __KERNEL__=None,
                 CO_KERNEL=None,
                 CO_HOST_KERNEL=None,
+                #
+                # _WIN32_WINNT is 0x0502 everywhere else, so that the userspace
+                # headers stop declaring functions XP x64 does not export. The
+                # DDK cannot take it: mingw-w64's ddk/wdm.h uses
+                # SYSTEM_POWER_STATE_CONTEXT unconditionally while winnt.h
+                # declares it only from Vista, so pinning the driver to 0x0502
+                # is an "unknown type name" on a line nothing here calls.
+                #
+                # 0xa00 is not a choice, it is what this subtree already had:
+                # ddk/ntddk.h defaults _WIN32_WINNT to 0xa00 when it is unset,
+                # which is how every driver this port has shipped was compiled.
+                # Restoring it keeps the driver exactly as it was while the
+                # userspace side gets the narrower value it needs.
+                #
+                # The version a kernel-mode header thinks it is targeting says
+                # nothing about what the driver imports, which is checked
+                # separately: linux.sys resolves against ntoskrnl.exe, HAL.dll
+                # and NDIS.SYS and nothing else.
+                _WIN32_WINNT='0x0A00',
             ),
             # mingw-w64's ddk/ntddk.h includes <wdm.h> unqualified, so the ddk
             # directory has to be on the search path in its own right. Confined
