@@ -1,0 +1,152 @@
+Runbook
+=======
+
+The two sequences that actually get used, written down because the order matters
+and because getting it wrong produces failures that name the wrong thing.
+
+Every command below is given twice: as it is typed on the box, and as it is
+driven from the development machine through the transfer agent. The second form
+is what most of this project has been done with.
+
+Two rules that apply to everything here, both learned expensively:
+
+  * Anything long-lived is launched with `-r 0` and never waited on. The
+    transfer agent retries a command it believes timed out, and a daemon never
+    returns, so without `-r 0` one launch becomes up to three -- two slirp
+    bridges competing for one guest's rings, two debug daemons splitting the
+    log. Each copy also holds a driver handle, so `sc stop` parks in
+    STOP_PENDING and the driver file cannot be replaced.
+  * `xstart.bat` is the exception that returns. `start` hands its console
+    handles to the child whatever you do with them, so a batch file that uses it
+    wedges its caller forever; xstart.bat goes through WScript.Shell instead.
+
+
+A. Clean box to a running desktop
+---------------------------------
+
+Starting point: the box is powered on, no coLinux processes, driver STOPPED.
+`tools/wol.py` will power it on if it is off.
+
+On the box, from F:\xfer\mocolinux-m2:
+
+    colinux-daemon.exe --install-driver     # idempotent; only creates the service
+    sc start CoLinuxDriver                  # this is what actually loads it
+    dbg-start.bat                           # optional; see note below
+    run-manjaro.bat                         # the guest. Never returns.
+    net.bat                                 # slirp. Never returns.
+    xstart.bat                              # X server. Returns immediately.
+    console.bat                             # console on 2323. Never returns.
+
+From the development machine:
+
+    X=python3 /path/to/xpc.py
+    $X -r 0 exec -T 60 -C mocolinux-m2 -- colinux-daemon.exe --install-driver
+    $X -r 0 exec -T 60 cmd /c "sc start CoLinuxDriver | findstr STATE"
+    ( $X -r 0 exec -T 7200 -C mocolinux-m2 cmd /c dbg-start.bat > logs/dbg.log 2>&1 & )
+    ( $X -r 0 exec -T 7200 -C mocolinux-m2 -- cmd /c run-manjaro.bat > logs/boot.log 2>&1 & )
+    ( $X -r 0 exec -T 7200 -C mocolinux-m2 -- cmd /c net.bat > logs/net.log 2>&1 & )
+    $X -r 0 exec -T 45 -C mocolinux-m2 cmd /c xstart.bat
+    ( $X -r 0 exec -T 7200 -C mocolinux-m2 -- cmd /c console.bat > logs/console.log 2>&1 & )
+
+Then connect, and start something:
+
+    python3 tools/coterm.py 'uptime; systemctl is-system-running'
+    python3 tools/coterm.py '( setsid konsole > ~/k.log 2>&1 & )'
+
+Notes that save time:
+
+  * The guest takes roughly half a minute to answer. `colinux-daemon.exe`
+    reaching about 57 MB in the task list means the image is loaded and the
+    guest is live; before that it sits near 10 MB. A console attempt that is too
+    early reports "connection refused" (console.bat has not bound yet) or hangs
+    with no prompt (the guest has not reached one). Neither is a failure.
+  * Order matters in one place only: the X server must exist before an X client
+    starts, and an X client with no server produces no error at all -- it simply
+    never appears. That cost an hour once.
+  * The guest configures its own network at boot. There is nothing to type; if
+    it were missing the symptom would be "cannot resolve host", which reads as
+    DNS rather than as a missing bridge.
+  * The debug daemon streams the driver's records to the development machine as
+    they are produced, so they survive a host reset. That is the only instrument
+    that says anything when the machine dies hard, and it is how both the
+    guest-RAM allocation freeze and the 32-bit triple fault were localised. It
+    is also, currently, able to bugcheck the machine itself (see TODO), so it is
+    started when something is being hunted and left off otherwise.
+
+Ending a session:
+
+    python3 tools/coterm.py 'sudo systemctl poweroff'     # if the filesystem matters
+    colinux-daemon.exe --stop                             # stop.bat: ends a wedged run
+
+`poweroff` and nothing else when anything was written. `stop.bat` and the run
+deadline do not unmount, and ext4 in data=ordered journals metadata but not
+contents, so a file written seconds earlier comes back as a correctly-named
+inode with no data. The console and the bridge exit on their own once the guest
+is gone; the driver then unloads cleanly with `sc stop CoLinuxDriver`.
+
+And the one that governs the whole day: **the first boot after a host reboot is
+reliable and the second is not.** Guest RAM is freed and re-hunted in unbroken
+32 MB runs every run, so the second boot's allocations grind the host until it
+is power-cycled, with memory showing as available throughout. Reboot between
+runs until that is fixed (TODO has the fix).
+
+
+B. Clean host to an installed Manjaro
+-------------------------------------
+
+Starting point: the box has the driver and the binaries, a `vmlinux`, and an
+existing bootable guest of some kind. That last requirement is the awkward part
+and is discussed at the end.
+
+1. Make the disk on the box. Instantly, and without transferring anything:
+
+       fsutil file createnew F:\xfer\mocolinux-m2\root-manjaro.img 32212254720
+
+   A 30 GB image is created in place. Do not build it on the development machine
+   and push it: the agent buffers the whole file and deploy verifies by reading
+   it back, which is tens of gigabytes of churn on a 4 GB machine and has taken
+   the box down.
+
+2. Boot a guest that has the new disk attached as a second unit. `run-arch.bat`
+   does exactly this -- the old Arch root on cobd0, the target on cobd1 --
+   together with net.bat and console.bat as in section A.
+
+3. Get the script into the guest. It is in the tree, so serve it over the link:
+
+       ( cd tools && python3 -m http.server 8099 --bind 192.168.137.1 & )
+       python3 tools/coterm.py 'curl -4 -s -o /root/mk.sh http://192.168.137.1:8099/mkmanjarorootfs.sh'
+
+4. Run it against the raw device, detached, because it takes twenty minutes and
+   the console must stay usable:
+
+       python3 tools/coterm.py '( sh /root/mk.sh /dev/cobd1 > /root/mk.out 2>&1; echo "RC=$?" >> /root/mk.out ) & echo STARTED'
+
+   Progress: `grep "==>" /root/mk.out`. It reports each stage, and the last line
+   is either "done, unmounted clean" or a warning that it could not unmount --
+   which matters, because an unflushed image is a tree of correct filenames with
+   no contents.
+
+5. Verify before trusting it. This is not optional; a block-layer bug once
+   produced an image whose own package database was binary noise:
+
+       python3 tools/coterm.py 'mount /dev/cobd1 /mnt/new && pacman --root /mnt/new -Qk | grep -v "0 missing files"'
+
+   Silence is a pass. Then `umount /mnt/new` and `sudo systemctl poweroff`.
+
+6. Boot it: `run-manjaro.bat`, which puts the new image on cobd0 and keeps the
+   old one on cobd1 as a recovery disk.
+
+What the script does, so the twenty minutes are not mysterious: creates the
+filesystem, lays down the directory skeleton alpm needs before it will
+initialise, installs about 790 packages, populates the pacman keyring (without
+which every package fails verification as untrusted while its signature is
+perfectly good), writes a real mirrorlist, runs ldconfig, and configures fstab,
+autologin, networking, DISPLAY, the user and sudo.
+
+The bootstrap problem, stated honestly: step 2 needs a Linux guest already
+running, so this reproduces an image but does not create the first one.
+`tools/mkmanjarorootfs.sh` is written to run on any Linux with pacman and
+e2fsprogs, including a development machine, which is the path that removes the
+circularity -- but it has only ever been run inside a guest, so that is a design
+intent rather than a tested claim. `tools/mkrootfs.sh` builds the minimal
+BusyBox image and is the other way in.
