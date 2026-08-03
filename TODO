@@ -194,20 +194,25 @@
 
  * STILL OPEN after that session, and worth stating precisely because it is
    easy to assume the above closed everything:
-   * The slirp bridge exits on its own during a heavy download. Reproduced
-     deliberately: a by-hand build died when the bridge vanished mid-pacman, the
-     guest's network went with it, and the script correctly reported an
-     incomplete image. The binary on the box predated the log tee so it died
-     silently and the reason is still unknown; the tee-enabled build is deployed
-     now, so the next occurrence should say. Two candidates worth reading first:
-     the bridge treats 100 consecutive ring-read failures at a 20 ms poll --
-     two seconds -- as "the guest is gone" and exits, which is a plausible false
-     positive under load; and a corrupt-ring check that stops the bridge rather
-     than resynchronising.
-   * There may be a second, real socket-path bug. The earliest bugcheck of that
-     evening (0x3B in afd.sys, STATUS_BREAKPOINT at ntoskrnl+0x26e20) PREDATES
-     the GDT modification that explains the later ones, so it cannot have the
-     same cause. Zero linux.sys frames on that stack either. Unexplained.
+   * NOT the slirp bridge, and this correction is the point. It was filed here
+     as "the bridge exits on its own during a heavy download", on the strength of
+     one by-hand build that died when the bridge vanished mid-pacman. The
+     timeline says otherwise: that run was on the driver from before the GDT fix,
+     which went out at 01:21, and the bridge disappeared ahead of the 01:15
+     bugcheck. On the fixed driver it stayed up through the whole 1.3 GB install.
+     So the bridge was doing exactly what it is written to do -- 100 consecutive
+     ring-read failures at a 20 ms poll means the guest is gone, so leave, so the
+     driver can be unloaded and the binaries replaced. The guest really was gone;
+     it was dying of the GDT corruption. A symptom got filed as a defect, which
+     is the same mistake as reading a quiet sample as a dead system, and it was
+     made three times in one evening.
+   * One bugcheck of that evening is still unexplained: 0x3B in afd.sys,
+     STATUS_BREAKPOINT at ntoskrnl+0x26e20, zero linux.sys frames. It predates
+     the GDT modification, so it cannot share that cause. It has not recurred,
+     and there is nothing to go on beyond one dump -- so it is recorded rather
+     than theorised about. If it comes back, the thing to establish first is
+     whether a driver/daemon swap or a taskkill happened near it, since both have
+     produced handle-teardown crashes here before.
    * colinux-daemon.exe --run cannot be deployed while a guest is running: the
      running daemon holds its own image, so the desktop shortcuts keep using
      whatever binary was there when the guest started. Harmless, but it means a
