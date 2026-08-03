@@ -15,19 +15,15 @@
 #
 #   mkmanjarorootfs.sh /path/to/root-manjaro.img [size]   build into a new image
 #   mkmanjarorootfs.sh /dev/cobd1                         build into a block device
-#   mkmanjarorootfs.sh --seed root-seed.img [size]        build the seed
 #
-# --seed builds the other end of the same pair: the smallest system that can
-# build the one above. It is what a release ships, because this script needs a
-# Linux with pacman and e2fsprogs already running and therefore cannot create
-# the first image -- so something has to be in the download, and the smallest
-# useful something is a system that can run this script. See doc/installer.
-#
-# The seed carries this script at /usr/local/bin/mkmanjarorootfs.sh and a
-# first-boot unit that runs it against /dev/cobd1, so the machine being
-# installed onto builds its own root filesystem with the same code that built
-# the seed. One script, two package sets, one definition of what a MoCoLinux
-# root filesystem is.
+# There was a --seed mode here that built a smaller system whose only job was to
+# build this one. It is gone: the shipped image carries this script at
+# /usr/local/bin/mkmanjarorootfs.sh and a first-boot unit that runs it against
+# /dev/cobd1, so the machine being installed onto builds its own root filesystem
+# with the same code, from the image that already boots. A second package set
+# meant a second thing to keep working, and the path that has actually run end
+# to end on this hardware is the one with the full image on cobd0. See
+# doc/installer.
 #
 # The second form is how it runs on the test box. A 6 GB image cannot be pushed
 # there -- the transfer agent buffers it and the deploy verifies by reading it
@@ -43,23 +39,24 @@ set -e
 
 SELF=$(readlink -f "$0")
 
-SEED=0
-if [ "$1" = "--seed" ]; then
-	SEED=1
+# --console selects the smaller of two package sets. Not a different code path:
+# the same script builds the same filesystem the same way, and only the list of
+# packages differs, so there is one definition of what a MoCoLinux root
+# filesystem is and one thing to keep working.
+#
+# It matters because it is the difference between a two-minute install and a
+# forty-minute one, for somebody who came here for a Linux shell inside XP
+# rather than for KDE. See doc/installer.
+CONSOLE=0
+if [ "$1" = "--console" ]; then
+	CONSOLE=1
 	shift
 fi
 
-TARGET=${1:?usage: mkmanjarorootfs.sh [--seed] <image-or-device> [size]}
+TARGET=${1:?usage: mkmanjarorootfs.sh [--console] <image-or-device> [size]}
 
-# The seed is deliberately small and mostly empty: its package cache is
-# deleted and its free space zeroed at the end, so what ships compresses to a
-# fraction of this. The full image is sized for a desktop plus room to install
-# things afterwards.
-if [ "$SEED" = 1 ]; then
-	SIZE=${2:-3G}
-else
-	SIZE=${2:-6G}
-fi
+# Sized for a desktop plus room to install things afterwards.
+SIZE=${2:-6G}
 
 # Manjaro's stable branch, which is the point of choosing Manjaro over Arch for
 # a machine somebody else has to live with: package sets that were held back and
@@ -132,30 +129,20 @@ PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 	  xcb-util-cursor \
 	  lib32-glibc lib32-gcc-libs"
 
-# The seed's set, and every entry earns its place because this is what a user
-# downloads before anything else happens.
-#
-# base brings systemd, pacman, both keyrings, iproute2 and iputils. e2fsprogs
-# is named explicitly rather than relied on: the one job this system exists to
-# do is mke2fs a second disk, and depending on it arriving as somebody else's
-# dependency is how that breaks quietly. curl is the network check in the
-# first-boot unit, and it is what fails with a clear message instead of pacman
-# failing with fifty lines. gnupg because pacman-key is a shell script driving
-# the gpg binary, so the keyring cannot be populated without it -- and a seed
-# with an unpopulated keyring is a seed that cannot install anything.
-#
-# zsh is here for one reason: the console autologs in as a user whose shell
-# this script sets to zsh, and a login shell that is not installed is a
-# console that does not work. It is six megabytes against the only way in.
-#
-# No desktop, no fonts, no lib32, no X clients. Those are what the target
-# downloads for itself.
-SEED_PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
-	  gnupg sudo nano inetutils curl e2fsprogs \
+# The console set. base brings systemd, pacman, both keyrings, iproute2 and
+# iputils. e2fsprogs is named rather than relied upon, because building a
+# filesystem is a thing this system may be asked to do and inheriting it as
+# somebody else's dependency is how that breaks quietly. gnupg because
+# pacman-key is a shell script driving the gpg binary, so without it the keyring
+# cannot be populated and nothing can be installed afterwards. zsh because the
+# console autologs in as a user whose shell this script sets to zsh, and a login
+# shell that is not installed is a console that does not work.
+CONSOLE_PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
+	  gnupg sudo nano inetutils curl e2fsprogs networkmanager \
 	  zsh zsh-completions"
 
-if [ "$SEED" = 1 ]; then
-	PACKAGES="$SEED_PACKAGES"
+if [ "$CONSOLE" = 1 ]; then
+	PACKAGES="$CONSOLE_PACKAGES"
 fi
 
 MNT=$(mktemp -d)
@@ -653,10 +640,19 @@ done
 echo "%wheel ALL=(ALL:ALL) NOPASSWD: ALL" > "$MNT/etc/sudoers.d/10-wheel"
 chmod 0440 "$MNT/etc/sudoers.d/10-wheel"
 
-# ---------------------------------------------------------------- the seed
+# ---------------------------------------------------------------- the builder
 
-# Everything below is what makes a seed a seed rather than a small install.
-if [ "$SEED" = 1 ]; then
+# The image carries the thing that builds the next one.
+#
+# This used to be gated behind --seed, on the theory that a release ships a
+# small system whose only job is to build the real one. That is gone: the
+# machine being installed onto boots this image and builds its own root
+# filesystem on the second disk, with the same script, and the path with the
+# full image on cobd0 is the one that has actually run end to end here.
+#
+# run-manjaro.bat already keeps the previous root attached as cobd1 for the same
+# reason in reverse: if the new system will not boot, the one that built it
+# still will.
 
 say "installing the builder and its first-boot unit"
 
@@ -679,19 +675,39 @@ install -Dm 0755 "$SELF" "$MNT/usr/local/bin/mkmanjarorootfs.sh"
 # stage lines, which become MOCO:STAGE. A reader that does not care about
 # markers still sees an ordinary build log.
 cat > "$MNT/usr/local/bin/mocolinux-setup" <<'SETUP'
-#!/bin/sh
+#!/bin/bash
 # Build this machine's root filesystem on the second disk, on first boot.
 #
-# Output goes to the console because that is the only channel out of this
-# guest: there is no framebuffer and no UART, just the hypervisor byte stream
-# the host reads through colinux-daemon --console.
-exec > /dev/console 2>&1
+# Output goes to hvc0 by name, and not to /dev/console, which is the mistake
+# this line replaces. There is no framebuffer and no UART in this guest: the
+# only channel out is the hypervisor byte stream that colinux-daemon --console
+# serves, and that is hvc0. /dev/console is whatever the kernel was told to
+# use with console= on its command line, which is not this -- so every marker
+# written there went nowhere at all, and the host had a progress protocol with
+# nothing on the other end of it.
+#
+# A file first, the console second.
+#
+# The file is what makes this diagnosable. Console output is a stream with no
+# history: anything printed before a client attaches, or while one is busy, is
+# gone, and a twenty-minute build watched through a terminal that comes and
+# goes shows whatever happened to be passing at the time. The log persists, so
+# progress can be read at any point with a single `tail`, and a failed build
+# can be examined afterwards instead of reconstructed.
+LOG=/var/log/mocolinux-setup.log
+exec > >(tee -a "$LOG" > /dev/hvc0) 2>&1
 
 TARGET=/dev/cobd1
-STAGES=7
+
+# Eight, not the seven doc/installer lists: the seven build stages, and then the
+# guest checking its own work. That verification is not a formality -- a
+# block-layer bug once produced an image whose own package database was binary
+# noise -- so it is a stage the user can watch rather than something that happens
+# in silence after the progress bar has already filled.
+STAGES=8
 MIRROR=https://mirror.aarnet.edu.au/pub/manjaro/stable/core/x86_64/core.db
 
-# console  -- the seed's own package set, so the built system is a shell and a
+# console  -- the smaller package set, so the built system is a shell and a
 #             network and nothing else, ready in a couple of minutes
 # desktop  -- the full set, which is the 2.5 GB download
 SET=desktop
@@ -716,7 +732,7 @@ curl -4 -s -I --max-time 30 -o /dev/null "$MIRROR" \
 	|| fail network "cannot reach the Manjaro mirror -- is the network bridge running?"
 
 ARGS=""
-[ "$SET" = console ] && ARGS="--seed"
+[ "$SET" = console ] && ARGS="--console"
 
 # The exit status has to come out of the pipeline, and `set -o pipefail` is
 # not in POSIX sh, so the builder records its own.
@@ -726,8 +742,43 @@ rm -f "$RC"
 while IFS= read -r line; do
 	case "$line" in
 	"==> "*)
-		STAGE=$((${STAGE:-1} + 1))
-		echo "MOCO:STAGE $STAGE/$STAGES ${line#==> }"
+		# A table, not a counter.
+		#
+		# Counting "==> " lines was the obvious thing and it is wrong: the
+		# builder prints one for every step it takes, which is seventeen
+		# and not seven, so the first real run reported "MOCO:STAGE 14/7"
+		# and then 15, 16 and 17 of 7. A progress bar fed that is worse
+		# than no progress bar, because it looks like it is working.
+		#
+		# So the numbered stages are the ones doc/installer names, matched
+		# on the builder's own text. Everything else the builder announces
+		# is real progress worth showing, but it belongs on the log line
+		# rather than in the stage count -- MOCO:INFO, which the wizard
+		# puts in the log pane and not in the stage label.
+		#
+		# Matched on a distinctive fragment rather than the whole line,
+		# because these strings carry counts and device names that change
+		# from run to run. If the builder's wording changes, a stage stops
+		# being recognised and its text arrives as INFO: the build still
+		# works and still reports, it just loses one number. That is the
+		# right way for this to fail.
+		text=${line#==> }
+		case "$text" in
+		*"making a filesystem"*|*"creating "*)
+			echo "MOCO:STAGE 2/$STAGES making the filesystem" ;;
+		*"installing "*"package groups"*)
+			echo "MOCO:STAGE 3/$STAGES downloading and installing" ;;
+		*"populating"*keyring*|*"pacman-key"*)
+			echo "MOCO:STAGE 4/$STAGES populating the keyring" ;;
+		*"ranking mirrors"*|*"pacman-mirrors"*)
+			echo "MOCO:STAGE 5/$STAGES ranking mirrors" ;;
+		*"re-verifying"*)
+			echo "MOCO:STAGE 6/$STAGES re-verifying every package" ;;
+		*"configuring"*)
+			echo "MOCO:STAGE 7/$STAGES configuring" ;;
+		*)
+			echo "MOCO:INFO $text" ;;
+		esac
 		;;
 	*)
 		echo "$line"
@@ -777,6 +828,22 @@ After=systemd-networkd-wait-online.service network-online.target
 Wants=network-online.target
 ConditionPathExists=/dev/cobd1
 
+# The console is the marker channel, so nothing else may write to it.
+#
+# hvc0 is the only way out of this guest and the login getty owns it by default,
+# so a build streaming markers there is one of two writers on a single tty. The
+# host then reads whichever won: measured, six minutes of build output reached
+# the log and none of it reached the console, while the capture filled with the
+# shell's own prompt redraws and bracketed-paste escapes.
+#
+# Conflicts stops the getty for the duration and systemd starts it again
+# afterwards, because the getty is Wanted by the same target. Nobody needs a
+# login shell while an unattended install runs, and the wizard needs the stream
+# clean -- a progress protocol that has to compete for its own channel is not a
+# protocol.
+Conflicts=serial-getty@hvc0.service
+Before=serial-getty@hvc0.service
+
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/mocolinux-setup
@@ -791,23 +858,14 @@ UNIT
 inside "systemctl enable mocolinux-setup.service" > /dev/null 2>&1 || \
 	say "  WARNING: could not enable mocolinux-setup.service"
 
-# The package cache is most of a seed's size and none of its value: the target
-# downloads its own packages from a mirror, and shipping ours only makes the
-# download bigger. The full build keeps its cache, because there it is what
-# makes a retry cheap.
-say "emptying the package cache"
-rm -rf "$MNT/var/cache/pacman/pkg"/*
-
-# Zero the free space, which costs a minute here and a great deal of download
-# everywhere else. Deleted files leave their contents behind on ext4, and an
-# image full of the remains of 700 MB of packages does not compress; an image
-# whose free space is zeroes compresses to almost nothing. The write is
-# expected to end in ENOSPC, which is the point.
-say "zeroing free space so the image compresses"
-dd if=/dev/zero of="$MNT/.zerofill" bs=4M 2>/dev/null || true
-rm -f "$MNT/.zerofill"
-
-fi
+# The package cache stays. It is what makes a retry cheap -- a mirror dropping
+# part way through is the likeliest failure anyone will meet, and pacman picking
+# up from a warm cache is the difference between a retry and an abandonment.
+#
+# Shrinking an image for release -- emptying the cache, then zeroing the free
+# space so that ext4's leftovers compress instead of shipping as noise -- is a
+# separate step against a finished image, not something to do to the working
+# copy while building it.
 
 # ---------------------------------------------------------------- done
 
