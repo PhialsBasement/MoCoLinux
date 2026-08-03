@@ -166,6 +166,7 @@ a pointer at all.
 | `tools/shot.cs` | screenshots the XP desktop, compiled and run on the box |
 | `tools/decode-minidump.py` | attribute a bugcheck's stack to this driver |
 | `tools/pe-clear-laa.py` | confine the slirp daemon to 2 GB of address space |
+| `doc/runbook` | the two sequences: box to desktop, and host to installed Manjaro |
 | `doc/porting-x86_64` | design notes for the port |
 | `doc/building-modern` | the working build recipe |
 
