@@ -1,0 +1,295 @@
+The installer
+=============
+
+Design for the thing a user actually downloads. doc/shipping is the wider plan
+and the constraints; this is the installer itself, in enough detail to write.
+
+The shape is two programs. mocolinux-setup.exe is NSIS and lays down files;
+mocolinux.exe --first-run brings the Linux system up and finishes installing
+it. The split is not cosmetic: the second half takes twenty to forty-five
+minutes over somebody's network, needs progress, cancel, retry and resume, and
+speaks to the guest over a TCP console. NSIS can do none of that well, and the
+launcher has to contain all of it anyway.
+
+
+1. The seed is the system
+--------------------------
+
+doc/runbook section B builds the root filesystem onto a second cobd unit from
+inside a running guest. That exists for one reason, stated in the runbook: a
+6 GB image cannot be pushed to the test box, so the guest builds the next
+guest's disk in place. No user of a release has that constraint, and carrying
+the workaround across costs them:
+
+  * two images on disk at once, one of them thrown away afterwards;
+  * mke2fs, the alpm directory skeleton, and `pacman-key --init && --populate`
+    run on a stranger's machine -- and the keyring is the step whose failure
+    presents as every package being untrusted while its signature is perfectly
+    good, which cost an evening here with someone watching who knew the code;
+  * a bootstrap guest that must be shipped anyway, so the seed exists either
+    way and is then used only as scaffolding.
+
+So the seed is the system. The release ships a small bootable Manjaro -- what
+tools/mkmanjarorootfs.sh already builds, with the desktop package set left out
+-- and the target machine does two things to it:
+
+    resize2fs /dev/cobd0        grow the filesystem to the file it was given
+    pacman -S <desktop set>     install the rest
+
+Both are online, both resume, and neither can produce a half-made filesystem.
+The keyring is already populated in the seed, mke2fs never runs on the user's
+machine, and mkmanjarorootfs.sh keeps its job unchanged: it is the build-host
+script that produces the artifact. What it stops doing is running on machines
+we do not own.
+
+Sizes, to be measured rather than promised, but the shape is:
+
+    seed, raw          ~700 MB    base, pacman, keyring, networkd, hvc0 getty
+    seed, in installer ~250 MB    NSIS LZMA over a mostly-empty ext4
+    desktop download   ~2.5 GB    plasma-meta and friends, at install time
+    installed          ~6 GB
+
+
+2. What is in the payload
+--------------------------
+
+    colinux-daemon.exe    every daemon mode, slirp bridge included
+    mocolinux.exe         launcher and first-run wizard
+    linux.sys             the driver
+    vmlinux               the guest kernel, ~53 MB
+    root-seed.img         section 1
+    vcxsrv1142\           VcXsrv 1.14.2.1, optional component (doc/shipping 5)
+    LICENSE, doc\         COPYING, the runbook, third-party notices
+
+Everything in it must load on a stock XP x64 -- no api-ms-win-*, no
+kernelbase.dll, no subsystem above 5.2 -- and `make dist` refuses to package a
+binary that fails that check. That is not belt and braces: it is the defect
+the whole release carried until it was measured.
+
+
+3. Pages
+---------
+
+    Welcome         what this is, in three sentences, and the two numbers that
+                    matter: how long the setup takes and how much it downloads.
+
+    Licence         GPL v2.
+
+    Install to      two directories, because they have different sizes and
+                    people put them on different disks.
+                      Program:  %ProgramFiles%\MoCoLinux         ~60 MB
+                      Linux:    C:\MoCoLinux                     see below
+                    The second is validated as it is typed: NTFS, writable,
+                    and enough free space. FAT32 is refused with the reason --
+                    the image is larger than 4 GB and FAT32 cannot hold it,
+                    which otherwise appears much later as a write error.
+
+    What to install   Desktop (KDE Plasma, downloads ~2.5 GB, 30-45 minutes)
+                      Console only (ready in about two minutes)
+                      X server (VcXsrv 1.14.2.1)  [ticked if none found]
+                    The console-only path is not a lesser option. It boots the
+                    same system and is what somebody wants who is here for a
+                    Linux shell inside XP rather than for KDE, and it turns a
+                    forty-minute install into a two-minute one.
+
+    Disk size       8 / 16 / 32 GB or custom, default 16.
+                    The space is committed at creation, by SetEndOfFile rather
+                    than by writing zeroes, so it costs no time but it does
+                    cost the disk. Said plainly on the page, because a sparse
+                    file that fails halfway through a package install is a
+                    worse trade than a reservation that fails immediately.
+
+    Installing      file copy, driver service, firewall entry.
+
+    Setting up      hands off to the wizard -- section 5.
+
+    Finished        with the reboot notice from section 7.
+
+
+4. Before anything is written
+------------------------------
+
+Each check names what to do about it, because "setup cannot continue" with no
+reason is how a user concludes the software is broken.
+
+    64-bit Windows        ${RunningX64}, else refuse: this is an x86-64 port
+                          and the driver must match the kernel.
+    5.2 or later          XP x64 / Server 2003 and up.
+    Administrators        the driver is a kernel service.
+    NTFS on the Linux     the image exceeds FAT32's 4 GB file limit.
+      directory
+    Free space            image size + 60 MB, on that volume.
+    CoLinuxDriver         if the service exists and is not ours -- a real
+      not already there   coLinux 0.7.9 install -- stop and say so. Both want
+                          the same service name and the same device object.
+    Nothing running       no colinux-daemon.exe in the task list.
+
+Deliberately not checked: whether one-core-api is present. Nothing in the
+release needs it any more, and probing for it would only invite the question.
+
+
+5. The wizard
+--------------
+
+One window, a stage list, a progress bar, a log pane that can be folded open,
+and Cancel. It is `mocolinux.exe --first-run <inifile>`, so it is re-runnable
+by hand and from the launcher's "Rebuild the Linux system".
+
+    1  create the image     copy root-seed.img to <linux>\root.img, then
+                            SetEndOfFile to the chosen size. Instant.
+    2  driver               install the service if absent, start it, wait for
+                            RUNNING. --install-driver reports success today
+                            without starting anything, which is a TODO item
+                            and a small fix; until it lands the wizard starts
+                            the service itself rather than trusting that.
+    3  boot                 spawn --boot, --slirp and --console as children:
+                            own pipes, no inherited console handles, a Job
+                            Object with KILL_ON_JOB_CLOSE as backstop only.
+                            `start` hands its standard handles to the child
+                            whatever you do with them, and three launchers in
+                            this tree have wedged that way.
+    4  wait for the guest   connect to 127.0.0.1:2323 and read. Half a minute
+                            is normal. Connection refused means the console
+                            has not bound; silence means the guest has not
+                            reached a prompt. Neither is a failure and neither
+                            is reported as one. Ninety seconds is.
+    5  grow and install     the guest does this and says what it is doing --
+                            section 6. Console-only stops after the resize.
+    6  verify               section 6.
+    7  shut down            send `systemctl poweroff` and wait for the boot
+                            child to exit. Never --stop: nothing else unmounts,
+                            and ext4 in data=ordered journals metadata and not
+                            contents, so a file written seconds earlier comes
+                            back as a correctly-named inode with no data. That
+                            exit is the flush.
+
+Cancel is honest about where it is. Before stage 5 it stops and removes what
+it made. During stage 5 it offers to leave the partial install in place, since
+several gigabytes of package cache are worth keeping for a retry.
+
+
+6. What the guest says
+-----------------------
+
+The guest drives its own installation and reports on the console. The host
+side only reads.
+
+The alternative -- the wizard pushing shell to a prompt and scraping the
+output -- was rejected: mkmanjarorootfs.sh already carries a comment about
+layered shell quoting eating a dollar sign when it ran that way, and a
+progress bar built on prompt-scraping breaks the first time a package name
+contains something interesting.
+
+So the seed carries /usr/lib/systemd/system/mocolinux-setup.service, wanted by
+multi-user.target, running a script that emits one marker per line to
+/dev/console:
+
+    MOCO:STAGE <n>/<total> <text>     a step began
+    MOCO:PCT <0-100>                  progress within it, where known
+    MOCO:INFO <text>                  for the log pane, not the stage line
+    MOCO:OK                           the whole thing succeeded
+    MOCO:FAIL <code> <text>           it did not, and this is why
+
+Anything not matching goes to the log pane verbatim. The wizard needs no shell
+and no sentinel, and a marker stream is greppable in a support log afterwards.
+
+    1/6  growing the filesystem      resize2fs /dev/cobd0
+    2/6  checking the network        one HTTP HEAD at the mirror, so an
+                                     unreachable network fails here with
+                                     "cannot reach the Manjaro mirror" rather
+                                     than a hundred lines into pacman
+    3/6  refreshing package lists    pacman -Sy
+    4/6  downloading and installing  pacman -S, PCT from packages done
+    5/6  configuring                 ldconfig, locale, services
+    6/6  verifying                   below
+
+The unit disables itself on MOCO:OK, so a second boot is an ordinary boot. On
+MOCO:FAIL it stays enabled and re-runs on the next boot, which is what makes
+retry work without the host having to know anything.
+
+Verification is the guest's job too, and it is not optional -- a block-layer
+bug once produced an image whose own package database was binary noise:
+
+    pacman -Qk                  every installed file present
+    systemctl is-system-running running or degraded, and which units failed
+    test -x /usr/lib/systemd/systemd, /etc/fstab, the hvc0 getty override
+
+Resume falls out of the design. The package cache lives in the image, pacman
+skips what it already has, and a dropped mirror mid-download -- the likeliest
+failure a user will meet -- costs the time already spent and nothing else.
+
+
+7. The reboot
+--------------
+
+The wizard boots the guest once, so the user's first real launch is the second
+boot on a loaded driver -- the case doc/runbook calls "the one that governs the
+whole day". Guest RAM is freed and re-hunted in unbroken 32 MB runs every run,
+so the second grinds the host with memory showing as available throughout.
+
+An installer that ends in a reboot is unremarkable, so that is the answer for
+now. The Finished page says why in one line rather than pretending it is
+routine hygiene, and the launcher warns if it is started before that reboot
+happens. TODO carries the fix -- allocate once per driver load -- and when it
+lands both come out.
+
+
+8. Registry and files
+----------------------
+
+    HKLM\SOFTWARE\MoCoLinux
+        InstallDir, LinuxDir, Version
+        XServer        bundled | detected | absent
+        XServerPath
+        Installed      the tickboxes, so the uninstaller and a repair run know
+                       what was done rather than guessing
+
+    HKLM\...\Uninstall\MoCoLinux      the usual, with EstimatedSize
+
+    <linux>\root.img                  the guest
+    <linux>\mocolinux.ini             the launcher's settings, plain ini
+    <linux>\logs\                     setup.log, boot.log, net.log, console.log
+
+Two directories rather than one because the binaries are 60 MB and belong with
+the program, and the image is tens of gigabytes and belongs where the user has
+room. The ini sits with the image, not with the program, because it names the
+disks.
+
+The firewall entry, from doc/shipping: XP prompts about vcxsrv on first launch
+because the server listens on 6000 on every interface. Blocked is correct --
+the guest reaches it over the host's own loopback, which slirp's rewrite
+produces and the firewall does not police -- so the installer establishes that
+state rather than asking the user to decide it:
+
+    netsh firewall add allowedprogram program="...\vcxsrv.exe" name="VcXsrv" mode=DISABLE
+
+
+9. Uninstall
+-------------
+
+    refuse if a guest is running, and say how to stop it
+    stop the service, wait for STOPPED, delete it
+    remove the firewall entry, the shortcuts, the program directory
+    ask about root.img, defaulting to keeping it
+
+The image is the user's data -- their installed packages, their files -- and it
+is the one thing here that cannot be recreated by downloading the installer
+again. Removing it by default because it is large is the wrong way round.
+
+Never taskkill anything, in the uninstaller or anywhere else. taskkill on a
+thread inside the driver closes its handles underneath kernel-mode code, and
+that is the recurring bugcheck 0x50 in this port's history.
+
+
+10. Still open
+---------------
+
+  * The seed does not exist yet. tools/mkseedrootfs.sh, and the first run of
+    the family of scripts on a build host rather than inside a guest -- which
+    is also the TODO entry saying that has never been done.
+  * mocolinux-setup.service, the marker vocabulary above, and the package set
+    split between seed and desktop.
+  * How long stage 4 really takes on a domestic connection through slirp, and
+    therefore whether the number on the Welcome page is honest.
+  * Whether the launcher's X option should offer to install the bundled server
+    after the fact, for somebody who unticked it and changed their mind.
