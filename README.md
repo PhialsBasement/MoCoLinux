@@ -25,15 +25,7 @@ guest's own memory and a NAT running as a Windows process.
 
 And since a terminal only proves so much:
 
-![Manjaro with KDE running as native windows on Windows XP x64](doc/img/moco-desktop.png)
-
-Kate editing a file, xterm running `fastfetch`, Dolphin browsing the guest's
-cooperative block device as *"16.0 GiB Internal Drive (cobd0)"*, and Konsole on
-zsh — each one an ordinary XP window with a Luna frame and a taskbar button,
-sitting next to Steam and the Start button. Down the left are the desktop
-shortcuts the installer creates: the applications, a terminal, and **Start
-MoCoLinux**. Nothing in that image was arranged by hand afterwards; the
-applications were started by double-clicking those icons.
+![Manjaro with KDE running as native windows on Windows XP x64](doc/img/mocolinux-desktop.png)
 
 Everything in that screenshot is one machine. On the left, `fastfetch` in an
 xterm: Manjaro Linux, kernel 7.1.5, 792 packages. In the middle, KDE's own
@@ -229,6 +221,8 @@ MoCoLinux** brings it up by hand if it was stopped.
 That takes about fifteen minutes and roughly 2.5 GB of downloads, nearly all of
 it pacman fetching packages on the target — the release itself carries no built
 desktop, only the seed that can make one.
+
+![The installer's desktop shortcuts, and four Linux applications started from them](doc/img/moco-desktop.png)
 
 The long way, which is what the short way runs and what to use while developing:
 
