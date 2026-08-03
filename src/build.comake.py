@@ -156,7 +156,17 @@ if settings.host_os == 'winnt':
     if settings.arch == 'x86_64':
         compiler_flags = []
         # 0x0502 is Windows Server 2003 / XP x64, the oldest 64-bit target.
+        #
+        # Both names, because they do different jobs and mingw-w64 derives one
+        # from the other only when the other is absent. WINVER gates the shell
+        # and GDI declarations, _WIN32_WINNT the kernel ones -- so with WINVER
+        # alone the headers still declare kernel32 functions this target does
+        # not have, and calling one compiles cleanly and fails at load time
+        # with an unresolved import. That is the same class of failure as the
+        # UCRT one in os/winnt/build, and equally invisible on a test box that
+        # has one-core-api supplying the missing exports.
         compiler_defines['WINVER'] = '0x0502'
+        compiler_defines['_WIN32_WINNT'] = '0x0502'
     else:
         # These pin down the stack-argument ABI that the i386 passage assembly
         # reads by hand at fixed %esp offsets. They mean nothing on x86-64.
