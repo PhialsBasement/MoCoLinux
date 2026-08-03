@@ -319,6 +319,12 @@ A few things that cost real time and are recorded in the commit messages:
   applications launched into a display that did not exist — and an X client with
   no server produces no error whatsoever. `grep -i vcxsrv` over the installer
   found one hit, and it was the label.
+- **A component that leaves on purpose is not a component that failed.** The
+  slirp bridge disappearing mid-download was filed as a bug in the bridge. It
+  was the bridge working: it gives up after two seconds of unreadable rings so
+  the driver can be unloaded, and the guest really had gone — it was dying of the
+  GDT corruption above. Three separate times that evening a symptom was mistaken
+  for a cause, in each case by trusting a single quiet sample over a timeline.
 - **The guest's interrupt flag is virtual, and hardware doesn't know that.** An
   interrupt gate clears the real IF on delivery and `SYSCALL` clears it from
   `MSR_SYSCALL_MASK`, so `local_irq_enable()` has to put the *hardware* flag
