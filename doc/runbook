@@ -84,6 +84,30 @@ contents, so a file written seconds earlier comes back as a correctly-named
 inode with no data. The console and the bridge exit on their own once the guest
 is gone; the driver then unloads cleanly with `sc stop CoLinuxDriver`.
 
+Recovering a box that has stopped answering. Three deaths, three recoveries,
+and telling them apart saves a walk to the machine:
+
+  * **Triple fault** -- the processor resets immediately. No bugcheck, no dump,
+    nothing in any log. The machine comes back on its own; wait for it.
+  * **Bugcheck** -- the kernel stops and waits, powered on, showing a screen.
+    `tools/autoreboot.bat` (run once per install) makes it write a minidump and
+    reboot instead. Nothing is lost by that: the code and parameters are in the
+    dump, which getdumps.bat collects, and every bugcheck this project has
+    diagnosed was read from a dump rather than off the screen.
+  * **Hard hang** -- powered, nothing executing. Only the power button.
+
+`tools/wol.py` distinguishes the first from the other two for free. A cleanly
+powered-off box answers about twenty seconds after the magic packet; if it does
+not, the machine is powered ON and not running, because the NIC only arms its
+magic-packet filter in a real power-off state. WoL failing is therefore evidence,
+not a broken tool.
+
+`tools/hardreset.exe` covers the case where Windows still schedules but
+`shutdown.exe` cannot finish -- a thread blocked inside our driver. See the
+comment at the top of tools/hardreset.cs; it goes through NtShutdownSystem so
+nothing in user mode is asked to co-operate, and forcing the user-mode path
+instead is the documented way to produce this port's recurring 0x50.
+
 And the one that governs the whole day: **the first boot after a host reboot is
 reliable and the second is not.** Guest RAM is freed and re-hunted in unbroken
 32 MB runs every run, so the second boot's allocations grind the host until it
