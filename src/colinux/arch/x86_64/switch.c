@@ -2837,6 +2837,7 @@ typedef struct {
 	unsigned long long sysenter_cs, sysenter_esp, sysenter_eip;
 	unsigned long long dr0, dr1, dr2, dr3, dr6;
 	unsigned long long cr8, pat, dr7, rflags, xcr0;
+	unsigned long long mtrr_def;
 	unsigned short	   gdt_limit, idt_limit, ldt, tr, cs, ss;
 	unsigned short	   ds, es, fs, gs;
 } co_host_snapshot_t;
@@ -2872,6 +2873,7 @@ static void co_host_repair(const co_host_snapshot_t* want,
 	unsigned int lo, hi;
 
 	co_wrmsr(0x277, want->pat);
+	co_wrmsr(0x2ff, want->mtrr_def);
 	asm volatile("mov %0, %%cr8" : : "r"(want->cr8));
 	asm volatile("mov %0, %%cr2" : : "r"(want->cr2));
 	if (want->cr4 & (1ULL << 18)) {
@@ -2969,6 +2971,24 @@ static void co_host_snapshot(co_host_snapshot_t* s)
 	 */
 	asm volatile("mov %%cr8, %0" : "=r"(v)); s->cr8 = v;
 	s->pat = co_rdmsr(0x277);
+	/*
+	 * MTRRdefType, the other per-core cache MSR, added after it cost 109
+	 * seconds of every boot.
+	 *
+	 * PAT above is here because Linux's pat_init rewrote it and changed what
+	 * Windows' live PTEs meant. This is the same problem one register along,
+	 * and worse: bit 11 is the MTRR enable, and with it clear every byte of
+	 * physical memory is uncacheable on this core -- so a host that resumes
+	 * with it clear does not merely misinterpret memory types, it runs the
+	 * whole of Windows with caching off.
+	 *
+	 * The guest reaches it through cache_disable() -> mtrr_disable() inside
+	 * cache_cpu_init(), a window upstream protects with local_irq_save() and
+	 * this port makes virtual. That path is now blocked on the guest side as
+	 * well (arch/x86/kernel/cpu/mtrr/mtrr.c), which is the actual fix; this
+	 * is here so that no future guest path can do it again silently.
+	 */
+	s->mtrr_def = co_rdmsr(0x2ff);
 	asm volatile("mov %%dr0, %0" : "=r"(v)); s->dr0 = v;
 	asm volatile("mov %%dr1, %0" : "=r"(v)); s->dr1 = v;
 	asm volatile("mov %%dr2, %0" : "=r"(v)); s->dr2 = v;
@@ -3031,6 +3051,7 @@ static co_host_field_t co_host_verify(const co_host_snapshot_t* want,
 	CO_CHECK(gs,		 CO_HOST_FIELD_GS);
 	CO_CHECK(cr8,		 CO_HOST_FIELD_CR8);
 	CO_CHECK(pat,		 CO_HOST_FIELD_PAT);
+	CO_CHECK(mtrr_def,	 CO_HOST_FIELD_MTRR_DEF);
 	CO_CHECK(dr7,		 CO_HOST_FIELD_DR7);
 	CO_CHECK(rflags,	 CO_HOST_FIELD_RFLAGS);
 	CO_CHECK(cr2,		 CO_HOST_FIELD_CR2);
@@ -3898,7 +3919,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 						     : "memory", "cc");
 
 					/*
-					 * Those three are plain values with no
+					 * Those four are plain values with no
 					 * machinery behind them, so a repaired
 					 * run is a healthy run and continues --
 					 * that is how the culprit gets named
@@ -3907,9 +3928,17 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 					 * switch itself failed to carry state
 					 * it owns, and nothing after that is
 					 * trustworthy.
+					 *
+					 * MTRRdefType belongs in this group and
+					 * is the most urgent of them to put back:
+					 * with its enable bit clear the host runs
+					 * entirely uncached, so leaving it for the
+					 * report to explain would mean writing
+					 * that report at a thousandth of speed.
 					 */
 					if (bad == CO_HOST_FIELD_CR8 ||
 					    bad == CO_HOST_FIELD_PAT ||
+					    bad == CO_HOST_FIELD_MTRR_DEF ||
 					    bad == CO_HOST_FIELD_DR7)
 						goto host_repaired;
 
