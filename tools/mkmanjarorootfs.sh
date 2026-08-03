@@ -15,6 +15,19 @@
 #
 #   mkmanjarorootfs.sh /path/to/root-manjaro.img [size]   build into a new image
 #   mkmanjarorootfs.sh /dev/cobd1                         build into a block device
+#   mkmanjarorootfs.sh --seed root-seed.img [size]        build the seed
+#
+# --seed builds the other end of the same pair: the smallest system that can
+# build the one above. It is what a release ships, because this script needs a
+# Linux with pacman and e2fsprogs already running and therefore cannot create
+# the first image -- so something has to be in the download, and the smallest
+# useful something is a system that can run this script. See doc/installer.
+#
+# The seed carries this script at /usr/local/bin/mkmanjarorootfs.sh and a
+# first-boot unit that runs it against /dev/cobd1, so the machine being
+# installed onto builds its own root filesystem with the same code that built
+# the seed. One script, two package sets, one definition of what a MoCoLinux
+# root filesystem is.
 #
 # The second form is how it runs on the test box. A 6 GB image cannot be pushed
 # there -- the transfer agent buffers it and the deploy verifies by reading it
@@ -28,8 +41,25 @@
 
 set -e
 
-TARGET=${1:?usage: mkmanjarorootfs.sh <image-or-device> [size]}
-SIZE=${2:-6G}
+SELF=$(readlink -f "$0")
+
+SEED=0
+if [ "$1" = "--seed" ]; then
+	SEED=1
+	shift
+fi
+
+TARGET=${1:?usage: mkmanjarorootfs.sh [--seed] <image-or-device> [size]}
+
+# The seed is deliberately small and mostly empty: its package cache is
+# deleted and its free space zeroed at the end, so what ships compresses to a
+# fraction of this. The full image is sized for a desktop plus room to install
+# things afterwards.
+if [ "$SEED" = 1 ]; then
+	SIZE=${2:-3G}
+else
+	SIZE=${2:-6G}
+fi
 
 # Manjaro's stable branch, which is the point of choosing Manjaro over Arch for
 # a machine somebody else has to live with: package sets that were held back and
@@ -101,6 +131,32 @@ PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 	  xorg-xauth xorg-xhost xorg-xrandr xterm \
 	  xcb-util-cursor \
 	  lib32-glibc lib32-gcc-libs"
+
+# The seed's set, and every entry earns its place because this is what a user
+# downloads before anything else happens.
+#
+# base brings systemd, pacman, both keyrings, iproute2 and iputils. e2fsprogs
+# is named explicitly rather than relied on: the one job this system exists to
+# do is mke2fs a second disk, and depending on it arriving as somebody else's
+# dependency is how that breaks quietly. curl is the network check in the
+# first-boot unit, and it is what fails with a clear message instead of pacman
+# failing with fifty lines. gnupg because pacman-key is a shell script driving
+# the gpg binary, so the keyring cannot be populated without it -- and a seed
+# with an unpopulated keyring is a seed that cannot install anything.
+#
+# zsh is here for one reason: the console autologs in as a user whose shell
+# this script sets to zsh, and a login shell that is not installed is a
+# console that does not work. It is six megabytes against the only way in.
+#
+# No desktop, no fonts, no lib32, no X clients. Those are what the target
+# downloads for itself.
+SEED_PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
+	  gnupg sudo nano inetutils curl e2fsprogs \
+	  zsh zsh-completions"
+
+if [ "$SEED" = 1 ]; then
+	PACKAGES="$SEED_PACKAGES"
+fi
 
 MNT=$(mktemp -d)
 CONF=$(mktemp)
@@ -241,6 +297,31 @@ mkdir -p "$MNT/dev/pts" && mount --bind /dev/pts "$MNT/dev/pts" 2>/dev/null || t
 
 inside() { chroot "$MNT" /bin/bash -c "$1"; }
 
+# A resolver for the chroot, and this one was silently missing for the life of
+# this script.
+#
+# Nothing installs /etc/resolv.conf -- the booted guest does not need one,
+# because Manjaro's nsswitch.conf lists `resolve` and systemd-resolved answers
+# through NSS -- but resolved is not running inside a chroot, so every name
+# lookup in here fails. What that looks like from pacman is:
+#
+#   error: failed retrieving file 'extra.db' from <every mirror in the list>
+#          : Could not resolve host: <every mirror in the list>
+#
+# which reads as a bad mirrorlist, and was read as one: the comment above the
+# mirror prepend blames servers that "do not resolve at all". They resolve
+# fine. Nothing in the chroot could resolve anything.
+#
+# The cost was the half of trust-on-first-use that closes it. Packages go down
+# with SigLevel = Never because the keyring arrives as one of them, and the
+# pacman -Syu below is what re-checks every one of them against the real
+# keyring afterwards. That step has never once run.
+#
+# Removed again at the end, so the build host's DNS does not ship inside the
+# image.
+cp /etc/resolv.conf "$MNT/etc/resolv.conf" 2>/dev/null || \
+	printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$MNT/etc/resolv.conf"
+
 say "populating the pacman keyring"
 # Not optional, and the failure mode is why it is called out here: without this,
 # every package fails verification as TRUST_UNDEFINED *while its signature is
@@ -273,12 +354,41 @@ if [ -f "$MNT/etc/pacman.d/mirrorlist" ]; then
 		"$MNT/etc/pacman.d/mirrorlist"
 fi
 
-say "re-verifying every installed package against the populated keyring"
-# The other half of the trust-on-first-use bargain. Signature checking is back
-# at the distribution default by now, because manjaro-release installed a real
-# pacman.conf over the bootstrap one.
-inside "pacman -Syu --noconfirm" || \
-	say "  full re-verification did not complete; check the image before shipping"
+say "re-verifying against the populated keyring"
+# The other half of the trust-on-first-use bargain, and worth stating exactly
+# rather than generously -- the comment here used to say a full -Syu
+# "re-verifies everything that was laid down here", and it does not.
+#
+# What it does check: the repository databases, which are signed, and that
+# every installed name and version matches what those signed databases say is
+# current. A mirror serving tampered or stale content is caught by that.
+#
+# What it does not check: the signature of each package file already on the
+# disk. Those went down under SigLevel = Never and, with nothing left to
+# upgrade, pacman has no reason to fetch or verify them again. Closing that
+# properly means either installing the keyring first and the rest with
+# signatures enforced, or fetching the .sig beside each cached package and
+# verifying it by hand. Recorded in TODO rather than half-done here.
+#
+# Fatal, and it did not used to be. It degraded to a warning, which is the
+# wrong shape for this particular step: everything above it was installed with
+# SigLevel = Never, so if this does not run then nothing in the image has had
+# its signature checked and the script says "done, unmounted clean" anyway.
+# That is precisely what happened on every build until the resolver above was
+# fixed, and a warning in the middle of a thousand lines of pacman output is
+# not how a security property should be reported.
+#
+# MOCO_ALLOW_UNVERIFIED=1 is for somebody who knows what they are giving up.
+if ! inside "pacman -Syu --noconfirm"; then
+	if [ "${MOCO_ALLOW_UNVERIFIED:-0}" = 1 ]; then
+		say "  WARNING: re-verification failed and was overridden --"
+		say "  nothing in this image has had its signature checked"
+	else
+		say "  re-verification failed: nothing here has been signature-checked."
+		say "  Fix the network and run again, or set MOCO_ALLOW_UNVERIFIED=1."
+		exit 1
+	fi
+fi
 
 # ---------------------------------------------------------------- the system
 
@@ -543,10 +653,176 @@ done
 echo "%wheel ALL=(ALL:ALL) NOPASSWD: ALL" > "$MNT/etc/sudoers.d/10-wheel"
 chmod 0440 "$MNT/etc/sudoers.d/10-wheel"
 
+# ---------------------------------------------------------------- the seed
+
+# Everything below is what makes a seed a seed rather than a small install.
+if [ "$SEED" = 1 ]; then
+
+say "installing the builder and its first-boot unit"
+
+# This script, inside the image it just built. The system that gets installed
+# on somebody's machine is therefore built by the same code that built the
+# seed, from the same file -- not a copy that drifted.
+install -Dm 0755 "$SELF" "$MNT/usr/local/bin/mkmanjarorootfs.sh"
+
+# The first-boot unit's wrapper.
+#
+# It runs the builder against the second disk and translates its output into
+# the marker vocabulary doc/installer specifies, so the host side reads a
+# stream rather than scraping a shell prompt. The reason that matters is two
+# lines up in this very file: the mirror configuration is written as literal
+# per-repo URLs because a dollar sign does not survive the layers of quoting
+# involved in driving this script through a serial console. Anything that
+# needs the host to compose shell has the same problem.
+#
+# Everything the builder prints goes through untouched except its own "==> "
+# stage lines, which become MOCO:STAGE. A reader that does not care about
+# markers still sees an ordinary build log.
+cat > "$MNT/usr/local/bin/mocolinux-setup" <<'SETUP'
+#!/bin/sh
+# Build this machine's root filesystem on the second disk, on first boot.
+#
+# Output goes to the console because that is the only channel out of this
+# guest: there is no framebuffer and no UART, just the hypervisor byte stream
+# the host reads through colinux-daemon --console.
+exec > /dev/console 2>&1
+
+TARGET=/dev/cobd1
+STAGES=7
+MIRROR=https://mirror.aarnet.edu.au/pub/manjaro/stable/core/x86_64/core.db
+
+# console  -- the seed's own package set, so the built system is a shell and a
+#             network and nothing else, ready in a couple of minutes
+# desktop  -- the full set, which is the 2.5 GB download
+SET=desktop
+for word in $(cat /proc/cmdline); do
+	case "$word" in
+	mocolinux.set=*) SET=${word#mocolinux.set=} ;;
+	esac
+done
+
+fail() {
+	echo "MOCO:FAIL $1 $2"
+	exit 1
+}
+
+[ -b "$TARGET" ] || fail nodisk "no second disk attached at $TARGET"
+
+echo "MOCO:STAGE 1/$STAGES checking the network"
+# Ahead of pacman deliberately. An unreachable network here is one line that
+# names the problem; the same failure inside pacman is a wall of TLS and
+# "transfer too slow" errors that reads as a broken mirror or a broken NAT.
+curl -4 -s -I --max-time 30 -o /dev/null "$MIRROR" \
+	|| fail network "cannot reach the Manjaro mirror -- is the network bridge running?"
+
+ARGS=""
+[ "$SET" = console ] && ARGS="--seed"
+
+# The exit status has to come out of the pipeline, and `set -o pipefail` is
+# not in POSIX sh, so the builder records its own.
+RC=/run/mocolinux-setup.rc
+rm -f "$RC"
+{ /usr/local/bin/mkmanjarorootfs.sh $ARGS "$TARGET"; echo $? > "$RC"; } 2>&1 |
+while IFS= read -r line; do
+	case "$line" in
+	"==> "*)
+		STAGE=$((${STAGE:-1} + 1))
+		echo "MOCO:STAGE $STAGE/$STAGES ${line#==> }"
+		;;
+	*)
+		echo "$line"
+		;;
+	esac
+done
+
+[ "$(cat $RC 2>/dev/null)" = 0 ] || fail build "building the root filesystem failed"
+
+# Verify before saying it worked. A block-layer bug in this port once produced
+# an image whose own package database read back as binary noise, so "the
+# script exited 0" is not the same as "there is a system on that disk".
+echo "MOCO:STAGE $STAGES/$STAGES verifying"
+VERIFY=/mnt/new
+mkdir -p "$VERIFY"
+mount "$TARGET" "$VERIFY" || fail mount "the new filesystem will not mount"
+
+MISSING=$(pacman --root "$VERIFY" -Qk 2>&1 | grep -v "0 missing files" || true)
+[ -x "$VERIFY/usr/lib/systemd/systemd" ] || { umount "$VERIFY"; fail noinit "no systemd in the new filesystem"; }
+[ -f "$VERIFY/etc/fstab" ] || { umount "$VERIFY"; fail nofstab "no fstab in the new filesystem"; }
+umount "$VERIFY"
+
+if [ -n "$MISSING" ]; then
+	echo "$MISSING"
+	fail damaged "installed packages are missing files -- the image is not sound"
+fi
+
+# Only now, and only after the filesystem is unmounted, which is the point at
+# which its contents are actually on the disk.
+e2fsck -n -f "$TARGET" > /dev/null 2>&1 || fail fsck "the new filesystem does not check clean"
+
+systemctl disable mocolinux-setup.service > /dev/null 2>&1
+echo "MOCO:OK"
+SETUP
+chmod 0755 "$MNT/usr/local/bin/mocolinux-setup"
+
+# Wanted by multi-user.target rather than run from the console, so it starts
+# whether or not anybody is attached, and after the network is configured.
+#
+# It stays enabled if it fails, so the next boot tries again -- which is what
+# makes a retry work without the host knowing anything about what went wrong.
+# On success it disables itself, and the seed becomes an ordinary system.
+cat > "$MNT/usr/lib/systemd/system/mocolinux-setup.service" <<'UNIT'
+[Unit]
+Description=Build the MoCoLinux root filesystem on the second disk
+After=systemd-networkd-wait-online.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/dev/cobd1
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mocolinux-setup
+RemainAfterExit=yes
+TimeoutStartSec=infinity
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+inside "systemctl enable mocolinux-setup.service" > /dev/null 2>&1 || \
+	say "  WARNING: could not enable mocolinux-setup.service"
+
+# The package cache is most of a seed's size and none of its value: the target
+# downloads its own packages from a mirror, and shipping ours only makes the
+# download bigger. The full build keeps its cache, because there it is what
+# makes a retry cheap.
+say "emptying the package cache"
+rm -rf "$MNT/var/cache/pacman/pkg"/*
+
+# Zero the free space, which costs a minute here and a great deal of download
+# everywhere else. Deleted files leave their contents behind on ext4, and an
+# image full of the remains of 700 MB of packages does not compress; an image
+# whose free space is zeroes compresses to almost nothing. The write is
+# expected to end in ENOSPC, which is the point.
+say "zeroing free space so the image compresses"
+dd if=/dev/zero of="$MNT/.zerofill" bs=4M 2>/dev/null || true
+rm -f "$MNT/.zerofill"
+
+fi
+
 # ---------------------------------------------------------------- done
 
+# The build host's resolver does not ship. The symlink is what a systemd
+# system expects to find here, and it costs nothing on a guest that resolves
+# through NSS anyway.
+rm -f "$MNT/etc/resolv.conf"
+ln -sf /run/systemd/resolve/stub-resolv.conf "$MNT/etc/resolv.conf"
+
 sync
-say "installed $(ls "$MNT/var/lib/pacman/local" | wc -l) packages, $(du -sm "$MNT" | cut -f1) MB"
+# df rather than du, because proc, sys and dev are still bound here: du walks
+# into the host's /proc and reports its size along with a page of errors about
+# pids that vanished while it was reading them. df asks the filesystem, which
+# is the number that was wanted in the first place.
+say "installed $(ls "$MNT/var/lib/pacman/local" | wc -l) packages, $(df -m "$MNT" | awk 'NR==2 {print $3}') MB"
 
 # The unmount happens in the EXIT trap, so the success line cannot be printed
 # before the data is actually on the disk. It is printed by the trap instead.
