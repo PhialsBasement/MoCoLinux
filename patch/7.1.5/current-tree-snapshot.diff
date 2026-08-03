@@ -2,98 +2,74 @@ Authoritative cumulative snapshot of ref/linux-7.1.5: the conet ethernet
 device, runtime text pokes through the kernel's own poking mm, and the 32-bit
 syscall gate left alone.
 
-Generated against download/linux-7.1.5.tar.xz on 2026-08-02.
+Generated against download/linux-7.1.5.tar.xz on 2026-08-03.
 
 Over the previous snapshot:
 
-  * The cooperative timer -- the guest's only asynchronous entry, and the end
-    of a design gap this tree's own comment had been describing as future work.
+  * A clock, and the two-minute stall it exposed.
 
-    Ticks used to be synthesised only in co_cpu_idle(), so while the guest was
-    busy no time passed at all: no tick, no scheduler preemption, and therefore
-    no way to take the processor from a task that stayed runnable. One
-    userspace loop froze the entire guest permanently. Everything downstream
-    then looked broken instead -- the receive kthread asleep on a timer that
-    could never fire, the console silent, the host's monitor loop at full speed
-    because no idle yield ever came.
+    tsc_early_khz on the command line hands the guest its TSC frequency instead
+    of asking it to measure one. All three calibration routes are deliberately
+    shut here -- the PIT belongs to Windows, nohpet removes the HPET, acpi=off
+    removes the PM timer -- so the guest fell back to jiffies, which only advance
+    when the host delivers ticks, which a booting kernel never reaches. Every
+    printk timestamp in every boot log this project has taken read [0.000000]
+    from the first line to "Run /sbin/init". A kernel phase taking minutes was
+    recorded as four milliseconds, which is why systemd-analyze always reported a
+    9 ms kernel and why nobody ever saw that booting was slow. tsc=reliable stops
+    the watchdog marking it unstable again; there is no second clocksource here
+    to check it against, so the watchdog could only ever conclude the one clock
+    was wrong.
 
-    Two deliveries. co_colinux_drain_time() is now also called from
-    __exit_to_user_mode_prepare(), the funnel every syscall and exception
-    returns through, which covers anything that enters the kernel and is what
-    made Qt applications work. And sysvec_co_timer, declared over
-    CO_TIMER_VECTOR, is what the host vectors a running guest to when it wants
-    to preempt one that does not.
+  * The guest no longer turns the host's caches off (mtrr.c).
 
-    No IDT gate is installed for that vector. The host synthesises the entry by
-    pointing its resume at asm_sysvec_co_timer over a frame it builds from the
-    one the interrupt stub already saved -- so what runs is the stock idtentry
-    body, with error_entry making the swapgs decision from the interrupted CS
-    and irqentry_exit doing the scheduling. Reusing that path rather than
-    writing one is the point: every part of taking an interrupt that is easy to
-    get wrong is already correct here.
+    With a real clock, one stretch of setup_arch containing about a hundred
+    instructions measured 109 seconds. cache_bp_init() ends by calling
+    cache_cpu_init():
 
-    co_colinux_take_ticks() exists so both deliveries share one baseline;
-    separate ones would let whichever ran hide elapsed time from the other.
+        local_irq_save(flags);
+        cache_disable();        /* CR0.CD=1, wbinvd, then mtrr_disable() */
+        mtrr_generic_set_state();
+        cache_enable();
+        local_irq_restore(flags);
 
-    Verified: a bare `while :; do :; done` in userspace is now preempted, the
-    guest stays responsive, and time advances across it at real speed.
+    mtrr_disable() is a real wrmsr clearing MTRRdefType.E, and with that bit
+    clear every byte of physical memory is uncacheable on the core. Upstream
+    guards the window with local_irq_save(), and its own comment says interrupts
+    taken here "would run extremely slow". In this port local_irq_save() is
+    virtual -- it clears co_colinux_virtual_if and returns without a cli, because
+    real IF has to stay set for the host's clock to keep crossing.
 
-  * co_colinux_adopt_traps() no longer overwrites vector 0x80.
+    So Windows' timer arrived inside the window at about a kilohertz. CR0 is
+    per-side across the world switch, so CD did not leak; MTRRdefType was carried
+    nowhere and checked nowhere. Every crossing ran the switch stub, the world
+    switch and the whole of Windows' interrupt service with caching off, going
+    from ~10 us to milliseconds -- longer than the tick period, so another tick
+    was already pending at nearly every re-entry. The guest retired a handful of
+    instructions per round trip and the window ratcheted shut over ~1e5
+    crossings. It ended exactly at cache_enable(), which is why nothing
+    downstream ever looked damaged.
 
-    The loop hands vectors 32-255 to the host's stubs, because those are the
-    machine's interrupts and Windows needs them. 0x80 is inside that range and
-    is not one of them: it is the 32-bit syscall gate, installed a moment
-    earlier by idt_setup_traps() as a DPL 3 system gate to entry_INT80_compat.
-    The gates this loop writes are DPL 0, so overwriting it makes `int $0x80`
-    from ring 3 a general protection fault -- error code (0x80 << 3) | 2, which
-    is 0x402, the IDT selector that was refused.
+    The fix withholds CACHE_MTRR from memory_caching_control for a cooperative
+    guest, so cache_cpu_init() never runs. get_mtrr_state() and mtrr_build_map()
+    stay -- Linux still needs the layout for memtype decisions, and the "MTRR
+    map: 8 entries" line still appears in dmesg. This mirrors the PAT guard in
+    pat_bp_init() a few lines below, which exists for the same reason about the
+    other per-core cache MSR; upstream sanctions the shape for guests through
+    guest_force_mtrr_state(). The host now also snapshots, verifies and repairs
+    MSR 0x2FF on every crossing, so no future guest path can do this silently.
 
-    Every 32-bit binary died at that instruction, and none of them said so.
-    ld-linux.so.2 faults before it can report anything, so `ldd` lists every
-    library as "not found" and an installer concludes libc.so.6 is missing while
-    it sits in /usr/lib32 in perfect health. Found by running Steam.
-
-    The host does not want the vector: Windows enters its kernel through
-    int 0x2e and syscall, so leaving 0x80 to Linux costs it nothing and is what
-    makes a 32-bit userland work at all.
-
-  * drivers/block/cobd.c: scatter-gather, and the passage page held across the
-    parameters and the crossing.
-
-    The descriptor form is the performance half: the block layer produces one
-    segment per page, so a readahead used to cost a world crossing per page.
-    The guest now describes the scattered runs once and crosses once.
-
-    preempt_disable() around the parameter writes is the correctness half.
-    There is one passage page and one set of parameters; queue_rq runs in fully
-    preemptible process context (BLK_MQ_F_BLOCKING, and blk_mq_submit_bio
-    issues directly in the submitting task's own context), so two tasks reach
-    it independently and CONFIG_PREEMPTION lets one displace the other between
-    the last store and the call. Interleaved, the second task's parameters are
-    the ones that cross, and the first is told its transfer succeeded when the
-    host never performed it -- pages marked uptodate holding whatever was in
-    them, which is program text on its way in. Nothing is logged when it fires:
-    both crossings succeed and the corruption arrives as data.
-
-  * text-poke-direct is gone, because both of its premises died on Aug 1.
-    It bypassed __text_poke()'s temporary-mm machinery on the grounds that
-    native_write_cr3() was a no-op (stale since the ring-3 commit made CR3
-    writes real) and that mark_rodata_ro()'s protection was never applied
-    (stale since boots started completing -- the first runtime jump-label
-    poke faulted with error code 0x3, present+write, which is read-only
-    text announcing itself). The upstream path is the right one now: the
-    poking-mm CR3 switch is the same operation every execve performs, and
-    the passage page is grafted into every mm pgd_alloc builds, so a
-    hardware interrupt mid-poke crosses exactly as it does from any
-    process. Boot-time static-key flips exercise this path before
-    userspace ever starts.
+    Measured, same code path either way: cache_bp_init() 580468 cycles before,
+    54749 after. Three consecutive guests then booted on one driver load at 22s,
+    42s and 41s -- a second run on a single driver load had previously failed
+    every time.
 
   * drivers/net/conet_colinux.c: the cooperative ethernet device, two byte
     rings in ordinary kernel .bss, one writer per word per direction.
 
 This file is intentionally not listed in series: it preserves the exact live
-
 guest source while the incremental patch set is still being repaired.
+
 diff -urN a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
 --- a/arch/x86/include/asm/desc.h	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/include/asm/desc.h	2026-08-01 10:49:13.251537400 +1000
@@ -590,6 +566,86 @@ diff -urN a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
  set_register:
  	asm volatile("mov %0,%%cr4": "+r" (val) : : "memory");
  
+diff -urN a/arch/x86/kernel/cpu/mtrr/mtrr.c b/arch/x86/kernel/cpu/mtrr/mtrr.c
+--- a/arch/x86/kernel/cpu/mtrr/mtrr.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/cpu/mtrr/mtrr.c	2026-08-03 16:17:50.655995200 +1000
+@@ -42,6 +42,14 @@
+ 
+ #include "mtrr.h"
+ 
++/*
++ * Set by the host before this kernel runs. Declared here rather than pulled in
++ * through a header, the same way asm/desc.h, asm/io.h and asm/irqflags.h each
++ * declare it for their own use. See the note at the CACHE_MTRR assignment in
++ * mtrr_bp_init().
++ */
++extern int co_colinux_guest;
++
+ static_assert(X86_MEMTYPE_UC == MTRR_TYPE_UNCACHABLE);
+ static_assert(X86_MEMTYPE_WC == MTRR_TYPE_WRCOMB);
+ static_assert(X86_MEMTYPE_WT == MTRR_TYPE_WRTHROUGH);
+@@ -580,7 +588,60 @@
+ 		if (mtrr_if == &generic_mtrr_ops) {
+ 			/* BIOS may override */
+ 			if (get_mtrr_state()) {
+-				memory_caching_control |= CACHE_MTRR;
++				/*
++				 * A cooperative guest reads the MTRRs and must
++				 * never write them. Same reasoning as the PAT
++				 * guard in pat_bp_init(), and the same MSR
++				 * ownership problem one level up.
++				 *
++				 * memory_caching_control is what makes
++				 * cache_bp_init() go on to call
++				 * cache_cpu_init(), which is:
++				 *
++				 *	local_irq_save(flags);
++				 *	cache_disable();
++				 *	mtrr_generic_set_state();
++				 *	cache_enable();
++				 *	local_irq_restore(flags);
++				 *
++				 * cache_disable() sets CR0.CD and then calls
++				 * mtrr_disable() -- a real wrmsr clearing
++				 * MTRRdefType.E, which makes every byte of
++				 * physical memory uncacheable on this core.
++				 * Upstream protects that window with
++				 * local_irq_save(), whose own comment says
++				 * interrupts here "would run extremely slow".
++				 *
++				 * In this guest local_irq_save() is virtual: it
++				 * clears co_colinux_virtual_if and returns
++				 * without a cli, because real IF must stay set
++				 * for the host's clock to keep crossing. So
++				 * Windows' timer interrupt arrives inside the
++				 * window at about a kilohertz, and CR0 is
++				 * per-side across the switch but MTRRdefType is
++				 * not carried at all -- every crossing, the
++				 * whole world switch and all of Windows'
++				 * interrupt service run with caching off.
++				 *
++				 * Measured: each crossing inflates from ~10 us
++				 * to milliseconds, which is longer than the tick
++				 * period, so another tick is already pending at
++				 * nearly every re-entry and the guest retires a
++				 * handful of instructions per round trip. The
++				 * window took 109 seconds of wall clock. It read
++				 * as [0.000000] in every log until the guest was
++				 * given a real clock, which is why a two-minute
++				 * stall went unnoticed for the life of this port.
++				 *
++				 * get_mtrr_state() and mtrr_build_map() stay:
++				 * Linux still needs to know the layout to make
++				 * memtype decisions. Only the permission to
++				 * reprogram is withheld. Upstream sanctions
++				 * exactly this shape for guests through
++				 * guest_force_mtrr_state() above.
++				 */
++				if (!co_colinux_guest)
++					memory_caching_control |= CACHE_MTRR;
+ 				changed_by_mtrr_cleanup = mtrr_cleanup();
+ 				mtrr_build_map();
+ 			} else {
 diff -urN a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
 --- a/arch/x86/kernel/early_printk.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/early_printk.c	2026-08-01 18:25:11.917353400 +1000
@@ -1562,7 +1618,7 @@ diff -urN a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
  			machine_shutdown();
 diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
 --- a/arch/x86/kernel/setup.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/setup.c	2026-08-01 09:13:13.500251200 +1000
++++ b/arch/x86/kernel/setup.c	2026-08-03 16:30:51.027939300 +1000
 @@ -55,6 +55,7 @@
  #include <asm/proto.h>
  #include <asm/realmode.h>
@@ -1645,6 +1701,23 @@ diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
  	idt_setup_early_traps();
  	early_cpu_init();
  	jump_label_init();
+@@ -1033,7 +1101,15 @@
+ 	 */
+ 	max_pfn = e820__end_of_ram_pfn();
+ 
+-	/* update e820 for memory not covered by WB MTRRs */
++	/*
++	 * update e820 for memory not covered by WB MTRRs
++	 *
++	 * cache_bp_init() ends in cache_cpu_init(), which disables the MTRRs to
++	 * reprogram them -- leaving all of physical memory uncacheable on this
++	 * core -- under a local_irq_save() that is virtual in this guest. That
++	 * cost 109 seconds of every boot until the guest stopped claiming
++	 * CACHE_MTRR; see the note in arch/x86/kernel/cpu/mtrr/mtrr.c.
++	 */
+ 	cache_bp_init();
+ 	if (mtrr_trim_uncached_memory(max_pfn))
+ 		max_pfn = e820__end_of_ram_pfn();
 diff -urN a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
 --- a/arch/x86/kernel/traps.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/traps.c	2026-08-01 11:49:58.702868100 +1000
