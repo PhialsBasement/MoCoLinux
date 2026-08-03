@@ -1855,6 +1855,57 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 				" pci=off nopat io_delay=none mce=off dis_ucode_ldr"
 				" nowatchdog 8250.nr_uarts=0 lpj=1600000"
 				/*
+				 * A clock. The guest has had none, and it cost
+				 * more than a missing feature: it made every
+				 * measurement this project has taken of a boot
+				 * meaningless.
+				 *
+				 * What the guest says about itself, read live:
+				 *
+				 *   tsc: Fast TSC calibration failed
+				 *   tsc: Unable to calibrate against PIT
+				 *   tsc: No reference (HPET/PMTIMER) available
+				 *   tsc: Marking TSC unstable due to could not
+				 *        calculate TSC khz
+				 *   clocksource: Switched to refined-jiffies
+				 *
+				 * Three calibration routes and all three are shut
+				 * by the options above this line, deliberately:
+				 * the PIT belongs to Windows, nohpet removes the
+				 * HPET, acpi=off removes the PM timer. So it falls
+				 * back to jiffies -- and jiffies only advance when
+				 * the host delivers ticks, at the idle boundary
+				 * and the exit-to-user drain, neither of which a
+				 * booting kernel reaches.
+				 *
+				 * The consequence is that sched_clock stands still
+				 * for the whole kernel phase. Every printk
+				 * timestamp in every boot log this project has is
+				 * [0.000000] up to "Run /sbin/init", then jumps to
+				 * 1.53 the moment userspace exists and the drain
+				 * starts running. A kernel phase that takes
+				 * minutes of wall clock is recorded as four
+				 * milliseconds, which is why systemd-analyze has
+				 * always reported a 9 ms kernel and why nobody
+				 * ever saw that booting is slow.
+				 *
+				 * tsc_early_khz hands over the frequency instead
+				 * of asking the guest to measure it, exactly as
+				 * lpj= above hands over the delay loop instead of
+				 * calibrating it. The number is not invented: the
+				 * host reads this core at 3193 MHz through the PIT
+				 * during its own early boot, and the guest itself
+				 * measured 3193 MHz the one time it was allowed to
+				 * drive the 8254.
+				 *
+				 * tsc=reliable stops the watchdog marking it
+				 * unstable again. There is no second clocksource
+				 * here to check the TSC against, so the watchdog
+				 * can only ever conclude that the one clock is
+				 * wrong -- which is what it did.
+				 */
+				" tsc_early_khz=3193000 tsc=reliable"
+				/*
 				 * No PCID. The guest owns CR3 now, and with
 				 * CR4.PCIDE set the kernel puts an address
 				 * space identifier in the low bits of every
