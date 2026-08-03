@@ -694,8 +694,29 @@ cat > "$MNT/usr/local/bin/mocolinux-setup" <<'SETUP'
 # goes shows whatever happened to be passing at the time. The log persists, so
 # progress can be read at any point with a single `tail`, and a failed build
 # can be examined afterwards instead of reconstructed.
+# The log is the channel. Not the console.
+#
+# hvc0 is the only byte stream out of this guest, and it is already carrying a
+# login shell. Writing the build to it as well put two writers on one tty, and
+# the host read whichever won -- measured, six minutes of build output reached
+# the log and none of it reached the console, while the capture filled with the
+# shell's prompt redraws and bracketed-paste escapes.
+#
+# Standing the getty down would fix that collision and create a worse one. The
+# host reads progress by running a command in the guest and matching a sentinel
+# in the reply, which needs a shell on hvc0; a build writing to the same tty
+# corrupts those replies mid-word, which is what "ddmesg" and "print ff" in this
+# project's own transcripts are. Either the console carries the build or it
+# carries the conversation, and the conversation is what the host needs.
+#
+# So: a file, and the host tails it. That is also strictly more than a stream can
+# offer. A stream has no history, so anything written before the wizard attaches,
+# or while it reconnects, is simply gone -- and this build takes long enough that
+# an operator will attach late, detach, and come back. The file can be re-read
+# from the beginning at any point, which makes progress idempotent to observe and
+# a failed build examinable afterwards instead of reconstructed.
 LOG=/var/log/mocolinux-setup.log
-exec > >(tee -a "$LOG" > /dev/hvc0) 2>&1
+exec >> "$LOG" 2>&1
 
 TARGET=/dev/cobd1
 
@@ -828,21 +849,10 @@ After=systemd-networkd-wait-online.service network-online.target
 Wants=network-online.target
 ConditionPathExists=/dev/cobd1
 
-# The console is the marker channel, so nothing else may write to it.
-#
-# hvc0 is the only way out of this guest and the login getty owns it by default,
-# so a build streaming markers there is one of two writers on a single tty. The
-# host then reads whichever won: measured, six minutes of build output reached
-# the log and none of it reached the console, while the capture filled with the
-# shell's own prompt redraws and bracketed-paste escapes.
-#
-# Conflicts stops the getty for the duration and systemd starts it again
-# afterwards, because the getty is Wanted by the same target. Nobody needs a
-# login shell while an unattended install runs, and the wizard needs the stream
-# clean -- a progress protocol that has to compete for its own channel is not a
-# protocol.
-Conflicts=serial-getty@hvc0.service
-Before=serial-getty@hvc0.service
+# The getty is deliberately left alone. An earlier version of this unit stopped
+# it, to keep the console clear for markers; that was backwards. The build writes
+# to a log now, and the host reads that log by running tail through the shell the
+# getty provides -- so the getty is the transport, not a competitor for it.
 
 [Service]
 Type=oneshot
