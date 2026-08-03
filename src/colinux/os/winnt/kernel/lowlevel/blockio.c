@@ -127,6 +127,44 @@ co_rc_t co_os_bdev_open(const char* path, co_os_bdev_t* dev_out,
 		return rc;
 	}
 
+	/*
+	 * Declare the whole file already valid, so writing to it never triggers
+	 * an NTFS zero-fill.
+	 *
+	 * NTFS tracks a valid-data length and zero-fills everything between it
+	 * and any write that lands beyond -- synchronously, inside that write.
+	 * A freshly reserved image (SetEndOfFile, or fsutil createnew) has VDL
+	 * zero, so the first write near the end of a 16 GB image makes the
+	 * filesystem write gigabytes of zeroes before that one request returns.
+	 * mke2fs puts its backup superblocks exactly there, and the transfer took
+	 * minutes: with synchronous block I/O that froze the whole guest, and with
+	 * asynchronous I/O it blocks that unit's worker just as long.
+	 *
+	 * The contents below VDL become whatever the disk previously held, which
+	 * is correct for a disk image whose filesystem is about to be created or
+	 * is already there -- the guest reads nothing it has not written, exactly
+	 * as with a real disk.
+	 *
+	 * Advisory: it needs SeManageVolumePrivilege, which the kernel has, but
+	 * it is refused on a raw volume and on a filesystem that does not track
+	 * VDL. A failure only means the old slow behaviour, so it is noted and
+	 * not fatal.
+	 */
+	{
+		FILE_VALID_DATA_LENGTH_INFORMATION vdl;
+		IO_STATUS_BLOCK			   visb;
+		NTSTATUS			   vstatus;
+
+		vdl.ValidDataLength.QuadPart = dev->size;
+		vstatus = ZwSetInformationFile(dev->handle, &visb, &vdl,
+					       sizeof(vdl),
+					       FileValidDataLengthInformation);
+		if (!NT_SUCCESS(vstatus))
+			co_debug("bdev: valid-data length not set on '%s'"
+				 " (status %x) -- writes past it will be slow",
+				 path, (int)vstatus);
+	}
+
 	*dev_out  = dev;
 	*size_out = dev->size;
 

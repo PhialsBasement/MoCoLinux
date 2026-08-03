@@ -257,6 +257,72 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		return co_winnt_probe_passage();
 	}
 
+	/*
+	 * Start one application in the guest and return.
+	 *
+	 * This exists so a desktop shortcut needs nothing but this binary. The
+	 * first version of the launchers was a Python script that opened a socket
+	 * to the console server, which works here only because this box has Python
+	 * for the transfer agent: on a stock XP there is none, so every icon would
+	 * have silently done nothing -- and an X client that never appears is the
+	 * hardest failure in this whole system to diagnose.
+	 *
+	 * Nothing new in the driver. The guest's console is a ring the console
+	 * ioctl already writes into, so "run this" is a line typed into the shell
+	 * that is already sitting on hvc0. Going through the driver rather than
+	 * the TCP server also means it does not compete for the console server's
+	 * single client slot -- an open terminal window keeps working.
+	 *
+	 * setsid and /dev/null because the shell receiving the line is a login
+	 * shell on the guest's console: a child left in its process group keeps
+	 * that tty, so its stderr would land in the middle of whatever the next
+	 * reader sees, and closing the terminal would take the application with
+	 * it. DISPLAY is set here rather than assumed because which startup file
+	 * a given shell has read is not something to depend on -- `su -` on
+	 * Manjaro does not run pam_env. 10.0.2.2 is slirp's gateway alias, which
+	 * it rewrites into a connection to this machine's own loopback, so it
+	 * reaches the X server with no port redirection at all.
+	 */
+	if (winnt_parameters.run) {
+		co_manager_handle_t handle;
+		char line[0x400];
+		unsigned long taken = 0, produced = 0;
+		co_rc_t rrc;
+
+		if (!winnt_parameters.run_arg[0]) {
+			co_terminal_print("--run wants a command to run in the guest\n");
+			return CO_RC(INVALID_PARAMETER);
+		}
+
+		handle = co_os_manager_open();
+		if (!handle) {
+			co_terminal_print("run: cannot open the driver -- is MoCoLinux running?\n");
+			return CO_RC(ERROR);
+		}
+
+		co_snprintf(line, sizeof(line),
+			    "\n( DISPLAY=10.0.2.2:0 setsid %s >/dev/null 2>&1 & )\n",
+			    winnt_parameters.run_arg);
+
+		rrc = co_manager_console(handle, line, co_strlen(line), &taken,
+					 NULL, 0, &produced);
+
+		co_os_manager_close(handle);
+
+		if (!CO_OK(rrc) || taken != co_strlen(line)) {
+			co_terminal_print("run: the guest is not listening on its console"
+					  " (rc %x, %lu of %lu bytes taken)\n",
+					  (int)rrc, taken,
+					  (unsigned long)co_strlen(line));
+			co_terminal_print("run: it may still be booting -- give it a moment\n");
+			return CO_RC(ERROR);
+		}
+
+		co_terminal_print("run: started '%s' in the guest\n",
+				  winnt_parameters.run_arg);
+		return CO_RC(OK);
+	}
+
 	if (winnt_parameters.console) {
 		unsigned long port = 0;
 
@@ -336,20 +402,21 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 						      winnt_parameters.init ?
 							winnt_parameters.init_arg : NULL,
 						      mem_mb,
-						      winnt_parameters.no_copic);
+						      winnt_parameters.no_copic,
+						      winnt_parameters.sync_cobd ? 0 : 1);
 		}
 	}
 
 	if (winnt_parameters.call_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0, 0, NULL, NULL, 0, 0);
+		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0, 0, NULL, NULL, 0, 0, 0);
 	}
 
 	if (winnt_parameters.enter_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0, 0, NULL, NULL, 0, 0);
+		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0, 0, NULL, NULL, 0, 0, 0);
 	}
 
 	if (winnt_parameters.load_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0, NULL, NULL, 0, 0);
+		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0, NULL, NULL, 0, 0, 0);
 	}
 
 	if (winnt_parameters.net_dump) {

@@ -50,6 +50,23 @@ extern void co_os_pin_cpu(void);
 extern void co_os_unpin_cpu(void);
 
 /*
+ * A kernel system thread, for the cooperative block device's async workers.
+ *
+ * The block transfer runs in the driver (ZwReadFile against a kernel handle),
+ * so its worker cannot be the user-mode co_os_thread_* in os/user/misc.h -- it
+ * has to be a real kernel thread (PsCreateSystemThread) at PASSIVE_LEVEL.
+ *
+ * co_os_kthread_start returns an opaque object reference or NULL.
+ * co_os_kthread_join waits for func to return and drops the reference; the
+ * join holds a reference to the KTHREAD object (not the handle), so it is
+ * race-free against the thread exiting first. func must return normally; the
+ * trampoline calls PsTerminateSystemThread for it.
+ */
+typedef void (*co_os_kthread_func_t)(void* arg);
+extern void* co_os_kthread_start(co_os_kthread_func_t func, void* arg);
+extern void  co_os_kthread_join(void* thread);
+
+/*
  * Which processor this thread is on right now.
  *
  * Exists so the host-state check can say whether a value came back wrong

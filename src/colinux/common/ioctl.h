@@ -546,6 +546,10 @@ typedef struct {
 	unsigned long long console_io_va;
 	/* where it keeps co_colinux_net_io, for the network rings */
 	unsigned long long net_io_va;
+	/* where it keeps co_colinux_cobd_io, the async block completion ring */
+	unsigned long long cobd_io_va;
+	/* 1 = run block I/O asynchronously off the monitor thread (default) */
+	int		   async_cobd;
 	/* out */
 	unsigned long long guest_cr3;
 	unsigned long	   tables;

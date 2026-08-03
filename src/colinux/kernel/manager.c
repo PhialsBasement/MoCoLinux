@@ -29,6 +29,7 @@
 #include "reversedpfns.h"
 #include "kload.h"
 #include "cobd.h"
+#include "cobd_async.h"
 #include "console.h"
 #include "net.h"
 
@@ -136,6 +137,10 @@ co_rc_t co_manager_load(co_manager_t *manager)
 		goto out_err_os;
 
 	rc = co_net_init();
+	if (!CO_OK(rc))
+		goto out_err_os;
+
+	rc = co_cobd_async_init();
 	if (!CO_OK(rc))
 		goto out_err_os;
 
@@ -266,6 +271,7 @@ void co_manager_unload(co_manager_t* manager)
 	if (manager->state >= CO_MANAGER_STATE_INITIALIZED_DEBUG)
 		co_debug_free(&manager->debug);
 
+	co_cobd_async_free();
 	co_net_free();
 	co_console_free();
 	/* Last, because everything above may still call co_kload_free. */
@@ -935,6 +941,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.passage_symbol_va  = params->passage_symbol_va;
 		co_console_set_address(params->console_io_va);
 		co_net_set_address(params->net_io_va);
+		in.cobd_io_va         = params->cobd_io_va;
+		in.async_cobd         = params->async_cobd;
 		in.max_switches       = params->max_switches ? params->max_switches : 4096;
 
 		co_memset(params, 0, sizeof(*params));
