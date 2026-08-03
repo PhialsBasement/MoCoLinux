@@ -118,14 +118,27 @@
      its signature is perfectly good), mirrors, ldconfig, fstab, autologin,
      10-eth0.network with systemd-networkd, IPv6 off, DISPLAY, and a user.
      It takes an image file or a block device.
-   * What is NOT done is running it anywhere except inside the guest. That is
-     the case that does not matter for shipping, and it is the only one that
-     has ever been exercised: a 6 GB image cannot be pushed to the test box
-     (the agent buffers it and deploy.sh reads it back to verify, which is
-     12 GB of churn on a 4 GB machine), so the guest builds the next guest's
-     disk in place on a second cobd unit. On a build host it should just work
-     -- pacman and e2fsprogs are all it needs -- and until someone runs it
-     there, "reproducible by someone else" is a claim rather than a fact.
+   * DONE, 2026-08-03: it has now run on a build host -- CachyOS, as root,
+     building the seed. It needed two fixes to work there, and both had been
+     failing inside the guest too, unnoticed:
+       - the chroot had no /etc/resolv.conf, so every name lookup in it failed
+         and pacman reported "Could not resolve host" for every mirror in the
+         list. That is what the mirror-ranking comment blamed on dead servers.
+         The cost was the whole re-verification step, which had therefore
+         never run in any build this project has ever made.
+       - the final `du -sm` walked the bound /proc, so the reported image size
+         included the host's and the run ended in a page of errors about pids
+         that vanished mid-walk. It asks df now.
+   * The re-verification proves less than the comment claimed, and now says
+     so. `pacman -Syu` checks the signed databases and that every installed
+     name and version matches them, which catches a tampered or stale mirror.
+     It does not check the signature of each package file already on disk:
+     those went down under SigLevel = Never and, with nothing to upgrade,
+     pacman never looks at them again. Closing it means either installing the
+     keyring first and everything else with signatures enforced -- which needs
+     a working chroot before the keyring exists, so it is not a one-liner --
+     or fetching the .sig beside each cached package and verifying by hand
+     before the cache is deleted.
    * The image also has to get smaller before it can ship. 6 GB with about a
      gigabyte used is mostly zeroes, so zstd takes it to a few hundred
      megabytes; something then has to expand it on first run.
