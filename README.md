@@ -25,7 +25,15 @@ guest's own memory and a NAT running as a Windows process.
 
 And since a terminal only proves so much:
 
-![Manjaro with KDE running as native windows on Windows XP x64](doc/img/mocolinux-desktop.png)
+![Manjaro with KDE running as native windows on Windows XP x64](doc/img/moco-desktop.png)
+
+Kate editing a file, xterm running `fastfetch`, Dolphin browsing the guest's
+cooperative block device as *"16.0 GiB Internal Drive (cobd0)"*, and Konsole on
+zsh — each one an ordinary XP window with a Luna frame and a taskbar button,
+sitting next to Steam and the Start button. Down the left are the desktop
+shortcuts the installer creates: the applications, a terminal, and **Start
+MoCoLinux**. Nothing in that image was arranged by hand afterwards; the
+applications were started by double-clicking those icons.
 
 Everything in that screenshot is one machine. On the left, `fastfetch` in an
 xterm: Manjaro Linux, kernel 7.1.5, 792 packages. In the middle, KDE's own
@@ -80,12 +88,25 @@ Working, on hardware:
 - Shuts down cleanly, and a run can be ended on demand from another process
 - Survives interrupt storms: hardware interrupts cross back and are replayed
   into Windows' live IDT, so the host never goes deaf
+- **Asynchronous block I/O.** Transfers run on kernel worker threads instead of
+  inline on the crossing, so the guest keeps scheduling while its disk works. It
+  used to freeze solid for the duration of every request — measured 8.7 s of
+  guest CPU over 5 m 14 s of wall clock during a package install, which tripped
+  systemd's own service watchdogs. A full build now answers the console in
+  16–125 ms throughout. `--sync-cobd` restores the old path for comparison
+- **Installs itself.** A single Win32 executable lays down the driver, the
+  daemons, the kernel, an X server and the launchers, creates desktop shortcuts
+  and a logon entry, then boots Linux and has it build its own Manjaro system on
+  a fresh disk image over the network. Verified end to end: 217 console polls,
+  zero timeouts, 1.3 GB downloaded, guest responsive the whole way
 
 Not yet: SMP, the coLinux message layer (`co_monitor_t`, queues, reactor) that
 upstream's `cocon`/`conet` consoles and devices expect — which is why
 `colinux-console-nt` cannot attach to a guest here — a DHCP client in the guest
-rather than a static address, inbound port redirects, a single-executable
-launcher, and a repaired incremental patch series:
+rather than a static address, inbound port redirects, hardware-accelerated
+OpenGL past the 1.4 the GLX wire protocol can carry (applications render in
+llvmpipe on the guest's single core, which is the main thing that makes a
+graphical desktop feel slow), and a repaired incremental patch series:
 `patch/7.1.5/current-tree-snapshot.diff` is the authoritative guest-side diff
 and is deliberately not in `series`. `TODO` is current and specific about the
 rest.
@@ -198,11 +219,25 @@ inside Linux's KASAN shadow region.
 
 ## Running
 
+The short way, on the target machine: run **`mocolinux-setup.exe`**. It lays down
+the driver, the daemons, the kernel, VcXsrv and the launchers, makes desktop
+shortcuts and a logon entry, asks for a restart, and then boots Linux and has it
+build its own Manjaro system on a fresh disk image over the network. After that
+the machine has Linux at every logon and an icon per application; **Start
+MoCoLinux** brings it up by hand if it was stopped.
+
+That takes about fifteen minutes and roughly 2.5 GB of downloads, nearly all of
+it pacman fetching packages on the target — the release itself carries no built
+desktop, only the seed that can make one.
+
+The long way, which is what the short way runs and what to use while developing:
+
 ```
 colinux-daemon.exe --boot-kernel vmlinux --max-switches none \
                    --cobd0 \??\C:\path\to\root.img
 colinux-daemon.exe --console 2323          (a second process: a terminal)
 colinux-slirp-net-daemon.exe -R            (a third: NAT for the guest)
+colinux-daemon.exe --run konsole           (start one app in a running guest)
 ```
 
 `--mem MB` sets the guest's RAM; the default is 1024. It is a target rather than
@@ -259,6 +294,31 @@ A few things that cost real time and are recorded in the commit messages:
   dump. Every entrance to the switch must have real IF clear.
 - **Anything restored per crossing must be saved per crossing** — including
   `GS_BASE`, which holds Windows' KPCR and moves whenever its scheduler runs.
+- **The host's structures are not ours to edit, and PatchGuard is watching.**
+  XP x64 is the first Windows with Kernel Patch Protection. A fix for an `ltr`
+  race left the *host's* TSS descriptor marked available instead of busy — one
+  standing bit in a live processor GDT — and the machine died minutes later with
+  bugcheck `0x109 CRITICAL_STRUCTURE_CORRUPTION`, parameter 4 = 3, *"a processor
+  GDT"*. It checks on a randomized timer, so the crash arrives long after the
+  cause, with the box idle and nothing of yours on the stack; it also
+  deliberately manifests as `STATUS_BREAKPOINT` in unrelated drivers. Hours went
+  into hunting a socket bug that did not exist. This is the same reason `antinx`
+  has no successor on x86-64.
+- **A queue has to be given the fairness a serial path had by accident.** Making
+  block I/O asynchronous with one worker and one FIFO was *slower* in the way
+  that matters: a multi-minute write to one disk blocked another disk's reads
+  behind it, and the guest could not page in its own shell. One queue and one
+  worker per unit fixed it. The synchronous version was fair because it could
+  only ever do one thing at a time.
+- **NTFS zero-fills on your behalf, synchronously, inside your write.** A freshly
+  reserved image has a valid-data length of zero, so the first write near its end
+  makes the filesystem write everything in between first. On a 16 GB image that
+  is minutes inside one request. `FileValidDataLengthInformation` removes it.
+- **A tickbox that does not do anything is worse than no tickbox.** Setup asked
+  whether to install the X server, recorded the answer and never acted on it, so
+  applications launched into a display that did not exist — and an X client with
+  no server produces no error whatsoever. `grep -i vcxsrv` over the installer
+  found one hit, and it was the label.
 - **The guest's interrupt flag is virtual, and hardware doesn't know that.** An
   interrupt gate clears the real IF on delivery and `SYSCALL` clears it from
   `MSR_SYSCALL_MASK`, so `local_irq_enable()` has to put the *hardware* flag

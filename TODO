@@ -111,6 +111,118 @@
      reads like a security finding to whoever sees it next. Either mark the map
      NX where the guest never executes, or write down why it is not worth doing.
 
+ * SOLVED 2026-08-04, kept so none of it is re-opened or re-derived. One
+   session, six real bugs, and the order they were found in is misleading --
+   each one hid the next.
+   * The ltr race, which presented as "the guest randomly does not reach a
+     shell". A selector load is a descriptor load, and ltr refuses a TSS
+     descriptor whose busy bit is already set. The guest writes its TSS
+     descriptor and is about to ltr when a hardware interrupt lands in the
+     instructions between the two; the crossing re-enters through the switch,
+     the switch's own ltr marks the descriptor busy, and the guest's ltr then
+     takes #GP with error code 0x40 -- the TSS selector. Boot dies seconds in,
+     and only when an interrupt hits a window a few instructions wide, which is
+     why it looked like a coin flip weighted by how busy the host was. Fixed by
+     clearing the busy bit again after ltr.
+   * Which introduced the next one, and it is the most instructive thing here:
+     doing that clear UNCONDITIONALLY left the HOST's TSS descriptor marked
+     available instead of busy -- a standing modification to a live processor
+     GDT. XP x64 is the first Windows with Kernel Patch Protection and a
+     modified GDT is exactly what it checks: bugcheck 0x109
+     CRITICAL_STRUCTURE_CORRUPTION, parameter 4 = 3 ("a processor GDT"),
+     parameter 3 the host's own GDT base. PatchGuard checks on a randomized
+     timer, so the machine died minutes later with the box idle and nothing of
+     ours on the stack. That is why it read as spontaneous and unrelated, why
+     traffic soaks could not reproduce it, and why the same evening produced
+     0x1000007E and 0x3B bugchecks with STATUS_BREAKPOINT in unrelated drivers
+     -- PatchGuard deliberately manifests as something else. Fixed by making the
+     post-ltr clear apply only when the side being entered is the guest.
+     The general rule this port already had, now paid for twice: the host's
+     structures are not ours to edit. It is why antinx has no successor.
+   * Blocking block I/O -- "defect 3", the one with a design note
+     (doc/async-cobd-design). Every cobd transfer ran inline on the CPU-pinned
+     monitor thread inside the crossing, so a single-processor guest made no
+     progress of any kind for the duration of host disk I/O: measured 8.7 s of
+     guest CPU over 5 m 14 s of wall clock, which tripped systemd's 3-minute
+     service watchdogs and SIGABRT'd journald and userdbd. Now asynchronous:
+     the monitor loop queues the request to kernel worker threads and returns
+     to the guest at once, and completions come back through a ring in guest
+     .bss (co_colinux_cobd_io) reaped on the cooperative tick. --sync-cobd
+     keeps the old path for A/B.
+   * Which introduced its own next bug: one global worker and one FIFO. The
+     backing handle is FILE_SYNCHRONOUS_IO_NONALERT so requests to one unit
+     serialize anyway, but with one queue requests to DIFFERENT units serialized
+     too -- so a multi-minute write to the image being built blocked the root
+     disk's reads behind it and the guest could not page in its own shell. The
+     synchronous path had fairness by accident, one request at a time; a queue
+     has to be given it deliberately. Now one worker and one queue per unit,
+     each with its own wake event.
+   * The multi-minute write itself: NTFS zero-fills from its valid-data length
+     up to any write beyond it, synchronously inside that write. A freshly
+     reserved 16 GB image has VDL zero and mke2fs writes backup superblocks near
+     the end, so one request made the filesystem write gigabytes of zeroes.
+     co_os_bdev_open now sets FileValidDataLengthInformation over the whole file,
+     so it cannot happen whoever created the image.
+   * intel_uncore_init killing PID 1. The guest's boot CPU is whichever
+     processor the monitor thread was pinned to, so its APIC ID need not be the
+     first the host firmware enumerates ("Boot CPU APIC ID not the first
+     enumerated"), and intel_uncore then indexes its per-package array with
+     garbage: an Oops in allocate_boxes and a dead init. A cooperative guest
+     cannot use the uncore PMU anyway -- Windows owns the counters -- so the
+     daemon adds initcall_blacklist=intel_uncore_init.
+   * And the installer, which was failing in three ways at once. It polled the
+     build log with `grep -a '==>\|RC='` and then tested the REPLY for "RC=" --
+     a string its own command contains, so a console backlog that returned the
+     echoed command read as a failed install ("The Linux install failed (grep
+     ...)"). The marker is MOCO_RC= now and the tests are anchored at the start
+     of the line. Its reply parser also fell back to returning the whole buffer
+     when it could not find the echo boundary, which is what handed the command
+     text to those tests; it returns nothing now and the caller polls again.
+     Next was disabled for the entire second half of the wizard
+     (`page < PG_INSTALL`), so a completed install could not advance and the
+     final page had all three buttons dead at once. And the X server tickbox
+     was cosmetic: `grep -i vcxsrv` over setup.c found exactly one hit and it
+     was the label, so a user could tick it, watch the install succeed, click a
+     Linux application and get nothing -- an X client with no server produces no
+     error at all. It installs VcXsrv 1.14.2.1 now, ships it, and ships the
+     launchers and shortcuts too.
+   * Verified on the M92p end to end afterwards: the installer built a full
+     Manjaro desktop onto a fresh 30 GB image over the network -- 217 console
+     polls with ZERO timeouts, responses in 16-125 ms throughout, 1.3 GB
+     downloaded, past both steps that had been "100% fatal", no bugcheck, and
+     the guest responsive during the whole build rather than frozen for minutes.
+
+ * STILL OPEN after that session, and worth stating precisely because it is
+   easy to assume the above closed everything:
+   * The slirp bridge exits on its own during a heavy download. Reproduced
+     deliberately: a by-hand build died when the bridge vanished mid-pacman, the
+     guest's network went with it, and the script correctly reported an
+     incomplete image. The binary on the box predated the log tee so it died
+     silently and the reason is still unknown; the tee-enabled build is deployed
+     now, so the next occurrence should say. Two candidates worth reading first:
+     the bridge treats 100 consecutive ring-read failures at a 20 ms poll --
+     two seconds -- as "the guest is gone" and exits, which is a plausible false
+     positive under load; and a corrupt-ring check that stops the bridge rather
+     than resynchronising.
+   * There may be a second, real socket-path bug. The earliest bugcheck of that
+     evening (0x3B in afd.sys, STATUS_BREAKPOINT at ntoskrnl+0x26e20) PREDATES
+     the GDT modification that explains the later ones, so it cannot have the
+     same cause. Zero linux.sys frames on that stack either. Unexplained.
+   * colinux-daemon.exe --run cannot be deployed while a guest is running: the
+     running daemon holds its own image, so the desktop shortcuts keep using
+     whatever binary was there when the guest started. Harmless, but it means a
+     driver/daemon swap needs the guest stopped first, and nothing says so.
+   * The guest-side async cobd changes are not in the snapshot diff yet. They
+     live in patch/7.1.5/async-cobd-src/ as whole files (cobd.c, process.c),
+     deliberately, until the design has had more than one successful run behind
+     it. patch/7.1.5/current-tree-snapshot.diff must be regenerated from the
+     pristine tarball before anyone else can build this kernel.
+   * Async cobd is one worker per unit, which is the right shape but not the
+     limit: a single unit still serializes on its FILE_SYNCHRONOUS_IO_NONALERT
+     handle. Parallelising one disk needs the handle reopened without that flag
+     and an event per request. doc/async-cobd-design section 3.8 has the
+     reasoning; nothing needs it yet.
+
  * The root filesystem is reproducible now, but only in one direction:
    * DONE: tools/mkmanjarorootfs.sh builds a bootable Manjaro image from
      nothing -- skeleton, packages, keyring (pacman-key --init && --populate,
@@ -243,16 +355,35 @@
      returns instead of wedging its caller, which `start` cannot do because it
      hands its console handles to the child whatever you do -- WScript.Shell's
      Run does not.
-   * What remains: colinux-daemon.exe --run, which installs the driver if it is
-     not installed, refuses if a guest is already running, and spawns the
-     console, the slirp bridge and the X server as children, reaping them on
-     exit. os/winnt/user/exec.c is the spawn path; a Job Object with
-     KILL_ON_JOB_CLOSE is the backstop, not the mechanism -- the children are
-     asked to leave and now know how.
-   * And the artifacts have to be premade for it to mean anything: a release is
-     the driver, the daemons, vmlinux and a compressed root image, so that
-     somebody on XP x64 downloads a zip and runs one executable with no cross
-     toolchain, no pacman and no Linux machine anywhere.
+   * DONE 2026-08-04, and not in the shape this entry expected. The launcher is
+     moco-boot.vbs rather than a mode of the daemon: it installs the driver if
+     needed, starts it, does nothing if a guest is already running, and starts
+     the guest, the slirp bridge, the console server and the X server -- all
+     hidden, because those four are services with nothing for a person to read
+     and a minimised window is still a taskbar button in the way. A .vbs because
+     no cmd construct can start a windowless detached child: `start /min`
+     flashes a console and `start /b` hands its own handles to the child and
+     wedges, which this project has already lost an evening to.
+   * And there IS a colinux-daemon.exe --run now, for a different job: it starts
+     one application inside the running guest and returns, by writing a line
+     into the guest's console ring through the driver. That is what the desktop
+     shortcuts use. It went through the driver rather than the console server's
+     TCP port for two reasons -- it does not compete for that server's single
+     client slot, so an open terminal keeps working, and more importantly it
+     needs no Python. The first version of the launchers was a Python script
+     opening a socket, which works only on a machine that happens to have
+     Python; a stock XP has none, so every icon would have silently done
+     nothing, which is the hardest failure in this system to diagnose.
+   * moco-icons.vbs makes the desktop shortcuts (Konsole, xterm, Kate, Firefox,
+     Dolphin, System Monitor, a terminal, and Start MoCoLinux) and the All Users
+     Startup entry, so Manjaro comes up at logon. The terminal shortcut is
+     telnet.exe, not a Python client: XP ships telnet, and the console server
+     negotiates SUPPRESS-GO-AHEAD and ECHO on connect precisely so a default
+     telnet client behaves like a raw socket.
+   * The installer ships and runs all of it: the launchers are in `payload`, and
+     install_shortcuts() hands both directories to moco-icons.vbs. Neither that
+     nor the X server install is fatal -- missing icons are an inconvenience, a
+     failed install is not.
  * SOLVED, kept only so it is not re-opened: the 32-bit triple fault.
    * A selector load is a descriptor load. The world switch restored the guest's
      saved FS/GS by `mov %ax,%gs`, and a 32-bit task runs with GS = 0x63, which
@@ -324,20 +455,28 @@
      per-CPU TSS address before the guest has settled which CPU it is on.
 
  * The release artifacts are not built by anything:
-   * The user-facing deliverable is meant to be a download and one executable --
-     no cross toolchain, no pacman, no Linux machine. That means the driver, the
-     daemons, vmlinux and root-manjaro.img all have to be produced by a build
-     step somebody can run, and today only the first three are, by hand.
-   * tools/mkmanjarorootfs.sh builds the image and runs anywhere with pacman and
-     e2fsprogs -- including inside the guest, which is how the current one was
-     made, because a 6 GB image cannot be pushed to the test box. It has never
-     been run on a build host, which is the case that matters for shipping, and
-     that is the one thing standing between "reproducible" and "reproducible by
-     someone else".
-   * The image also has to get smaller before it can ship. 6 GB with about a
-     gigabyte used is mostly zeroes, so zstd takes it to a few hundred
-     megabytes; the launcher then has to expand it on first run, which is
-     another thing the single exe should own.
+   * Mostly answered, and by a different route than this entry assumed. The
+     shipped download does not contain a built Manjaro at all: it contains the
+     driver, the daemons, vmlinux, the ~1.2 GB Arch seed image that carries the
+     builder, VcXsrv 1.14.2.1, the launchers and Setup. The target then builds
+     its own Manjaro over the network with tools/mkmanjarorootfs.sh, which is
+     what the successful end-to-end run did. So there is no multi-gigabyte
+     desktop image to produce, compress or expand on first run -- that whole
+     problem went away with the decision in doc/installer.
+   * DONE: mkmanjarorootfs.sh has now run on a build host as well as inside a
+     guest, which is what closed "reproducible by someone else". Two silent
+     failures came out of that: no /etc/resolv.conf in the chroot (so every
+     mirror "could not resolve" and the trust-on-first-use re-verification never
+     ran, while the script still said "done, unmounted clean"), and a `du -sm`
+     that walked the host's /proc because it ran before the unmount.
+   * What is left is packaging discipline rather than capability: nothing yet
+     assembles those files into one directory and checks that the set is
+     complete, so the payload list in setup.c is the only description of what a
+     release must contain, and a missing entry is discovered by a user rather
+     than by a build. The seed image is also still produced by hand.
+   * The mirror ranking is no longer part of the cost: --fasttrack timed all
+     ~125 servers including the dead ones, which was minutes of the build doing
+     nothing visible. It is --geoip now, with --fasttrack only as the fallback.
 
  * Real OpenGL in the guest, which nothing here can currently deliver:
    * Where it stands. The guest has no GPU, no DRI device and pci=off, so its
