@@ -188,22 +188,55 @@ thing being downloaded. And installing it unasked is the highest-liability act
 available here -- it replaces core system DLLs and requires a reboot, so a
 machine it breaks was broken by our installer.
 
-So the X server has to be one that XP x64 can load unaided. VcXsrv 1.17.x is
-the interesting range: xorg-server 1.17 is where +iglx became a flag worth
-having, -wgl predates it, and the build tooling of that era still emitted 5.0x
-subsystems. Xming 6.9.0.31 is the fallback, 32-bit through WOW64 and
-unambiguously XP-native, at the cost of being from 2007.
+So the X server has to be one that XP x64 can load unaided, and there is one:
+VcXsrv 1.14.2.1, the last release before 1.14.3.0 dropped XP support.
+Measured, by extracting the installer and reading the headers rather than by
+trying it:
 
-The acceptance test is mechanical and should be run before anything is
-bundled: subsystem 5.02 or lower, every import present on a stock XP x64, and
--multiwindow -wgl +iglx -ac -clipboard all understood. If no build passes,
-the fallback is to detect an X server rather than ship one, enable the
-launcher's X option only when one is found, and say plainly in one line what
-is missing and why.
+    every PE in the installer     subsystem 5.2
+    vcxsrv.exe imports            ADVAPI32 GDI32 KERNEL32 ole32 OPENGL32
+                                  SHELL32 SHLWAPI USER32 WS2_32, plus
+                                  MSVCR100 and its own bundled X libraries
+    MSVCR100.dll, MSVCP100.dll    shipped inside the installer directory
 
-Either way the installer looks for an X server already on the machine and
-prefers it, and records in its own registry key whether the bundled one was
-installed, so the uninstaller removes only what it put there.
+MSVCR100 is the Visual C++ 2010 runtime, which supports XP, and it does not
+have to be installed separately because the installer lays it down beside the
+binaries. Nothing in the set needs a backported API.
+
+One flag has to go, and it is not a loss. xstart.bat passes +iglx, which
+exists because xorg-server 1.17 disabled indirect GLX by default. This server
+is xorg-server 1.14 and predates that: the string "iglx" does not appear in
+the binary at all, indirect GLX is simply on, and passing the option would be
+a fatal-error dialog on a headless machine. -wgl, -multiwindow, -clipboard,
+-ac and -notrayicon are all present. tools/xstart1142.bat is xstart.bat
+without it.
+
+Verified end to end on the M92p with the guest of the commit that made the
+release loadable: installed to its own directory with /S /D so the 1.20 build
+already there was left alone, launched through WScript.Shell, and then from
+the guest --
+
+    xdpyinfo    vendor string HC-Consult, vendor release 11402001
+    xrandr      Screen 0: current 1600 x 900
+    xterm       a rootless window with an XP title bar, showing
+                Linux mocolinux 7.1.5 #62 PREEMPT_DYNAMIC x86_64
+
+-- which is the README's screenshot reproduced on a stack with no one-core-api
+in it anywhere.
+
+The one piece of friction it surfaced: Windows Firewall prompts about vcxsrv
+the first time, because the server listens on 6000 on every interface. The
+guest is unaffected either way -- slirp rewrites 10.0.2.2:0 into a connection
+to the host's own loopback, which the firewall does not police, and the xterm
+above appeared with the dialog still on screen unanswered. Keeping it blocked
+is the right answer, so the installer should make it rather than ask: XP's
+`netsh firewall add allowedprogram ... mode=DISABLE` puts the program on the
+exception list in the disabled state, which suppresses the prompt without
+opening anything.
+
+The installer still looks for an X server already on the machine and prefers
+it, and records in its own registry key whether the bundled one was installed,
+so the uninstaller removes only what it put there.
 
 
 6. The reboot at the end, and why it is there for now
