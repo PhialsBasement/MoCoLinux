@@ -189,6 +189,14 @@ typedef struct {
 	 * cooperatively by calling the switch blob through it.
 	 */
 	unsigned long long passage_symbol_va;
+	/*
+	 * Async cooperative block I/O (doc/async-cobd-design). cobd_io_va is
+	 * the guest's co_colinux_cobd_io completion ring; async_cobd gates
+	 * whether block requests are queued to worker threads (default) or
+	 * performed inline on the monitor thread (the old sync path).
+	 */
+	unsigned long long cobd_io_va;
+	int		   async_cobd;
 } co_arch_boot_t;
 
 typedef struct {

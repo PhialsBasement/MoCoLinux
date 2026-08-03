@@ -63,6 +63,13 @@ typedef struct co_winnt_parameters {
 	 */
 	bool_t no_copic;
 	/*
+	 * Force synchronous block I/O -- the old path that performs each cobd
+	 * transfer inline on the monitor thread, freezing the single-CPU guest
+	 * for its duration (defect 3). Async is the default; this is the A/B
+	 * escape hatch and the known-good fallback.
+	 */
+	bool_t sync_cobd;
+	/*
 	 * Backing store for each cobd unit. Unit 0 is the guest's root device
 	 * and is the one root= names; the rest are ordinary disks. An NT object
 	 * path: an image file as \??\F:\xfer\root.img, or a raw partition as
@@ -85,6 +92,13 @@ typedef struct co_winnt_parameters {
 
 	bool_t console;
 	char   console_arg[0x20];
+	/*
+	 * Start one application inside the running guest and return. What the
+	 * desktop shortcuts use, so a launcher needs no scripting host and no
+	 * Python -- neither of which a stock XP has.
+	 */
+	bool_t run;
+	char   run_arg[0x200];
 	bool_t cobd[CO_COBD_MAX_UNITS];
 	char   cobd_arg[CO_COBD_MAX_UNITS][0x200];
 	bool_t call_kernel;

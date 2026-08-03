@@ -56,6 +56,21 @@ extern void co_os_user_msleep(unsigned long msec);
  * say so and exit without opening the driver.
  */
 extern bool_t co_os_claim_single_instance(const char* name);
+
+/*
+ * A background thread, for the one job that needs it: streaming the guest's
+ * kernel log while the boot ioctl blocks the main thread inside the driver.
+ * The reader has to run concurrently with that ioctl and be joined before the
+ * guest's memory is torn down, which is what keeps its page-table walk off the
+ * freed-space race a cross-process reader would hit.
+ *
+ * co_os_thread_start returns an opaque handle or NULL. co_os_thread_join waits
+ * for the function to return and releases the handle.
+ */
+typedef void (*co_os_thread_func_t)(void* arg);
+extern void* co_os_thread_start(co_os_thread_func_t func, void* arg);
+extern void  co_os_thread_join(void* thread);
+
 extern int co_udp_socket_connect(const char* addr, unsigned short int port);
 extern int co_udp_socket_send(int sock, const char* buffer, unsigned long size);
 extern void co_udp_socket_close(int sock);

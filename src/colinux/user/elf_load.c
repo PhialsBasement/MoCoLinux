@@ -982,7 +982,8 @@ static void co_e820_entry(unsigned char* p, unsigned long long addr,
  *                              fall in different wraps of the ring starts at
  *                              index 0, not at begin's index.
  */
-static void co_dump_kernel_log(co_manager_handle_t handle, co_elf_data_t* pl)
+static void co_dump_kernel_log_ex(co_manager_handle_t handle, co_elf_data_t* pl,
+				  unsigned long long* p_since, int summary)
 {
 	co_elf_symbol_t* s_prb = co_get_symbol_by_name(pl, "prb");
 	unsigned long long rb_va = 0, descs_va, infos_va, data_va;
@@ -991,6 +992,8 @@ static void co_dump_kernel_log(co_manager_handle_t handle, co_elf_data_t* pl)
 	unsigned long long desc_count, data_size;
 	unsigned long long head_id, tail_id, id;
 	unsigned long long shown = 0, missed = 0;
+	unsigned long long since = p_since ? *p_since : 0;
+	unsigned long long high = since;	/* highest seq+1 printed */
 	co_rc_t rc;
 
 	if (s_prb)
@@ -1001,7 +1004,8 @@ static void co_dump_kernel_log(co_manager_handle_t handle, co_elf_data_t* pl)
 		co_elf_symbol_t* s_static = co_get_symbol_by_name(pl, "printk_rb_static");
 
 		if (!s_static) {
-			co_terminal_print("  (no prb / printk_rb_static symbol -- log unreadable)\n");
+			if (summary)
+				co_terminal_print("  (no prb / printk_rb_static symbol -- log unreadable)\n");
 			return;
 		}
 		rb_va = co_elf_get_symbol_value(s_static);
@@ -1009,8 +1013,9 @@ static void co_dump_kernel_log(co_manager_handle_t handle, co_elf_data_t* pl)
 
 	rc = co_manager_kread(handle, rb_va, rb, sizeof(rb));
 	if (!CO_OK(rc)) {
-		co_terminal_print("  (printk_ringbuffer at 0x%llx unreadable, rc %x)\n",
-				  rb_va, (int)rc);
+		if (summary)
+			co_terminal_print("  (printk_ringbuffer at 0x%llx unreadable, rc %x)\n",
+					  rb_va, (int)rc);
 		return;
 	}
 
@@ -1023,9 +1028,10 @@ static void co_dump_kernel_log(co_manager_handle_t handle, co_elf_data_t* pl)
 	memcpy(&data_va,    rb + 56, 8);
 
 	if (count_bits < 4 || count_bits > 20 || size_bits < 8 || size_bits > 26) {
-		co_terminal_print("  (ringbuffer geometry is nonsense: %u desc bits,"
-				  " %u data bits -- wrong offsets or trampled memory)\n",
-				  count_bits, size_bits);
+		if (summary)
+			co_terminal_print("  (ringbuffer geometry is nonsense: %u desc bits,"
+					  " %u data bits -- wrong offsets or trampled memory)\n",
+					  count_bits, size_bits);
 		return;
 	}
 
@@ -1041,8 +1047,9 @@ static void co_dump_kernel_log(co_manager_handle_t handle, co_elf_data_t* pl)
 		char text[1024];
 
 		if (id - tail_id > desc_count + 64) {
-			co_terminal_print("  (stopping: walked more ids than exist"
-					  " -- corrupt head/tail)\n");
+			if (summary)
+				co_terminal_print("  (stopping: walked more ids than exist"
+						  " -- corrupt head/tail)\n");
 			break;
 		}
 
@@ -1071,6 +1078,16 @@ static void co_dump_kernel_log(co_manager_handle_t handle, co_elf_data_t* pl)
 		memcpy(&seq,      info + 0,  8);
 		memcpy(&ts,       info + 8,  8);
 		memcpy(&text_len, info + 16, 2);
+
+		/*
+		 * Only what has not been streamed already. This is what makes
+		 * a 400 ms poll from the live thread emit just the new lines
+		 * each time instead of the whole log over and over.
+		 */
+		if (p_since && seq < since)
+			continue;
+		if (seq + 1 > high)
+			high = seq + 1;
 
 		if ((begin & 1) && (next & 1)) {
 			if (begin == 0x3 && next == 0x3)
@@ -1113,10 +1130,58 @@ static void co_dump_kernel_log(co_manager_handle_t handle, co_elf_data_t* pl)
 		shown++;
 	}
 
-	co_terminal_print("\n  %llu records", shown);
-	if (missed)
-		co_terminal_print(", %llu unreadable or torn", missed);
-	co_terminal_print("  (descriptor ids %llu..%llu)\n", tail_id, head_id);
+	if (p_since)
+		*p_since = high;
+
+	if (summary) {
+		co_terminal_print("\n  %llu records", shown);
+		if (missed)
+			co_terminal_print(", %llu unreadable or torn", missed);
+		co_terminal_print("  (descriptor ids %llu..%llu)\n", tail_id, head_id);
+	}
+}
+
+static void co_dump_kernel_log(co_manager_handle_t handle, co_elf_data_t* pl)
+{
+	unsigned long long since = 0;
+
+	co_dump_kernel_log_ex(handle, pl, &since, 1);
+}
+
+/*
+ * The live kernel log: a thread that streams the printk ring while the boot
+ * ioctl blocks the main thread inside the driver.
+ *
+ * This exists because kboot is one long blocking call -- the guest runs to a
+ * stop, a wedge, or a bugcheck entirely inside it, and until it returns the
+ * post-run dump cannot run. A guest that hangs mid-boot, or takes the host
+ * down, then left nothing to read. This prints every record as it appears, so
+ * the last thing the guest said is on disk the instant it says it, wedge or
+ * not.
+ *
+ * It reads on a SECOND driver handle, concurrently with kboot on the first,
+ * and the main thread joins it before KLOAD_END -- so its page-table walk is
+ * sequenced before the guest's memory is freed, which is the same invariant
+ * that makes the post-run dump safe and the thing a cross-process reader
+ * cannot promise.
+ */
+struct co_klog_ctx {
+	co_manager_handle_t handle;
+	co_elf_data_t*	    pl;
+	unsigned long long* since;
+	volatile int	    stop;
+};
+
+static void co_klog_stream(void* arg)
+{
+	struct co_klog_ctx* c = arg;
+
+	for (;;) {
+		co_dump_kernel_log_ex(c->handle, c->pl, c->since, 0);
+		if (c->stop)
+			return;
+		co_os_user_msleep(400);
+	}
 }
 
 /*
@@ -1226,7 +1291,7 @@ static void co_report_bug_at(co_elf_data_t* pl, unsigned long long rip)
 co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			       unsigned long max_switches, unsigned long batch,
 			       const char* const* cobd, const char* init_path,
-			       unsigned long mem_mb, int no_copic)
+			       unsigned long mem_mb, int no_copic, int async_cobd)
 {
 	const char* cobd0 = cobd ? cobd[0] : NULL;
 	co_elf_data_t* pl;
@@ -1515,6 +1580,9 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 	if (enter == 3) {
 		co_manager_ioctl_kboot_t b = {0, };
 		co_manager_ioctl_kram_t  m = {0, };
+		struct co_klog_ctx	 klog_ctx = {0, };
+		void*			 klog_thread = NULL;
+		unsigned long long	 klog_since = 0;
 		unsigned char bp[4096];
 		/*
 		 * Sized against COMMAND_LINE_SIZE (2048 on x86), not against
@@ -1918,7 +1986,23 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 				 * cause. One variable fewer while ring 3 is
 				 * the thing under test.
 				 */
-				" nopcid");
+				" nopcid"
+				/*
+				 * No uncore PMU. The guest's boot CPU is
+				 * whichever physical core the monitor thread
+				 * was pinned on, so its real APIC ID may not
+				 * be the first one in the host firmware's
+				 * MP-table -- the kernel then builds an
+				 * inconsistent topology ("Boot CPU APIC ID
+				 * not the first enumerated") and intel_uncore
+				 * indexes its per-package array with garbage:
+				 * an Oops in allocate_boxes and a dead PID 1,
+				 * on exactly the boots that landed on the
+				 * wrong core. A cooperative guest cannot use
+				 * the uncore PMU anyway -- Windows owns the
+				 * hardware counters.
+				 */
+				" initcall_blacklist=intel_uncore_init");
 
 		/*
 		 * A root filesystem, if the host attached one. Without it the
@@ -2135,6 +2219,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		{
 			co_elf_symbol_t* s_cio = co_get_symbol_by_name(pl, "co_colinux_console_io");
 			co_elf_symbol_t* s_nio = co_get_symbol_by_name(pl, "co_colinux_net_io");
+			co_elf_symbol_t* s_bio = co_get_symbol_by_name(pl, "co_colinux_cobd_io");
 
 			if (s_cio) {
 				b.console_io_va = co_elf_get_symbol_value(s_cio);
@@ -2147,6 +2232,24 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 				co_terminal_print("    net rings at     0x%016llx"
 						  "  (--net-dump to watch)\n",
 						  b.net_io_va);
+			}
+			/*
+			 * The async block completion ring. If the guest kernel
+			 * predates it the symbol is absent, so cobd_io_va stays 0
+			 * and the host silently keeps the inline sync path -- an
+			 * old vmlinux still boots.
+			 */
+			if (s_bio && async_cobd) {
+				b.cobd_io_va = co_elf_get_symbol_value(s_bio);
+				b.async_cobd = 1;
+				co_terminal_print("    cobd ring at     0x%016llx"
+						  "  (async block I/O)\n",
+						  b.cobd_io_va);
+			} else {
+				b.async_cobd = 0;
+				co_terminal_print("    block I/O is synchronous%s\n",
+						  s_bio ? " (--sync-cobd)"
+							: " (guest has no cobd ring)");
 			}
 		}
 
@@ -2169,8 +2272,36 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		co_terminal_print("\n  entering co_arch_start_kernel with real IF held clear,\n");
 		co_terminal_print("  initial_code pointed at start_kernel, the early console\n");
 		co_terminal_print("  wired, and cooperative safe points returning to Windows\n\n");
+		co_terminal_print("  ---- live kernel log (streamed as the guest runs) ----\n");
+
+		/*
+		 * Stream the kernel log while the run is in progress. The thread
+		 * reads on its own handle and is joined below before KLOAD_END,
+		 * so it cannot outlive the guest's mapped memory. If the thread
+		 * cannot start, the run still proceeds and the post-run dump
+		 * covers it -- the stream is an addition, not a dependency.
+		 */
+		klog_ctx.handle = co_os_manager_open_quite();
+		klog_ctx.pl     = pl;
+		klog_ctx.since  = &klog_since;
+		klog_ctx.stop   = 0;
+		if (klog_ctx.handle)
+			klog_thread = co_os_thread_start(co_klog_stream, &klog_ctx);
 
 		rc = co_manager_kboot(handle, &b);
+
+		/* Stop and join before anything else, in particular before the
+		 * KLOAD_END that out_end reaches. */
+		if (klog_thread) {
+			klog_ctx.stop = 1;
+			co_os_thread_join(klog_thread);
+			klog_thread = NULL;
+		}
+		if (klog_ctx.handle) {
+			co_os_manager_close(klog_ctx.handle);
+			klog_ctx.handle = NULL;
+		}
+
 		if (!CO_OK(rc) || !CO_OK(b.rc)) {
 			co_terminal_print("  kboot failed (rc %x / %x)\n", (int)rc, (int)b.rc);
 			goto out_end;
@@ -2402,8 +2533,8 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 * the ringbuffer post mortem -- the guest is stopped, its
 		 * memory is still mapped, and KLOAD_END has not run yet.
 		 */
-		co_terminal_print("\n  ------------------ the kernel's own log ------------------\n");
-		co_dump_kernel_log(handle, pl);
+		co_terminal_print("\n  ------------ the kernel's own log (tail since the live stream) ------------\n");
+		co_dump_kernel_log_ex(handle, pl, &klog_since, 1);
 		co_terminal_print("  -----------------------------------------------------------\n");
 
 		/*

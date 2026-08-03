@@ -18,6 +18,62 @@
 
 static co_terminal_print_hook_func_t terminal_print_hook;
 
+/*
+ * Everything this process says, appended to a file beside its own executable,
+ * as it is said.
+ *
+ * The terminal has never been where this output is actually read: manual runs
+ * capture it through the transfer agent, the installer redirects it to a log,
+ * and a daemon launched detached prints into nothing at all. Two failures of
+ * that arrangement cost tonight dearly. The CRT block-buffers stdout when it
+ * is a file, so a wedged daemon's log read as zero bytes while the narration
+ * sat in a buffer that only a clean exit would flush -- the report existed and
+ * was unreadable at precisely the moment it was wanted. And a report that is
+ * only produced post mortem is lost entirely when the process never dies.
+ *
+ * So every line lands here immediately: opened, appended, closed per call, so
+ * a kill at any instant loses nothing already said. Timestamp and pid per
+ * call, because two daemons from the same directory (a boot daemon and a
+ * console server) share this file.
+ */
+static void co_terminal_file_tee(const char *text)
+{
+	static char path[512];
+	static int  path_state;	/* 0 not yet resolved, 1 usable, -1 not */
+	char head[48];
+	SYSTEMTIME t;
+	HANDLE h;
+	DWORD n;
+
+	if (path_state == 0) {
+		DWORD len = GetModuleFileName(NULL, path, sizeof(path) - 8);
+
+		if (len == 0 || len >= sizeof(path) - 8) {
+			path_state = -1;
+			return;
+		}
+		strcat(path, ".log");
+		path_state = 1;
+	}
+	if (path_state < 0)
+		return;
+
+	h = CreateFile(path, FILE_APPEND_DATA,
+		       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+		       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return;
+
+	GetLocalTime(&t);
+	snprintf(head, sizeof(head), "[%02u:%02u:%02u.%03u %5u] ",
+		 t.wHour, t.wMinute, t.wSecond, t.wMilliseconds,
+		 (unsigned)GetCurrentProcessId());
+
+	WriteFile(h, head, strlen(head), &n, NULL);
+	WriteFile(h, text, strlen(text), &n, NULL);
+	CloseHandle(h);
+}
+
 static void co_terminal_printv(const char *format, va_list ap)
 {
 	/*
@@ -31,6 +87,14 @@ static void co_terminal_printv(const char *format, va_list ap)
 	vsnprintf(buf, sizeof(buf), format, ap);
 
 	printf("%s", buf);
+	/*
+	 * Immediately, not at exit. Redirected stdout is block-buffered, and
+	 * the readers of this stream are log files being tailed while the
+	 * process is still running -- or still wedged.
+	 */
+	fflush(stdout);
+
+	co_terminal_file_tee(buf);
 
 	if (terminal_print_hook != NULL)
 		terminal_print_hook(buf);
@@ -157,4 +221,47 @@ bool_t co_os_claim_single_instance(const char* name)
 	 * anything this code would have to clean up itself.
 	 */
 	return PTRUE;
+}
+
+struct co_os_thread_ctx {
+	co_os_thread_func_t func;
+	void*		    arg;
+};
+
+static DWORD WINAPI co_os_thread_trampoline(LPVOID p)
+{
+	struct co_os_thread_ctx ctx = *(struct co_os_thread_ctx*)p;
+
+	co_os_free(p);
+	ctx.func(ctx.arg);
+	return 0;
+}
+
+void* co_os_thread_start(co_os_thread_func_t func, void* arg)
+{
+	struct co_os_thread_ctx* ctx;
+	HANDLE h;
+
+	ctx = co_os_malloc(sizeof(*ctx));
+	if (!ctx)
+		return NULL;
+	ctx->func = func;
+	ctx->arg  = arg;
+
+	h = CreateThread(NULL, 0, co_os_thread_trampoline, ctx, 0, NULL);
+	if (!h)
+		co_os_free(ctx);
+
+	return (void*)h;
+}
+
+void co_os_thread_join(void* thread)
+{
+	HANDLE h = (HANDLE)thread;
+
+	if (!h)
+		return;
+
+	WaitForSingleObject(h, INFINITE);
+	CloseHandle(h);
 }
