@@ -1,0 +1,41 @@
+The installer.
+
+setup.c                A single-executable Win32 setup program, no dependencies:
+                       custom-drawn pages, a licence box that reads COPYING,
+                       browsable directories with live NTFS and free-space
+                       validation, a disk-size chooser, the pre-flight refusals
+                       from doc/installer section 4, payload and image copying,
+                       driver service creation, the X server, desktop shortcuts
+                       and a logon entry, image reservation with a valid-data
+                       length, a restart step with an HKLM Run autostart that
+                       removes itself on success, and a console conversation with
+                       the guest that runs the maker script and follows its
+                       progress.
+
+Build (mingw-w64, from this directory):
+
+    x86_64-w64-mingw32-gcc setup.c -o mocolinux-setup.exe -O2 -mwindows \
+        -lshlwapi -lole32 -lws2_32 -ladvapi32
+
+What a release directory has to contain beside it -- the `payload` array in
+setup.c is the authoritative list, and a missing entry is fatal at install time:
+
+    colinux-daemon.exe  colinux-slirp-net-daemon.exe  linux.sys  vmlinux
+    COPYING  moco-boot.vbs  moco-icons.vbs  xstart1142.bat  stop.bat
+    root-arch.img                            (the seed that builds the system)
+    vcxsrv-64.1.14.2.1.installer.exe         (optional; the X server)
+
+1.14.2.1 is not a whim: 1.14.3.0 dropped XP support, and every PE in 1.20.x
+declares subsystem 6.0 and wants the Universal CRT, which a 5.2 loader refuses.
+
+Verified end to end on the M92p on 2026-08-04: the host half, a restart, then
+the guest building a full Manjaro desktop onto a fresh 30 GB image over the
+network -- 217 console polls with zero timeouts, 1.3 GB downloaded, no bugcheck.
+
+Three things it got wrong for a long time, all of them worth not repeating.
+It polled the build log with a command containing "RC=" and then tested the
+reply for "RC=", so a console backlog that echoed the command read as a failed
+install. Its reply parser fell back to returning the whole buffer when it could
+not find the echo boundary, which is what handed the command text to that test.
+And Next was disabled for the whole second half of the wizard, so a completed
+install could not advance and the last page had all three buttons dead at once.

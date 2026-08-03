@@ -322,8 +322,29 @@ say "writing a real mirrorlist"
 # the actual mirror list for the stable branch; if it cannot reach the network
 # it leaves what is already there, which still works.
 inside "pacman-mirrors --api --set-branch stable" >/dev/null 2>&1 || true
-inside "pacman-mirrors --fasttrack 5" >/dev/null 2>&1 || \
-	say "  pacman-mirrors could not rank mirrors; keeping the bootstrap servers"
+
+# --geoip, not --fasttrack.
+#
+# --fasttrack ranks by measurement, and it deliberately ignores any country
+# filter: it fetches the whole list -- around 125 servers -- and connects to
+# every one to time it. Each mirror that is dead or does not resolve costs a
+# full connection timeout first, and this list has several of those, so through
+# slirp on a single-processor guest the step takes minutes of doing nothing but
+# waiting. It is the slowest thing in the build that produces no output.
+#
+# --geoip asks the API which country this machine is in and keeps that
+# country's mirrors, which is both faster (no probing at all) and a better
+# answer for whoever ends up running the image -- a mirror on the same
+# continent beats one that happened to time well from the build host.
+#
+# --fasttrack stays as the fallback for a machine geolocation cannot place,
+# and the prepend below means neither of them is load-bearing: the first entry
+# is a server that has actually answered here regardless of what ranking says.
+if ! inside "pacman-mirrors --geoip" >/dev/null 2>&1; then
+	say "  geoip could not place this machine; ranking by speed instead"
+	inside "pacman-mirrors --fasttrack 5" >/dev/null 2>&1 || \
+		say "  pacman-mirrors could not rank mirrors; keeping the bootstrap servers"
+fi
 
 # Put the mirror we measured back at the top of whatever pacman-mirrors chose.
 #
