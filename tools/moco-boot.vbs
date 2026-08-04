@@ -114,6 +114,14 @@ shell.Run """" & moco & "\colinux-daemon.exe"" --boot-kernel vmlinux" & _
 ' guest has finished booting -- they wait for it -- and both exit on their own
 ' once it is gone, so nothing here has to clean them up.
 shell.Run """" & moco & "\colinux-slirp-net-daemon.exe"" -R", HIDDEN, NOWAIT
+
+' The GPU daemon: the host side of the guest's virtio-gpu device. Hidden like
+' the other two -- nothing for a person to read, and it writes its own log
+' beside the images. After the guest, because it maps the guest's RAM, which
+' does not exist until the boot daemon has allocated it. The transport
+' tolerates a late daemon by design, so this ordering is safe rather than
+' merely convenient.
+shell.Run """" & moco & "\cogpu-daemon.exe""", HIDDEN, NOWAIT
 shell.Run """" & moco & "\colinux-daemon.exe"" --console 2323", HIDDEN, NOWAIT
 
 ' The X server last, so the guest's windows have somewhere to go. It checks for
