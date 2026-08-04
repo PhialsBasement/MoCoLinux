@@ -180,6 +180,71 @@ static void *resolve_gpa(void *ctx, uint64_t gpa, uint32_t len)
 	return NULL;
 }
 
+/*
+ * Gather a payload that spans several readable descriptors.
+ *
+ * A virtio request is a CHAIN, and the guest splits its payload across as many
+ * descriptors as its scatter list needed -- one per physically contiguous run.
+ * Anything larger than a page therefore arrives in pieces, and Firefox submits
+ * command streams over a hundred kilobytes long, which is dozens of them.
+ *
+ * Reading only in[1] and trusting its length is wrong twice over: a stream
+ * that spans in[1]..in[N] gets truncated to its first fragment, and the
+ * fragment boundary falls in the middle of a virgl command. What reaches
+ * virglrenderer is a prefix ending mid-instruction, so the CREATE_OBJECT
+ * commands near the end are simply absent while the binds that reference them
+ * still execute -- which it reports as "Illegal handle" on a bind, a long way
+ * from the truncation that caused it.
+ *
+ * Copying is unavoidable here and cheap at these sizes: the pieces are not
+ * adjacent in this process's address space, and virglrenderer wants one
+ * pointer. Command streams are copied before decoding anyway (see vrend.c on
+ * the time-of-check/time-of-use boundary), so this replaces that copy rather
+ * than adding one.
+ */
+static void *chain_gather(struct cogpu_chain *chain, int first,
+			  uint32_t skip, uint32_t want, uint32_t *got)
+{
+	static unsigned char *buf;
+	static uint32_t buf_size;
+	uint32_t done = 0;
+	int i;
+
+	*got = 0;
+	if (want == 0)
+		return NULL;
+
+	if (want > buf_size) {
+		unsigned char *p = realloc(buf, want);
+
+		if (!p)
+			return NULL;
+		buf	 = p;
+		buf_size = want;
+	}
+
+	for (i = first; i < chain->in_count && done < want; i++) {
+		const unsigned char *src = chain->in[i].addr;
+		uint32_t len = chain->in[i].len;
+
+		/* The header sits at the front of the first descriptor. */
+		if (i == first) {
+			if (len <= skip)
+				continue;
+			src += skip;
+			len -= skip;
+		}
+		if (len > want - done)
+			len = want - done;
+
+		memcpy(buf + done, src, len);
+		done += len;
+	}
+
+	*got = done;
+	return buf;
+}
+
 /* -------------------------------------------------------- the virtio-gpu bits */
 
 /*
@@ -393,7 +458,7 @@ static uint32_t serve(struct cogpu_chain *chain)
 		 * for why that copy is not optional).
 		 */
 		struct { uint32_t size, num_in_fences; } sub;
-		const char *cmds;
+		const void *cmds;
 		uint32_t avail;
 
 		if (chain->in[0].len < sizeof(req) + sizeof(sub)) {
@@ -402,14 +467,18 @@ static uint32_t serve(struct cogpu_chain *chain)
 		}
 		memcpy(&sub, (char *)chain->in[0].addr + sizeof(req), sizeof(sub));
 
-		cmds  = (const char *)chain->in[0].addr + sizeof(req) + sizeof(sub);
-		avail = chain->in[0].len - sizeof(req) - sizeof(sub);
-		if (sub.size > avail && chain->in_count > 1) {
-			/* the stream is in the next descriptor */
-			cmds  = (const char *)chain->in[1].addr;
-			avail = chain->in[1].len;
-		}
-		if (sub.size > avail) {
+		/*
+		 * The stream, gathered from however many descriptors it took.
+		 * Firefox submits buffers of a hundred kilobytes and more --
+		 * dozens of fragments -- and taking only the first one hands
+		 * the decoder a prefix that ends mid-command.
+		 */
+		cmds = chain_gather(chain, 0, sizeof(req) + sizeof(sub),
+				    sub.size, &avail);
+		if (!cmds || avail < sub.size) {
+			logline("  SUBMIT_3D: stream is %u bytes but the chain"
+				" carries %u across %d descriptors\n",
+				sub.size, avail, chain->in_count);
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
 			break;
 		}
@@ -491,6 +560,13 @@ static uint32_t serve(struct cogpu_chain *chain)
 		 */
 		struct { uint32_t resource_id, nr_entries; } a;
 		struct { uint64_t addr; uint32_t length, pad; } ent;
+		/*
+		 * Staging only. cogpu_vrend_attach_iov copies this into a
+		 * per-resource allocation, because virglrenderer keeps the
+		 * pointer it is given -- see vrend.c. Handing this array
+		 * straight to it made every resource share one backing
+		 * description.
+		 */
 		static struct iovec iov[4096];
 		const char *p;
 		uint32_t i;
@@ -507,15 +583,26 @@ static uint32_t serve(struct cogpu_chain *chain)
 			break;
 		}
 
-		/* The entries follow the header, in this descriptor or the next. */
-		if (chain->in[0].len >= sizeof(req) + sizeof(a) +
-					a.nr_entries * sizeof(ent))
-			p = (const char *)chain->in[0].addr + sizeof(req) + sizeof(a);
-		else if (chain->in_count > 1)
-			p = (const char *)chain->in[1].addr;
-		else {
-			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
-			break;
+		/*
+		 * The entry list, gathered the same way. 256 entries is
+		 * exactly one page, so a larger backing -- or a guest whose
+		 * allocation fell back to vmalloc -- splits it across
+		 * descriptors, and reading only the first would produce
+		 * plausible garbage addresses rather than an error.
+		 */
+		{
+			uint32_t want = a.nr_entries * (uint32_t)sizeof(ent);
+			uint32_t got = 0;
+
+			p = chain_gather(chain, 0, sizeof(req) + sizeof(a),
+					 want, &got);
+			if (!p || got < want) {
+				logline("  ATTACH_BACKING res %u: %u entries need"
+					" %u bytes, chain carries %u\n",
+					a.resource_id, a.nr_entries, want, got);
+				resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+				break;
+			}
 		}
 
 		niov = 0;

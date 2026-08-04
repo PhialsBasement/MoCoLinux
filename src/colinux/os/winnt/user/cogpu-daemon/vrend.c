@@ -214,17 +214,61 @@ void cogpu_vrend_resource_unref(uint32_t res_id)
 		virgl_renderer_resource_unref(res_id);
 }
 
+/*
+ * The iovec array belongs to the resource, and virglrenderer KEEPS THE POINTER.
+ *
+ * virgl_renderer_resource_attach_iov does not copy: virgl_resource.c and
+ * vrend_renderer.c both simply store `res->iov = iov`. The array must
+ * therefore live as long as the resource does, and be a separate allocation
+ * per resource -- which is how QEMU uses this API, handing the pointer back at
+ * detach time to be freed.
+ *
+ * Passing one shared buffer instead is catastrophic and quiet. Every resource
+ * ends up pointing at the same memory, so each new attach silently rewrites
+ * the backing of every resource attached before it. The visible half is
+ * virglrenderer refusing transfers -- "IOV data size exceeds resource
+ * capacity", each resource short by an arbitrary amount -- because it sums an
+ * array that now describes somebody else's pages. The invisible half is worse:
+ * when the overwritten entries happen to sum large enough to pass the bounds
+ * check, the transfer reads and writes the WRONG GUEST PAGES, which is guest
+ * memory corruption with no error anywhere.
+ *
+ * So the array is copied here, once per attach, and freed at detach.
+ */
 int cogpu_vrend_attach_iov(uint32_t res_id, struct iovec *iov, int niov)
 {
-	if (!vrend_ready)
+	struct iovec *own;
+
+	if (!vrend_ready || niov <= 0)
 		return -1;
-	return virgl_renderer_resource_attach_iov(res_id, iov, niov);
+
+	own = malloc((size_t)niov * sizeof(*own));
+	if (!own)
+		return -1;
+	memcpy(own, iov, (size_t)niov * sizeof(*own));
+
+	if (virgl_renderer_resource_attach_iov(res_id, own, niov) != 0) {
+		free(own);
+		return -1;
+	}
+	return 0;
 }
 
+/*
+ * Detach hands the array back so it can be freed. Passing NULL for both
+ * out-parameters -- which this did -- discards the pointer and leaks one
+ * allocation per resource for the life of the daemon.
+ */
 void cogpu_vrend_detach_iov(uint32_t res_id)
 {
-	if (vrend_ready)
-		virgl_renderer_resource_detach_iov(res_id, NULL, NULL);
+	struct iovec *iov = NULL;
+	int niov = 0;
+
+	if (!vrend_ready)
+		return;
+
+	virgl_renderer_resource_detach_iov(res_id, &iov, &niov);
+	free(iov);
 }
 
 void cogpu_vrend_ctx_attach(uint32_t ctx_id, uint32_t res_id)
