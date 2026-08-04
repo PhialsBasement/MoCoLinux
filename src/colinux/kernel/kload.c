@@ -43,6 +43,7 @@
 #include "kload.h"
 #include "console.h"
 #include "net.h"
+#include "vgpu.h"
 
 static co_arch_guest_space_t* kload_space;
 static unsigned long long     kload_min_va;
@@ -474,6 +475,7 @@ void co_kload_free(co_manager_t* manager)
 	 */
 	co_console_set_address(0);
 	co_net_set_address(0);
+	co_vgpu_set_address(manager, 0);
 
 	/*
 	 * Clear the global before destroying what it points at.
@@ -924,6 +926,42 @@ co_rc_t co_kload_write_cr3(co_manager_t* manager, unsigned long long cr3,
 			   unsigned long size)
 {
 	return kload_xfer_cr3(manager, cr3, va, (unsigned char*)buf, size, PTRUE);
+}
+
+/*
+ * One guest virtual address, resolved once to a host pointer.
+ *
+ * For callers that will read the same word again and again and cannot afford
+ * a page-table walk each time -- the monitor loop's idle gate is the case this
+ * exists for, where a walk or a mutex per yield would be felt.
+ *
+ * The pointer is only valid while the guest's address space and the blocks
+ * behind it are alive, so the ONLY correct use is: resolve while the guest is
+ * certainly up, and drop the pointer in the same retirement that runs before
+ * co_kload_free releases anything. co_vgpu_set_address is the worked example.
+ * Anything that caches this across a teardown is the 0xD5 class again.
+ *
+ * Single page: a caller wanting more must resolve each page, because nothing
+ * guarantees two guest-virtual neighbours are host-physical neighbours.
+ */
+void* co_kload_host_ptr(co_manager_t* manager, unsigned long long va)
+{
+	unsigned long offset = (unsigned long)(va & ~CO_ARCH_PAGE_MASK);
+	co_pa_t	      pa     = 0;
+	int	      level  = -1;
+	unsigned char* p;
+
+	if (kload_space == NULL)
+		return NULL;
+
+	if (!CO_OK(co_arch_guest_lookup(manager, kload_space, va, &pa, &level)) || !pa)
+		return NULL;
+
+	p = co_kload_frame_va((co_pfn_t)(pa >> CO_ARCH_PAGE_SHIFT));
+	if (p == NULL)
+		return NULL;
+
+	return p + offset;
 }
 
 co_rc_t co_kload_read(co_manager_t* manager, unsigned long long va,

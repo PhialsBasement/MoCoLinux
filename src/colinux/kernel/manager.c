@@ -32,6 +32,7 @@
 #include "cobd_async.h"
 #include "console.h"
 #include "net.h"
+#include "vgpu.h"
 
 #ifndef min
 # define min(a,b) 	((a)<(b)?(a):(b))
@@ -137,6 +138,10 @@ co_rc_t co_manager_load(co_manager_t *manager)
 		goto out_err_os;
 
 	rc = co_net_init();
+	if (!CO_OK(rc))
+		goto out_err_os;
+
+	rc = co_vgpu_init();
 	if (!CO_OK(rc))
 		goto out_err_os;
 
@@ -272,6 +277,7 @@ void co_manager_unload(co_manager_t* manager)
 		co_debug_free(&manager->debug);
 
 	co_cobd_async_free();
+	co_vgpu_free();
 	co_net_free();
 	co_console_free();
 	/* Last, because everything above may still call co_kload_free. */

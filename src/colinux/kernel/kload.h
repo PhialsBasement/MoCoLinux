@@ -93,6 +93,13 @@ extern void		  co_kload_range(int i, unsigned long long* pa,
 					 unsigned long long* reserved);
 extern co_rc_t		  co_kload_table_frame(co_manager_t* manager, co_pfn_t* pfn_out);
 extern void*		  co_kload_frame_va(co_pfn_t pfn);
+/*
+ * One guest virtual address resolved once to a host pointer, for readers
+ * that cannot afford a walk per access. Valid only while the guest is up --
+ * see the implementation for the lifetime rule.
+ */
+extern void*		  co_kload_host_ptr(co_manager_t* manager,
+				      unsigned long long va);
 
 /*
  * Guest memory through the root the guest was running on, rather than the
