@@ -35,6 +35,7 @@
 #include <colinux/os/kernel/alloc.h>
 #include <colinux/os/kernel/misc.h>
 #include <colinux/os/kernel/mutex.h>
+#include <colinux/os/timer.h>		/* co_os_msleep, for the deferred-free wait */
 #include <colinux/arch/mmu.h>
 #include <colinux/arch/space.h>
 
@@ -126,6 +127,31 @@ static int		      kload_last_hit;
 static co_os_mutex_t	      kload_lock;
 static unsigned long long     kload_phys_base;	/* what the guest's __pa() adds */
 static unsigned long long     kload_table_top;	/* block 0 offset; tables grow down */
+
+/*
+ * User-mode mappings of the blocks, and why teardown has to wait for them.
+ *
+ * R3 hands a host process a direct window onto guest RAM (see KMAP in
+ * ioctl.h). Those mappings name physical pages inside kload_block[], so
+ * freeing a block while one is live gives a user process a writable window
+ * onto memory the host has re-issued to something else. That is not a crash,
+ * which is what makes it worse than one: it is silent corruption of an
+ * unrelated driver's data, discovered later and somewhere else.
+ *
+ * So teardown is split. co_kload_free still does everything that stops the
+ * guest -- retires the cross-process readers, publishes kload_space = NULL,
+ * destroys the address space -- because none of that is what the mappings
+ * name. But if a mapping is outstanding it sets pending_free and returns
+ * WITHOUT releasing the pages; the last unmap runs the release instead.
+ *
+ * The count is only ever touched under kload_lock. The waiter in
+ * co_kload_begin deliberately does NOT hold the lock while it waits, because
+ * the handle-close that would satisfy it needs the same lock -- holding it
+ * across the wait is a guaranteed ten-second livelock followed by a refused
+ * boot, which is a worse failure than the one being prevented.
+ */
+static int		      kload_user_maps;
+static bool_t		      kload_pending_free;
 
 /*
  * Page tables come out of the top of the block and that region is reported to
@@ -473,6 +499,25 @@ void co_kload_free(co_manager_t* manager)
 	if (space != NULL)
 		co_arch_guest_space_destroy(manager, space);
 	co_arch_guest_space_set_frame_source(NULL, NULL);
+
+	/*
+	 * The pages, unless a user-mode mapping still names them.
+	 *
+	 * Everything above has already happened: the guest is stopped, the
+	 * readers are retired and the address space is gone. What is deferred
+	 * is only the physical release, and only while a KMAP is outstanding.
+	 * co_kload_user_map_put runs it when the last one goes away -- which
+	 * happens at process exit even if the process never asked, because
+	 * IRP_MJ_CLEANUP unmaps what the descriptor recorded.
+	 */
+	if (kload_user_maps != 0) {
+		kload_pending_free = PTRUE;
+		co_debug("kload: teardown deferred, %d user mapping(s) outstanding",
+			 kload_user_maps);
+		co_os_mutex_release(kload_lock);
+		return;
+	}
+
 	kload_release_pages(manager);
 
 	kload_pages     = 0;
@@ -481,6 +526,107 @@ void co_kload_free(co_manager_t* manager)
 	kload_ram_pages = 0;
 
 	co_os_mutex_release(kload_lock);
+}
+
+/*
+ * A user mapping was taken. Takes kload_lock itself; the mutex stays private
+ * to this file so there is one place that knows the order.
+ */
+void co_kload_user_map_get(void)
+{
+	co_os_mutex_acquire(kload_lock);
+	kload_user_maps++;
+	co_os_mutex_release(kload_lock);
+}
+
+/*
+ * A user mapping went away. Takes kload_lock itself, so it is safe to call
+ * from a close path that holds nothing.
+ *
+ * This is where a deferred teardown finally completes. It is deliberately the
+ * unmapper's job rather than a watchdog's: the process that held the window is
+ * the only one that knows it has let go, and by the time this returns the
+ * pages are either released or still named by somebody else.
+ */
+void co_kload_user_map_put(co_manager_t* manager)
+{
+	co_os_mutex_acquire(kload_lock);
+
+	if (kload_user_maps > 0)
+		kload_user_maps--;
+
+	if (kload_user_maps == 0 && kload_pending_free) {
+		co_debug("kload: last user mapping gone, completing deferred teardown");
+		kload_release_pages(manager);
+		kload_pages	   = 0;
+		kload_chunks	   = 0;
+		kload_ram_bytes	   = 0;
+		kload_ram_pages	   = 0;
+		kload_pending_free = PFALSE;
+	}
+
+	co_os_mutex_release(kload_lock);
+}
+
+/*
+ * Blocks, for the mapper. Under the lock, because kload_release_pages clears
+ * these slots one at a time while it frees.
+ */
+int co_kload_block_count(void)
+{
+	int n;
+
+	co_os_mutex_acquire(kload_lock);
+	n = kload_block_count;
+	co_os_mutex_release(kload_lock);
+	return n;
+}
+
+co_rc_t co_kload_block(int i, void** va_out, unsigned long long* pa_out,
+		       unsigned long long* bytes_out)
+{
+	co_rc_t rc = CO_RC(ERROR);
+
+	co_os_mutex_acquire(kload_lock);
+
+	if (i >= 0 && i < kload_block_count && kload_block[i].va != NULL) {
+		*va_out	   = kload_block[i].va;
+		*pa_out	   = kload_block[i].pa;
+		*bytes_out = kload_block[i].bytes;
+		rc	   = CO_RC(OK);
+	}
+
+	co_os_mutex_release(kload_lock);
+	return rc;
+}
+
+/*
+ * Whether a new run may start yet.
+ *
+ * Waits outside the lock, in short sleeps, for a deferred teardown to finish.
+ * Ten seconds and then a loud refusal: the alternative -- proceeding anyway --
+ * would re-allocate guest RAM while a user process still has a window onto the
+ * previous run's pages.
+ */
+static bool_t kload_wait_for_deferred_free(void)
+{
+	int waited;
+
+	for (waited = 0; waited < 10000; waited += 50) {
+		bool_t pending;
+
+		co_os_mutex_acquire(kload_lock);
+		pending = kload_pending_free;
+		co_os_mutex_release(kload_lock);
+
+		if (!pending)
+			return PTRUE;
+
+		co_os_msleep(50);
+	}
+
+	co_debug("kload: a user mapping has held guest RAM for 10s; refusing to start");
+	return PFALSE;
 }
 
 co_rc_t co_kload_init(void)
@@ -504,6 +650,15 @@ co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 	co_rc_t rc;
 
 	co_kload_free(manager);
+
+	/*
+	 * If the previous run's pages are still named by a user mapping, the
+	 * free above only deferred. Starting anyway would allocate this run's
+	 * RAM while another process holds a window onto the last run's -- so
+	 * wait for the unmap, outside the lock, and refuse loudly on timeout.
+	 */
+	if (!kload_wait_for_deferred_free())
+		return CO_RC(ERROR);
 
 	if (min_va >= max_va || !CO_ARCH_VA_CANONICAL(min_va) || !CO_ARCH_VA_CANONICAL(max_va - 1))
 		return CO_RC(INVALID_PARAMETER);

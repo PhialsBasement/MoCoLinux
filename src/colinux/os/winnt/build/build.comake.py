@@ -26,6 +26,7 @@ targets['executables'] = Target(
     Input('colinux-slirp-net-daemon.exe'),
     Input('colinux-serial-daemon.exe'),
     Input('kread-hammer.exe'),
+    Input('kmap-test.exe'),
     Input('linux.sys'),
     ] + optional_targets(),
     tool = Empty(),
@@ -246,6 +247,18 @@ targets['colinux-serial-daemon.exe'] = Target(
 targets['kread-hammer.exe'] = Target(
     inputs = [
         Input('../user/kread-hammer/build.o'),
+    ] + user_dep,
+    tool = Compiler(),
+    mono_options = generate_options('gcc'),
+)
+
+# R3 step 1's verification tool. Maps the guest's RAM into itself and then lets
+# go in one of three ways -- tidily, by exiting without unmapping, or by
+# crashing outright -- because the assumption the whole rung stands on is that
+# IRP_MJ_CLEANUP unmaps for a process that never asked.
+targets['kmap-test.exe'] = Target(
+    inputs = [
+        Input('../user/kmap-test/build.o'),
     ] + user_dep,
     tool = Compiler(),
     mono_options = generate_options('gcc'),

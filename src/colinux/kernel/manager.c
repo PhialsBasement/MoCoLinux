@@ -450,6 +450,151 @@ co_rc_t co_manager_close(co_manager_t *manager, co_manager_open_desc_t opened)
 	return CO_RC(OK);
 }
 
+/*
+ * Map the guest's RAM into the calling process, in slices.
+ *
+ * Called from the ioctl path, so it runs in the requesting process's context
+ * -- which is required: MmMapLockedPagesSpecifyCache with UserMode maps into
+ * whatever process is current.
+ *
+ * All or nothing. A half-mapped guest is a caller that thinks it has a
+ * complete view and silently reads zeroes off the end of the part that
+ * worked, which is the kind of failure that gets diagnosed as a GPU bug three
+ * rungs later.
+ */
+static co_rc_t co_manager_kmap(co_manager_t*		 manager,
+			       co_manager_open_desc_t	 opened,
+			       co_manager_ioctl_kmap_t*	 params)
+{
+	unsigned long long slice_bytes = params->max_slice ? params->max_slice
+							  : CO_KMAP_SLICE_BYTES;
+	int blocks, i, n = 0;
+
+	params->count	    = 0;
+	params->total_bytes = 0;
+
+	if (!opened)
+		return CO_RC(INVALID_PARAMETER);
+
+	/* One window per handle. A second request would leak the first. */
+	if (opened->kmap_slices != 0)
+		return CO_RC(ERROR);
+
+	if (slice_bytes < CO_ARCH_PAGE_SIZE || slice_bytes > CO_KMAP_SLICE_BYTES)
+		slice_bytes = CO_KMAP_SLICE_BYTES;
+
+	blocks = co_kload_block_count();
+	if (blocks == 0)
+		return CO_RC(ERROR);
+
+	opened->kmap_slice = co_os_malloc(sizeof(opened->kmap_slice[0]) *
+					  CO_KMAP_MAX_RANGES);
+	if (!opened->kmap_slice)
+		return CO_RC(OUT_OF_MEMORY);
+	co_memset(opened->kmap_slice, 0,
+		  sizeof(opened->kmap_slice[0]) * CO_KMAP_MAX_RANGES);
+
+	for (i = 0; i < blocks; i++) {
+		void*		   va;
+		unsigned long long pa, bytes, off;
+
+		if (!CO_OK(co_kload_block(i, &va, &pa, &bytes)))
+			continue;
+
+		for (off = 0; off < bytes; off += slice_bytes) {
+			unsigned long long this = bytes - off;
+			unsigned long	   pages;
+			void*		   uva	  = NULL;
+			void*		   handle = NULL;
+
+			if (this > slice_bytes)
+				this = slice_bytes;
+			pages = (unsigned long)(this >> CO_ARCH_PAGE_SHIFT);
+			if (pages == 0)
+				continue;
+
+			if (n >= CO_KMAP_MAX_RANGES) {
+				co_debug("kmap: more than %d slices needed",
+					 CO_KMAP_MAX_RANGES);
+				goto fail;
+			}
+
+			if (!CO_OK(co_os_userspace_map((char*)va + off, pages,
+						       &uva, &handle))) {
+				co_debug("kmap: slice %d (%lu pages) refused", n, pages);
+				goto fail;
+			}
+
+			opened->kmap_slice[n].handle  = handle;
+			opened->kmap_slice[n].user_va = uva;
+			opened->kmap_slice[n].pages   = pages;
+
+			params->range[n].pa	 = pa + off;
+			params->range[n].bytes	 = this;
+			params->range[n].user_va = (unsigned long long)(unsigned long)uva;
+			params->total_bytes	+= this;
+			n++;
+			opened->kmap_slices = n;
+		}
+	}
+
+	if (n == 0)
+		goto fail;
+
+	/*
+	 * One reference per handle that holds windows, taken after the last
+	 * slice rather than per slice: what teardown has to wait for is a
+	 * process with a view, not a count of MDLs.
+	 */
+	co_kload_user_map_get();
+
+	params->count = n;
+	co_debug("kmap: %d slices, %llu MB mapped into the caller",
+		 n, params->total_bytes >> 20);
+	return CO_RC(OK);
+
+fail:
+	/* Unwind whatever did map; see the all-or-nothing note above. */
+	while (n-- > 0) {
+		co_os_userspace_unmap(opened->kmap_slice[n].user_va,
+				      opened->kmap_slice[n].handle,
+				      opened->kmap_slice[n].pages);
+	}
+	co_os_free(opened->kmap_slice);
+	opened->kmap_slice  = NULL;
+	opened->kmap_slices = 0;
+	params->total_bytes = 0;
+	return CO_RC(ERROR);
+}
+
+void co_manager_kmap_release(co_manager_t* manager, co_manager_open_desc_t opened)
+{
+	int i;
+
+	if (!opened || opened->kmap_slices == 0)
+		return;
+
+	for (i = 0; i < opened->kmap_slices; i++) {
+		if (opened->kmap_slice[i].handle == NULL)
+			continue;
+		co_os_userspace_unmap(opened->kmap_slice[i].user_va,
+				      opened->kmap_slice[i].handle,
+				      opened->kmap_slice[i].pages);
+	}
+
+	co_debug("kmap: released %d slices", opened->kmap_slices);
+
+	co_os_free(opened->kmap_slice);
+	opened->kmap_slice  = NULL;
+	opened->kmap_slices = 0;
+
+	/*
+	 * After the unmaps, never before: this is what may complete a deferred
+	 * teardown and free the very pages just unmapped.
+	 */
+	co_kload_user_map_put(manager);
+}
+
 co_rc_t co_manager_open_desc_deactive_and_close(co_manager_t*	       manager,
 						co_manager_open_desc_t opened)
 {
@@ -457,6 +602,17 @@ co_rc_t co_manager_open_desc_deactive_and_close(co_manager_t*	       manager,
 
 	if (!co_manager_open_alive(opened, "co_manager_open_desc_deactive_and_close"))
 		return CO_RC(ERROR);
+
+	/*
+	 * The windows first, while this is still the dying process's context.
+	 *
+	 * Reached from IRP_MJ_CLEANUP, which is the close path that runs in the
+	 * process that is letting go -- and MmUnmapLockedPages for a UserMode
+	 * mapping must run there. Doing it later, from the descriptor's final
+	 * free, would run in whatever process happened to drop the last
+	 * reference.
+	 */
+	co_manager_kmap_release(manager, opened);
 
 	opened->active = PFALSE;
 	if (opened->monitor != NULL) {
@@ -715,6 +871,30 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->rc = co_kload_read_locked(manager, params->va,
 						  params->data, params->size);
 		*return_size = sizeof(*params) + params->size;
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KMAP: {
+		co_manager_ioctl_kmap_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_manager_kmap(manager, opened, params);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KUNMAP: {
+		co_manager_ioctl_kunmap_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->released = (unsigned long)(opened ? opened->kmap_slices : 0);
+		co_manager_kmap_release(manager, opened);
+		params->rc = CO_RC(OK);
+		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}
 
