@@ -53,7 +53,8 @@ apps = Array( _
 	"Kate|kate|shell32.dll,70", _
 	"Firefox|firefox|shell32.dll,14", _
 	"Files (Dolphin)|dolphin|shell32.dll,4", _
-	"System Monitor|plasma-systemmonitor|shell32.dll,24" )
+	"System Monitor|plasma-systemmonitor|shell32.dll,24", _
+	"System Settings|systemsettings|shell32.dll,21" )
 
 made = 0
 For Each entry In apps

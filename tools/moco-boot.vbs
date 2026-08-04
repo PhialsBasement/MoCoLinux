@@ -24,6 +24,7 @@
 ' guards, not the only one.
 
 Const HIDDEN = 0
+Const SHOWN = 1
 Const WAIT = True
 Const NOWAIT = False
 
@@ -61,12 +62,20 @@ If Running("colinux-daemon.exe") Then
 	' Already up. Still make sure the X server is there, because it can be
 	' closed independently of the guest and an X client with no server
 	' produces no error at all -- it simply never appears.
-	shell.Run "cmd /c """ & moco & "\xstart1142.bat""", HIDDEN, NOWAIT
+	shell.Run "cmd /c """ & moco & "\xstart1142.bat"" """ & moco & """", HIDDEN, NOWAIT
 	WScript.Quit 0
 End If
 
 ' Linux. No switch limit and no deadline: this is a session somebody is using,
 ' and it ends when the guest powers off or stop.bat asks it to.
+'
+' Shown, unlike the other two. This is the one child with something worth
+' reading: it narrates the load, streams the guest's kernel log as it boots,
+' and when a run ends it dumps that log -- which is the evidence for every
+' failure that leaves no bugcheck behind. Hidden, all of that goes nowhere and
+' a guest that dies during boot looks identical to one that never started.
+' Closing its window ends the guest, which is the same as pulling the plug, so
+' stop.bat remains the way to shut down.
 ' \DosDevices\, never \??\. They name the same NT object directory, but the
 ' daemon's msvcrt CRT expands ? as a wildcard in argv before main() runs, so a
 ' \??\ path whose pattern matches anything on disk arrives as its own basename
@@ -77,7 +86,7 @@ shell.Run """" & moco & "\colinux-daemon.exe"" --boot-kernel vmlinux" & _
 	" --max-switches none" & _
 	" --cobd0 \DosDevices\" & linux & "\root.img" & _
 	" --cobd1 \DosDevices\" & linux & "\root-arch.img" & _
-	" --init /sbin/init", HIDDEN, NOWAIT
+	" --init /sbin/init", SHOWN, NOWAIT
 
 ' The network bridge and the terminal server. Both may be started before the
 ' guest has finished booting -- they wait for it -- and both exit on their own
@@ -87,4 +96,4 @@ shell.Run """" & moco & "\colinux-daemon.exe"" --console 2323", HIDDEN, NOWAIT
 
 ' The X server last, so the guest's windows have somewhere to go. It checks for
 ' itself whether one is already running on :0.
-shell.Run "cmd /c """ & moco & "\xstart1142.bat""", HIDDEN, NOWAIT
+shell.Run "cmd /c """ & moco & "\xstart1142.bat"" """ & moco & """", HIDDEN, NOWAIT
