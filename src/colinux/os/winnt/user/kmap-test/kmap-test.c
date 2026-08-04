@@ -76,6 +76,7 @@ int main(int argc, char** argv)
 	int i, checked = 0, mismatches = 0;
 	double t0, t1;
 	unsigned long long total = 0;
+	static volatile unsigned long long sink;
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--clean"))
@@ -124,24 +125,93 @@ int main(int argc, char** argv)
 		printf("  ... and %lu more\n", map->count - 4);
 
 	/*
-	 * Read every slice through the window, and time it. This is also the
-	 * first measurement of what R3 is for: in-place reads at memory speed
-	 * rather than an ioctl per buffer.
+	 * Read bandwidth, measured as reading rather than as hashing.
+	 *
+	 * The first version of this timed sum_of() -- a byte-at-a-time FNV --
+	 * over every slice and reported 819 MB/s, which is SSD speed and
+	 * obviously wrong for DDR3: what it measured was the hash, not the
+	 * memory. One multiply and one xor per BYTE cannot keep up with a
+	 * memory bus, so the number said more about the loop than the mapping.
+	 * (R1 made exactly this mistake with a CRC and understated readback by
+	 * 2.5x. Twice is a pattern: never put a per-byte computation inside a
+	 * span meant to measure a transfer.)
+	 *
+	 * So the timed loop now does the cheapest thing that still forces every
+	 * cache line to be fetched -- a 64-bit accumulate, one operation per
+	 * eight bytes -- and the checksum moved out of it. 1 GB does not fit in
+	 * this part's 6 MB of L3, so this is genuine DRAM bandwidth rather than
+	 * a cache measurement.
 	 */
 	t0 = now_s();
 	for (i = 0; i < (int)map->count; i++) {
-		const unsigned char* p =
-			(const unsigned char*)(unsigned long)map->range[i].user_va;
-		volatile unsigned long long s = sum_of(p, (unsigned long)map->range[i].bytes);
+		const unsigned long long* q =
+			(const unsigned long long*)(unsigned long)map->range[i].user_va;
+		unsigned long long n = map->range[i].bytes / sizeof(*q);
+		unsigned long long acc = 0, j;
 
-		(void)s;
+		for (j = 0; j < n; j++)
+			acc += q[j];
+
+		/* Consumed, so the loop above cannot be optimised away. */
+		sink += acc;
 		total += map->range[i].bytes;
 	}
 	t1 = now_s();
 
-	printf("\nread %llu MB through the window in %.2f s = %.0f MB/s\n",
+	printf("\nread %llu MB through the window in %.3f s = %.0f MB/s\n",
 	       total >> 20, t1 - t0,
 	       (double)(total >> 20) / (t1 - t0 > 0 ? t1 - t0 : 1));
+
+	/*
+	 * The control, and the load-bearing comparison of this whole rung.
+	 *
+	 * KREAD reaches the same memory through an ioctl and a page-table walk
+	 * per call. If the window were somehow not a real mapping -- if it had
+	 * quietly degraded to copying, say -- the two would come out alike. A
+	 * large ratio is the evidence that nothing is being copied.
+	 */
+	{
+		static const unsigned long sizes[] = { 4096, 65536 };
+		const unsigned long long PAGE_OFFSET = 0xffff888000000000ULL;
+		double win_mbs = (double)(total >> 20) / (t1 - t0);
+		unsigned char* ctl = malloc(65536);
+		int s;
+
+		if (ctl) {
+			for (s = 0; s < 2; s++) {
+				unsigned long	   chunk = sizes[s];
+				unsigned long long ctl_bytes = 0;
+				/* 64 MB per size, so the timer has something to
+				 * measure -- 4 ms of samples was noise. */
+				unsigned long	   iters = (64UL << 20) / chunk;
+				double		   c0, c1;
+				unsigned long	   k;
+
+				c0 = now_s();
+				for (k = 0; k < iters; k++) {
+					unsigned long long va =
+						PAGE_OFFSET + map->range[0].pa +
+						(unsigned long long)(k % 128) * chunk;
+
+					if (!CO_OK(co_manager_kread(handle, va, ctl, chunk)))
+						break;
+					ctl_bytes += chunk;
+				}
+				c1 = now_s();
+
+				if (ctl_bytes && c1 > c0) {
+					double ctl_mbs = (double)(ctl_bytes >> 20) / (c1 - c0);
+
+					printf("KREAD control @ %5lu B: %.0f MB/s"
+					       "  (%.1f us/call)  -> window %.0fx faster\n",
+					       chunk, ctl_mbs,
+					       (c1 - c0) * 1e6 / (double)(ctl_bytes / chunk),
+					       ctl_mbs > 0 ? win_mbs / ctl_mbs : 0.0);
+				}
+			}
+			free(ctl);
+		}
+	}
 
 	/*
 	 * The cross-check. KREAD takes a guest VIRTUAL address, and what the
