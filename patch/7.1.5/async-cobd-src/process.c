@@ -1028,6 +1028,19 @@ static unsigned int co_colinux_take_ticks(void)
  */
 void co_cobd_drain_completions(void);
 
+/*
+ * The GPU transport's completions, reaped at the same three points.
+ *
+ * Weak and empty by default so a kernel built without the transport still
+ * links; virtio_colinux.c provides the real one. The three call sites below
+ * are deliberately the same ones the block path uses -- a completion that only
+ * arrives on one of them can be delayed arbitrarily by a guest that happens
+ * not to take that path, which is how a fence turns into a hang.
+ */
+void __weak co_vgpu_drain(void)
+{
+}
+
 DEFINE_IDTENTRY_SYSVEC(sysvec_co_timer)
 {
 	struct pt_regs *old = set_irq_regs(regs);
@@ -1037,6 +1050,7 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_co_timer)
 		co_colinux_clockevent.event_handler(&co_colinux_clockevent);
 
 	co_cobd_drain_completions();
+	co_vgpu_drain();
 
 	set_irq_regs(old);
 }
@@ -1054,6 +1068,7 @@ void co_colinux_drain_time(void)
 		 * boundary where its I/O comes back and wakes it.
 		 */
 		co_cobd_drain_completions();
+		co_vgpu_drain();
 		return;
 	}
 
@@ -1083,6 +1098,7 @@ void co_colinux_drain_time(void)
 	while (n--)
 		co_colinux_clockevent.event_handler(&co_colinux_clockevent);
 	co_cobd_drain_completions();
+	co_vgpu_drain();
 	set_irq_regs(old);
 	irq_exit();
 }

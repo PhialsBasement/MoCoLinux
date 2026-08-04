@@ -2251,6 +2251,60 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 						  s_bio ? " (--sync-cobd)"
 							: " (guest has no cobd ring)");
 			}
+
+			/*
+			 * The GPU transport, and the one thing only this code
+			 * can do: tell the guest the device exists.
+			 *
+			 * The guest's transport driver runs at device_initcall
+			 * and looks for a magic word. Nothing else is in a
+			 * position to write it -- the GPU daemon has not
+			 * started, and could not reach guest memory before the
+			 * image is loaded anyway -- so the boot daemon fills in
+			 * the header here, between loading the image and
+			 * starting the guest. This mirrors the cobd enabled-word
+			 * precedent exactly.
+			 *
+			 * An absent symbol means a kernel without the transport,
+			 * which is normal and silent: vgpu_io_va stays zero, the
+			 * initcall finds no magic, and the guest boots with no
+			 * GPU.
+			 */
+			{
+				co_elf_symbol_t* s_gio =
+					co_get_symbol_by_name(pl, "co_colinux_vgpu_io");
+
+				if (s_gio) {
+					struct {
+						unsigned int	   magic;
+						unsigned int	   abi_version;
+						unsigned long long host_features;
+					} hdr;
+
+					b.vgpu_io_va = co_elf_get_symbol_value(s_gio);
+
+					hdr.magic	  = 0x55504756;	/* 'VGPU' */
+					hdr.abi_version	  = 1;
+					hdr.host_features = (1ULL << 32) | (1ULL << 0);
+
+					/*
+					 * The same path every other byte of the
+					 * image took: the pages are already
+					 * allocated and mapped, and the guest is
+					 * not running yet.
+					 */
+					if (CO_OK(co_manager_kload_chunk(handle, b.vgpu_io_va,
+									 &hdr, sizeof(hdr), 0))) {
+						co_terminal_print("    vgpu transport at 0x%016llx"
+								  "  (virtio-gpu, render-only)\n",
+								  b.vgpu_io_va);
+					} else {
+						co_terminal_print("    vgpu transport present but"
+								  " its header could not be written\n");
+						b.vgpu_io_va = 0;
+					}
+				}
+			}
 		}
 
 		co_terminal_print("\n  booting:\n");
