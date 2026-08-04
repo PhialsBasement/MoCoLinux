@@ -27,12 +27,47 @@ rem  WScript.Shell rather than `start`, for the reason xstart.bat spells out at
 rem  length: `start` hands its console handles to the child whatever you do,
 rem  the caller then waits for an end-of-file that cannot come, and the call
 rem  never returns.
+rem  Where the server is, asked rather than assumed.
+rem
+rem  This said F:\xfer\mocolinux-m2\vcxsrv1142 until 2026-08-04, which is this
+rem  development box and nowhere else, so every installed machine took the "is
+rem  not there" branch -- and moco-boot.vbs runs this hidden, so the
+rem  explanation went to a console nobody sees. The symptom is the worst shape
+rem  available: Linux applications start, connect to nothing and never appear,
+rem  with no error anywhere on either side.
+rem
+rem  Four sources, in order of how much they know:
+rem    1. an argument, which is what moco-boot.vbs passes -- the shortcuts hand
+rem       it both directories, so it is the only caller that knows for certain;
+rem    2. mocolinux.ini, which is the installer's own record of where it put
+rem       things and is authoritative for an installed machine;
+rem    3. beside this script, which is true whenever the two travel together;
+rem    4. the development boxes, so this is still runnable by hand.
 setlocal
 set XVBS=%TEMP%\mocolinux-xstart1142.vbs
-set XEXE=F:\xfer\mocolinux-m2\vcxsrv1142\vcxsrv.exe
+set PROG=%~1
+if not "%PROG%"=="" goto have_prog
+
+rem  The ini lives with the images, in the Linux directory. Its default is the
+rem  root of the system drive; the program directory is written inside it.
+set INI=%SystemDrive%\MoCoLinux\mocolinux.ini
+if not exist "%INI%" set INI=%~dp0mocolinux.ini
+if exist "%INI%" for /f "usebackq tokens=1,* delims==" %%a in (`findstr /b /i "program=" "%INI%"`) do set PROG=%%b
+if not "%PROG%"=="" goto have_prog
+
+set PROG=%~dp0
+
+:have_prog
+rem  %~dp0 ends in a backslash and an ini value does not; normalise so the
+rem  path below is built the same way whichever source answered.
+if "%PROG:~-1%"=="\" set PROG=%PROG:~0,-1%
+
+set XEXE=%PROG%\vcxsrv1142\vcxsrv.exe
+if not exist "%XEXE%" set XEXE=F:\xfer\mocolinux-m2\vcxsrv1142\vcxsrv.exe
+if not exist "%XEXE%" set XEXE=E:\xfer\mocolinux-m2\vcxsrv1142\vcxsrv.exe
 
 if not exist "%XEXE%" (
-	echo xstart1142: %XEXE% is not there -- was the installer run with /D?
+	echo xstart1142: no vcxsrv.exe under "%PROG%" or on the fallback paths
 	exit /b 1
 )
 
