@@ -263,6 +263,25 @@
      only on disk after a clean poweroff. stop.bat and the run deadline do not
      unmount, so a file written seconds earlier comes back as a journaled inode
      with no data -- zero bytes, which looks like the write never happened.
+ * The seed image carries its own copy of the maker script, and it goes stale:
+   * The installer runs /root/mk.sh out of root-arch.img, preferring it over
+     /usr/local/bin/mkmanjarorootfs.sh. On 2026-08-04 that copy was the
+     pre-geoip version: the tree had been switched to `pacman-mirrors --geoip`
+     precisely to stop the build timing all ~125 mirrors, and the install still
+     did the slow ranking, because the tree is not what runs -- the image is.
+     Nothing reported a mismatch, and nothing could: the file is inside an ext4
+     image that no build step ever looks into.
+   * The copy in dist-x64/root-arch.img has been refreshed by hand (debugfs
+     write + e2fsck, verified byte-identical to the tree script). That fixes
+     the next install and nothing after it. release/MoCoLinux-0.1.0 still ships
+     the old one, deliberately -- its sha256.txt describes what was published.
+   * The real fix is for Setup to put the current script into the guest before
+     invoking it, rather than trusting whatever the image happens to carry. It
+     already has a console conversation and the script is 40 KB; the same
+     argument applies to any other tool the build depends on. Until then, every
+     change to tools/mkmanjarorootfs.sh has to be written into the seed image
+     by hand or it does not exist as far as an install is concerned.
+
  * The box-side scripts are not in the tree:
    * deploy.sh, run-arch.bat, run-linux.bat, console.bat, net.bat, stop.bat,
      reboot.bat, dbg-start.bat, verifier-on/off.bat and getdumps.bat all live in

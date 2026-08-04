@@ -3195,9 +3195,12 @@ static void draw_page(HDC dc, RECT *client)
 		break;
 	default:
 		head = "Finished";
-		body = "MoCoLinux is installed.\n\nPlease restart Windows before "
-		       "the first launch. The driver reserves its memory when it "
-		       "loads, and a fresh start is what makes that reliable.";
+		body = "MoCoLinux is installed.\n\nWindows should be restarted "
+		       "before Linux is started for the first time \x97 the driver "
+		       "reserves its memory when it loads, and it finds it "
+		       "reliably on a machine that has just started. Finish "
+		       "offers to do it.\n\nAfter that MoCoLinux starts by itself "
+		       "at logon, and there are shortcuts on the desktop.";
 		break;
 	}
 
@@ -3314,6 +3317,81 @@ static int hit_button(int x, int y)
 	return -1;
 }
 
+/*
+ * Restart Windows.
+ *
+ * The privilege has to be enabled first: SeShutdownPrivilege is present in an
+ * administrator's token but disabled, and ExitWindowsEx just fails without
+ * saying why.
+ *
+ * EWX_FORCEIFHUNG, not EWX_FORCE: a hung application should not be able to
+ * block the restart, but nobody else's unsaved work goes with it either.
+ */
+static BOOL reboot_windows(void)
+{
+	HANDLE tok;
+	TOKEN_PRIVILEGES tp;
+
+	if (OpenProcessToken(GetCurrentProcess(),
+			     TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+		LookupPrivilegeValue(NULL, SE_SHUTDOWN_NAME, &tp.Privileges[0].Luid);
+		tp.PrivilegeCount = 1;
+		tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+		AdjustTokenPrivileges(tok, FALSE, &tp, 0, NULL, NULL);
+		CloseHandle(tok);
+	}
+
+	return ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, 0);
+}
+
+/*
+ * Finish, and offer the restart that should come before the first launch.
+ *
+ * Asked rather than stated. The last page has said "please restart" in prose
+ * since the beginning, which is precisely the kind of instruction a user
+ * clicks past on their way out of a wizard -- and the cost of missing it is
+ * not cosmetic. The driver reserves its guest RAM as unbroken 32 MB physical
+ * runs when it loads, and this Setup has just written a couple of gigabytes
+ * through the cache and run a guest for ten minutes, so the host's physical
+ * memory is as fragmented as it ever gets. A first launch on a fresh boot is
+ * the difference between a guest that starts and one that grinds the machine
+ * hunting for runs that no longer exist in one piece.
+ *
+ * Only offered when there is something installed to launch: a failed or
+ * abandoned run has nothing to gain from a restart, and asking anyway would
+ * read as the installer trying to hide a failure behind a reboot.
+ */
+static void finish_setup(HWND wnd)
+{
+	int done, failed;
+
+	EnterCriticalSection(&work_lock);
+	done   = work_done;
+	failed = work_failed;
+	LeaveCriticalSection(&work_lock);
+
+	if (done && !failed) {
+		if (MessageBox(wnd,
+			"MoCoLinux is installed.\n\n"
+			"Please restart Windows before starting Linux for the "
+			"first time. The driver reserves its memory when it "
+			"loads, and it finds it reliably on a machine that has "
+			"just started.\n\n"
+			"MoCoLinux starts by itself when you log back in.\n\n"
+			"Restart now?",
+			"MoCoLinux Setup", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+			if (!reboot_windows())
+				MessageBox(wnd,
+					"Windows would not restart. Please "
+					"restart it yourself before starting "
+					"Linux for the first time.",
+					"MoCoLinux Setup", MB_OK | MB_ICONWARNING);
+		}
+	}
+
+	DestroyWindow(wnd);
+}
+
 static LRESULT CALLBACK proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 {
 	switch (msg) {
@@ -3346,32 +3424,7 @@ static LRESULT CALLBACK proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 			"MoCoLinux Setup", MB_YESNO | MB_ICONQUESTION);
 
 		if (answer == IDYES) {
-			/*
-			 * Shutting down needs the privilege enabled first: it is
-			 * present in an administrator's token but disabled, and
-			 * ExitWindowsEx simply fails without saying why.
-			 */
-			HANDLE tok;
-			TOKEN_PRIVILEGES tp;
-
-			if (OpenProcessToken(GetCurrentProcess(),
-					     TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-					     &tok)) {
-				LookupPrivilegeValue(NULL, SE_SHUTDOWN_NAME,
-						     &tp.Privileges[0].Luid);
-				tp.PrivilegeCount = 1;
-				tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-				AdjustTokenPrivileges(tok, FALSE, &tp, 0, NULL, NULL);
-				CloseHandle(tok);
-			}
-
-			/*
-			 * EWX_FORCEIFHUNG, not EWX_FORCE. Nothing of ours is running
-			 * -- the driver has deliberately not been loaded yet -- so
-			 * there is no reason to take other people's unsaved work
-			 * with us, but a hung application should not block it either.
-			 */
-			if (!ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, 0))
+			if (!reboot_windows())
 				MessageBox(wnd,
 					"Windows would not restart. Please restart "
 					"it yourself; Setup will continue when you "
@@ -3505,7 +3558,7 @@ static LRESULT CALLBACK proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 				 * behave dead for the entire second half.
 				 */
 				if (page == PG_DONE)
-					DestroyWindow(wnd);
+					finish_setup(wnd);
 				else {
 					page++;
 					if (page == PG_INSTALL)
@@ -3550,7 +3603,7 @@ static LRESULT CALLBACK proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 		else if ((wp == VK_RETURN || wp == VK_RIGHT) && btn_enabled(B_NEXT)) {
 			/* Same rule as the button; see WM_LBUTTONUP. */
 			if (page == PG_DONE)
-				DestroyWindow(wnd);
+				finish_setup(wnd);
 			else {
 				page++;
 				if (page == PG_INSTALL)
