@@ -45,7 +45,7 @@
  * machine is unsuitable, and most of these are things they can fix in a minute.
  */
 
-#define PAYLOAD_MAX 12
+#define PAYLOAD_MAX 20
 
 /* Laid down beside each other; the image goes to the Linux directory instead. */
 static const char *payload[PAYLOAD_MAX] = {
@@ -68,6 +68,26 @@ static const char *payload[PAYLOAD_MAX] = {
 	"moco-icons.vbs",
 	"xstart1142.bat",
 	"stop.bat",
+	/*
+	 * The GPU half. Without these an install has a working Linux whose
+	 * graphics are rendered by the guest's single core -- which is the
+	 * state every release before this one shipped in.
+	 *
+	 * cogpu-daemon is the virtio-gpu device: it services the guest's
+	 * rings, maps guest memory, and drives virglrenderer. moco-boot.vbs
+	 * already starts it, so the only thing missing was the file.
+	 *
+	 * The DLLs are its dependencies and none are optional. virglrenderer
+	 * is the renderer, libepoxy resolves the GL entry points, and the two
+	 * mingw runtimes are what the toolchain links against -- an install
+	 * without libgcc_s_seh-1.dll produces a daemon that will not start and
+	 * says nothing about why, because the loader fails before main().
+	 */
+	"cogpu-daemon.exe",
+	"libvirglrenderer-1.dll",
+	"libepoxy-0.dll",
+	"libgcc_s_seh-1.dll",
+	"libwinpthread-1.dll",
 	/* The licence travels with the program, and the licence page reads it from
 	 * beside Setup rather than from a compiled-in copy that could drift. */
 	"COPYING",
