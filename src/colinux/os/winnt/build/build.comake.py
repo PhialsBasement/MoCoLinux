@@ -27,6 +27,7 @@ targets['executables'] = Target(
     Input('colinux-serial-daemon.exe'),
     Input('kread-hammer.exe'),
     Input('kmap-test.exe'),
+    Input('cogpu-daemon.exe'),
     Input('linux.sys'),
     ] + optional_targets(),
     tool = Empty(),
@@ -259,6 +260,18 @@ targets['kread-hammer.exe'] = Target(
 targets['kmap-test.exe'] = Target(
     inputs = [
         Input('../user/kmap-test/build.o'),
+    ] + user_dep,
+    tool = Compiler(),
+    mono_options = generate_options('gcc'),
+)
+
+# R4's daemon: the host side of the guest's GPU. A sibling of the slirp bridge
+# -- an ordinary userspace program that services one of the guest's device
+# rings -- and it lives in userspace because that is where WGL and the NVIDIA
+# driver are. Will embed virglrenderer at R5.
+targets['cogpu-daemon.exe'] = Target(
+    inputs = [
+        Input('../user/cogpu-daemon/build.o'),
     ] + user_dep,
     tool = Compiler(),
     mono_options = generate_options('gcc'),

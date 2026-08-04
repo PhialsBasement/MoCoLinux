@@ -73,6 +73,11 @@ extern co_rc_t co_manager_kmap(co_manager_handle_t handle, unsigned long max_sli
 			       co_manager_ioctl_kmap_t* out);
 extern co_rc_t co_manager_kunmap(co_manager_handle_t handle,
 				 unsigned long* released_out);
+extern co_rc_t co_manager_vgpu_address(co_manager_handle_t handle,
+				       unsigned long long* va_out);
+extern co_rc_t co_manager_kvirt_to_phys(co_manager_handle_t handle,
+					unsigned long long va,
+					unsigned long long* pa_out);
 extern co_rc_t co_manager_kload_enter(co_manager_handle_t handle,
 				      co_manager_ioctl_test_switch_t* out);
 extern co_rc_t co_manager_kcall(co_manager_handle_t handle,

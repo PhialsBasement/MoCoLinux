@@ -57,6 +57,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_CONET_PUT,
 	CO_MANAGER_IOCTL_KMAP,
 	CO_MANAGER_IOCTL_KUNMAP,
+	CO_MANAGER_IOCTL_VGPU,
 } co_manager_ioctl_t;
 
 /*
@@ -362,6 +363,23 @@ typedef struct {
 	co_rc_t		   rc;
 	unsigned long	   released;	/* out: slices unmapped */
 } co_manager_ioctl_kunmap_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_VGPU: where the guest's transport structure
+ * is, and what a guest virtual address resolves to.
+ *
+ * The daemon needs both and can compute neither. The structure's address moves
+ * with every kernel build, so it is published by the loader rather than
+ * guessed; and it is a guest VIRTUAL address, while the daemon's windows are
+ * indexed by physical -- so one translation is needed before the daemon can
+ * treat it as a pointer. Everything after that is arithmetic.
+ */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long va;		/* out: co_colinux_vgpu_io, guest virtual */
+	unsigned long long query_va;	/* in:  a guest virtual address, or 0 */
+	unsigned long long query_pa;	/* out: what it resolves to */
+} co_manager_ioctl_vgpu_t;
 
 /*
  * interface for CO_MANAGER_IOCTL_COBD: attach a backing store to a unit.

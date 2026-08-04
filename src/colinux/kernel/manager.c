@@ -904,6 +904,36 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_VGPU: {
+		co_manager_ioctl_vgpu_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->va	 = co_vgpu_address();
+		params->query_pa = 0;
+		params->rc	 = CO_RC(OK);
+
+		/*
+		 * One guest virtual address translated, if asked. The daemon's
+		 * windows are indexed by physical address, so it needs this
+		 * once for the transport structure and never again -- every
+		 * descriptor it reads afterwards already carries a physical
+		 * address, which is the property this whole design rests on.
+		 */
+		if (params->query_va) {
+			co_pa_t pa = 0;
+
+			if (CO_OK(co_kload_virt_to_phys(manager, params->query_va, &pa)))
+				params->query_pa = pa;
+			else
+				params->rc = CO_RC(NOT_FOUND);
+		}
+
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_COBD: {
 		co_manager_ioctl_cobd_t* params = (typeof(params))(io_buffer);
 
@@ -1134,6 +1164,14 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.passage_symbol_va  = params->passage_symbol_va;
 		co_console_set_address(params->console_io_va);
 		co_net_set_address(params->net_io_va);
+		/*
+		 * And the GPU transport, published here for the same reason as
+		 * the two above: this is the moment the guest's address space
+		 * is built and its symbols are known, and the daemons that read
+		 * these structures are separate processes that cannot be told
+		 * any earlier. Zero when the kernel has no transport.
+		 */
+		co_vgpu_set_address(manager, params->vgpu_io_va);
 		in.cobd_io_va         = params->cobd_io_va;
 		in.async_cobd         = params->async_cobd;
 		in.max_switches       = params->max_switches ? params->max_switches : 4096;

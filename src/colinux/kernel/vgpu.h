@@ -68,7 +68,12 @@ struct co_vgpu_io {
  */
 #define CO_VGPU_F_VERSION_1	(1ULL << 32)	/* VIRTIO_F_VERSION_1 */
 #define CO_VGPU_F_VIRGL		(1ULL << 0)	/* VIRTIO_GPU_F_VIRGL */
-#define CO_VGPU_HOST_FEATURES	(CO_VGPU_F_VERSION_1 | CO_VGPU_F_VIRGL)
+#define CO_VGPU_F_CONTEXT_INIT	(1ULL << 4)	/* VIRTIO_GPU_F_CONTEXT_INIT */
+#define CO_VGPU_F_RESOURCE_UUID	(1ULL << 2)
+#define CO_VGPU_F_RESOURCE_BLOB	(1ULL << 3)
+#define CO_VGPU_HOST_FEATURES	(CO_VGPU_F_VERSION_1 | CO_VGPU_F_VIRGL | \
+				 CO_VGPU_F_RESOURCE_UUID | CO_VGPU_F_RESOURCE_BLOB | \
+				 CO_VGPU_F_CONTEXT_INIT)
 
 /*
  * Where the guest's structure lives, published by the loader once it has
