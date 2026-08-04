@@ -568,10 +568,29 @@
      - Actual passthrough of the card to the guest. Not credible: there is no
        IOMMU in play, the guest deliberately touches no host hardware, and
        Windows is still driving the GT730 while the guest runs.
-   * Before any of that, measure. glxinfo -B in the guest reports the renderer
-     and the maximum GL version actually offered over the indirect path with
-     the real card behind it; that number decides whether this is worth doing
-     at all or whether 1.4-with-acceleration covers what anyone runs.
+   * MEASURED 2026-08-04, and the answer is that 1.4-with-acceleration does not
+     cover it. `glhw glxinfo -B` in the guest, on Windows 7 with the GT 730:
+         direct rendering: No (LIBGL_ALWAYS_INDIRECT set)
+         OpenGL vendor:   NVIDIA Corporation
+         OpenGL renderer: GeForce GT 730/PCIe/SSE2
+         OpenGL version:  1.4 (4.6.0 NVIDIA 388.13)
+     The card is reached and its driver is 4.6-capable; the GLX wire protocol
+     is what caps it, exactly as argued above. It is worse than a cap, though:
+     the same run died with GLXBadContext on X_GLXMakeCurrent, and the default
+     (software) path does not get that far -- glxinfo fails with GLXBadDrawable
+     on X_GLXGetDrawableAttributes, a 2026 Mesa talking to a 2013 server. So
+     neither path currently produces a usable context for a client that asks
+     for one properly.
+   * And the cost is not confined to games. KDE's System Settings comes up as a
+     black window: Plasma 6's configuration UI is QML, Qt Quick wants a GL
+     context, and there is not one to be had. QT_QUICK_BACKEND=software renders
+     it perfectly, which is the proof that the application is fine and the
+     context is what is missing. The applications that have always worked --
+     Konsole, Kate, Dolphin -- are QtWidgets drawn by QPainter on the CPU, so
+     they never asked. Expect the same black window from plasma-systemmonitor,
+     Discover and most modern settings modules. That moves this entry from a
+     performance question to a usability one: today roughly half of Plasma's
+     own interface does not draw.
    * And note the two settings are useless apart. LIBGL_ALWAYS_INDIRECT without
      `+iglx` gets refused by the server; `-wgl` without LIBGL_ALWAYS_INDIRECT
      accelerates nothing, because the guest has already finished drawing before
