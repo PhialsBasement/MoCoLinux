@@ -763,6 +763,27 @@ co_slirp_parse_args(co_command_line_params_t cmdline, start_parameters_t *parame
 		return rc;
 
 	/*
+	 * Redirections, before the mode-specific early returns.
+	 *
+	 * Ring mode returns immediately below, and the redirect block used to
+	 * sit after that return -- so "-R -r tcp:2222:22" parsed the argument,
+	 * stored it, and silently did nothing. The daemon started, reported no
+	 * error, listened on nothing, and every connection to the redirected
+	 * port timed out with no indication anywhere that the option had been
+	 * discarded. Redirections are not specific to either mode; slirp holds
+	 * them in its own state and serves them however the guest is reached.
+	 */
+	if (redir_specified) {
+		rc = parse_redir_param(redir_buff);
+		if (!CO_OK(rc)) {
+			co_terminal_print("conet-slirp-daemon: Error in redirection '%s'\n",
+					  redir_buff);
+			return rc;
+		}
+		redir_specified = PFALSE;	/* done; do not repeat below */
+	}
+
+	/*
 	 * Ring mode needs no instance id and no unit: it finds the guest
 	 * through the driver, which learned the rings' address at boot.
 	 */
