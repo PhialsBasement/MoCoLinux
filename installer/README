@@ -15,7 +15,14 @@ setup.c                A single-executable Win32 setup program, no dependencies:
 Build (mingw-w64, from this directory):
 
     x86_64-w64-mingw32-gcc setup.c -o mocolinux-setup.exe -O2 -mwindows \
-        -lshlwapi -lole32 -lws2_32 -ladvapi32
+        -mcrtdll=msvcrt-os -lshlwapi -lole32 -lws2_32 -ladvapi32
+
+-mcrtdll=msvcrt-os is not optional: without it mingw-w64 16.1 links the
+Universal CRT (api-ms-win-crt-*), which XP does not have at all and a
+Windows 7 without KB2999226 does not have either -- the exe then fails to
+start on exactly the machines it exists for. Check with
+`objdump -p mocolinux-setup.exe | grep -i "dll name"`: msvcrt.dll is right,
+anything api-ms-win-crt-* is wrong.
 
 What a release directory has to contain beside it -- the `payload` array in
 setup.c is the authoritative list, and a missing entry is fatal at install time:
