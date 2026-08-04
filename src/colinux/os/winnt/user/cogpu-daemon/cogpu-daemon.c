@@ -112,6 +112,40 @@ static void logline(const char *fmt, ...)
 static co_manager_ioctl_kmap_t *g_map;
 static int			g_last_hit;
 
+/*
+ * How much of a buffer starting at `gpa` is reachable as one host pointer.
+ *
+ * Guest RAM is mapped in 8 MB slices, and those slices are separate MDL
+ * mappings -- adjacent in guest-physical space, unrelated in host-virtual
+ * space. A guest buffer crossing a boundary therefore has no single host
+ * pointer, and resolving it as one made every large ATTACH_BACKING fail:
+ * anything bigger than a slice, or unluckily placed, came back ERR_UNSPEC and
+ * every draw against it failed afterwards. R5's probe buffers fitted inside
+ * one slice by luck, which is why this survived that long.
+ *
+ * Returning the reachable prefix lets the caller split the entry into as many
+ * iovecs as it spans -- which is what an iovec list is for.
+ */
+static uint32_t resolve_run(uint64_t gpa, uint32_t len)
+{
+	int i, n;
+
+	if (!g_map)
+		return 0;
+
+	n = (int)g_map->count;
+	for (i = 0; i < n; i++) {
+		co_kmap_range_t *r = &g_map->range[i];
+
+		if (gpa >= r->pa && gpa < r->pa + r->bytes) {
+			uint64_t avail = r->pa + r->bytes - gpa;
+
+			return (avail < len) ? (uint32_t)avail : len;
+		}
+	}
+	return 0;
+}
+
 static void *resolve_gpa(void *ctx, uint64_t gpa, uint32_t len)
 {
 	int i, n;
@@ -457,10 +491,10 @@ static uint32_t serve(struct cogpu_chain *chain)
 		 */
 		struct { uint32_t resource_id, nr_entries; } a;
 		struct { uint64_t addr; uint32_t length, pad; } ent;
-		static struct iovec iov[1024];
+		static struct iovec iov[4096];
 		const char *p;
 		uint32_t i;
-		int bad = 0;
+		int bad = 0, niov = 0;
 
 		if (chain->in[0].len < sizeof(req) + sizeof(a)) {
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
@@ -468,7 +502,7 @@ static uint32_t serve(struct cogpu_chain *chain)
 		}
 		memcpy(&a, (char *)chain->in[0].addr + sizeof(req), sizeof(a));
 
-		if (a.nr_entries == 0 || a.nr_entries > 1024) {
+		if (a.nr_entries == 0 || a.nr_entries > 2048) {
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
 			break;
 		}
@@ -484,29 +518,85 @@ static uint32_t serve(struct cogpu_chain *chain)
 			break;
 		}
 
-		for (i = 0; i < a.nr_entries; i++) {
-			void *host;
+		niov = 0;
+		for (i = 0; i < a.nr_entries && !bad; i++) {
+			uint64_t addr;
+			uint32_t left;
 
 			memcpy(&ent, p + i * sizeof(ent), sizeof(ent));
-			host = resolve_gpa(NULL, ent.addr, ent.length);
-			if (!host) {
-				logline("  ATTACH_BACKING res %u: entry %u"
-					" (0x%llx +%u) is outside guest RAM\n",
-					a.resource_id, i,
-					(unsigned long long)ent.addr, ent.length);
-				bad = 1;
-				break;
+			addr = ent.addr;
+			left = ent.length;
+
+			/*
+			 * One entry can span several mapping slices, so it
+			 * becomes several iovecs. Not an optimisation: a
+			 * buffer crossing a boundary has no single host
+			 * pointer, so splitting is the only correct answer.
+			 */
+			while (left && !bad) {
+				uint32_t run = resolve_run(addr, left);
+				void *host;
+
+				if (run == 0) {
+					logline("  ATTACH_BACKING res %u: entry %u"
+						" (0x%llx +%u) outside guest RAM"
+						" -- %lu slices, %llu MB mapped\n",
+						a.resource_id, i,
+						(unsigned long long)addr, left,
+						g_map->count,
+						(unsigned long long)(g_map->total_bytes >> 20));
+					bad = 1;
+					break;
+				}
+				if (niov >= (int)(sizeof(iov) / sizeof(iov[0]))) {
+					logline("  ATTACH_BACKING res %u: over %d"
+						" iovecs\n", a.resource_id,
+						(int)(sizeof(iov) / sizeof(iov[0])));
+					bad = 1;
+					break;
+				}
+
+				host = resolve_gpa(NULL, addr, run);
+				if (!host) {
+					bad = 1;
+					break;
+				}
+
+				iov[niov].iov_base = host;
+				iov[niov].iov_len  = run;
+				niov++;
+
+				g_stats.backing_bytes += run;
+				addr += run;
+				left -= run;
 			}
-			iov[i].iov_base = host;
-			iov[i].iov_len	= ent.length;
-			g_stats.backing_bytes += ent.length;
 		}
 
-		if (bad || cogpu_vrend_attach_iov(a.resource_id, iov,
-						  (int)a.nr_entries) != 0)
+		if (bad) {
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
-		else
+		} else if (cogpu_vrend_attach_iov(a.resource_id, iov, niov) != 0) {
+			logline("  ATTACH_BACKING res %u: renderer refused"
+				" %d iovecs\n", a.resource_id, niov);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+		} else {
+			uint64_t total = 0;
+			int k;
+
+			for (k = 0; k < niov; k++)
+				total += iov[k].iov_len;
+
+			/*
+			 * The attached size, logged on success too:
+			 * virglrenderer refuses a transfer whose computed size
+			 * exceeds the backing, and without this number the only
+			 * symptom is EINVAL on a transfer whose own parameters
+			 * look perfectly correct.
+			 */
+			logline("  ATTACH_BACKING res %u: %d iovecs,"
+				" %llu bytes\n", a.resource_id, niov,
+				(unsigned long long)total);
 			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+		}
 		break;
 	}
 
@@ -524,10 +614,35 @@ static uint32_t serve(struct cogpu_chain *chain)
 	case VIRTIO_GPU_CMD_RESOURCE_UNREF: {
 		struct { uint32_t resource_id, pad; } d;
 
-		if (chain->in[0].len >= sizeof(req) + sizeof(d)) {
-			memcpy(&d, (char *)chain->in[0].addr + sizeof(req), sizeof(d));
-			cogpu_vrend_resource_unref(d.resource_id);
+		if (chain->in[0].len < sizeof(req) + sizeof(d)) {
+			logline("  RESOURCE_UNREF: short descriptor;"
+				" NOT dropping the backing\n");
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
 		}
+		memcpy(&d, (char *)chain->in[0].addr + sizeof(req), sizeof(d));
+
+		/*
+		 * Stop pointing at the guest's pages BEFORE acknowledging.
+		 *
+		 * virgl_renderer_resource_unref decrements a refcount. A
+		 * resource still attached to a context -- and the guest is not
+		 * obliged to send CTX_DETACH_RESOURCE first -- survives the
+		 * unref with its iovecs intact, still aimed at guest physical
+		 * pages. The guest driver frees those pages as soon as this
+		 * reply lands, the allocator hands them to something else, and
+		 * the next readback writes host pixels over whatever now lives
+		 * there.
+		 *
+		 * Not a theory: it panicked the guest twice, once in
+		 * landlock's cred-free hook reading a domain pointer of
+		 * all-ones out of a recycled cred, and once as "Oops: Bad
+		 * pagetable" in Xorg with the page table itself overwritten.
+		 * Both are pages that had just been freed and reused.
+		 */
+		cogpu_vrend_detach_iov(d.resource_id);
+		cogpu_vrend_resource_unref(d.resource_id);
+
 		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 		break;
 	}
@@ -583,7 +698,70 @@ static uint32_t serve(struct cogpu_chain *chain)
 		break;
 	}
 
+	case VIRTIO_GPU_CMD_RESOURCE_CREATE_2D: {
+		/*
+		 * A 2D resource, which used to fall through to the catch-all
+		 * and be answered OK while nothing was created.
+		 *
+		 * The guest makes its cursor and framebuffer this way, attaches
+		 * backing to them and renders; with nothing created here,
+		 * ATTACH_BACKING was refused by the renderer and every transfer
+		 * afterwards failed against a resource that did not exist.
+		 *
+		 * virtio-gpu's format numbers are gallium's, which is what
+		 * virglrenderer wants, so the format passes straight through.
+		 */
+		struct { uint32_t resource_id, format, width, height; } r2;
+		struct virgl_renderer_resource_create_args args;
+
+		if (chain->in[0].len < sizeof(req) + sizeof(r2)) {
+			logline("  RESOURCE_CREATE_2D: short header\n");
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+		memcpy(&r2, (char *)chain->in[0].addr + sizeof(req), sizeof(r2));
+
+		memset(&args, 0, sizeof(args));
+		args.handle	= r2.resource_id;
+		args.target	= 2;		/* PIPE_TEXTURE_2D */
+		args.format	= r2.format;
+		args.bind	= (1 << 1);	/* VIRGL_BIND_RENDER_TARGET */
+		args.width	= r2.width;
+		args.height	= r2.height;
+		args.depth	= 1;
+		args.array_size	= 1;
+
+		if (cogpu_vrend_resource_create(&args) != 0) {
+			logline("  RESOURCE_CREATE_2D %u (%ux%u fmt %u) refused\n",
+				r2.resource_id, r2.width, r2.height, r2.format);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+		} else {
+			logline("  RESOURCE_CREATE_2D %u: %ux%u fmt %u\n",
+				r2.resource_id, r2.width, r2.height, r2.format);
+			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+		}
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
+	case VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID:
+	case VIRTIO_GPU_CMD_GET_EDID:
+		/*
+		 * Not implemented, and said so.
+		 *
+		 * These used to reach the catch-all and be answered OK, which
+		 * is how the guest came to hold blob resources that were never
+		 * created here -- and then every transfer naming one failed,
+		 * far from the cause. A guest copes with a refusal; it cannot
+		 * cope with being told something exists when it does not.
+		 */
+		logline("  cmd 0x%04x is not implemented; refusing rather than"
+			" pretending\n", type);
+		resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+		break;
+
 	default:
+		logline("  unknown command 0x%04x, answering OK\n", type);
 		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 		break;
 	}
@@ -642,6 +820,23 @@ int main(int argc, char **argv)
 	 */
 	setvbuf(stdout, NULL, _IONBF, 0);
 	g_log = fopen("C:\\MoCoLinux\\cogpu-daemon.log", "w");
+
+	/*
+	 * virglrenderer's own diagnostics.
+	 *
+	 * Every EINVAL it returns comes with a vrend_report_context_error
+	 * naming the exact check that failed -- illegal resource, transfer
+	 * bounds, and so on -- written to stderr. Started hidden from a .vbs,
+	 * this process's stderr goes to a console nobody sees, so the renderer
+	 * was explaining itself into nothing while its failures were guessed
+	 * at from the guest's "response 0x1200".
+	 */
+	{
+		FILE *e = freopen("C:\\MoCoLinux\\cogpu-vrend.log", "w", stderr);
+
+		if (e)
+			setvbuf(e, NULL, _IONBF, 0);
+	}
 
 	logline("cogpu-daemon: the host side of the guest's GPU\n\n");
 
@@ -814,7 +1009,32 @@ int main(int argc, char **argv)
 			vq[i].used  = resolve_gpa(NULL, io->vq[i].used_gpa, 8);
 
 			if (vq[i].desc && vq[i].avail && vq[i].used) {
-				logline("queue %d: %u descriptors\n", i, vq[i].num);
+				/*
+				 * Start where the guest is, not at zero.
+				 *
+				 * This daemon attaches long after the guest has
+				 * been running, and is restarted during
+				 * development while the guest keeps going.
+				 * Starting last_avail at zero leaves it hundreds
+				 * of entries behind, and cogpu_vring_pop's
+				 * sanity check -- more than a ring's worth
+				 * behind means the ring is not trustworthy --
+				 * then refuses every request forever. The
+				 * symptom is a daemon that polls busily and
+				 * serves nothing: kick 259, served 0.
+				 *
+				 * Joining at USED rather than AVAIL because the
+				 * gap between them is the guest's outstanding
+				 * work. Skipping it abandons every thread
+				 * waiting on those fences; replaying it answers
+				 * them and the guest carries on.
+				 */
+				vq[i].last_avail = vq[i].used->idx;
+				vq[i].used_idx	 = vq[i].used->idx;
+
+				logline("queue %d: %u descriptors,"
+					" joining at used %u\n",
+					i, vq[i].num, vq[i].used_idx);
 			} else {
 				logline("queue %d: addresses outside guest RAM\n", i);
 				vq[i].desc = NULL;
