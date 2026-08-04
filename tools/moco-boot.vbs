@@ -67,10 +67,16 @@ End If
 
 ' Linux. No switch limit and no deadline: this is a session somebody is using,
 ' and it ends when the guest powers off or stop.bat asks it to.
+' \DosDevices\, never \??\. They name the same NT object directory, but the
+' daemon's msvcrt CRT expands ? as a wildcard in argv before main() runs, so a
+' \??\ path whose pattern matches anything on disk arrives as its own basename
+' and the attach fails with "cannot attach cobd0 to '\root.img'". It only bites
+' when a match exists, which is why F: paths worked for days and the first C:
+' one did not.
 shell.Run """" & moco & "\colinux-daemon.exe"" --boot-kernel vmlinux" & _
 	" --max-switches none" & _
-	" --cobd0 \??\" & linux & "\root.img" & _
-	" --cobd1 \??\" & linux & "\root-arch.img" & _
+	" --cobd0 \DosDevices\" & linux & "\root.img" & _
+	" --cobd1 \DosDevices\" & linux & "\root-arch.img" & _
 	" --init /sbin/init", HIDDEN, NOWAIT
 
 ' The network bridge and the terminal server. Both may be started before the
