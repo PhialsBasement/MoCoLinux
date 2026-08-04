@@ -98,6 +98,8 @@ extern void*		  co_kload_frame_va(co_pfn_t pfn);
  * that cannot afford a walk per access. Valid only while the guest is up --
  * see the implementation for the lifetime rule.
  */
+extern co_rc_t		  co_kload_virt_to_phys(co_manager_t* manager,
+					        unsigned long long va, co_pa_t* pa);
 extern void*		  co_kload_host_ptr(co_manager_t* manager,
 				      unsigned long long va);
 

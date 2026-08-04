@@ -2285,7 +2285,25 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 
 					hdr.magic	  = 0x55504756;	/* 'VGPU' */
 					hdr.abi_version	  = 1;
-					hdr.host_features = (1ULL << 32) | (1ULL << 0);
+					/*
+					 * VERSION_1 (bit 32), VIRGL (bit 0) and
+					 * CONTEXT_INIT (bit 4).
+					 *
+					 * CONTEXT_INIT is how a modern Mesa
+					 * creates a 3D context and names the
+					 * capset it wants; without it the
+					 * driver refuses the ioctl outright --
+					 * its only gate is has_context_init --
+					 * so leaving it out of this word means
+					 * no guest client can ever open a
+					 * context, which is not a limitation
+					 * anyone would guess from the symptom.
+					 */
+hdr.host_features = (1ULL << 32) |	/* VERSION_1        */
+							    (1ULL << 0)  |	/* VIRGL            */
+							    (1ULL << 2)  |	/* RESOURCE_UUID    */
+							    (1ULL << 3)  |	/* RESOURCE_BLOB    */
+							    (1ULL << 4);	/* CONTEXT_INIT     */
 
 					/*
 					 * The same path every other byte of the

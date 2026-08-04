@@ -316,7 +316,36 @@ static co_kload_block_t* kload_block_alloc(unsigned long long bytes)
 
 	b = &kload_block[kload_block_count++];
 	b->raw	 = raw;
-	b->bytes = bytes;
+	/*
+	 * A whole number of 2 MB pages, always, and this is a correctness
+	 * requirement rather than tidiness.
+	 *
+	 * co_kload_build_ram pre-maps every block into the guest's direct map
+	 * with 2 MB leaves. The kernel then runs init_mem_mapping over the same
+	 * e820 and, for any RAM region that is not 2 MB aligned at both ends,
+	 * needs 4 KB granularity -- so it tries to install a page-table pointer
+	 * (pa | _PAGE_TABLE) into a PMD where it finds our 2 MB leaf instead.
+	 * The entries differ, and phys_pmd_init answers that with BUG():
+	 * vector 6 at phys_pmd_init, minutes into a boot, with no other clue.
+	 *
+	 * The base was already aligned below. The LENGTH was not, and the
+	 * halving fallback plus the final trim to the requested total produced
+	 * blocks of 5, 6 and 7 MB -- every one of them a region the kernel had
+	 * to split. That is why this failed intermittently and looked like
+	 * fragmentation: fragmentation is what produced the odd sizes.
+	 *
+	 * Rounding down is free: the allocation is already bytes + 2 MB, so
+	 * there is room for the base adjustment and a whole-page tail.
+	 */
+	b->bytes = bytes & ~(CO_ARCH_PMD_SIZE - 1);
+
+	if (b->bytes == 0) {
+		kload_block_count--;
+		co_os_free_contiguous_pages(raw,
+					    (unsigned int)((bytes + CO_ARCH_PMD_SIZE)
+							   >> CO_ARCH_PAGE_SHIFT));
+		return NULL;
+	}
 
 	{
 		co_pa_t raw_pa = co_os_virt_to_phys(raw);
@@ -962,6 +991,31 @@ void* co_kload_host_ptr(co_manager_t* manager, unsigned long long va)
 		return NULL;
 
 	return p + offset;
+}
+
+/*
+ * One guest virtual address to its physical address, under the teardown lock.
+ *
+ * For user-mode callers, which is why it locks: the walk goes through the
+ * guest's page tables and those live in memory a teardown can free.
+ */
+co_rc_t co_kload_virt_to_phys(co_manager_t* manager, unsigned long long va,
+			      co_pa_t* pa_out)
+{
+	co_rc_t rc = CO_RC(NOT_FOUND);
+	int	level = -1;
+	co_pa_t pa = 0;
+
+	co_os_mutex_acquire(kload_lock);
+
+	if (kload_space != NULL &&
+	    CO_OK(co_arch_guest_lookup(manager, kload_space, va, &pa, &level)) && pa) {
+		*pa_out = pa | (va & ~CO_ARCH_PAGE_MASK);
+		rc = CO_RC(OK);
+	}
+
+	co_os_mutex_release(kload_lock);
+	return rc;
 }
 
 co_rc_t co_kload_read(co_manager_t* manager, unsigned long long va,

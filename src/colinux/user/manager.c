@@ -346,6 +346,43 @@ co_rc_t co_manager_kunmap(co_manager_handle_t handle, unsigned long* released_ou
 	return rc;
 }
 
+co_rc_t co_manager_vgpu_address(co_manager_handle_t handle, unsigned long long* va_out)
+{
+	co_manager_ioctl_vgpu_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_VGPU,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (CO_OK(rc))
+		*va_out = params.va;
+
+	return rc;
+}
+
+co_rc_t co_manager_kvirt_to_phys(co_manager_handle_t handle,
+				 unsigned long long va, unsigned long long* pa_out)
+{
+	co_manager_ioctl_vgpu_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	params.query_va = va;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_VGPU,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (CO_OK(rc))
+		*pa_out = params.query_pa;
+
+	return rc;
+}
+
 co_rc_t co_manager_cobd(co_manager_handle_t handle, int unit, const char* path,
 			unsigned long long* size_out)
 {
