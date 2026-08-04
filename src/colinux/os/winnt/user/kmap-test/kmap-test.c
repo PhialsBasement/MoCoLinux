@@ -69,7 +69,7 @@ static unsigned long long sum_of(const unsigned char* p, unsigned long n)
 
 int main(int argc, char** argv)
 {
-	enum { MODE_CLEAN, MODE_EXIT, MODE_CRASH } mode = MODE_CLEAN;
+	enum { MODE_CLEAN, MODE_EXIT, MODE_CRASH, MODE_STARVE } mode = MODE_CLEAN;
 	co_manager_handle_t handle;
 	co_manager_ioctl_kmap_t* map;
 	unsigned long slice = 0;
@@ -85,6 +85,8 @@ int main(int argc, char** argv)
 			mode = MODE_EXIT;
 		else if (!strcmp(argv[i], "--crash"))
 			mode = MODE_CRASH;
+		else if (!strcmp(argv[i], "--starve"))
+			mode = MODE_STARVE;
 		else if (!strcmp(argv[i], "--slice") && i + 1 < argc)
 			slice = strtoul(argv[++i], NULL, 0);
 		else {
@@ -106,8 +108,67 @@ int main(int argc, char** argv)
 	}
 
 	printf("kmap-test: mode %s, slice %lu\n",
-	       mode == MODE_CLEAN ? "clean" : mode == MODE_EXIT ? "exit" : "crash",
-	       slice);
+	       mode == MODE_CLEAN ? "clean" : mode == MODE_EXIT ? "exit" :
+	       mode == MODE_CRASH ? "crash" : "starve", slice);
+
+	/*
+	 * The failure path, exercised rather than assumed.
+	 *
+	 * The driver probes for free user address space before every map,
+	 * because MmMapLockedPagesSpecifyCache RAISES on failure and cannot be
+	 * caught in this toolchain -- so the probe is the only thing standing
+	 * between an exhausted address space and a bugcheck. Untested code is
+	 * the thing this project keeps being bitten by, so this mode reserves
+	 * essentially the whole user address space first and then asks for a
+	 * gigabyte of windows.
+	 *
+	 * The pass condition is a clean refusal and a live host. A bugcheck
+	 * here means the probe does not work; a SUCCESS here means the
+	 * starvation did not take, and the test proved nothing.
+	 */
+	if (mode == MODE_STARVE) {
+		unsigned long long held = 0;
+		void* p;
+
+		printf("reserving user address space until it runs out...\n");
+		for (;;) {
+			p = VirtualAlloc(NULL, 256ULL << 20, MEM_RESERVE,
+					 PAGE_READWRITE);
+			if (!p)
+				break;
+			held += 256ULL << 20;
+			if (held > (200ULL << 30))
+				break;
+		}
+		printf("reserved %llu GB; largest remaining hole is now small\n",
+		       held >> 30);
+
+		/* Squeeze the rest out in smaller pieces, so nothing 8 MB wide
+		 * is left -- an 8 MB slice is what the driver will ask for. */
+		for (;;) {
+			p = VirtualAlloc(NULL, 8ULL << 20, MEM_RESERVE,
+					 PAGE_READWRITE);
+			if (!p)
+				break;
+			held += 8ULL << 20;
+		}
+		printf("no 8 MB hole remains. asking the driver to map anyway.\n");
+
+		if (CO_OK(co_manager_kmap(handle, slice, map))) {
+			printf("\nFAIL: KMAP SUCCEEDED with no address space left"
+			       " -- the starvation did not take, so this run\n"
+			       "      proves nothing about the probe.\n");
+			co_manager_kunmap(handle, NULL);
+			co_os_manager_close(handle);
+			return 1;
+		}
+
+		printf("\nPASS: KMAP refused cleanly and the host is alive.\n"
+		       "      That is the probe working; without it this is a"
+		       " bugcheck 0x1E/0x7E.\n");
+		co_os_manager_close(handle);
+		return 0;
+	}
 
 	if (!CO_OK(co_manager_kmap(handle, slice, map))) {
 		printf("KMAP failed -- is a guest running?\n");
@@ -276,6 +337,15 @@ int main(int argc, char** argv)
 		printf("\ncrashing on purpose, still holding %lu slices.\n",
 		       map->count);
 		fflush(stdout);
+		/*
+		 * No crash dialog. The fault is deliberate, and Windows Error
+		 * Reporting otherwise puts up "kmap-test.exe has stopped
+		 * working" and keeps the dying process alive until a human
+		 * clicks it -- which blocks any script running this, and, worse,
+		 * means the handle is NOT yet closed, so the very cleanup path
+		 * under test has not run. Twice this looked like a hang.
+		 */
+		SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
 		*(volatile int*)0 = 1;
 		break;
 	}
