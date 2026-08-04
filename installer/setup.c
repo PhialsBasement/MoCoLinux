@@ -234,6 +234,61 @@ static BOOL check_x64(char *why, int n)
 	return FALSE;
 }
 
+/*
+ * Which family of Windows this is, asked once and only as a floor.
+ *
+ * NT 6.0 is where the things this file must do differently begin: UAC (so a
+ * Run-key autostart is never elevated), kernel-mode code signing (so the
+ * driver needs test-signing switched on), and Task Scheduler 2.0 (which is
+ * what replaces the Run key). GetVersionEx lies upward on 8.1+ without a
+ * manifest -- it reports 6.2 -- and that is fine here too: everything that
+ * lies about being 6.2 still has all three of those properties.
+ */
+static BOOL host_is_nt6(void)
+{
+	OSVERSIONINFO v;
+
+	ZeroMemory(&v, sizeof(v));
+	v.dwOSVersionInfoSize = sizeof(v);
+	if (!GetVersionEx(&v))
+		return FALSE;	/* claim XP; the XP path asks for less */
+	return v.dwMajorVersion >= 6;
+}
+
+/*
+ * Run a command with no window and wait for it, for the two conversations
+ * Setup has with OS tools (bcdedit, schtasks). Returns the exit code, or -1
+ * if it would not start at all.
+ */
+static void glog(const char *fmt, ...);
+
+static int run_tool(const char *cmdline, int timeout_ms)
+{
+	STARTUPINFO si;
+	PROCESS_INFORMATION pi;
+	DWORD code = (DWORD)-1;
+	char buf[1024];
+
+	ZeroMemory(&si, sizeof(si));
+	si.cb = sizeof(si);
+	ZeroMemory(&pi, sizeof(pi));
+	lstrcpyn(buf, cmdline, sizeof(buf));
+
+	if (!CreateProcess(NULL, buf, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+			   NULL, NULL, &si, &pi)) {
+		glog("tool would not start (error %lu): %.200s",
+		     (unsigned long)GetLastError(), cmdline);
+		return -1;
+	}
+
+	WaitForSingleObject(pi.hProcess, timeout_ms);
+	GetExitCodeProcess(pi.hProcess, &code);
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	glog("tool exited %ld: %.200s", (long)code, cmdline);
+	return (int)code;
+}
+
 /* 5.2 or later: XP x64 and Server 2003 are 5.2, and nothing older is supported. */
 static BOOL check_version(char *why, int n)
 {
@@ -569,6 +624,36 @@ static BOOL install_driver(void)
 	CloseServiceHandle(svc);
 	CloseServiceHandle(scm);
 	return TRUE;
+}
+
+/*
+ * Test-signing, on the Windows that check signatures.
+ *
+ * From Vista on, x64 kernel-mode code signing refuses the driver outright --
+ * not a warning, a load failure (error 577) that surfaces one reboot later as
+ * "the driver would not start". The shipped linux.sys carries a test
+ * signature, which those systems accept only with test-signing switched on.
+ * XP ignores embedded signatures entirely, so on 5.2 there is nothing to do.
+ *
+ * Done here, before the restart the install already takes, because that is
+ * the reboot the setting needs. Never fatal: if bcdedit fails the install
+ * still lays everything down, and the driver-start error message names this
+ * exact fix. Reported plainly, because quietly changing a boot setting is
+ * not something an installer gets to do.
+ */
+static void enable_testsigning(void)
+{
+	if (!host_is_nt6())
+		return;
+
+	work_at(3, -1, "Enabling test-signed drivers");
+
+	if (run_tool("bcdedit /set testsigning on", 30000) == 0)
+		work_say("test-signing enabled -- the desktop will show a Test"
+			 " Mode watermark");
+	else
+		work_say("could not enable test-signing; the driver may refuse"
+			 " to load after the restart");
 }
 
 /*
@@ -1298,28 +1383,63 @@ static void log_child_exits(void)
 	}
 }
 
+/*
+ * Retried, because the one place this runs is the one place it fails.
+ *
+ * The Linux half starts at logon, and on Windows 7 the first StartService
+ * minutes after boot has been seen to fail with ERROR_PATH_NOT_FOUND against
+ * an ImagePath that is verifiably there -- and succeed unchanged a moment
+ * later, once the volume's letter has settled. Ten tries two seconds apart
+ * costs nothing when the first one works, which on a warm machine it does.
+ *
+ * The last error is kept for the caller: "would not start" with no number
+ * sends someone hunting a build problem, when 577 (the image hash check)
+ * means exactly "test-signing is off" and error 3 means "try again".
+ */
+static DWORD start_driver_error;
+
 static BOOL start_driver_service(void)
 {
 	SC_HANDLE scm, svc;
-	BOOL ok = TRUE;
+	int attempt;
+
+	start_driver_error = 0;
 
 	scm = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
-	if (!scm)
+	if (!scm) {
+		start_driver_error = GetLastError();
 		return FALSE;
+	}
 
 	svc = OpenService(scm, "CoLinuxDriver", SERVICE_START | SERVICE_QUERY_STATUS);
 	if (!svc) {
+		start_driver_error = GetLastError();
 		CloseServiceHandle(scm);
 		return FALSE;
 	}
 
-	if (!StartService(svc, 0, NULL) &&
-	    GetLastError() != ERROR_SERVICE_ALREADY_RUNNING)
-		ok = FALSE;
+	for (attempt = 0; attempt < 10; attempt++) {
+		if (StartService(svc, 0, NULL) ||
+		    GetLastError() == ERROR_SERVICE_ALREADY_RUNNING) {
+			start_driver_error = 0;
+			break;
+		}
+
+		start_driver_error = GetLastError();
+		glog("driver start attempt %d failed (error %lu)",
+		     attempt + 1, (unsigned long)start_driver_error);
+
+		/* 577 is a verdict, not a race: the kernel refused the image's
+		 * signature and will refuse it identically nine more times. */
+		if (start_driver_error == ERROR_INVALID_IMAGE_HASH)
+			break;
+
+		Sleep(2000);
+	}
 
 	CloseServiceHandle(svc);
 	CloseServiceHandle(scm);
-	return ok;
+	return start_driver_error == 0;
 }
 
 static BOOL build_linux(void)
@@ -1346,8 +1466,15 @@ static BOOL build_linux(void)
 	}
 
 	if (!start_driver_service()) {
-		work_fatal("The MoCoLinux driver would not start. A restart may be"
-			   " needed before Setup can continue.");
+		if (start_driver_error == ERROR_INVALID_IMAGE_HASH)
+			work_fatal("Windows refused the driver's signature."
+				   " Enable test-signing (bcdedit /set testsigning"
+				   " on) and restart, then run Setup again.");
+		else
+			work_fatal("The MoCoLinux driver would not start"
+				   " (error %lu). A restart may be needed before"
+				   " Setup can continue.",
+				   (unsigned long)start_driver_error);
 		return FALSE;
 	}
 	work_say("driver loaded");
@@ -1357,10 +1484,19 @@ static BOOL build_linux(void)
 	 * inside the first and writes the second, which is the arrangement the
 	 * runbook has used for every image this project has produced.
 	 */
+	/*
+	 * \DosDevices\, never \??\. They name the same object directory, but the
+	 * daemon's msvcrt CRT expands ? as a wildcard in argv before main() ever
+	 * runs, and when the pattern happens to match something on disk the path
+	 * arrives as its own basename. It only bites when a match exists, which
+	 * is why it passed every XP run for days and then ate the first E: path
+	 * it saw. \DosDevices\ carries no wildcard characters and works on both.
+	 */
 	_snprintf(cmd, sizeof(cmd) - 1,
 		  "\"%s\\colinux-daemon.exe\" --boot-kernel \"%s\\vmlinux\""
 		  " --max-switches none"
-		  " --cobd0 \\??\\%s --cobd1 \\??\\%s --init /sbin/init",
+		  " --cobd0 \\DosDevices\\%s --cobd1 \\DosDevices\\%s"
+		  " --init /sbin/init",
 		  dir_program, dir_program, base, built);
 	cmd[sizeof(cmd) - 1] = 0;
 
@@ -1667,9 +1803,20 @@ static void resume_path(char *out, int n)
 #define AUTORUN_KEY   "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define AUTORUN_VALUE "MoCoLinuxSetup"
 
+/*
+ * On NT 6+ the Run key is the wrong tool: UAC launches Run-key entries with
+ * the filtered token and never elevates them, so the --finish half would come
+ * up unable to start a kernel service and refuse itself -- or, with a manifest
+ * demanding elevation, not be launched at all. A scheduled task carries its
+ * own run level; /RL HIGHEST is exactly "run this elevated at logon without
+ * asking". XP's schtasks has no /RL and XP has no UAC, so 5.2 keeps the Run
+ * key that has already worked there end to end.
+ */
+#define AUTORUN_TASK "MoCoLinuxSetup"
+
 static void autostart_set(void)
 {
-	char self[MAX_PATH], copy[MAX_PATH], cmd[MAX_PATH + 32];
+	char self[MAX_PATH], copy[MAX_PATH], cmd[MAX_PATH * 2];
 	HKEY key;
 
 	GetModuleFileName(NULL, self, sizeof(self));
@@ -1679,6 +1826,26 @@ static void autostart_set(void)
 	/* Ignore failure: if it is already this file, CopyFile refuses and the
 	 * path is right anyway. */
 	CopyFile(self, copy, FALSE);
+
+	if (host_is_nt6()) {
+		/*
+		 * \" inside the /tr value: the task's action is itself a command
+		 * line, and the path has spaces. schtasks wants the whole /tr
+		 * argument quoted and the embedded quotes escaped.
+		 */
+		_snprintf(cmd, sizeof(cmd) - 1,
+			  "schtasks /create /f /tn " AUTORUN_TASK
+			  " /sc onlogon /rl highest /tr \"\\\"%s\\\" --finish\"",
+			  copy);
+		cmd[sizeof(cmd) - 1] = 0;
+
+		if (run_tool(cmd, 30000) == 0)
+			return;
+
+		glog("schtasks refused; falling back to the Run key");
+		/* fall through: an unelevated resume that at least says what it
+		 * needs beats no resume at all */
+	}
 
 	_snprintf(cmd, sizeof(cmd) - 1, "\"%s\" --finish", copy);
 	cmd[sizeof(cmd) - 1] = 0;
@@ -1694,6 +1861,11 @@ static void autostart_set(void)
 static void autostart_clear(void)
 {
 	HKEY key;
+
+	/* Both mechanisms, unconditionally: the set path can fall back, so the
+	 * clear path cannot afford to guess which one is in place. */
+	if (host_is_nt6())
+		run_tool("schtasks /delete /f /tn " AUTORUN_TASK, 30000);
 
 	if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, AUTORUN_KEY, 0, KEY_SET_VALUE,
 			 &key) == ERROR_SUCCESS) {
@@ -1821,6 +1993,7 @@ static DWORD WINAPI worker(LPVOID unused)
 		return 1;
 	if (!install_driver())
 		return 1;
+	enable_testsigning();		/* NT 6+ only; never fatal */
 	install_xserver();		/* never fatal; see the function */
 	install_shortcuts();		/* likewise */
 	if (!copy_image())
