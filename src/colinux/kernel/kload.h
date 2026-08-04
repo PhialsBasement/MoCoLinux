@@ -75,6 +75,17 @@
 #define CO_KLOAD_CHUNK_BYTES	(32ULL << 20)
 #define CO_KLOAD_MAX_BLOCKS	127
 
+/*
+ * The blocks themselves, for the KMAP path, plus the reference count that
+ * keeps teardown from freeing pages a user mapping still names. See the
+ * comment on kload_user_maps in kload.c.
+ */
+extern int	 co_kload_block_count(void);
+extern co_rc_t	 co_kload_block(int i, void** va, unsigned long long* pa,
+				unsigned long long* bytes);
+extern void	 co_kload_user_map_get(void);
+extern void	 co_kload_user_map_put(co_manager_t* manager);
+
 extern unsigned long long co_kload_phys_base(void);
 extern int		  co_kload_range_count(void);
 extern void		  co_kload_range(int i, unsigned long long* pa,

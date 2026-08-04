@@ -305,6 +305,47 @@ co_rc_t co_manager_kread(co_manager_handle_t handle, unsigned long long va,
 	return rc;
 }
 
+/*
+ * Map the guest's RAM into this process, in slices, and hand back where each
+ * one landed. The mapping lives until KUNMAP or until this handle closes --
+ * including the close the OS performs when the process dies, which is the
+ * point: a daemon that crashes must not leave the driver unable to free guest
+ * memory.
+ */
+co_rc_t co_manager_kmap(co_manager_handle_t handle, unsigned long max_slice,
+			co_manager_ioctl_kmap_t* out)
+{
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	co_memset(out, 0, sizeof(*out));
+	out->max_slice = max_slice;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KMAP,
+				 out, sizeof(*out), out, sizeof(*out), &returned);
+	if (CO_OK(rc))
+		rc = out->rc;
+
+	return rc;
+}
+
+co_rc_t co_manager_kunmap(co_manager_handle_t handle, unsigned long* released_out)
+{
+	co_manager_ioctl_kunmap_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KUNMAP,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (CO_OK(rc) && released_out)
+		*released_out = params.released;
+
+	return rc;
+}
+
 co_rc_t co_manager_cobd(co_manager_handle_t handle, int unit, const char* path,
 			unsigned long long* size_out)
 {

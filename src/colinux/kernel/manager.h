@@ -60,6 +60,27 @@ typedef struct co_manager_open_desc {
 
 	co_manager_open_desc_os_t os;
 	co_debug_section_t *debug_section;
+
+	/*
+	 * R3: this handle's user-mode windows onto guest RAM, if any.
+	 *
+	 * Recorded here rather than in the mapper because the mapping belongs
+	 * to the handle, not to the request: a process that maps and then dies
+	 * without unmapping has to be cleaned up by whoever closes its handle,
+	 * and that is IRP_MJ_CLEANUP -- which is the one close path that runs
+	 * in the dying process's own context, the context MmUnmapLockedPages
+	 * requires for a UserMode mapping. IRP_MJ_CLOSE can run in an arbitrary
+	 * process and must not be the one to do it.
+	 *
+	 * The MDL is stored as void* because this header is OS-independent;
+	 * co_os_userspace_map already hands it back that way.
+	 */
+	struct {
+		void	     *handle;	/* the MDL */
+		void	     *user_va;
+		unsigned long pages;
+	} *kmap_slice;
+	int kmap_slices;
 } *co_manager_open_desc_t;
 
 /*
@@ -112,6 +133,13 @@ extern co_rc_t co_manager_send(co_manager_t *manager, co_manager_open_desc_t ope
 extern co_rc_t co_manager_open(co_manager_t *manager, co_manager_open_desc_t *opened_out);
 extern co_rc_t co_manager_open_ref(co_manager_open_desc_t opened);
 extern co_rc_t co_manager_open_desc_deactive_and_close(co_manager_t *manager, co_manager_open_desc_t opened);
+
+/*
+ * Drop every window this handle holds. Runs at IRP_MJ_CLEANUP, and is a no-op
+ * for the overwhelming majority of handles, which never map anything.
+ */
+extern void co_manager_kmap_release(co_manager_t *manager,
+				    co_manager_open_desc_t opened);
 extern co_rc_t co_manager_close(co_manager_t *manager, co_manager_open_desc_t opened);
 
 extern void co_manager_unload(co_manager_t *manager);

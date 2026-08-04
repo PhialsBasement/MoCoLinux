@@ -55,6 +55,8 @@ typedef enum {
 	CO_MANAGER_IOCTL_CONET_DUMP,
 	CO_MANAGER_IOCTL_CONET_TAKE,
 	CO_MANAGER_IOCTL_CONET_PUT,
+	CO_MANAGER_IOCTL_KMAP,
+	CO_MANAGER_IOCTL_KUNMAP,
 } co_manager_ioctl_t;
 
 /*
@@ -312,6 +314,54 @@ typedef struct {
 	unsigned long	   size;
 	unsigned char	   data[0];
 } co_manager_ioctl_kread_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_KMAP / CO_MANAGER_IOCTL_KUNMAP: give a
+ * user-mode process a direct, persistent view of the guest's RAM.
+ *
+ * This is the thing a virtual machine cannot do and this design gets for free.
+ * Guest physical memory IS host physical memory here, so a host process does
+ * not need to marshal anything across an address-space boundary -- it needs the
+ * pages mapped once, and then a texture or a vertex buffer the guest wrote is
+ * simply memory the daemon can read at memcpy speed. KREAD, by contrast, is an
+ * ioctl and a page-table walk per call; it is right for a few kilobytes of
+ * printk ring and hopeless for a gigabyte a second of GPU resources.
+ *
+ * SLICED, and not by preference. An MDL records its length in a CSHORT, so one
+ * MDL can describe at most (32767 - sizeof(MDL)) / sizeof(PFN_NUMBER) pages --
+ * on x86-64 that is (32767 - 48) / 8 = 4089 pages, a little under 16 MB. A
+ * kload block is CO_KLOAD_CHUNK_BYTES (32 MB, 8192 pages), so one MDL per block
+ * fails on every full-size block, deterministically, every time. 8 MB slices
+ * are used instead: comfortably under the ceiling with room for a differently
+ * sized MDL header, and a round number of them per block.
+ *
+ * (The design note this came from said 16 MB and 4089-versus-8185 pages. 8185
+ * is the 32-bit figure, where PFN_NUMBER is four bytes; a 4096-page slice would
+ * have overshot the real x86-64 ceiling by seven pages and failed on the first
+ * call. The arithmetic is spelled out above so the next person can check it
+ * rather than inherit it.)
+ */
+#define CO_KMAP_SLICE_BYTES	(8ULL << 20)
+#define CO_KMAP_MAX_RANGES	256
+
+typedef struct {
+	unsigned long long pa;		/* guest physical == host physical */
+	unsigned long long bytes;
+	unsigned long long user_va;	/* where the caller may read it */
+} co_kmap_range_t;
+
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long	   count;	/* out: ranges actually filled */
+	unsigned long	   max_slice;	/* in: 0 means CO_KMAP_SLICE_BYTES */
+	unsigned long long total_bytes;	/* out */
+	co_kmap_range_t	   range[CO_KMAP_MAX_RANGES];
+} co_manager_ioctl_kmap_t;
+
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long	   released;	/* out: slices unmapped */
+} co_manager_ioctl_kunmap_t;
 
 /*
  * interface for CO_MANAGER_IOCTL_COBD: attach a backing store to a unit.
