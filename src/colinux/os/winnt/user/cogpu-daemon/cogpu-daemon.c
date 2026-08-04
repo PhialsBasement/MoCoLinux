@@ -37,6 +37,13 @@
 
 #include "vring.h"
 #include "vrend.h"
+/*
+ * mingw has no sys/uio.h, and virglrenderer's header takes struct iovec as
+ * given. Two members, same layout as everywhere else; virglrenderer only ever
+ * reads iov_base and iov_len.
+ */
+struct iovec { void *iov_base; size_t iov_len; };
+#include <virgl/virglrenderer.h>
 
 COLINUX_DEFINE_MODULE("cogpu-daemon");
 
@@ -200,6 +207,9 @@ struct gpu_stats {
 	unsigned long long refused;
 	unsigned long long submits;
 	unsigned long long cmd_bytes;
+	unsigned long long resources;
+	unsigned long long transfers;
+	unsigned long long backing_bytes;
 	unsigned long long by_type[16];
 };
 
@@ -324,10 +334,15 @@ static uint32_t serve(struct cogpu_chain *chain)
 			       ? chain->in[0].len - sizeof(req) : sizeof(c));
 
 		if (cogpu_vrend_ctx_create(req.ctx_id, c.name,
-					   c.namelen > 63 ? 63 : c.namelen) == 0)
+					   c.namelen > 63 ? 63 : c.namelen,
+					   c.ctx_init) == 0) {
 			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
-		else
+			if (verbose)
+				logline("  ctx %u created, capset %u\n",
+					req.ctx_id, c.ctx_init & 0xff);
+		} else {
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+		}
 		break;
 	}
 
@@ -365,12 +380,205 @@ static uint32_t serve(struct cogpu_chain *chain)
 			break;
 		}
 
-		if (cogpu_vrend_submit(req.ctx_id, cmds, sub.size) == 0) {
+		{
+			int rc2 = cogpu_vrend_submit(req.ctx_id, cmds, sub.size);
+
+			if (rc2 == 0) {
+				resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+				g_stats.submits++;
+				g_stats.cmd_bytes += sub.size;
+			} else {
+				resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+				logline("  SUBMIT_3D ctx %u, %u bytes, refused (%d)\n",
+					req.ctx_id, sub.size, rc2);
+			}
+		}
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D: {
+		/*
+		 * A real resource in the renderer. This used to fall through to
+		 * the default case and answer OK without creating anything --
+		 * and the consequence was not a missing texture but a rejected
+		 * command stream: SUBMIT_3D referencing a resource that does
+		 * not exist comes back EINVAL, which reads as "the renderer is
+		 * broken" and is really "you told the guest yes and did
+		 * nothing".
+		 */
+		struct {
+			uint32_t resource_id, target, format, bind;
+			uint32_t width, height, depth, array_size;
+			uint32_t last_level, nr_samples, flags, pad;
+		} r;
+		struct virgl_renderer_resource_create_args args;
+
+		if (chain->in[0].len < sizeof(req) + sizeof(r)) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+		memcpy(&r, (char *)chain->in[0].addr + sizeof(req), sizeof(r));
+
+		memset(&args, 0, sizeof(args));
+		args.handle	= r.resource_id;
+		args.target	= r.target;
+		args.format	= r.format;
+		args.bind	= r.bind;
+		args.width	= r.width;
+		args.height	= r.height;
+		args.depth	= r.depth;
+		args.array_size	= r.array_size;
+		args.last_level	= r.last_level;
+		args.nr_samples	= r.nr_samples;
+		args.flags	= r.flags;
+
+		if (cogpu_vrend_resource_create(&args) == 0) {
 			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
-			g_stats.submits++;
-			g_stats.cmd_bytes += sub.size;
+			g_stats.resources++;
 		} else {
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			logline("  RESOURCE_CREATE_3D %u refused\n", r.resource_id);
+		}
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: {
+		/*
+		 * Where the zero copy actually happens.
+		 *
+		 * The guest hands a list of {guest physical address, length}
+		 * and the host attaches them as iovecs pointing straight into
+		 * those pages through R3's mappings. Nothing is copied: a
+		 * texture the guest uploads is memory the renderer reads in
+		 * place. Every extent is checked to lie wholly inside guest RAM
+		 * before the first byte -- an extent that does not is refused,
+		 * never clamped, because a clamped extent renders the wrong
+		 * thing quietly.
+		 */
+		struct { uint32_t resource_id, nr_entries; } a;
+		struct { uint64_t addr; uint32_t length, pad; } ent;
+		static struct iovec iov[1024];
+		const char *p;
+		uint32_t i;
+		int bad = 0;
+
+		if (chain->in[0].len < sizeof(req) + sizeof(a)) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+		memcpy(&a, (char *)chain->in[0].addr + sizeof(req), sizeof(a));
+
+		if (a.nr_entries == 0 || a.nr_entries > 1024) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
+		/* The entries follow the header, in this descriptor or the next. */
+		if (chain->in[0].len >= sizeof(req) + sizeof(a) +
+					a.nr_entries * sizeof(ent))
+			p = (const char *)chain->in[0].addr + sizeof(req) + sizeof(a);
+		else if (chain->in_count > 1)
+			p = (const char *)chain->in[1].addr;
+		else {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
+		for (i = 0; i < a.nr_entries; i++) {
+			void *host;
+
+			memcpy(&ent, p + i * sizeof(ent), sizeof(ent));
+			host = resolve_gpa(NULL, ent.addr, ent.length);
+			if (!host) {
+				logline("  ATTACH_BACKING res %u: entry %u"
+					" (0x%llx +%u) is outside guest RAM\n",
+					a.resource_id, i,
+					(unsigned long long)ent.addr, ent.length);
+				bad = 1;
+				break;
+			}
+			iov[i].iov_base = host;
+			iov[i].iov_len	= ent.length;
+			g_stats.backing_bytes += ent.length;
+		}
+
+		if (bad || cogpu_vrend_attach_iov(a.resource_id, iov,
+						  (int)a.nr_entries) != 0)
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+		else
+			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING: {
+		struct { uint32_t resource_id, pad; } d;
+
+		if (chain->in[0].len >= sizeof(req) + sizeof(d)) {
+			memcpy(&d, (char *)chain->in[0].addr + sizeof(req), sizeof(d));
+			cogpu_vrend_detach_iov(d.resource_id);
+		}
+		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_RESOURCE_UNREF: {
+		struct { uint32_t resource_id, pad; } d;
+
+		if (chain->in[0].len >= sizeof(req) + sizeof(d)) {
+			memcpy(&d, (char *)chain->in[0].addr + sizeof(req), sizeof(d));
+			cogpu_vrend_resource_unref(d.resource_id);
+		}
+		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE: {
+		struct { uint32_t resource_id, pad; } d;
+
+		if (chain->in[0].len >= sizeof(req) + sizeof(d)) {
+			memcpy(&d, (char *)chain->in[0].addr + sizeof(req), sizeof(d));
+			cogpu_vrend_ctx_attach(req.ctx_id, d.resource_id);
+		}
+		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE: {
+		struct { uint32_t resource_id, pad; } d;
+
+		if (chain->in[0].len >= sizeof(req) + sizeof(d)) {
+			memcpy(&d, (char *)chain->in[0].addr + sizeof(req), sizeof(d));
+			cogpu_vrend_ctx_detach(req.ctx_id, d.resource_id);
+		}
+		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D:
+	case VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D: {
+		struct {
+			uint32_t x, y, z, w, h, d;
+			uint64_t offset;
+			uint32_t resource_id, level, stride, layer_stride;
+		} t;
+		int rc2;
+
+		if (chain->in[0].len < sizeof(req) + sizeof(t)) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+		memcpy(&t, (char *)chain->in[0].addr + sizeof(req), sizeof(t));
+
+		rc2 = cogpu_vrend_transfer(type == VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D,
+					   t.resource_id, req.ctx_id, t.level,
+					   t.stride, t.layer_stride,
+					   t.x, t.y, t.z, t.w, t.h, t.d, t.offset);
+		if (rc2 == 0) {
+			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+			g_stats.transfers++;
+		} else {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			logline("  TRANSFER res %u refused (%d)\n", t.resource_id, rc2);
 		}
 		break;
 	}
@@ -665,6 +873,8 @@ int main(int argc, char **argv)
 	       g_stats.requests, g_stats.fenced, g_stats.refused, sweeps);
 	logline("3D submits %llu, %llu command bytes, %llu fences from the renderer\n",
 	       g_stats.submits, g_stats.cmd_bytes, cogpu_vrend_fences());
+	logline("resources %llu, transfers %llu, %llu MB of guest-backed storage\n",
+	       g_stats.resources, g_stats.transfers, g_stats.backing_bytes >> 20);
 
 	io->enabled = 0;
 	co_manager_kunmap(handle, NULL);

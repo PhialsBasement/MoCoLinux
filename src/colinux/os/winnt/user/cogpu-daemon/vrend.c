@@ -32,6 +32,14 @@
 #include <string.h>
 #include <stdint.h>
 
+/*
+ * Both are forward-declared in virglrenderer.h and defined in headers the
+ * install does not ship (virgl_hw.h stays internal; sys/uio.h does not exist
+ * on mingw). Six words and two, and virglrenderer only reads the members.
+ */
+struct virgl_box { uint32_t x, y, z, w, h, d; };
+struct iovec { void *iov_base; size_t iov_len; };
+
 #include <virgl/virglrenderer.h>
 
 #include "vrend.h"
@@ -122,11 +130,34 @@ void cogpu_vrend_fill_caps(uint32_t set, uint32_t version, void *caps)
 		virgl_renderer_fill_caps(set, version, caps);
 }
 
-int cogpu_vrend_ctx_create(uint32_t ctx_id, const char *name, uint32_t namelen)
+/*
+ * A context, created for the capset the guest asked for.
+ *
+ * The capset id rides in the low byte of the context flags, and getting it
+ * wrong is not a clean failure: the context is created, CTX_CREATE returns
+ * success, and then every command stream is rejected because Mesa encodes for
+ * VIRGL2 while the context was made for something else. What that looks like
+ * from the guest is "response 0x1200 (command 0x207)" and a black framebuffer
+ * -- a renderer that says virgl and renders nothing.
+ *
+ * virtio-gpu passes the guest's choice in the CTX_CREATE context_init field,
+ * which carries the capset id in the same low byte.
+ */
+int cogpu_vrend_ctx_create(uint32_t ctx_id, const char *name, uint32_t namelen,
+			   uint32_t context_init)
 {
+	uint32_t capset = context_init & VIRGL_RENDERER_CONTEXT_FLAG_CAPSET_ID_MASK;
+
 	if (!vrend_ready)
 		return -1;
-	return virgl_renderer_context_create(ctx_id, namelen, name);
+
+	/* No capset named means the legacy default, which is VIRGL2 here --
+	 * it is what this renderer advertises and what Mesa encodes for. */
+	if (capset == 0)
+		capset = 2;
+
+	return virgl_renderer_context_create_with_flags(ctx_id, capset,
+							namelen, name);
 }
 
 void cogpu_vrend_ctx_destroy(uint32_t ctx_id)
@@ -200,6 +231,43 @@ void cogpu_vrend_ctx_attach(uint32_t ctx_id, uint32_t res_id)
 {
 	if (vrend_ready)
 		virgl_renderer_ctx_attach_resource((int)ctx_id, (int)res_id);
+}
+
+void cogpu_vrend_ctx_detach(uint32_t ctx_id, uint32_t res_id)
+{
+	if (vrend_ready)
+		virgl_renderer_ctx_detach_resource((int)ctx_id, (int)res_id);
+}
+
+/*
+ * A transfer between the guest's backing pages and the renderer's texture.
+ *
+ * The iovec is NULL on purpose: the resource already has its backing attached
+ * (ATTACH_BACKING), so virglrenderer uses that, which is the guest's own pages
+ * through R3's mappings. Passing a fresh iovec here would be the copy this
+ * design exists to avoid.
+ */
+int cogpu_vrend_transfer(int to_host, uint32_t res_id, uint32_t ctx_id,
+			 uint32_t level, uint32_t stride, uint32_t layer_stride,
+			 uint32_t x, uint32_t y, uint32_t z,
+			 uint32_t w, uint32_t h, uint32_t d, uint64_t offset)
+{
+	struct virgl_box box;
+
+	if (!vrend_ready)
+		return -1;
+
+	box.x = x; box.y = y; box.z = z;
+	box.w = w; box.h = h; box.d = d;
+
+	if (to_host)
+		return virgl_renderer_transfer_write_iov(res_id, ctx_id, (int)level,
+							 stride, layer_stride,
+							 &box, offset, NULL, 0);
+
+	return virgl_renderer_transfer_read_iov(res_id, ctx_id, level,
+						stride, layer_stride,
+						&box, offset, NULL, 0);
 }
 
 void cogpu_vrend_poll(void)

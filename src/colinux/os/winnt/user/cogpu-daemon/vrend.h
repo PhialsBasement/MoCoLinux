@@ -21,9 +21,17 @@ const char *cogpu_vrend_renderer(void);
 void	    cogpu_vrend_capset(uint32_t set, uint32_t *max_ver, uint32_t *max_size);
 void	    cogpu_vrend_fill_caps(uint32_t set, uint32_t version, void *caps);
 
-int	    cogpu_vrend_ctx_create(uint32_t ctx_id, const char *name, uint32_t namelen);
+int	    cogpu_vrend_ctx_create(uint32_t ctx_id, const char *name,
+				   uint32_t namelen, uint32_t context_init);
 void	    cogpu_vrend_ctx_destroy(uint32_t ctx_id);
 void	    cogpu_vrend_ctx_attach(uint32_t ctx_id, uint32_t res_id);
+void	    cogpu_vrend_ctx_detach(uint32_t ctx_id, uint32_t res_id);
+int	    cogpu_vrend_transfer(int to_host, uint32_t res_id, uint32_t ctx_id,
+				 uint32_t level, uint32_t stride,
+				 uint32_t layer_stride,
+				 uint32_t x, uint32_t y, uint32_t z,
+				 uint32_t w, uint32_t h, uint32_t d,
+				 uint64_t offset);
 
 int	    cogpu_vrend_submit(uint32_t ctx_id, const void *cmds, uint32_t bytes);
 
