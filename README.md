@@ -1,9 +1,10 @@
 # MoCoLinux
 
 Cooperative Linux for x86-64: a modern Linux kernel running as a guest inside
-Windows XP x64 on real hardware, without a hypervisor, emulation, or
-virtualization extensions. It is a port of [coLinux](http://colinux.org/)
-(i386, unmaintained since ~2011) to x86-64, against a 2026 kernel.
+Windows XP x64 and Windows 7 x64 on real hardware, without a hypervisor,
+emulation, or virtualization extensions. It is a port of
+[coLinux](http://colinux.org/) (i386, unmaintained since ~2011) to x86-64,
+against a 2026 kernel.
 
 ```
 [root@mocolinux ~]# systemctl is-system-running
@@ -25,6 +26,14 @@ The screenshot is one machine: KDE Plasma 6.7.3 applications and `cmd.exe`
 the guest — applications are X clients talking to a VcXsrv on the Windows side
 in multiwindow mode (`DISPLAY=10.0.2.2:0`; slirp rewrites that address to the
 host's loopback).
+
+![The same guest on Windows 7 x64: Dolphin, Kate and Konsole as Aero windows](doc/img/mocolinux-win7-desktop.png)
+
+The same driver, kernel and root image on Windows 7 x64 — Dolphin, Kate and
+Konsole with Aero frames and taskbar buttons, `fastfetch` reporting the
+ThinkCentre's own i5-3470. One binary serves both hosts: XP ignores embedded
+signatures, and Windows 7 accepts the same test-signed driver once
+`bcdedit /set testsigning on` is in force, which Setup does for you.
 
 ## How it works
 
@@ -77,7 +86,8 @@ vendored slirp, run in a process confined to a 2 GB address space so its
 
 ## Status
 
-Working, verified on hardware (Lenovo ThinkCentre M92p, i5-3470):
+Working, verified on hardware (Lenovo ThinkCentre M92p, i5-3470) under both
+Windows XP x64 and Windows 7 x64:
 
 - Boots Manjaro with systemd to multi-user target, no failed units, from an
   image the tree builds (`tools/mkmanjarorootfs.sh`)
@@ -137,7 +147,7 @@ workaround; pseudo-physical memory is the fix. Both are in `TODO`.
 | `tools/mkmanjarorootfs.sh` | builds the Manjaro desktop image |
 | `tools/mkrootfs.sh` | builds the minimal BusyBox bring-up image |
 | `tools/coterm.py` | client for the guest's console port |
-| `tools/shot.cs` | screenshots the XP desktop, compiled and run on the box |
+| `tools/shot.cs` | screenshots the host desktop, compiled and run on the box |
 | `tools/decode-minidump.py` | attribute a bugcheck's stack to this driver |
 | `tools/pe-clear-laa.py` | confine the slirp daemon to 2 GB of address space |
 | `doc/runbook` | box to desktop, and host to installed Manjaro |
