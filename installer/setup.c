@@ -1995,7 +1995,6 @@ static DWORD WINAPI worker(LPVOID unused)
 		return 1;
 	enable_testsigning();		/* NT 6+ only; never fatal */
 	install_xserver();		/* never fatal; see the function */
-	install_shortcuts();		/* likewise */
 	if (!copy_image())
 		return 1;
 	if (!create_image())
@@ -2041,6 +2040,22 @@ linux_half:
 
 	finish_guest();
 	write_ini();
+
+	/*
+	 * The shortcuts and the logon entry, only now.
+	 *
+	 * They used to be made in the first half, which put moco-boot.vbs in the
+	 * All Users Startup folder before the restart -- so the logon that was
+	 * supposed to resume Setup booted a guest of its own first, and Setup's
+	 * boot daemon then refused with "a guest is already running" (the
+	 * single-instance guard doing its job). The bridge and console server
+	 * refused for the same reason, and the install stalled waiting for a
+	 * console that belonged to somebody else's guest.
+	 *
+	 * Nothing before this point needs them, and after it the system they
+	 * start actually exists.
+	 */
+	install_shortcuts();		/* never fatal; see the function */
 
 	/*
 	 * Only here. Both of these are what make the install retry, so they come

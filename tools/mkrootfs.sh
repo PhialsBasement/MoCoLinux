@@ -9,7 +9,7 @@
 #   mkrootfs.sh [size-mb]        default 512
 #
 # The result is dist-x64/root.img, deployed like any other artifact and
-# attached with `colinux-daemon --cobd0 \??\F:\xfer\root.img`. Pointing cobd0
+# attached with `colinux-daemon --cobd0 \DosDevices\F:\xfer\root.img`. Pointing cobd0
 # at a raw partition instead is a path change and nothing else; the driver
 # opens whatever it is given.
 
