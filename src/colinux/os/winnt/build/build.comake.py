@@ -25,6 +25,7 @@ targets['executables'] = Target(
     Input('colinux-ndis-net-daemon.exe'),
     Input('colinux-slirp-net-daemon.exe'),
     Input('colinux-serial-daemon.exe'),
+    Input('kread-hammer.exe'),
     Input('linux.sys'),
     ] + optional_targets(),
     tool = Empty(),
@@ -233,6 +234,18 @@ targets['colinux-serial-daemon.exe'] = Target(
     inputs = [
         Input('../user/daemon/res/colinux-serial.res'),
         Input('../user/coserial-daemon/build.o'),
+    ] + user_dep,
+    tool = Compiler(),
+    mono_options = generate_options('gcc'),
+)
+
+# R0's verification tool, not a shipped daemon: it hammers CO_MANAGER_IOCTL_KREAD
+# from a second process across a guest teardown, which is the race the KREAD
+# lock exists to close. Built here rather than by hand so it cannot drift from
+# the headers it tests against.
+targets['kread-hammer.exe'] = Target(
+    inputs = [
+        Input('../user/kread-hammer/build.o'),
     ] + user_dep,
     tool = Compiler(),
     mono_options = generate_options('gcc'),
