@@ -119,6 +119,20 @@ extern co_rc_t co_kload_write(co_manager_t* manager, unsigned long long va,
 			      const unsigned char* buf, unsigned long size);
 extern co_rc_t co_kload_read(co_manager_t* manager, unsigned long long va,
 			     unsigned char* buf, unsigned long size);
+
+/*
+ * The same read, holding the teardown lock, for callers outside the driver.
+ *
+ * Use this from any ioctl handler. co_kload_read is for the in-driver callers
+ * that already own the guest for the duration; a user-mode caller does not,
+ * and racing a teardown means walking page tables inside pool that has been
+ * handed back. The bound exists so a reader cannot hold a teardown for an
+ * unbounded time -- ask for more by asking more often.
+ */
+#define CO_KREAD_MAX_BYTES	(2 * 1024 * 1024)
+
+extern co_rc_t co_kload_read_locked(co_manager_t* manager, unsigned long long va,
+				    unsigned char* buf, unsigned long size);
 extern co_rc_t co_kload_build_ram(co_manager_t* manager, unsigned long long ram_bytes,
 				  unsigned long long text_va, unsigned long long end_va);
 extern unsigned long co_kload_ram_pages(void);
