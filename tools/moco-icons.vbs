@@ -61,10 +61,21 @@ For Each entry In apps
 	part = Split(entry, "|")
 	Set lnk = shell.CreateShortcut(desktop & "\" & part(0) & " (Linux).lnk")
 	lnk.TargetPath       = daemon
-	lnk.Arguments        = "--run " & part(1)
+	' Every application goes through moco-gl, whether or not it draws with
+	' OpenGL.
+	'
+	' The wrapper points the program's GL at /dev/dri/renderD128 -- virgl,
+	' which is the host's real graphics card -- and pushes the finished
+	' frames into the same X window. A program that never issues a GL call
+	' loses nothing by being wrapped; one that does and is NOT wrapped gets
+	' software rendering, or no GL at all, because software GLX against the
+	' X server on Windows fails outright with GLXBadDrawable. Wrapping
+	' everything is therefore the safe default, and it means a user never
+	' has to know which of these applications happen to use the GPU.
+	lnk.Arguments        = "--run moco-gl " & part(1)
 	lnk.WorkingDirectory = moco
 	lnk.IconLocation     = part(2)
-	lnk.Description      = part(1) & ", running in MoCoLinux"
+	lnk.Description      = part(1) & ", running in MoCoLinux on the GPU"
 	lnk.WindowStyle      = 7          ' minimised: nothing to look at
 	lnk.Save
 	made = made + 1
