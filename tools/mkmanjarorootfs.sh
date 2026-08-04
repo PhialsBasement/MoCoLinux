@@ -127,7 +127,22 @@ PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 	  ttf-liberation ttf-dejavu \
 	  xorg-xauth xorg-xhost xorg-xrandr xterm \
 	  xcb-util-cursor \
+	  virtualgl mesa-utils openssh \
 	  lib32-glibc lib32-gcc-libs"
+
+# virtualgl is what makes the GPU reachable, and it is the whole reason this
+# release exists. The guest has no display of its own: applications draw 2D
+# over the X protocol to the X server on Windows, which has no acceleration,
+# and their GL used to fall back to llvmpipe -- or fail outright, since
+# software GLX against that server dies with GLXBadDrawable. VirtualGL
+# redirects the GL onto /dev/dri/renderD128, which is virgl, which is the
+# host's real card; the finished frames are pushed into the same X windows. So
+# windows stay native and rootless while the drawing happens on the GPU.
+#
+# mesa-utils is glxinfo and glxgears: how anyone checks whether that actually
+# happened, rather than trusting it. openssh because a serial console is the
+# wrong instrument for diagnosing a graphics stack, and slirp can redirect a
+# port to it (see -r on the network daemon).
 
 # The console set. base brings systemd, pacman, both keyrings, iproute2 and
 # iputils. e2fsprogs is named rather than relied upon, because building a
@@ -674,6 +689,54 @@ chmod 0440 "$MNT/etc/sudoers.d/10-wheel"
 # run-manjaro.bat already keeps the previous root attached as cobd1 for the same
 # reason in reverse: if the new system will not boot, the one that built it
 # still will.
+
+say "installing the GPU wrapper"
+
+# One command that runs an application on the host's GPU, with the three
+# settings that are not optional and not guessable.
+#
+# VGL_COMPRESS=proxy is the one that matters. With a remote DISPLAY -- which
+# this always is, the X server being on Windows -- VirtualGL otherwise selects
+# its own transport and tries to connect to a vglclient on the display host.
+# Nothing is listening, so it blocks in connect() forever: no error, no
+# timeout, no log line, just an application that starts and never draws. An
+# evening was lost to that. "proxy" means send the frames down the X
+# connection that is already open, which needs no client at all.
+#
+# VGL_PROBEGLX=0 skips VirtualGL's probe of the 2D server for stereo visuals.
+# That probe asks the X server for GLX capabilities, and this one answers in a
+# way that hangs the probe -- again silently.
+#
+# -d egl0 selects the EGL device by index. Naming the DRM node directly
+# (-d /dev/dri/renderD128) is refused with "Invalid EGL device": virglrenderer's
+# node does not advertise itself through EGL_EXT_device_drm the way VirtualGL
+# expects, but it is there and it is first.
+install -Dm 0755 /dev/stdin "$MNT/usr/local/bin/moco-gl" <<'MOCOGL'
+#!/bin/sh
+# Run a program with its OpenGL on the host's GPU.
+#
+#   moco-gl firefox
+#   moco-gl glxgears
+#
+# Without this wrapper an application gets software rendering at best, and at
+# worst no GL at all -- software GLX against the Windows X server fails with
+# GLXBadDrawable.
+if [ $# -eq 0 ]; then
+	echo "usage: moco-gl <program> [args...]" >&2
+	exit 2
+fi
+
+: "${DISPLAY:=10.0.2.2:0}"
+export DISPLAY
+
+exec env VGL_PROBEGLX=0 VGL_COMPRESS=proxy vglrun -d egl0 "$@"
+MOCOGL
+
+# sshd, because diagnosing this system through a serial console is worse than
+# the problems being diagnosed. Reachable once the network daemon is given a
+# redirection: colinux-slirp-net-daemon -R -r tcp:2222:22
+inside "systemctl enable sshd" >/dev/null 2>&1 || \
+	say "  WARNING: could not enable sshd"
 
 say "installing the builder and its first-boot unit"
 
