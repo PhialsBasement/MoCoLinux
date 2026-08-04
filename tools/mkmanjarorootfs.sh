@@ -528,39 +528,48 @@ EOF
 # reaches an X server listening on 127.0.0.1:6000 on the Windows machine, with
 # no port redirection and nothing new in the driver.
 #
-# OpenGL, and why the faster-sounding option is not the default.
+# OpenGL, and the one wrapper that matters.
 #
-# The guest has no GPU and no DRI device, so Mesa falls back to llvmpipe and
-# renders in the guest's single core. Setting LIBGL_ALWAYS_INDIRECT=1 sends GLX
-# protocol to the X server instead, which executes it on the host's real card --
-# and measured on this hardware that is a GeForce GT 730 reporting OpenGL 1.4,
-# against llvmpipe's 4.6. The card's own driver does 4.5; the 1.4 is the GLX
-# wire protocol, which has no encodings for modern core profiles.
+# The guest has a GPU: /dev/dri/renderD128 is virtio-gpu talking to
+# virglrenderer on the Windows side, which executes the GL on the host's real
+# card. What it does not have is a display -- applications draw 2D over the X
+# protocol to the X server on Windows, and that server has no acceleration.
 #
-# So the choice is a complete-but-slow renderer or a fast one stuck in 2002, and
-# as a system-wide default the second breaks more than it helps: anything
-# wanting a modern context -- Chromium, and therefore Steam -- refuses outright
-# rather than running slowly. glxinfo also reports GLXBadCurrentWindow on the
-# indirect path, so it is not entirely healthy either.
+# So the two halves are separated. VirtualGL redirects a program's GL onto the
+# render node and pushes the finished frames into the same X windows, which
+# leaves the windows native and rootless while the drawing happens on the GT
+# 730. Measured on this hardware: glxgears at 132 fps against llvmpipe, and
+# Firefox rendering rather than falling back.
 #
-# Default is therefore llvmpipe, with the hardware path one word away:
-#
-#     glhw glxgears        instead of        glxgears
+# The old advice was `glhw`, which set LIBGL_ALWAYS_INDIRECT=1 to send GLX
+# protocol to the X server. That path is worse than it looked: capped at GL 1.4
+# by the wire protocol, and on this server it does not work at all -- software
+# GLX fails with GLXBadDrawable before a frame is drawn. glhw is kept only as a
+# shim onto the working path, so anything that already invokes it keeps running.
 mkdir -p "$MNT/usr/local/bin"
 cat > "$MNT/usr/local/bin/glhw" <<'EOF'
 #!/bin/sh
-# Run one program with OpenGL on the host's graphics card instead of in this
-# guest's CPU. Needs the X server started with -wgl +iglx. Capped at GL 1.4 by
-# the GLX protocol regardless of what the card can do -- see /etc/environment.
-exec env LIBGL_ALWAYS_INDIRECT=1 "$@"
+# Superseded by moco-gl, which this now calls.
+#
+# glhw used to set LIBGL_ALWAYS_INDIRECT=1, sending GLX protocol to the X
+# server on Windows. That is limited to GL 1.4 by the wire protocol and on this
+# server fails outright with GLXBadDrawable. moco-gl renders on the host's card
+# through virgl instead, at full GL 4.2.
+echo "glhw: superseded by moco-gl; running that instead" >&2
+exec moco-gl "$@"
 EOF
 chmod 0755 "$MNT/usr/local/bin/glhw"
 
 cat > "$MNT/etc/environment" <<'EOF'
 DISPLAY=10.0.2.2:0
-# OpenGL renders in this guest's CPU (llvmpipe, GL 4.6, complete but slow).
-# For the host's graphics card instead, run one program through `glhw` --
-# hardware accelerated but limited to GL 1.4 by the GLX wire protocol.
+# OpenGL: run a program through `moco-gl` to render on the host's graphics
+# card (virgl on the real GPU, full GL 4.2). Without it a program gets
+# llvmpipe in this guest's CPU, or no GL at all -- software GLX against the
+# X server on Windows fails with GLXBadDrawable.
+#
+#     moco-gl firefox
+#
+# The desktop shortcuts already do this.
 EOF
 
 # zsh, and the four files it reads.
