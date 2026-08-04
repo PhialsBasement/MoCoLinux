@@ -55,6 +55,7 @@
 #include <linux/virtio_ids.h>
 #include <linux/platform_device.h>
 #include <linux/delay.h>
+#include <linux/kthread.h>
 #include <linux/console.h>	/* co_vgpu_drain's prototype lives with the
 					 * other cooperative hooks */
 
@@ -381,6 +382,42 @@ static void co_vgpu_release(struct device *dev)
 	/* The virtio device is embedded in a static allocation. */
 }
 
+/*
+ * Poll for the daemon, then publish the device.
+ *
+ * Two minutes is generous on purpose: the daemon maps a gigabyte of guest RAM
+ * before it sets this flag, and on a fragmented host that is not instant. A
+ * guest that waits a little is strictly better than one that decides too early
+ * that it has no GPU.
+ */
+static int co_vgpu_wait_and_register(void *arg)
+{
+	struct co_vgpu_device *cd = arg;
+	int waited;
+
+	for (waited = 0; waited < 120000; waited += 100) {
+		if (kthread_should_stop())
+			return 0;
+		if (READ_ONCE(co_colinux_vgpu_io.enabled))
+			break;
+		msleep(100);
+	}
+
+	if (!READ_ONCE(co_colinux_vgpu_io.enabled)) {
+		pr_info("colinux vgpu: no host daemon appeared; no GPU this run\n");
+		return 0;
+	}
+
+	if (register_virtio_device(&cd->vdev)) {
+		pr_err("colinux vgpu: register_virtio_device failed\n");
+		return 0;
+	}
+
+	pr_info("colinux vgpu: host daemon is serving; device registered,"
+		" %u capsets\n", co_colinux_vgpu_io.num_capsets);
+	return 0;
+}
+
 static int __init co_vgpu_init(void)
 {
 	struct co_vgpu_device *cd;
@@ -440,6 +477,35 @@ static int __init co_vgpu_init(void)
 	cd->vdev.dev.release = co_vgpu_release;
 
 	co_vgpu = cd;
+
+	/*
+	 * Wait for the host daemon before letting virtio-gpu see the device.
+	 *
+	 * The driver's probe asks for capset information and waits five
+	 * seconds for the answer. This transport's initcall runs about fifty
+	 * milliseconds into boot, while the daemon that answers is a Windows
+	 * process the launcher starts moments AFTER the guest -- so the query
+	 * went out before anyone was listening, timed out, and the driver came
+	 * up with no usable capset. Mesa then reported "No virgl contexts
+	 * available on host" and fell back to llvmpipe, which looks exactly
+	 * like a device that does not work.
+	 *
+	 * So registration is deferred to a thread that waits for the daemon to
+	 * announce itself. Boot is not held up: if no daemon ever appears the
+	 * thread gives up quietly and the guest simply has no GPU, which is
+	 * the correct outcome for a host that is not offering one.
+	 */
+	if (READ_ONCE(co_colinux_vgpu_io.enabled) == 0) {
+		struct task_struct *t;
+
+		t = kthread_run(co_vgpu_wait_and_register, cd, "covgpu-wait");
+		if (!IS_ERR(t)) {
+			pr_info("colinux vgpu: waiting for the host daemon\n");
+			return 0;
+		}
+		/* No thread: fall through and register now, so a host that is
+		 * already serving still works. */
+	}
 
 	rc = register_virtio_device(&cd->vdev);
 	if (rc) {

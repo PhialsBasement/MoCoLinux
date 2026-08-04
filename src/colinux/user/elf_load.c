@@ -2279,12 +2279,34 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 						unsigned int	   magic;
 						unsigned int	   abi_version;
 						unsigned long long host_features;
+						unsigned long long guest_features;
+						unsigned int	   status;
+						unsigned int	   enabled;
+						unsigned int	   num_capsets;
+						unsigned int	   num_scanouts;
 					} hdr;
+
+					memset(&hdr, 0, sizeof(hdr));
 
 					b.vgpu_io_va = co_elf_get_symbol_value(s_gio);
 
 					hdr.magic	  = 0x55504756;	/* 'VGPU' */
 					hdr.abi_version	  = 1;
+					/*
+					 * Two capsets: VIRGL and VIRGL2. Mesa's
+					 * virgl driver looks for VIRGL2 and
+					 * refuses the device without it. The
+					 * guest asks
+					 * for its contents at probe and Mesa
+					 * refuses to use the device without
+					 * them, so a zero here is a device
+									 * nothing can render on.
+					 * The daemon answers the query from
+					 * virgl_renderer_get_cap_set, so what
+					 * is advertised is what the host GL
+					 * can actually do.
+					 */
+					hdr.num_capsets	  = 2;
 					/*
 					 * VERSION_1 (bit 32), VIRGL (bit 0) and
 					 * CONTEXT_INIT (bit 4).
