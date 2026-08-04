@@ -226,16 +226,56 @@ void co_os_free(void *ptr)
 
 co_rc_t co_os_userspace_map(void *address, unsigned int pages, void **user_address_out, void **handle_out)
 {
-	void *user_address;
-	unsigned long memory_size = ((unsigned long)pages) << CO_ARCH_PAGE_SHIFT;
+	void *user_address = NULL;
+	/*
+	 * SIZE_T, not unsigned long. Windows is LLP64, so `unsigned long` is 32
+	 * bits here and this shift overflows silently at 4 GB of pages -- the
+	 * same truncation class that has bitten vm_ptr_t, the host ISR address
+	 * and CO_ARCH_PAGE_MASK in this tree already. Nothing asks for that much
+	 * today; the type is correct so that nothing has to notice when it does.
+	 */
+	SIZE_T memory_size = ((SIZE_T)pages) << CO_ARCH_PAGE_SHIFT;
 	PMDL mdl;
 
-	mdl = IoAllocateMdl(address, memory_size, FALSE, FALSE, NULL);
+	mdl = IoAllocateMdl(address, (ULONG)memory_size, FALSE, FALSE, NULL);
 	if (!mdl)
 		return CO_RC(ERROR);
 
 	MmBuildMdlForNonPagedPool(mdl);
-	user_address = MmMapLockedPagesSpecifyCache(mdl, UserMode, MmCached, NULL, FALSE, HighPagePriority);
+
+	/*
+	 * UNGUARDED, AND KNOWN TO BE. Read this before adding a caller.
+	 *
+	 * MmMapLockedPagesSpecifyCache with AccessMode == UserMode RAISES an
+	 * exception when it cannot map; it does not return NULL, and the
+	 * BugCheckOnFailure argument is documented as ignored for UserMode. So
+	 * the NULL test below never runs on the path that actually fails, and an
+	 * unhandled exception in a driver is a bugcheck (0x1E / 0x7E), not an
+	 * error return.
+	 *
+	 * It is not guarded here because it cannot be guarded well with this
+	 * toolchain: GCC's C frontend has no __try/__except -- that is MSVC
+	 * syntax -- and mingw's x64 substitute (__try1/__except1 in excpt.h) is
+	 * inline assembly emitting .seh_handler scope tables by hand. Getting
+	 * that subtly wrong corrupts the stack on precisely the path meant to
+	 * save the machine, and it cannot be exercised without Driver Verifier
+	 * and a deliberately exhausted address space. Shipping untested SEH into
+	 * a driver is a worse trade than a documented sharp edge.
+	 *
+	 * Today nothing reaches it: the one caller maps a handful of pages while
+	 * address space is plentiful. R3 of the GPU ladder is what changes that
+	 * -- it maps around a gigabyte in dozens of slices on every daemon start
+	 * -- so R3 owns the fix, and has two options that do not need SEH: map
+	 * KernelMode and hand userspace a section object instead, or probe the
+	 * caller's free address space before committing. R3's first step is an
+	 * isolated Verifier test of exactly this failure path.
+	 *
+	 * The NULL check stays regardless: a Windows that returns NULL rather
+	 * than raising must not be treated as success.
+	 */
+	user_address = MmMapLockedPagesSpecifyCache(mdl, UserMode, MmCached,
+						    NULL, FALSE, HighPagePriority);
+
 	if (!user_address) {
 		IoFreeMdl(mdl);
 		return CO_RC(ERROR);

@@ -705,8 +705,15 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		if (out_size < sizeof(*params) + params->size)
 			return CO_RC(INVALID_PARAMETER);
 
-		params->rc = co_kload_read(manager, params->va, params->data,
-					   params->size);
+		/*
+		 * The locked reader, because this one is reachable from any
+		 * process at any moment -- including while another is closing
+		 * its handle and tearing the address space down. See
+		 * co_kload_read_locked; the size cap is what keeps a reader from
+		 * holding a teardown open indefinitely.
+		 */
+		params->rc = co_kload_read_locked(manager, params->va,
+						  params->data, params->size);
 		*return_size = sizeof(*params) + params->size;
 		return CO_RC(OK);
 	}
@@ -1130,6 +1137,25 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 	}
 
 	case CO_MANAGER_IOCTL_KLOAD_END: {
+		/*
+		 * Refuse while a monitor loop is running.
+		 *
+		 * This handler frees the guest's RAM and address space, and it
+		 * is reachable from ANY handle -- so today it is only safe
+		 * because the one process that sends it is the same one running
+		 * the guest, and it sends it after the run ends. That is a
+		 * convention held by one program, not a property of the
+		 * interface, and R4 puts a second and third process on manager
+		 * handles. KSTOP already reads this flag for the same reason;
+		 * this makes the convention an invariant for the cost of an if.
+		 */
+		if (co_arch_boot_running()) {
+			co_debug_error("KLOAD_END refused: a monitor loop is "
+				       "still running");
+			*return_size = 0;
+			return CO_RC(ERROR);
+		}
+
 		/*
 		 * Retire the console before the address space it reads through
 		 * is freed. A console client is another process entirely and

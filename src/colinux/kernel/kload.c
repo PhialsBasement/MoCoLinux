@@ -805,6 +805,53 @@ co_rc_t co_kload_read(co_manager_t* manager, unsigned long long va,
 }
 
 /*
+ * co_kload_read for a caller outside the driver, holding the teardown lock.
+ *
+ * co_kload_read itself takes nothing. That is correct for its in-driver callers
+ * -- the monitor loop owns the guest for the duration, and taking a mutex per
+ * page there would be a real regression -- but it is not correct for the KREAD
+ * ioctl, which any process can issue at any moment, including while another
+ * closes its handle and tears the address space down underneath it. The tables
+ * being walked are inside the blocks kload_release_pages hands back, so a walk
+ * that outlives the free reads pool that has been reissued: bugcheck 0xD5 under
+ * Driver Verifier's special pool, and silent corruption without it. It has been
+ * safe until now only because the single caller was sequenced before its own
+ * teardown, which is a property of one program rather than of this interface.
+ *
+ * Holding kload_lock across the whole walk is what makes it safe, because
+ * co_kload_free takes the same lock and does its retiring and freeing inside
+ * it. The cost is that a reader delays a teardown, so the transfer is bounded:
+ * CO_KREAD_MAX_BYTES caps how long any one call can hold the lock, and a
+ * caller wanting more issues more calls, each of which is a fresh chance for
+ * the teardown to win.
+ */
+co_rc_t co_kload_read_locked(co_manager_t* manager, unsigned long long va,
+			     unsigned char* buf, unsigned long size)
+{
+	co_rc_t rc;
+
+	if (size > CO_KREAD_MAX_BYTES)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(kload_lock);
+
+	/*
+	 * Re-checked under the lock, not before it. Checking outside would be
+	 * the same bug in a politer form: the space can be destroyed between
+	 * the test and the acquire.
+	 */
+	if (kload_space == NULL) {
+		co_os_mutex_release(kload_lock);
+		return CO_RC(ERROR);
+	}
+
+	rc = co_kload_read(manager, va, buf, size);
+
+	co_os_mutex_release(kload_lock);
+	return rc;
+}
+
+/*
  * Write guest memory through the guest's own page tables -- co_kload_read in
  * the other direction, and it exists for the same reason the reader does: a
  * guest virtual address is not a host pointer.
