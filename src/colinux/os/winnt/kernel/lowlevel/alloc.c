@@ -244,32 +244,62 @@ co_rc_t co_os_userspace_map(void *address, unsigned int pages, void **user_addre
 	MmBuildMdlForNonPagedPool(mdl);
 
 	/*
-	 * UNGUARDED, AND KNOWN TO BE. Read this before adding a caller.
+	 * Probe before mapping, because the map cannot be caught if it fails.
 	 *
 	 * MmMapLockedPagesSpecifyCache with AccessMode == UserMode RAISES an
 	 * exception when it cannot map; it does not return NULL, and the
-	 * BugCheckOnFailure argument is documented as ignored for UserMode. So
-	 * the NULL test below never runs on the path that actually fails, and an
-	 * unhandled exception in a driver is a bugcheck (0x1E / 0x7E), not an
-	 * error return.
+	 * BugCheckOnFailure argument is documented as ignored for UserMode. The
+	 * NULL test below therefore never runs on the path that actually
+	 * fails, and an unhandled exception in a driver is a bugcheck
+	 * (0x1E / 0x7E), not an error return.
 	 *
-	 * It is not guarded here because it cannot be guarded well with this
-	 * toolchain: GCC's C frontend has no __try/__except -- that is MSVC
-	 * syntax -- and mingw's x64 substitute (__try1/__except1 in excpt.h) is
-	 * inline assembly emitting .seh_handler scope tables by hand. Getting
-	 * that subtly wrong corrupts the stack on precisely the path meant to
-	 * save the machine, and it cannot be exercised without Driver Verifier
-	 * and a deliberately exhausted address space. Shipping untested SEH into
-	 * a driver is a worse trade than a documented sharp edge.
+	 * It cannot be guarded with this toolchain: GCC's C frontend has no
+	 * __try/__except -- that is MSVC syntax -- and mingw's x64 substitute
+	 * (__try1/__except1 in excpt.h) is inline assembly emitting
+	 * .seh_handler scope tables by hand. Getting that subtly wrong corrupts
+	 * the stack on precisely the path meant to save the machine.
 	 *
-	 * Today nothing reaches it: the one caller maps a handful of pages while
-	 * address space is plentiful. R3 of the GPU ladder is what changes that
-	 * -- it maps around a gigabyte in dozens of slices on every daemon start
-	 * -- so R3 owns the fix, and has two options that do not need SEH: map
-	 * KernelMode and hand userspace a section object instead, or probe the
-	 * caller's free address space before committing. R3's first step is an
-	 * isolated Verifier test of exactly this failure path.
+	 * So instead of catching the failure, make it not happen: ask the
+	 * caller's address space for a reservation of exactly this size first.
+	 * If there is no contiguous hole that big, the reservation fails
+	 * cleanly with a status code and this returns an error, which is what
+	 * the caller wanted all along. If there is, it is released again
+	 * immediately and the map takes it.
 	 *
+	 * The window between the release and the map is real, and it is
+	 * accepted knowingly: the only caller that maps at this scale is the
+	 * daemon's single-threaded startup, nothing else in the process is
+	 * reserving address space at that moment, and the alternative is
+	 * hand-written SEH. It converts "certain bugcheck when VA runs out"
+	 * into "clean refusal, with a vanishingly small chance of the old
+	 * behaviour". R3 maps ~1 GB in 130 slices on every daemon start, which
+	 * is what makes this path reachable at all.
+	 *
+	 * MEM_RESERVE only -- no pages are committed, so this costs address
+	 * space for the length of the call and nothing else.
+	 */
+	{
+		PVOID	 probe = NULL;
+		SIZE_T	 probe_size = memory_size;
+		NTSTATUS status;
+
+		status = ZwAllocateVirtualMemory(ZwCurrentProcess(), &probe, 0,
+						 &probe_size, MEM_RESERVE,
+						 PAGE_READWRITE);
+		if (!NT_SUCCESS(status)) {
+			co_debug("userspace_map: no %lu KB of free user VA (status %x)",
+				 (unsigned long)(memory_size >> 10),
+				 (unsigned int)status);
+			IoFreeMdl(mdl);
+			return CO_RC(ERROR);
+		}
+
+		probe_size = 0;	/* MEM_RELEASE requires zero, with the base */
+		ZwFreeVirtualMemory(ZwCurrentProcess(), &probe, &probe_size,
+				    MEM_RELEASE);
+	}
+
+	/*
 	 * The NULL check stays regardless: a Windows that returns NULL rather
 	 * than raising must not be treated as success.
 	 */

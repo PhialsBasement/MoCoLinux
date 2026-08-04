@@ -320,7 +320,35 @@
      it work means either porting the monitor path and coconsole, or teaching it
      to read the CONSOLE ioctl and parse VT sequences itself.
 
+ * moco-boot.vbs cannot tell the boot daemon from the console server:
+   * It decides whether a guest is already running with
+     Running("colinux-daemon.exe") -- but the console server is that same
+     executable (`colinux-daemon.exe --console 2323`). So an orphaned console
+     server left over from a previous run makes the launcher believe the guest
+     is up: it starts the X server and quits, and no guest is booted, silently.
+   * Found while writing R3's soak, where every cycle after the first tested
+     nothing at all and looked like it had passed. The soak drives the boot
+     daemon directly now, which is the right thing for a test, but the launcher
+     still has the bug for real use.
+   * The fix is to match on the command line rather than the image name, or to
+     have the boot daemon publish something the launcher can ask about -- it
+     already has a single-instance mutex, so asking whether that is held is
+     both cheaper and exact.
+
  * Guest RAM is freed and re-allocated every run, and that fragments the host:
+   * QUANTIFIED 2026-08-04 while soaking R3, and the number is better than the
+     entry below implies: on Windows 7, four consecutive boot/teardown cycles
+     each got the full 1024 MB back. What fails first is not the gigabyte, it
+     is block 0 -- the ~44 MB unbroken run for the image plus page tables --
+     with CO_RC(OUT_OF_MEMORY) at kload.c:702. The allocator visibly works
+     harder on the way there, needing 64, 66, 65 then 89 blocks for the same
+     gigabyte as the free pool breaks up.
+   * Driver Verifier's special pool makes it far worse and was on for that run,
+     so four cycles is a floor rather than the number to quote.
+   * A driver reload does NOT cure it, because it does not defragment host
+     physical memory; a host reboot does, immediately and completely. That
+     asymmetry is the quickest way to tell this apart from a leak in our own
+     accounting, which a reload would clear.
    * The symptom, which is worth stating first because it looks like a driver
      bug and is not: the first boot after `sc start` is reliable, and a second
      boot on the same loaded driver makes the whole box sluggish or wedges it
