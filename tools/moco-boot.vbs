@@ -50,6 +50,28 @@ Function Running(name)
 		"select ProcessId from Win32_Process where Name='" & name & "'").Count > 0
 End Function
 
+' Start the X server, passing the program directory.
+'
+' The doubled outer quotes are required and are not a typo. `cmd /c` has a
+' documented rule: when what follows /c begins with a quote and contains more
+' than one quoted token, it strips the first and last quote character and runs
+' what is left. So the obvious
+'
+'     cmd /c "C:\Program Files\MoCoLinux\xstart1142.bat" "C:\Program Files\MoCoLinux"
+'
+' arrives as C:\Program Files\...bat" "C:\Program Files\MoCoLinux and dies on
+' the first space -- 'C:\Program' is not recognized. Wrapping the whole command
+' line in one more pair defeats the stripping, because the pair cmd removes is
+' the one that was added for it. This cost a silent X server twice: the failure
+' happens inside a hidden window, so a Linux application simply never appears.
+'
+' Chr(34) rather than escaped quotes, so the count is legible.
+Sub StartX(dir)
+	q = Chr(34)
+	shell.Run "cmd /c " & q & q & dir & "\xstart1142.bat" & q & _
+		  " " & q & dir & q & q, HIDDEN, NOWAIT
+End Sub
+
 shell.CurrentDirectory = moco
 
 ' The driver. --install-driver only creates the service; sc start is what loads
@@ -62,7 +84,7 @@ If Running("colinux-daemon.exe") Then
 	' Already up. Still make sure the X server is there, because it can be
 	' closed independently of the guest and an X client with no server
 	' produces no error at all -- it simply never appears.
-	shell.Run "cmd /c """ & moco & "\xstart1142.bat"" """ & moco & """", HIDDEN, NOWAIT
+	StartX moco
 	WScript.Quit 0
 End If
 
@@ -96,4 +118,4 @@ shell.Run """" & moco & "\colinux-daemon.exe"" --console 2323", HIDDEN, NOWAIT
 
 ' The X server last, so the guest's windows have somewhere to go. It checks for
 ' itself whether one is already running on :0.
-shell.Run "cmd /c """ & moco & "\xstart1142.bat"" """ & moco & """", HIDDEN, NOWAIT
+StartX moco
