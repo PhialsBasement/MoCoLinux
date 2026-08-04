@@ -598,6 +598,14 @@ typedef struct {
 	unsigned long long net_io_va;
 	/* where it keeps co_colinux_cobd_io, the async block completion ring */
 	unsigned long long cobd_io_va;
+	/*
+	 * Where it keeps co_colinux_vgpu_io, the virtio-gpu transport.
+	 *
+	 * Zero when the guest kernel has no transport driver, which is the
+	 * normal state for any vmlinux built before R4 -- the device simply
+	 * never appears and everything else boots exactly as before.
+	 */
+	unsigned long long vgpu_io_va;
 	/* 1 = run block I/O asynchronously off the monitor thread (default) */
 	int		   async_cobd;
 	/* out */

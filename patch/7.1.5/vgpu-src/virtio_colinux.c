@@ -55,6 +55,8 @@
 #include <linux/virtio_ids.h>
 #include <linux/platform_device.h>
 #include <linux/delay.h>
+#include <linux/console.h>	/* co_vgpu_drain's prototype lives with the
+					 * other cooperative hooks */
 
 /*
  * The shared structure, and the one rule about it: this layout is ABI.
@@ -406,9 +408,35 @@ static int __init co_vgpu_init(void)
 
 	spin_lock_init(&cd->lock);
 
+	/*
+	 * A parent device, and it is not a formality.
+	 *
+	 * virtio_gpu_probe hands vdev->dev.parent straight to drm_dev_alloc,
+	 * and DRM refuses a NULL parent with -EINVAL -- which is exactly how
+	 * this failed the first time it ran: the transport registered, the
+	 * driver bound, and probe returned -22 before printing a single line
+	 * of its own, because the failure is upstream of everything that
+	 * reports. A real transport gets this for free (virtio_mmio has its
+	 * platform device, virtio_pci its PCI device); a transport invented
+	 * from nothing has to supply one.
+	 *
+	 * A bare platform device is the honest choice. It is not pretending to
+	 * be hardware -- dev_is_pci() on it is false, so virtio_gpu skips its
+	 * PCI quirk -- it exists to give DRM something to hang the device on.
+	 */
+	cd->pdev = platform_device_register_simple("colinux-vgpu", -1, NULL, 0);
+	if (IS_ERR(cd->pdev)) {
+		int rc2 = PTR_ERR(cd->pdev);
+
+		pr_err("colinux vgpu: no parent device (%d)\n", rc2);
+		kfree(cd);
+		return rc2;
+	}
+
 	cd->vdev.id.device = VIRTIO_ID_GPU;
 	cd->vdev.id.vendor = 0x434f4c58;	/* 'COLX' */
 	cd->vdev.config    = &co_vgpu_config_ops;
+	cd->vdev.dev.parent  = &cd->pdev->dev;
 	cd->vdev.dev.release = co_vgpu_release;
 
 	co_vgpu = cd;
@@ -417,6 +445,7 @@ static int __init co_vgpu_init(void)
 	if (rc) {
 		pr_err("colinux vgpu: register_virtio_device failed (%d)\n", rc);
 		co_vgpu = NULL;
+		platform_device_unregister(cd->pdev);
 		kfree(cd);
 		return rc;
 	}
