@@ -198,7 +198,29 @@ virgl_renderer_gl_context wgl_create_context(void *cookie, int scanout,
 				     : WGL_CONTEXT_CORE_PROFILE_BIT_ARB;
 	attribs[n++] = 0;
 
-	rc = ws_createattribs(ws_dc, p->shared ? ws_base : NULL, attribs);
+	/*
+	 * Every context shares with ws_base, including the ones virglrenderer
+	 * asks for unshared.
+	 *
+	 * Honouring shared==false literally puts that context in a share group
+	 * of its own, and virglrenderer creates its first context that way --
+	 * then creates GL objects while it is current. Every later guest
+	 * context shares with ws_base instead, a different group, so those
+	 * objects are simply not visible: glBindBuffer binds nothing,
+	 * glGetBufferParameteriv returns nothing, and glMapBufferRange fails
+	 * with GL_INVALID_OPERATION on a buffer that demonstrably exists and
+	 * has the right size. What the guest sees is "Illegal handle" on every
+	 * bind and a black window.
+	 *
+	 * One share group for the whole daemon is what virglrenderer assumes on
+	 * every other platform -- GLX and EGL both hand it a display whose
+	 * contexts share by construction -- so this matches the behaviour it
+	 * was written against. Sharing more widely than asked costs nothing;
+	 * sharing less breaks object visibility in a way that surfaces far from
+	 * the cause.
+	 */
+	rc = ws_createattribs(ws_dc, ws_base, attribs);
+	(void)p->shared;
 	if (!rc) {
 		/* Asking for a version the driver will not give is normal --
 		 * vrend probes downwards -- so this is not an error to shout
