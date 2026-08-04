@@ -36,6 +36,7 @@
 #include <colinux/os/alloc.h>
 
 #include "vring.h"
+#include "vrend.h"
 
 COLINUX_DEFINE_MODULE("cogpu-daemon");
 
@@ -145,12 +146,35 @@ static void *resolve_gpa(void *ctx, uint64_t gpa, uint32_t len)
  * to complete a fenced no-op. The renderer is not here yet; what is being
  * proved is that a request crosses, is understood, and its fence comes back.
  */
+/*
+ * Counted off enum virtio_gpu_ctrl_type in the guest's own
+ * include/uapi/linux/virtio_gpu.h rather than remembered. The first version of
+ * this file guessed, and put GET_CAPSET_INFO at 0x0102 -- which is really
+ * RESOURCE_UNREF -- so the capset query fell through to the default case, got
+ * a bare OK, and the driver sat waiting five seconds for an answer it had
+ * already been given. "timed out waiting for cap set 0" was that.
+ */
 #define VIRTIO_GPU_CMD_GET_DISPLAY_INFO		0x0100
-#define VIRTIO_GPU_CMD_GET_CAPSET_INFO		0x0102
-#define VIRTIO_GPU_CMD_GET_CAPSET		0x0103
-#define VIRTIO_GPU_CMD_GET_EDID			0x0104
+#define VIRTIO_GPU_CMD_RESOURCE_CREATE_2D	0x0101
+#define VIRTIO_GPU_CMD_RESOURCE_UNREF		0x0102
+#define VIRTIO_GPU_CMD_SET_SCANOUT		0x0103
+#define VIRTIO_GPU_CMD_RESOURCE_FLUSH		0x0104
+#define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D	0x0105
+#define VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING	0x0106
+#define VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING	0x0107
+#define VIRTIO_GPU_CMD_GET_CAPSET_INFO		0x0108
+#define VIRTIO_GPU_CMD_GET_CAPSET		0x0109
+#define VIRTIO_GPU_CMD_GET_EDID			0x010a
+#define VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID	0x010b
+#define VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB	0x010c
+
 #define VIRTIO_GPU_CMD_CTX_CREATE		0x0200
 #define VIRTIO_GPU_CMD_CTX_DESTROY		0x0201
+#define VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE	0x0202
+#define VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE	0x0203
+#define VIRTIO_GPU_CMD_RESOURCE_CREATE_3D	0x0204
+#define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D	0x0205
+#define VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D	0x0206
 #define VIRTIO_GPU_CMD_SUBMIT_3D		0x0207
 
 #define VIRTIO_GPU_RESP_OK_NODATA		0x1100
@@ -174,6 +198,8 @@ struct gpu_stats {
 	unsigned long long requests;
 	unsigned long long fenced;
 	unsigned long long refused;
+	unsigned long long submits;
+	unsigned long long cmd_bytes;
 	unsigned long long by_type[16];
 };
 
@@ -193,6 +219,14 @@ static uint32_t serve(struct cogpu_chain *chain)
 {
 	struct virtio_gpu_ctrl_hdr req, *resp;
 	uint32_t type;
+	/*
+	 * How many bytes the reply actually occupies. This is published in the
+	 * used ring and it is not decoration: a response carrying a payload
+	 * that claims to be only a header long is a short reply, and the driver
+	 * waits for the rest of an answer that has already been given. That is
+	 * what "timed out waiting for cap set 0" was.
+	 */
+	uint32_t written;
 
 	if (chain->in_count == 0 || chain->in[0].len < sizeof(req) ||
 	    chain->out_count == 0 || chain->out[0].len < sizeof(*resp)) {
@@ -205,6 +239,7 @@ static uint32_t serve(struct cogpu_chain *chain)
 
 	resp = (struct virtio_gpu_ctrl_hdr *)chain->out[0].addr;
 	memset(resp, 0, sizeof(*resp));
+	written = sizeof(*resp);
 
 	switch (type) {
 	case VIRTIO_GPU_CMD_GET_DISPLAY_INFO:
@@ -214,24 +249,132 @@ static uint32_t serve(struct cogpu_chain *chain)
 		 * render-only device should say.
 		 */
 		resp->type = VIRTIO_GPU_RESP_OK_DISPLAY_INFO;
-		if (chain->out[0].len > sizeof(*resp))
+		if (chain->out[0].len > sizeof(*resp)) {
 			memset((char *)resp + sizeof(*resp), 0,
 			       chain->out[0].len - sizeof(*resp));
+			written = chain->out[0].len;
+		}
 		break;
 
-	case VIRTIO_GPU_CMD_GET_CAPSET_INFO:
-	case VIRTIO_GPU_CMD_GET_CAPSET:
+	case VIRTIO_GPU_CMD_GET_CAPSET_INFO: {
 		/*
-		 * Refused for now, and honestly: capsets describe what the
-		 * renderer can do, and there is no renderer yet. Advertising a
-		 * capability here would be a lie Mesa would then act on.
+		 * What the renderer can actually do, asked of virglrenderer
+		 * rather than asserted. A hand-written capset tells Mesa the
+		 * host supports things this GL context does not, and Mesa then
+		 * emits commands that fail a long way from here.
+		 *
+		 * The guest asks by INDEX and we answer with an ID, and the two
+		 * are not the same thing. Mesa's virgl driver wants
+		 * VIRTIO_GPU_CAPSET_VIRGL2 (id 2) -- offering only id 1 gets
+		 * "No virgl contexts available on host" and a silent fall back
+		 * to llvmpipe, which looks exactly like the device not working.
 		 */
-		resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+		struct { uint32_t capset_index, pad; } q;
+		struct { uint32_t capset_id, version, size, pad; } *info =
+			(void *)((char *)resp + sizeof(*resp));
+
+		if (chain->out[0].len < sizeof(*resp) + sizeof(*info)) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
+		memset(&q, 0, sizeof(q));
+		if (chain->in[0].len >= sizeof(req) + sizeof(q))
+			memcpy(&q, (char *)chain->in[0].addr + sizeof(req), sizeof(q));
+
+		/* index 0 -> VIRGL (1), index 1 -> VIRGL2 (2) */
+		info->capset_id = (q.capset_index == 0) ? 1 : 2;
+		cogpu_vrend_capset(info->capset_id, &info->version, &info->size);
+		info->pad = 0;
+
+		if (verbose)
+			logline("  capset index %u -> id %u, version %u, %u bytes\n",
+				q.capset_index, info->capset_id,
+				info->version, info->size);
+
+		resp->type = VIRTIO_GPU_RESP_OK_CAPSET_INFO;
+		written	   = sizeof(*resp) + sizeof(*info);
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_GET_CAPSET: {
+		struct { uint32_t capset_id, capset_version; } req2;
+
+		if (chain->in[0].len < sizeof(req) + sizeof(req2)) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+		memcpy(&req2, (char *)chain->in[0].addr + sizeof(req), sizeof(req2));
+		if (chain->out_count > 0 && chain->out[0].len > sizeof(*resp)) {
+			cogpu_vrend_fill_caps(req2.capset_id, req2.capset_version,
+					      (char *)resp + sizeof(*resp));
+			written = chain->out[0].len;
+		}
+		resp->type = VIRTIO_GPU_RESP_OK_CAPSET;
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_CTX_CREATE: {
+		struct { uint32_t namelen, ctx_init; char name[64]; } c;
+
+		memset(&c, 0, sizeof(c));
+		if (chain->in[0].len >= sizeof(req) + 8)
+			memcpy(&c, (char *)chain->in[0].addr + sizeof(req),
+			       (chain->in[0].len - sizeof(req)) < sizeof(c)
+			       ? chain->in[0].len - sizeof(req) : sizeof(c));
+
+		if (cogpu_vrend_ctx_create(req.ctx_id, c.name,
+					   c.namelen > 63 ? 63 : c.namelen) == 0)
+			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+		else
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_CTX_DESTROY:
+		cogpu_vrend_ctx_destroy(req.ctx_id);
+		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 		break;
 
-	case VIRTIO_GPU_CMD_CTX_CREATE:
-	case VIRTIO_GPU_CMD_CTX_DESTROY:
-	case VIRTIO_GPU_CMD_SUBMIT_3D:
+	case VIRTIO_GPU_CMD_SUBMIT_3D: {
+		/*
+		 * The command stream itself. Everything after the request
+		 * header in the readable half is virgl commands; hand it to
+		 * the renderer, which copies it before decoding (see vrend.c
+		 * for why that copy is not optional).
+		 */
+		struct { uint32_t size, num_in_fences; } sub;
+		const char *cmds;
+		uint32_t avail;
+
+		if (chain->in[0].len < sizeof(req) + sizeof(sub)) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+		memcpy(&sub, (char *)chain->in[0].addr + sizeof(req), sizeof(sub));
+
+		cmds  = (const char *)chain->in[0].addr + sizeof(req) + sizeof(sub);
+		avail = chain->in[0].len - sizeof(req) - sizeof(sub);
+		if (sub.size > avail && chain->in_count > 1) {
+			/* the stream is in the next descriptor */
+			cmds  = (const char *)chain->in[1].addr;
+			avail = chain->in[1].len;
+		}
+		if (sub.size > avail) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
+		if (cogpu_vrend_submit(req.ctx_id, cmds, sub.size) == 0) {
+			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+			g_stats.submits++;
+			g_stats.cmd_bytes += sub.size;
+		} else {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+		}
+		break;
+	}
+
 	default:
 		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 		break;
@@ -253,7 +396,7 @@ static uint32_t serve(struct cogpu_chain *chain)
 		       (req.flags & VIRTIO_GPU_FLAG_FENCE) ? " (fenced)" : "",
 		       resp->type);
 
-	return sizeof(*resp);
+	return written;
 }
 
 /* ------------------------------------------------------------------- main */
@@ -304,6 +447,24 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/*
+	 * The renderer, before anything else that matters. If it will not come
+	 * up there is no point servicing a ring: the guest would get OK to
+	 * everything and render nothing, which is worse than a device that
+	 * refuses honestly.
+	 */
+	if (cogpu_vrend_init(NULL, NULL) != 0) {
+		logline("virglrenderer would not initialise -- no GPU today\n");
+		return 1;
+	}
+	logline("renderer: %s\n", cogpu_vrend_renderer());
+	{
+		unsigned int v = 0, sz = 0;
+
+		cogpu_vrend_capset(1, &v, &sz);
+		logline("virgl capset: version %u, %u bytes\n", v, sz);
+	}
+
 	handle = co_os_manager_open();
 	if (!handle) {
 		logline("cannot open the driver -- is it started?\n");
@@ -316,10 +477,35 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (!CO_OK(co_manager_kmap(handle, 0, g_map))) {
-		logline("KMAP failed -- is a guest running?\n");
-		co_os_manager_close(handle);
-		return 1;
+	/*
+	 * Wait for a guest rather than requiring one.
+	 *
+	 * moco-boot.vbs starts this a fraction of a second after the boot
+	 * daemon, and guest RAM does not exist until that daemon has allocated
+	 * it -- so a daemon that demanded a guest at startup exited instantly
+	 * every time it was launched the normal way, and only ever worked when
+	 * started by hand afterwards. The transport was written to tolerate a
+	 * LATE daemon; this is the other half, tolerating an early one.
+	 *
+	 * Bounded, because a daemon that waits forever for a guest that is
+	 * never coming is a process someone has to find and kill.
+	 */
+	{
+		int tries;
+
+		for (tries = 0; tries < 120; tries++) {
+			if (CO_OK(co_manager_kmap(handle, 0, g_map)))
+				break;
+			if (tries == 0)
+				logline("waiting for a guest...\n");
+			Sleep(500);
+		}
+
+		if (tries >= 120) {
+			logline("no guest after 60 s -- exiting\n");
+			co_os_manager_close(handle);
+			return 1;
+		}
 	}
 	logline("mapped %lu slices, %llu MB of guest RAM\n",
 	       g_map->count, g_map->total_bytes >> 20);
@@ -329,7 +515,17 @@ int main(int argc, char **argv)
 	 * the boot record; this daemon asks the driver for it rather than
 	 * guessing, because the address moves with every kernel build.
 	 */
-	if (!CO_OK(co_manager_vgpu_address(handle, &vgpu_va)) || !vgpu_va) {
+	{
+		int tries;
+
+		for (tries = 0; tries < 120; tries++) {
+			if (CO_OK(co_manager_vgpu_address(handle, &vgpu_va)) && vgpu_va)
+				break;
+			Sleep(500);
+		}
+	}
+
+	if (!vgpu_va) {
 		logline("the guest has no vgpu transport (old kernel?)\n");
 		co_manager_kunmap(handle, NULL);
 		co_os_manager_close(handle);
@@ -467,6 +663,8 @@ int main(int argc, char **argv)
 
 	logline("\nrequests %llu, fenced %llu, refused %llu, sweeps %llu\n",
 	       g_stats.requests, g_stats.fenced, g_stats.refused, sweeps);
+	logline("3D submits %llu, %llu command bytes, %llu fences from the renderer\n",
+	       g_stats.submits, g_stats.cmd_bytes, cogpu_vrend_fences());
 
 	io->enabled = 0;
 	co_manager_kunmap(handle, NULL);

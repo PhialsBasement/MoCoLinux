@@ -47,12 +47,14 @@ winnt_daemon_libs = [
 # is not visible from inside a function body. Defaults are evaluated at def
 # time, where it is.
 
-def generate_options(compiler_def_type, libs=None, lflags=None,
+def generate_options(compiler_def_type, libs=None, lflags=None, ladd=None,
                      winnt_daemon_libs=winnt_daemon_libs):
     if not libs:
         libs = []
     if not lflags:
         lflags = []
+    if not ladd:
+        ladd = []
     # This file is exec'd with separate globals and locals, so the import at the
     # top of it is not visible from inside a function body.
     from comake.settings import settings
@@ -119,6 +121,9 @@ def generate_options(compiler_def_type, libs=None, lflags=None,
         # runtime, and a second missing-DLL dialog is no better than the first.
         #
         linker_flags = lflags + [ '-static' ] + crt_flags,
+        # After the objects, which is where a library has to be for ld to
+        # resolve anything from it.
+        linker_add = ladd,
         compiler_libs = libs + winnt_daemon_libs + crt + ['shlwapi']),
     )
 
@@ -269,12 +274,27 @@ targets['kmap-test.exe'] = Target(
 # -- an ordinary userspace program that services one of the guest's device
 # rings -- and it lives in userspace because that is where WGL and the NVIDIA
 # driver are. Will embed virglrenderer at R5.
+# Links virglrenderer and libepoxy from the cross build in download/, plus the
+# WGL winsys R2 wrote. The renderer is what turns a guest command stream into
+# GL on the host's card.
+VIRGL_PREFIX = '/mnt/big-bricks/RProject/MoCoLinux/download/prefix-mingw'
+
 targets['cogpu-daemon.exe'] = Target(
     inputs = [
         Input('../user/cogpu-daemon/build.o'),
     ] + user_dep,
     tool = Compiler(),
-    mono_options = generate_options('gcc'),
+    # The import libraries are named outright rather than with -l, because
+    # generate_options passes -static (so every daemon carries its runtime
+    # rather than needing DLLs beside it) and -static makes ld skip .dll.a
+    # entirely. Naming the archives directly still works: an import library is
+    # a static archive of stubs.
+    mono_options = generate_options(
+        'gcc',
+        libs = ['opengl32'],
+        ladd = [VIRGL_PREFIX + '/lib/libvirglrenderer.dll.a',
+                VIRGL_PREFIX + '/lib/libepoxy.dll.a'],
+    ),
 )
 
 targets['colinux-console-fltk.exe'] = Target(

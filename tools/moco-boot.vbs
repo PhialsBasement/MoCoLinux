@@ -121,7 +121,7 @@ shell.Run """" & moco & "\colinux-slirp-net-daemon.exe"" -R", HIDDEN, NOWAIT
 ' does not exist until the boot daemon has allocated it. The transport
 ' tolerates a late daemon by design, so this ordering is safe rather than
 ' merely convenient.
-shell.Run """" & moco & "\cogpu-daemon.exe""", HIDDEN, NOWAIT
+shell.Run """" & moco & "\cogpu-daemon.exe"" --verbose", HIDDEN, NOWAIT
 shell.Run """" & moco & "\colinux-daemon.exe"" --console 2323", HIDDEN, NOWAIT
 
 ' The X server last, so the guest's windows have somewhere to go. It checks for
