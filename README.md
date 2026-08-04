@@ -82,7 +82,42 @@ its own `.bss` (one writer per word per direction). Frames are stored whole:
 The host reads the rings by walking the guest's page tables; the base address
 is retired under a lock before the address space is freed. NAT is coLinux's
 vendored slirp, run in a process confined to a 2 GB address space so its
-32-bit queue links can hold pointers.
+32-bit queue links can hold pointers. `-r tcp:2222:22` redirects a host port
+into the guest (the image runs sshd, which is a far better instrument than a
+serial console for diagnosing anything graphical).
+
+### Graphics
+
+The guest has a real GPU device: virtio-gpu, render-only, over a transport
+with no traps in it. MMIO transports work because a store to a fake register
+traps; nothing traps in this design, so every "register" is a plain store
+into a structure in guest RAM, and the kick is a counter that
+`cogpu-daemon.exe` spin-polls from another core. No ioctl and no world switch
+in the submission path — 2000 context round trips from a guest client measure
+a 3 µs median.
+
+```
+  guest: Mesa/virgl ─► virtio rings in guest RAM ◄── cogpu-daemon.exe
+         /dev/dri/renderD128                          │ (persistent user-mode
+                                                      │  windows onto guest RAM)
+                                                      ▼
+                                            virglrenderer ─► WGL ─► the card
+```
+
+The daemon maps the whole of guest RAM into its own address space through
+persistent user-mode windows (KMAP, 8 MB slices), so it parses requests and
+writes replies in place, and a resource's backing — the guest's list of
+{guest physical address, length} — becomes iovecs pointing straight into the
+guest's pages. Zero copies on the command path. virglrenderer, cross-built
+for mingw behind a WGL winsys, replays the guest's GL onto the host's actual
+card: the guest reports `virgl (GeForce GT 730/PCIe/SSE2)`, GL 4.2, where
+indirect GLX gave it 1.4 in software.
+
+Presentation is VirtualGL: applications run through the `moco-gl` wrapper,
+render on `/dev/dri/renderD128`, and the finished frames are pushed into the
+same VcXsrv windows, so windows stay native and rootless while the drawing
+happens on the GPU. Every desktop shortcut is wrapped — a program that issues
+no GL call loses nothing, and one that does never falls back to llvmpipe.
 
 ## Status
 
@@ -100,6 +135,12 @@ Windows XP x64 and Windows 7 x64:
 - Networking: guest ethernet device, host NAT, static address via
   `systemd-networkd`; pacman installs a 791-package desktop over HTTPS at
   16 MB/s
+- Hardware-accelerated OpenGL on the host's card: virtio-gpu in the guest,
+  virglrenderer on the host, VirtualGL to the windows. Firefox renders through
+  virgl on the GT 730 with zero renderer errors; guest Xorg with glamor
+  reports direct rendering; `colinux-daemon --run moco-gl glxgears` — the
+  exact command a desktop shortcut issues — draws at 128 fps
+- Inbound port redirects (`-r tcp:2222:22` reaches the guest's sshd)
 - 32-bit binaries (the guest keeps its own `int $0x80` gate)
 - Landlock and user namespaces (required by pacman 7 and modern sandboxes)
 - Virtual time from the host clock; clean shutdown; stop-on-demand from
@@ -110,8 +151,8 @@ Windows XP x64 and Windows 7 x64:
   unit); console latency stays at 16–125 ms through a full package install.
   `--sync-cobd` restores the synchronous path for comparison
 - Self-installing: `mocolinux-setup.exe` lays down driver, daemons, kernel,
-  X server and launchers, then boots Linux and builds a Manjaro system on a
-  fresh image over the network
+  the GPU daemon with virglrenderer, X server and launchers, then boots Linux
+  and builds a Manjaro system on a fresh image over the network
 
 Not yet:
 
@@ -119,9 +160,14 @@ Not yet:
 - The coLinux message layer (`co_monitor_t`, queues, reactor), so upstream's
   `cocon`/`conet` consoles and devices — including `colinux-console-nt` —
   cannot attach
-- DHCP in the guest (static address only); inbound port redirects
-- Hardware-accelerated OpenGL beyond GLX 1.4 (applications render in llvmpipe
-  on the guest's single core — the main reason the desktop feels slow)
+- DHCP in the guest (static address only)
+- Presentation off TCP. The drawing happens on the GPU, but every finished
+  frame still reaches the screen through VirtualGL's image transport over the
+  X protocol, through slirp's NAT — a userspace TCP stack is now the
+  frame-rate ceiling on a path that ends at a real card. The plan is to take
+  presentation off TCP entirely and hand frames to the host through guest
+  RAM, the same zero-copy R3 windows the GPU command stream already rides
+  (parked on the `r6-window-presentation` branch)
 - A repaired incremental patch series: `patch/7.1.5/current-tree-snapshot.diff`
   is the authoritative guest-side diff and is deliberately not in `series`
 
@@ -140,10 +186,12 @@ workaround; pseudo-physical memory is the fix. Both are in `TODO`.
 | `src/colinux/kernel/cobd.c` | cooperative block device, host half |
 | `src/colinux/kernel/console.c` | terminal rings, host half |
 | `src/colinux/kernel/net.c` | network rings, host half — read, consume, inject |
+| `src/colinux/kernel/vgpu.c` | virtio-gpu transport, host half — publish, retire, idle gate |
+| `src/colinux/os/winnt/user/cogpu-daemon/` | the GPU device: vring service, virglrenderer, the WGL winsys |
 | `src/colinux/user/conet_ring.c` | the ring format and its decoder, shared by both readers |
 | `src/colinux/user/slirp/` | vendored slirp, with its Win64 repairs |
 | `src/colinux/user/elf_load.c` | the daemon: ELF loading, symbol resolution, boot |
-| `patch/7.1.5/` | the guest-side kernel changes, including `drivers/net/conet_colinux.c` |
+| `patch/7.1.5/` | the guest-side kernel changes, including `conet_colinux.c` and the trapless virtio transport `vgpu-src/virtio_colinux.c` |
 | `tools/mkmanjarorootfs.sh` | builds the Manjaro desktop image |
 | `tools/mkrootfs.sh` | builds the minimal BusyBox bring-up image |
 | `tools/coterm.py` | client for the guest's console port |
@@ -197,6 +245,7 @@ colinux-daemon.exe --boot-kernel vmlinux --max-switches none \
                    --cobd0 \??\C:\path\to\root.img
 colinux-daemon.exe --console 2323          (a second process: a terminal)
 colinux-slirp-net-daemon.exe -R            (a third: NAT for the guest)
+cogpu-daemon.exe                           (a fourth: the guest's GPU)
 colinux-daemon.exe --run konsole           (start one app in a running guest)
 ```
 
@@ -208,6 +257,9 @@ colinux-daemon.exe --run konsole           (start one app in a running guest)
 - For a desktop, start an X server on the Windows side in multiwindow mode
   (`vcxsrv :0 -multiwindow -ac`, or `dist-x64/xstart.bat`) and run X clients
   in the guest. `DISPLAY=10.0.2.2:0` is already in the image's environment.
+  Run GL applications through `moco-gl` (every installed shortcut already
+  does); `moco-gl glxinfo | grep renderer` is how to check the card is
+  actually being used rather than trusting it.
 - `tools/mkrootfs.sh` builds the minimal BusyBox image (`--init /bin/sh`);
   `tools/mkmanjarorootfs.sh` builds the Manjaro desktop image (needs a Linux
   host with `pacman` and `e2fsprogs`; handles the alpm skeleton, package
