@@ -121,8 +121,9 @@ no GL call loses nothing, and one that does never falls back to llvmpipe.
 
 ## Status
 
-Working, verified on hardware (Lenovo ThinkCentre M92p, i5-3470) under both
-Windows XP x64 and Windows 7 x64:
+Working, verified on hardware (Lenovo ThinkCentre M92p, i5-3470) under Windows
+XP x64, Windows 7 x64 and Windows 8.1 x64 — see [Windows 8 and
+8.1](#windows-8-and-81) for what that host asks for:
 
 - Boots Manjaro with systemd to multi-user target, no failed units, from an
   image the tree builds (`tools/mkmanjarorootfs.sh`)
@@ -270,6 +271,49 @@ colinux-daemon.exe --run konsole           (start one app in a running guest)
   guest, or by unloading the driver.
 - `--net-dump` prints the guest's network rings and decodes their frames
   read-only; `--net-take` does the same and consumes them.
+
+## Windows 8 and 8.1
+
+Supported and verified on hardware, with everything the XP and 7 hosts do —
+including hardware-accelerated OpenGL on the host's card.
+
+![Manjaro on Windows 8.1: fastfetch reporting virgl on the GT 730, KDE's About
+this System showing the virtual graphics processor, and cmd.exe showing
+6.3.9600](doc/img/mocolinux-win81-desktop.png)
+
+NT 6.x asks for four things XP never did. The installer handles all of them and
+refuses to continue rather than half-install if it cannot:
+
+- **Secure Boot must be off.** A test-signed driver cannot load with it on, and
+  nothing later in the install can work around that, so the suitability check
+  stops there with the firmware steps spelled out.
+- **Test signing must be on.** The installer enables it and reboots; the driver
+  *service* is created after that reboot, not before, because creating it while
+  signing is still enforced leaves a service that can never start.
+- **No hypervisor.** Hyper-V, VBS/HVCI or a running VM means the guest is not
+  at ring 0 on real hardware. Checked via CPUID leaf 1 ECX bit 31.
+- **Elevation.** `mocolinux-setup.exe` carries a `requireAdministrator`
+  manifest. The logon entry cannot: UAC runs Startup-folder shortcuts with the
+  filtered token, so `moco-boot.vbs` re-launches itself through the `runas`
+  verb on NT 6 and later. Without that the X server came up, the desktop looked
+  like a working install, `sc start CoLinuxDriver` was silently refused, and
+  only the Linux half was missing.
+
+Two smaller differences from XP:
+
+- **No telnet client.** It has been an optional Windows feature, off by
+  default, since Vista. The terminal shortcut goes through `moco-term.bat`,
+  which offers to enable it and otherwise says which box to tick.
+- **User-space mappings land above 4 GB.** XP and 7 place the driver's MDL
+  mappings of guest RAM low; 8.1 does not. `co_manager_kmap` reported those
+  addresses through an `unsigned long`, which is 32 bits under LLP64, so every
+  slice above 4 GB lost its top half and the GPU daemon dereferenced half a
+  pointer. Fixed; noted here because it is the one place where the host version
+  changed behaviour rather than policy, and because the same truncation class
+  has bitten `vm_ptr_t`, the host ISR address and `snprintf %p` in this tree.
+
+Windows 8 (6.2) shares all of the above and is expected to work, but has not
+been run on hardware.
 
 ## Porting notes
 
