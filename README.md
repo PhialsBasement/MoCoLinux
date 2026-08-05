@@ -1,8 +1,8 @@
 # MoCoLinux
 
 Cooperative Linux for x86-64: a modern Linux kernel running as a guest inside
-Windows XP x64 and Windows 7 x64 on real hardware, without a hypervisor,
-emulation, or virtualization extensions. It is a port of
+Windows XP x64, Windows 7 x64 and Windows 8.1 x64 on real hardware, without a
+hypervisor, emulation, or virtualization extensions. It is a port of
 [coLinux](http://colinux.org/) (i386, unmaintained since ~2011) to x86-64,
 against a 2026 kernel.
 
@@ -31,9 +31,15 @@ host's loopback).
 
 The same driver, kernel and root image on Windows 7 x64 — Dolphin, Kate and
 Konsole with Aero frames and taskbar buttons, `fastfetch` reporting the
-ThinkCentre's own i5-3470. One binary serves both hosts: XP ignores embedded
-signatures, and Windows 7 accepts the same test-signed driver once
-`bcdedit /set testsigning on` is in force, which Setup does for you.
+ThinkCentre's own i5-3470.
+
+![The same guest again on Windows 8.1 x64, with cmd.exe reporting 6.3.9600 beside it](doc/img/mocolinux-win81-desktop.png)
+
+And the same again on Windows 8.1 x64, `cmd.exe` reporting 6.3.9600 next to
+KDE's own report of the card. One binary serves all three hosts: XP ignores
+embedded signatures, while Windows 7 and 8.1 accept the same test-signed driver
+once `bcdedit /set testsigning on` is in force, which Setup does for you. 8.1
+asks for a little more besides — see [Windows 8 and 8.1](#windows-8-and-81).
 
 ## How it works
 
@@ -275,24 +281,23 @@ colinux-daemon.exe --run konsole           (start one app in a running guest)
 ## Windows 8 and 8.1
 
 Supported and verified on hardware, with everything the XP and 7 hosts do —
-including hardware-accelerated OpenGL on the host's card.
+including hardware-accelerated OpenGL on the host's card (screenshot above).
 
-![Manjaro on Windows 8.1: fastfetch reporting virgl on the GT 730, KDE's About
-this System showing the virtual graphics processor, and cmd.exe showing
-6.3.9600](doc/img/mocolinux-win81-desktop.png)
+Two of the following apply to Windows 7 as well, which is NT 6.1: it wants
+testsigning and it has UAC. The other two are what 8.1 adds. The installer
+handles all four and refuses to continue rather than half-install if it cannot:
 
-NT 6.x asks for four things XP never did. The installer handles all of them and
-refuses to continue rather than half-install if it cannot:
-
-- **Secure Boot must be off.** A test-signed driver cannot load with it on, and
-  nothing later in the install can work around that, so the suitability check
-  stops there with the firmware steps spelled out.
-- **Test signing must be on.** The installer enables it and reboots; the driver
-  *service* is created after that reboot, not before, because creating it while
-  signing is still enforced leaves a service that can never start.
-- **No hypervisor.** Hyper-V, VBS/HVCI or a running VM means the guest is not
-  at ring 0 on real hardware. Checked via CPUID leaf 1 ECX bit 31.
-- **Elevation.** `mocolinux-setup.exe` carries a `requireAdministrator`
+- **Secure Boot must be off** *(8.1)*. A test-signed driver cannot load with it
+  on, and nothing later in the install can work around that, so the suitability
+  check stops there with the firmware steps spelled out.
+- **Test signing must be on** *(7 and 8.1)*. The installer enables it and
+  reboots; the driver *service* is created after that reboot, not before,
+  because creating it while signing is still enforced leaves a service that can
+  never start.
+- **No hypervisor** *(8.1)*. Hyper-V, VBS/HVCI or a running VM means the guest
+  is not at ring 0 on real hardware. Checked via CPUID leaf 1 ECX bit 31.
+- **Elevation** *(7 and 8.1)*. `mocolinux-setup.exe` carries a
+  `requireAdministrator`
   manifest. The logon entry cannot: UAC runs Startup-folder shortcuts with the
   filtered token, so `moco-boot.vbs` re-launches itself through the `runas`
   verb on NT 6 and later. Without that the X server came up, the desktop looked
