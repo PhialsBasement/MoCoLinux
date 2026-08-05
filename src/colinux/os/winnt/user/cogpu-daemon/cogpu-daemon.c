@@ -997,8 +997,43 @@ int main(int argc, char **argv)
 			return 1;
 		}
 	}
-	logline("mapped %lu slices, %llu MB of guest RAM\n",
-	       g_map->count, g_map->total_bytes >> 20);
+	logline("mapped %lu slices, %llu MB of guest RAM"
+		" (driver tag 0x%08lx -> valid=%lu, %lu pages)\n",
+	       g_map->count, g_map->total_bytes >> 20,
+	       (unsigned long)g_map->max_slice,
+	       (g_map->max_slice >> 16) & 0xff,
+	       g_map->max_slice & 0xffff);
+
+	/*
+	 * Is ANY of it actually here?
+	 *
+	 * The driver reports slices and addresses and the first read of guest
+	 * memory faults, so the two possibilities are "one range is wrong" and
+	 * "none of them landed in this process at all". Sampling the first and
+	 * last range answers that in one line instead of another hour.
+	 */
+	{
+		unsigned long probe[2];
+		int p;
+
+		probe[0] = 0;
+		probe[1] = g_map->count ? g_map->count - 1 : 0;
+
+		for (p = 0; p < 2; p++) {
+			co_kmap_range_t *r = &g_map->range[probe[p]];
+			MEMORY_BASIC_INFORMATION mbi;
+			char *at = (char *)(size_t)r->user_va;
+
+			ZeroMemory(&mbi, sizeof(mbi));
+			VirtualQuery(at, &mbi, sizeof(mbi));
+			logline("  probe range %lu: user_va 0x%llx -> state 0x%lx"
+				" protect 0x%lx region 0x%llx\n",
+				probe[p], r->user_va,
+				(unsigned long)mbi.State,
+				(unsigned long)mbi.Protect,
+				(unsigned long long)mbi.RegionSize);
+		}
+	}
 
 	/*
 	 * Where the transport structure is. The loader knows, and puts it in
@@ -1030,6 +1065,9 @@ int main(int argc, char **argv)
 	 */
 	{
 		unsigned long long gpa = 0;
+		int tries;
+		/* 0 means the driver's default (8 MB); halved on each retry. */
+		unsigned long slice = 0;
 
 		if (!CO_OK(co_manager_kvirt_to_phys(handle, vgpu_va, &gpa))) {
 			logline("could not resolve the transport's address\n");
@@ -1037,14 +1075,229 @@ int main(int argc, char **argv)
 			co_os_manager_close(handle);
 			return 1;
 		}
-		io = (struct co_vgpu_io_abi *)resolve_gpa(NULL, gpa, sizeof(*io));
+
+		/*
+		 * Re-map until the transport's page is actually in the window.
+		 *
+		 * The mapping is not all-or-nothing and it is not stable across
+		 * runs: two consecutive starts on the same guest mapped 129
+		 * slices / 1028 MB and then 86 slices / 684 MB. The driver hands
+		 * back the ranges it could place in this process's address space
+		 * at that moment, and this daemon used to accept whatever came,
+		 * report the total, and only discover 200 lines later that the
+		 * page it actually needs was in the missing third -- as an access
+		 * violation on the first read, because resolve_gpa answers "is
+		 * this inside a mapped range", which a short mapping makes a
+		 * different question from "is this mapped".
+		 *
+		 * The transport lives in the guest kernel's .bss, near the top of
+		 * guest RAM, so it is precisely what a short mapping loses first.
+		 *
+		 * So: ask, check the one page that matters, and if it is not
+		 * there drop the mapping and ask again. Nothing else in the
+		 * process holds it yet, and a fresh attempt gets a fresh
+		 * placement -- which is why the two runs above differed at all.
+		 */
+		for (tries = 0; tries < 30; tries++) {
+			MEMORY_BASIC_INFORMATION mbi;
+			unsigned long j;
+
+			/*
+			 * Every range that could hold it, not just the first.
+			 *
+			 * resolve_gpa returns the first range whose [pa, pa+bytes)
+			 * contains the address and stops. That is the right answer
+			 * only if the ranges are disjoint -- and the evidence says
+			 * they are not: the chosen range reported an 8 MB slice
+			 * whose mapping demonstrably ended at 0x6AE000, at exactly
+			 * the offset being asked for, at three different base
+			 * addresses across three runs. A boundary that follows the
+			 * request rather than the allocation is not a short
+			 * mapping; it is the wrong range.
+			 *
+			 * So ask each candidate whether its computed address is
+			 * really there, and take the first that is. A range that
+			 * overlaps another, or whose pa is stale, then costs a
+			 * VirtualQuery instead of an access violation.
+			 */
+			io = NULL;
+			for (j = 0; g_map && j < g_map->count; j++) {
+				co_kmap_range_t *r = &g_map->range[j];
+				char *cand;
+
+				if (gpa < r->pa || gpa + sizeof(*io) > r->pa + r->bytes)
+					continue;
+
+				cand = (char *)(size_t)(r->user_va + (gpa - r->pa));
+
+				ZeroMemory(&mbi, sizeof(mbi));
+				if (VirtualQuery(cand, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+				    mbi.State != MEM_FREE &&
+				    !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+				    (size_t)((char *)mbi.BaseAddress + mbi.RegionSize -
+					     cand) >= sizeof(*io)) {
+					io = (struct co_vgpu_io_abi *)cand;
+					logline("transport found in range %lu"
+						" (pa 0x%llx user_va 0x%llx)\n",
+						j, r->pa, r->user_va);
+					break;
+				}
+			}
+			if (io)
+				break;
+
+			/*
+			 * Name the range, not just the verdict.
+			 *
+			 * "in a range but not backed" is where this stalled: it
+			 * says the arithmetic found something and the memory
+			 * disagreed, which is exactly the pair of facts that
+			 * cannot be told apart without seeing the range itself.
+			 * Either the driver reported a slice it did not map, or
+			 * user_va + (gpa - pa) is not where that slice landed.
+			 */
+			{
+				unsigned long j;
+
+				logline("attempt %d: transport at guest physical"
+					" 0x%llx is %s (%lu slices, %llu MB)\n",
+					tries + 1, gpa,
+					io ? "in a range but not backed"
+					   : "outside every mapped range",
+					g_map ? g_map->count : 0,
+					g_map ? (g_map->total_bytes >> 20) : 0);
+
+				for (j = 0; g_map && j < g_map->count; j++) {
+					co_kmap_range_t *r = &g_map->range[j];
+
+					if (gpa >= r->pa && gpa < r->pa + r->bytes) {
+						logline("  range %lu: pa 0x%llx"
+							" bytes 0x%llx user_va"
+							" 0x%llx -> computed"
+							" 0x%llx\n",
+							j, r->pa, r->bytes,
+							r->user_va,
+							r->user_va + (gpa - r->pa));
+						break;
+					}
+				}
+				if (g_map && j >= g_map->count)
+					logline("  no range contains it; first pa"
+						" 0x%llx, last pa 0x%llx + 0x%llx\n",
+						g_map->range[0].pa,
+						g_map->range[g_map->count - 1].pa,
+						g_map->range[g_map->count - 1].bytes);
+			}
+
+			/*
+			 * Remap in smaller slices.
+			 *
+			 * The mapping is not always as long as the range says it
+			 * is. Measured on Windows 8.1: range 4 reported pa
+			 * 0xdbc00000, bytes 0x800000, user_va 0x8d8e0000 -- and
+			 * VirtualQuery found free address space beginning at
+			 * 0x8df8e000, so only 0x6AE000 of that 8 MB slice was
+			 * actually there. The transport sat past the end of it,
+			 * which is why the first read of the 'VGPU' magic was an
+			 * access violation and why every retry at the same size
+			 * failed identically.
+			 *
+			 * Halving the slice each time costs more entries -- the
+			 * ioctl allows 256, and 1 GB needs 129 at 8 MB, so there
+			 * is room down to 4 MB and then the count becomes the
+			 * limit. Smaller requests are what a fragmented user
+			 * address space can actually satisfy whole, which is the
+			 * property being bought.
+			 */
+			io = NULL;
+			co_manager_kunmap(handle, NULL);
+			g_last_hit = 0;
+			Sleep(200);
+
+			if (slice == 0)
+				slice = 8u << 20;	/* the default we just had */
+			if (slice > (1u << 20))
+				slice >>= 1;
+
+			if (!CO_OK(co_manager_kmap(handle, slice, g_map))) {
+				logline("could not map guest RAM on retry"
+					" (slice %lu KB)\n", slice >> 10);
+				co_os_manager_close(handle);
+				return 1;
+			}
+			logline("  remapped %lu slices of %lu KB, %llu MB\n",
+				g_map->count, slice >> 10,
+				g_map->total_bytes >> 20);
+		}
 	}
 
-	if (!io || io->magic != CO_VGPU_MAGIC) {
-		logline("the transport structure is not where it should be\n");
-		co_manager_kunmap(handle, NULL);
-		co_os_manager_close(handle);
-		return 1;
+	/*
+	 * Read the magic behind an exception handler, because a pointer from
+	 * resolve_gpa is arithmetic and not a promise.
+	 *
+	 * resolve_gpa only asks whether a guest-physical address falls inside a
+	 * mapped range and returns user_va + offset. It cannot ask whether the
+	 * page behind that address is actually backed, so a non-NULL return says
+	 * "this is inside guest RAM", not "this is readable now". The NULL guard
+	 * below therefore passes and the very first dereference is what finds
+	 * out -- as an access violation, which took the whole daemon down.
+	 *
+	 * Seen on Windows 8.1, first boot after an install: the daemon mapped
+	 * 1028 MB across 129 slices, resolved the transport's address, and died
+	 * on the magic read (0xC0000005 at +0x75ba, the cmpl against 'VGPU').
+	 * The window is the guest still coming up -- the driver knows where the
+	 * symbol lives as soon as the ELF is loaded, which is before the guest
+	 * has necessarily backed that page. The same race exists on XP and 7 and
+	 * has simply not been lost there yet.
+	 *
+	 * VirtualQuery rather than __try/__except or IsBadReadPtr. mingw's gcc
+	 * has no MSVC structured exception handling, and IsBadReadPtr is
+	 * documented as the wrong tool anyway -- it probes by touching, which
+	 * trips guard pages and answers about one instant while the caller acts
+	 * on another. VirtualQuery asks the memory manager what the page IS:
+	 * committed, and readable, or not.
+	 *
+	 * Not committed is treated as "not ready", which is a thing the launcher
+	 * already handles by starting this again. Dying with no message and a
+	 * Windows crash dialog is the behaviour being replaced.
+	 */
+	{
+		unsigned int magic = 0;
+		int readable = 0;
+
+		if (io) {
+			MEMORY_BASIC_INFORMATION mbi;
+
+			ZeroMemory(&mbi, sizeof(mbi));
+			if (VirtualQuery(io, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+			    mbi.State == MEM_COMMIT &&
+			    !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+			    /* the whole structure, not just the byte it starts on */
+			    (size_t)((char *)mbi.BaseAddress + mbi.RegionSize -
+				     (char *)io) >= sizeof(*io)) {
+				readable = 1;
+				magic = io->magic;
+			}
+		}
+
+		if (!io || !readable) {
+			logline("the transport is at guest physical 0x%llx but that"
+				" page is not backed yet -- the guest is still"
+				" starting; run this again once it is up\n",
+				(unsigned long long)vgpu_va);
+			co_manager_kunmap(handle, NULL);
+			co_os_manager_close(handle);
+			return 1;
+		}
+
+		if (magic != CO_VGPU_MAGIC) {
+			logline("the transport structure is not where it should be"
+				" (magic 0x%08x, expected 0x%08x)\n",
+				magic, (unsigned int)CO_VGPU_MAGIC);
+			co_manager_kunmap(handle, NULL);
+			co_os_manager_close(handle);
+			return 1;
+		}
 	}
 
 	logline("transport at guest va 0x%llx, status 0x%x\n\n",

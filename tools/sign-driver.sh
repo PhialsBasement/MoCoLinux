@@ -33,7 +33,34 @@ command -v osslsigncode >/dev/null || {
 	exit 1
 }
 
-[ $# -gt 0 ] || set -- /mnt/big-bricks/RProject/MoCoLinux/dist-x64/linux.sys
+# Take the driver the build just produced, not whatever is sitting in dist-x64.
+#
+# These are two different files and nothing connected them. The build writes
+# src/colinux/os/winnt/build/linux.sys -- a symlink into a content-hashed
+# .comake.build cache -- while this script signed dist-x64/linux.sys, which no
+# step ever refreshed. So make.py said "Targets rebuilt", signing said "signed",
+# the copy to the target machine said "1 file(s) copied", and the md5 matched on
+# both ends, because it was the same stale binary at every step.
+#
+# That cost an entire session. Five driver builds were deployed and four
+# machine reboots performed against a linux.sys that contained none of the
+# changes, while the unchanged behaviour was read as evidence and three further
+# "fixes" were built on top of it. The one that mattered -- a 32-bit truncation
+# of user addresses in co_manager_kmap -- had been correct from the first
+# attempt and simply never reached the machine.
+#
+# Copying here, rather than trusting the caller, because the failure is silent:
+# a stale signed driver is indistinguishable from a fresh one until the machine
+# behaves oddly hours later.
+BUILT=/mnt/big-bricks/RProject/MoCoLinux/mocolinux/src/colinux/os/winnt/build/linux.sys
+DIST=/mnt/big-bricks/RProject/MoCoLinux/dist-x64/linux.sys
+
+if [ $# -eq 0 ] && [ -e "$BUILT" ]; then
+	cp -L "$BUILT" "$DIST" || exit 1
+	echo "  dist-x64/linux.sys <- fresh build ($(md5sum "$DIST" | cut -c1-12))"
+fi
+
+[ $# -gt 0 ] || set -- "$DIST"
 
 for f in "$@"; do
 	# Re-signing a signed file is refused by osslsigncode; strip first so the

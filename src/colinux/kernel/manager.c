@@ -537,7 +537,29 @@ static co_rc_t co_manager_kmap(co_manager_t*		 manager,
 
 			params->range[n].pa	 = pa + off;
 			params->range[n].bytes	 = this;
-			params->range[n].user_va = (unsigned long long)(unsigned long)uva;
+			/*
+			 * (size_t), never (unsigned long).
+			 *
+			 * Windows is LLP64: unsigned long is 32 bits here, so
+			 * this cast threw away the top half of every user
+			 * address above 4 GB. The daemon then computed
+			 * user_va + (gpa - pa) from half a pointer and read it,
+			 * which is an access violation on the first touch --
+			 * seen as cogpu-daemon.exe dying at +0x75ba on the
+			 * 'VGPU' magic, and before that as "the transport page
+			 * is not backed".
+			 *
+			 * It hid for three releases because XP and 7 placed
+			 * these MDL mappings below 4 GB, where the truncation
+			 * changes nothing. Windows 8.1 places them higher, and
+			 * the reported user_va came back as 0xbdc70000 -- a
+			 * plausible-looking address that was simply the bottom
+			 * 32 bits of the real one.
+			 *
+			 * The same mistake, with the same cause, is recorded
+			 * against this tree's snprintf %p.
+			 */
+			params->range[n].user_va = (unsigned long long)(size_t)uva;
 			params->total_bytes	+= this;
 			n++;
 			opened->kmap_slices = n;
@@ -555,6 +577,28 @@ static co_rc_t co_manager_kmap(co_manager_t*		 manager,
 	co_kload_user_map_get();
 
 	params->count = n;
+	/*
+	 * max_slice is an input the caller no longer needs; it carries the
+	 * driver's own view of the last mapping back out, so the daemon can
+	 * print what the kernel saw beside what it sees itself.
+	 *
+	 * The 0xD0 tag is here because the first attempt at this came back as a
+	 * clean zero while params->count, written on the line above, arrived
+	 * intact -- which is not a result, it is two indistinguishable failures
+	 * wearing the same value. A constant the driver cannot have computed by
+	 * accident separates them: if the daemon sees the tag, the write-back
+	 * works and co_os_userspace_map is not reaching its own report; if it
+	 * sees zero, the field never made the trip and nothing measured through
+	 * it has meant anything.
+	 */
+	{
+		extern unsigned long co_last_map_state;
+		extern unsigned long co_last_map_protect;
+
+		params->max_slice = 0xD0000000u |
+				    ((co_last_map_state & 0xff) << 16) |
+				    (co_last_map_protect & 0xffff);
+	}
 	co_debug("kmap: %d slices, %llu MB mapped into the caller",
 		 n, params->total_bytes >> 20);
 	return CO_RC(OK);

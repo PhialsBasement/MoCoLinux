@@ -62,11 +62,13 @@ static const char *payload[PAYLOAD_MAX] = {
 	 *
 	 * moco-boot.vbs   starts driver, guest, network, console and X, hidden
 	 * moco-icons.vbs  makes the desktop shortcuts and the logon entry
+	 * moco-term.bat   the console shortcut's target; finds or enables telnet
 	 * xstart1142.bat  starts the X server, once, if one is not already there
 	 * stop.bat        ends a wedged guest without a reboot
 	 */
 	"moco-boot.vbs",
 	"moco-icons.vbs",
+	"moco-term.bat",
 	"xstart1142.bat",
 	"stop.bat",
 	/*

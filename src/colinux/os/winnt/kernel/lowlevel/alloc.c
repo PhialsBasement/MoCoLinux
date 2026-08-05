@@ -224,6 +224,13 @@ void co_os_free(void *ptr)
 	ExFreePoolWithTag(ptr, CO_OS_POOL_TAG);
 }
 
+/*
+ * What the last user mapping looked like to the driver, one instruction after
+ * making it. Read out through the kmap ioctl; see the note at the query below.
+ */
+unsigned long co_last_map_state;
+unsigned long co_last_map_protect;
+
 co_rc_t co_os_userspace_map(void *address, unsigned int pages, void **user_address_out, void **handle_out)
 {
 	void *user_address = NULL;
@@ -241,7 +248,41 @@ co_rc_t co_os_userspace_map(void *address, unsigned int pages, void **user_addre
 	if (!mdl)
 		return CO_RC(ERROR);
 
-	MmBuildMdlForNonPagedPool(mdl);
+	/*
+	 * Fill the MDL from the real physical addresses, rather than asking
+	 * MmBuildMdlForNonPagedPool to infer them.
+	 *
+	 * That routine is documented for non-paged POOL, and it derives the page
+	 * frames from the virtual address by the fixed relationship the pool has
+	 * with physical memory. Guest RAM here does not come from the pool: it is
+	 * MmAllocateContiguousMemory, a different allocator with no such
+	 * relationship. On XP and 7 the inference happened to land on the right
+	 * frames and everything worked for three releases. On Windows 8.1 it does
+	 * not: the MDL then describes pages that are not the guest's, the user
+	 * mapping is built from those, and every address the driver hands back
+	 * reads as free address space in the daemon -- all 129 of them, first and
+	 * last alike, which is what finally distinguished this from a bad range
+	 * or a short map.
+	 *
+	 * MmGetPhysicalAddress per page is the answer that does not depend on
+	 * which allocator produced the memory. The pages are already resident and
+	 * cannot be paged out -- contiguous allocations are non-paged -- so
+	 * marking them locked is honest and no probe is needed.
+	 */
+	{
+		PPFN_NUMBER pfn = MmGetMdlPfnArray(mdl);
+		unsigned int i;
+
+		for (i = 0; i < pages; i++) {
+			PHYSICAL_ADDRESS pa =
+				MmGetPhysicalAddress((char *)address +
+						     ((SIZE_T)i << CO_ARCH_PAGE_SHIFT));
+
+			pfn[i] = (PFN_NUMBER)(pa.QuadPart >> CO_ARCH_PAGE_SHIFT);
+		}
+
+		mdl->MdlFlags |= MDL_PAGES_LOCKED;
+	}
 
 	/*
 	 * Probe before mapping, because the map cannot be caught if it fails.
@@ -312,7 +353,57 @@ co_rc_t co_os_userspace_map(void *address, unsigned int pages, void **user_addre
 	}
 
 	*handle_out = (void *)mdl;
-	*user_address_out = PAGE_ALIGN(user_address) + MmGetMdlByteOffset(mdl);
+
+	/*
+	 * The address Windows gave, not one recomputed from it.
+	 *
+	 * This used to return PAGE_ALIGN(user_address) + MmGetMdlByteOffset(mdl),
+	 * which is only the same value when the MDL's byte offset agrees with the
+	 * low bits of the mapping -- and it does not have to.
+	 * MmMapLockedPagesSpecifyCache already returns a pointer to the start of
+	 * the described data, so rounding it down to a page and adding the offset
+	 * back is at best a no-op and at worst moves the pointer off the mapping
+	 * entirely. Windows 8.1 is where that showed: the daemon was handed 129
+	 * addresses and VirtualQuery found free address space at every one of
+	 * them, then took an access violation on the first read.
+	 *
+	 * There is nothing to reconstruct. The mapping starts where the function
+	 * says it starts.
+	 */
+	*user_address_out = user_address;
+
+	/*
+	 * Check the mapping is there, from inside the driver, at the moment it
+	 * is made.
+	 *
+	 * The daemon receives every address the driver reports and VirtualQuery
+	 * finds free address space at all of them -- first range, last range,
+	 * alike. Two possibilities remain and they need different fixes: the map
+	 * never happened in this process, or it happened and was undone before
+	 * the ioctl returned. Asking one instruction after the call separates
+	 * them, and that is the whole point of this block.
+	 *
+	 * MmIsAddressValid, not ZwQueryVirtualMemory: the latter is not in the
+	 * set MmGetSystemRoutineAddress will resolve for a driver, so the first
+	 * attempt at this silently reported state 0 and answered nothing.
+	 * MmIsAddressValid is exported on every NT and needs no prototype games.
+	 * It reports only whether a read would fault right now, which is exactly
+	 * the question, and it is safe at PASSIVE_LEVEL on a user address in the
+	 * current process.
+	 *
+	 * co_debug goes to the colinux debug channel, which needs a reader
+	 * nobody is running, so the answer also rides back through the ioctl in
+	 * co_last_map_* where the daemon can print it.
+	 */
+	{
+		BOOLEAN here = MmIsAddressValid(user_address);
+
+		co_debug("kmap slice: user %p valid=%d (%lu pages)",
+			 user_address, (int)here, (unsigned long)pages);
+
+		co_last_map_state   = here ? 1 : 0;
+		co_last_map_protect = (unsigned long)pages;
+	}
 
 	return CO_RC(OK);
 }

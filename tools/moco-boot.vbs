@@ -28,6 +28,79 @@ Const SHOWN = 1
 Const WAIT = True
 Const NOWAIT = False
 
+' Ask for administrator, on the Windows that need asking.
+'
+' Starting a kernel service needs it, and the logon entry cannot have it: UAC
+' launches Startup-folder shortcuts with the filtered token and never elevates
+' them. So on NT 6 and later this script came up unprivileged, "sc start
+' CoLinuxDriver" was refused, the driver stayed STOPPED and the boot daemon
+' exited immediately for want of it. What made that hard to see is that the X
+' server needs no privilege at all: VcXsrv appeared exactly as usual, the
+' desktop looked like a working install, and only the Linux half was missing.
+'
+' Seen on Windows 8.1 after a clean install. XP has no UAC, so 5.2 was never
+' affected and neither was any run started by hand from an elevated console --
+' which is every test this launcher had.
+'
+' Re-launching itself through the "runas" verb is the whole fix: Windows shows
+' the prompt, the elevated copy does the work, and this copy stands down. The
+' marker argument is what stops that being a loop -- an elevated instance that
+' somehow still cannot start the service must fail honestly rather than spawn
+' another one.
+Const ELEVATED_MARK = "--elevated"
+
+Function Elevated()
+	' Asked by trying. "net session" needs administrator and touches nothing;
+	' its exit code is the answer, and it is the same question the service
+	' manager is about to be asked.
+	Elevated = (CreateObject("WScript.Shell") _
+		    .Run("cmd /c net session", HIDDEN, WAIT) = 0)
+End Function
+
+Function NeedsElevation()
+	Dim v
+	NeedsElevation = False
+	On Error Resume Next
+	v = CreateObject("WScript.Shell").RegRead( _
+		"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\CurrentVersion")
+	If Err.Number = 0 Then
+		' "5.2" on XP x64 and Server 2003; "6.1", "6.3" and later above it.
+		' CDbl on the leading number rather than a string compare, because
+		' "10.0" sorts before "6.1" as text.
+		If CDbl(Split(v, ".")(0)) >= 6 Then NeedsElevation = True
+	End If
+	On Error GoTo 0
+End Function
+
+' The real arguments, with the marker taken out.
+'
+' Kept separately rather than indexing WScript.Arguments below, because the
+' marker is appended when this re-launches itself: a script started with no
+' arguments would come back with exactly one, and the directory lookup would
+' take "--elevated" for the program directory.
+Dim i, already, passthru, argv, argc
+already = False
+passthru = ""
+argc = 0
+ReDim argv(WScript.Arguments.Count)
+For i = 0 To WScript.Arguments.Count - 1
+	If WScript.Arguments(i) = ELEVATED_MARK Then
+		already = True
+	Else
+		passthru = passthru & " """ & WScript.Arguments(i) & """"
+		argv(argc) = WScript.Arguments(i)
+		argc = argc + 1
+	End If
+Next
+
+If (Not already) And NeedsElevation() And (Not Elevated()) Then
+	CreateObject("Shell.Application").ShellExecute _
+		"wscript.exe", _
+		"""" & WScript.ScriptFullName & """" & passthru & " " & ELEVATED_MARK, _
+		"", "runas", SHOWN
+	WScript.Quit 0
+End If
+
 ' Where things are. The shortcuts pass both directories, because only the
 ' installer knows where the user chose to put them.
 '
@@ -44,14 +117,14 @@ Const NOWAIT = False
 ' ask where it is; and the images live under the system drive, which is what
 ' mocolinux.ini already assumes. Neither fallback can now name another
 ' machine's layout.
-If WScript.Arguments.Count >= 1 Then
-	moco = WScript.Arguments(0)
+If argc >= 1 Then
+	moco = argv(0)
 Else
 	moco = Left(WScript.ScriptFullName, _
 	            InStrRev(WScript.ScriptFullName, "\") - 1)
 End If
-If WScript.Arguments.Count >= 2 Then
-	linux = WScript.Arguments(1)
+If argc >= 2 Then
+	linux = argv(1)
 Else
 	linux = CreateObject("WScript.Shell") _
 	        .ExpandEnvironmentStrings("%SystemDrive%") & "\MoCoLinux"

@@ -79,7 +79,16 @@ For Each entry In apps
 	' X server on Windows fails outright with GLXBadDrawable. Wrapping
 	' everything is therefore the safe default, and it means a user never
 	' has to know which of these applications happen to use the GPU.
-	lnk.Arguments        = "--run moco-gl " & part(1)
+	' Quoted, because --run takes ONE argument.
+	'
+	' The daemon parses this with the single-argument form, so an unquoted
+	' "--run moco-gl xterm" hands it the command "moco-gl" and leaves "xterm"
+	' as a stray token. The guest then runs the wrapper with no application to
+	' wrap, which exits immediately -- so every one of these shortcuts opened
+	' nothing at all, silently, with the console window flashing past too fast
+	' to read. Launching the same thing by hand always worked, because a
+	' quoted command is the natural way to type it.
+	lnk.Arguments        = "--run " & Chr(34) & "moco-gl " & part(1) & Chr(34)
 	lnk.WorkingDirectory = moco
 	lnk.IconLocation     = part(2)
 	lnk.Description      = part(1) & ", running in MoCoLinux on the GPU"
@@ -90,11 +99,20 @@ Next
 
 ' The terminal, which needs a console window of its own rather than hiding it.
 Set lnk = shell.CreateShortcut(desktop & "\MoCoLinux Terminal.lnk")
-' telnet, not a Python client: XP ships telnet.exe, and the console server
-' negotiates SUPPRESS-GO-AHEAD and ECHO on connect precisely so a default telnet
-' client behaves like a raw socket. One less thing the target machine must have.
-lnk.TargetPath       = "telnet.exe"
-lnk.Arguments        = "127.0.0.1 2323"
+' Through moco-term.bat, with an absolute path, for two separate reasons.
+'
+' A bare "telnet.exe" is not a path, and CreateShortcut resolves what it is
+' given: with no telnet on PATH it wrote C:\Users\<name>\Desktop\telnet.exe --
+' the creating process's directory -- into the .lnk, naming a file that has
+' never existed on any machine. Absolute paths cannot do that.
+'
+' And telnet itself is no longer a given. Telnet Client has been an optional
+' Windows feature, off by default, since Vista; 8.1 has no telnet.exe at all
+' until somebody turns it on. The .bat detects that, offers to enable it, and
+' says plainly what to tick if the elevation prompt is refused, instead of
+' flashing a console and vanishing.
+lnk.TargetPath       = moco & "\moco-term.bat"
+lnk.Arguments        = ""
 lnk.WorkingDirectory = moco
 lnk.IconLocation     = "shell32.dll,3"
 lnk.Description      = "A shell inside MoCoLinux, on this machine's console"
