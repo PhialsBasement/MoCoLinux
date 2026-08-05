@@ -249,40 +249,27 @@ co_rc_t co_os_userspace_map(void *address, unsigned int pages, void **user_addre
 		return CO_RC(ERROR);
 
 	/*
-	 * Fill the MDL from the real physical addresses, rather than asking
-	 * MmBuildMdlForNonPagedPool to infer them.
+	 * MmBuildMdlForNonPagedPool, which is what this is for.
 	 *
-	 * That routine is documented for non-paged POOL, and it derives the page
-	 * frames from the virtual address by the fixed relationship the pool has
-	 * with physical memory. Guest RAM here does not come from the pool: it is
-	 * MmAllocateContiguousMemory, a different allocator with no such
-	 * relationship. On XP and 7 the inference happened to land on the right
-	 * frames and everything worked for three releases. On Windows 8.1 it does
-	 * not: the MDL then describes pages that are not the guest's, the user
-	 * mapping is built from those, and every address the driver hands back
-	 * reads as free address space in the daemon -- all 129 of them, first and
-	 * last alike, which is what finally distinguished this from a bad range
-	 * or a short map.
+	 * A hand-rolled fill lived here briefly -- MmGetPhysicalAddress per page
+	 * plus MDL_PAGES_LOCKED set by hand -- on the theory that this routine is
+	 * only valid for pool memory and guest RAM comes from
+	 * MmAllocateContiguousMemory. That theory was wrong twice over.
 	 *
-	 * MmGetPhysicalAddress per page is the answer that does not depend on
-	 * which allocator produced the memory. The pages are already resident and
-	 * cannot be paged out -- contiguous allocations are non-paged -- so
-	 * marking them locked is honest and no probe is needed.
+	 * Microsoft states it plainly: "For mappings to user space, MDLs that are
+	 * built by the MmBuildMdlForNonPagedPool routine can be used." It was
+	 * never the reason 8.1 failed -- that was a 32-bit truncation of the
+	 * returned address in co_manager_kmap, and this call was innocent
+	 * throughout. Replacing it fixed nothing and was never tested on the
+	 * hosts that already worked.
+	 *
+	 * It also bugchecked XP: opening one application was enough. An MDL whose
+	 * flags claim locked pages the memory manager did not lock is a lie it
+	 * acts on, and setting MDL_PAGES_LOCKED by hand skips the bookkeeping the
+	 * real routine does. Reverted, and left with this note so the idea is not
+	 * had again.
 	 */
-	{
-		PPFN_NUMBER pfn = MmGetMdlPfnArray(mdl);
-		unsigned int i;
-
-		for (i = 0; i < pages; i++) {
-			PHYSICAL_ADDRESS pa =
-				MmGetPhysicalAddress((char *)address +
-						     ((SIZE_T)i << CO_ARCH_PAGE_SHIFT));
-
-			pfn[i] = (PFN_NUMBER)(pa.QuadPart >> CO_ARCH_PAGE_SHIFT);
-		}
-
-		mdl->MdlFlags |= MDL_PAGES_LOCKED;
-	}
+	MmBuildMdlForNonPagedPool(mdl);
 
 	/*
 	 * Probe before mapping, because the map cannot be caught if it fails.
