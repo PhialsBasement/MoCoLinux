@@ -766,7 +766,10 @@ static BOOL install_driver(void)
 	SC_HANDLE scm, svc;
 	char sys[MAX_PATH];
 
-	work_at(3, -1, "Installing the driver");
+	/* Stage 6: this runs in the second half now, after the restart. It said
+	 * 3 from when it ran before the reboot, which made the step counter and
+	 * the bar jump backwards from 6 to 3 in front of the user. */
+	work_at(6, -1, "Installing the driver");
 
 	_snprintf(sys, sizeof(sys) - 1, "%s\\linux.sys", dir_program);
 	sys[sizeof(sys) - 1] = 0;
