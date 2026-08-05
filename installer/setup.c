@@ -2182,9 +2182,11 @@ static DWORD WINAPI worker(LPVOID unused)
 
 	if (!copy_payload())
 		return 1;
-	if (!install_driver())
-		return 1;
 	enable_testsigning();		/* NT 6+ only; never fatal */
+
+	/*
+	 * The driver service is NOT created here. See linux_half.
+	 */
 	install_xserver();		/* never fatal; see the function */
 	if (!copy_image())
 		return 1;
@@ -2224,6 +2226,26 @@ static DWORD WINAPI worker(LPVOID unused)
 	return 0;
 
 linux_half:
+	/*
+	 * The driver service, created after the restart and not before it.
+	 *
+	 * enable_testsigning() ran in the first half, and bcdedit's setting does
+	 * not exist until the machine has booted with it. Registering a kernel
+	 * service against a test-signed binary while the loader is still
+	 * enforcing full code integrity is asking the question a restart is
+	 * about to answer, and on the versions that check at registration rather
+	 * than at load it is asking it in the one state where the answer is no.
+	 *
+	 * Doing it here also means the same is true of Secure Boot and of a
+	 * hypervisor: whatever the user had to change, they changed it, restarted,
+	 * and only then does anything of ours go near the service manager.
+	 *
+	 * Idempotent, and reached on the resume path only, so an install that is
+	 * re-run finds the service already correct and updates its ImagePath.
+	 */
+	if (!install_driver())
+		return 1;
+
 	if (!build_linux()) {
 		finish_guest();
 		return 1;
