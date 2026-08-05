@@ -335,6 +335,92 @@ static BOOL check_version(char *why, int n)
 }
 
 /*
+ * Is UEFI Secure Boot switched on?
+ *
+ * It matters because it overrules test-signing. With Secure Boot enabled the
+ * kernel refuses an unsigned or test-signed driver whatever bcdedit says, so
+ * everything below succeeds, the restart happens, and the driver then fails
+ * with the same ERROR_INVALID_IMAGE_HASH that a missing test-signing setting
+ * produces -- sending someone to fix a setting that is already correct.
+ *
+ * Read from the registry rather than Confirm-SecureBootUEFI, because that is a
+ * PowerShell cmdlet and this program has no dependencies. The key exists only
+ * on UEFI firmware; its absence means a legacy/BIOS boot, where Secure Boot
+ * cannot be on.
+ *
+ * Nothing here can turn it off. It is a firmware setting with no API, by
+ * design -- software that could disable Secure Boot would defeat the point of
+ * it. All an installer can do is notice and say so.
+ */
+static BOOL secure_boot_on(void)
+{
+	HKEY  key;
+	DWORD val = 0, size = sizeof(val), type = 0;
+	BOOL  on = FALSE;
+
+	if (RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+			 "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
+			 0, KEY_READ, &key) != ERROR_SUCCESS)
+		return FALSE;	/* no key: not UEFI, so not Secure Boot */
+
+	if (RegQueryValueEx(key, "UEFISecureBoot", NULL, &type,
+			    (LPBYTE)&val, &size) == ERROR_SUCCESS &&
+	    type == REG_DWORD)
+		on = (val != 0);
+
+	RegCloseKey(key);
+	return on;
+}
+
+/*
+ * Secure Boot, which no installer can switch off.
+ *
+ * A hard stop rather than a warning. With Secure Boot on, the kernel refuses a
+ * test-signed driver whatever bcdedit says -- so an install that continued
+ * would copy a gigabyte, restart the machine, and only then fail with a
+ * signature error, having changed a boot setting for nothing.
+ *
+ * The wording is deliberately plain and deliberately long. This is the one
+ * failure that cannot be fixed from inside Windows: the person has to reboot
+ * into a firmware screen, and if they have never done that, "disable Secure
+ * Boot" is not an instruction, it is a riddle.
+ */
+static BOOL check_secure_boot(char *why, int n)
+{
+	if (!secure_boot_on())
+		return TRUE;
+
+	lstrcpyn(why,
+		 "Secure Boot is switched on, and MoCoLinux cannot install "
+		 "while it is.\r\n\r\n"
+		 "Secure Boot is a setting in your computer's firmware -- the "
+		 "menu that appears before Windows starts. It blocks drivers "
+		 "that are not signed by Microsoft, and MoCoLinux is not. No "
+		 "program can change it for you, including this one.\r\n\r\n"
+		 "To turn it off:\r\n\r\n"
+		 "  1.  Save any work and close your programs.\r\n"
+		 "  2.  Restart the computer.\r\n"
+		 "  3.  As it starts, press the setup key repeatedly. It is "
+		 "usually F2, F10, F12 or Delete -- the correct one is shown "
+		 "for a moment on the first screen, often as \"Press F2 for "
+		 "Setup\". If Windows loads instead, you were too late; "
+		 "restart and try again, pressing sooner.\r\n"
+		 "  4.  In the menus that appear, look for a page called Boot, "
+		 "Security or Authentication, and an entry called Secure "
+		 "Boot.\r\n"
+		 "  5.  Change it to Disabled.\r\n"
+		 "  6.  Choose Save and Exit (often F10).\r\n"
+		 "  7.  Let Windows start, then run this Setup again.\r\n\r\n"
+		 "If Secure Boot is greyed out and will not change, look for "
+		 "an option to set an administrator or supervisor password "
+		 "first, or to switch the boot mode from UEFI to Legacy/CSM; "
+		 "either usually unlocks it.\r\n\r\n"
+		 "Nothing has been installed or changed on your computer.",
+		 n);
+	return FALSE;
+}
+
+/*
  * Administrators, because installing a kernel service needs it.
  *
  * Asked by trying rather than by inspecting the token: OpenSCManager with
@@ -1487,9 +1573,14 @@ static BOOL build_linux(void)
 
 	if (!start_driver_service()) {
 		if (start_driver_error == ERROR_INVALID_IMAGE_HASH)
-			work_fatal("Windows refused the driver's signature."
-				   " Enable test-signing (bcdedit /set testsigning"
-				   " on) and restart, then run Setup again.");
+			work_fatal(secure_boot_on()
+				   ? "Windows refused the driver's signature, and"
+				     " UEFI Secure Boot is ON -- which overrules"
+				     " test-signing. Disable Secure Boot in the"
+				     " firmware setup screen, then run Setup again."
+				   : "Windows refused the driver's signature."
+				     " Enable test-signing (bcdedit /set testsigning"
+				     " on) and restart, then run Setup again.");
 		else
 			work_fatal("The MoCoLinux driver would not start"
 				   " (error %lu). A restart may be needed before"
@@ -1979,6 +2070,7 @@ static DWORD WINAPI worker(LPVOID unused)
 
 	if (!check_x64(why, sizeof(why)) ||
 	    !check_version(why, sizeof(why)) ||
+	    !check_secure_boot(why, sizeof(why)) ||
 	    !check_admin(why, sizeof(why)) ||
 	    !check_no_foreign_driver(why, sizeof(why)) ||
 	    !check_nothing_running(why, sizeof(why)) ||
