@@ -93,12 +93,25 @@ For i = 0 To WScript.Arguments.Count - 1
 	End If
 Next
 
-If (Not already) And NeedsElevation() And (Not Elevated()) Then
-	CreateObject("Shell.Application").ShellExecute _
-		"wscript.exe", _
-		"""" & WScript.ScriptFullName & """" & passthru & " " & ELEVATED_MARK, _
-		"", "runas", SHOWN
-	WScript.Quit 0
+' Nested, not "A And B And C".
+'
+' VBScript's And does not short-circuit: every operand is evaluated, always. So
+' a single combined condition ran Elevated() -- and therefore "net session" --
+' on XP too, where NeedsElevation() is already False and the answer cannot
+' matter. On XP x64 that call reports "No network provider accepted the given
+' network path", which is what the boot appeared to fail with, on the one
+' Windows that never needed any of this.
+If Not already Then
+	If NeedsElevation() Then
+		If Not Elevated() Then
+			CreateObject("Shell.Application").ShellExecute _
+				"wscript.exe", _
+				"""" & WScript.ScriptFullName & """" & passthru & _
+				" " & ELEVATED_MARK, _
+				"", "runas", SHOWN
+			WScript.Quit 0
+		End If
+	End If
 End If
 
 ' Where things are. The shortcuts pass both directories, because only the

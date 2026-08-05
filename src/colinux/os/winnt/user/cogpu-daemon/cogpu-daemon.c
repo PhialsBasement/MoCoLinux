@@ -906,7 +906,35 @@ int main(int argc, char **argv)
 	 * minutes of staring at a zero-byte file.
 	 */
 	setvbuf(stdout, NULL, _IONBF, 0);
-	g_log = fopen("C:\\MoCoLinux\\cogpu-daemon.log", "w");
+
+	/*
+	 * Beside the images, wherever those are -- not a hardcoded C:.
+	 *
+	 * The installer puts images under %SystemDrive%\MoCoLinux, and the system
+	 * drive is not C: on every install: this project's XP x64 boots from E:,
+	 * so a literal "C:\MoCoLinux\..." opened nothing, fopen returned NULL,
+	 * and the daemon ran perfectly while appearing to produce no log at all.
+	 * Diagnosing a silent daemon is exactly what the log exists for.
+	 *
+	 * Falling back to the current directory rather than giving up, because a
+	 * log in the wrong place still beats no log.
+	 */
+	{
+		char path[MAX_PATH];
+		char drive[8];
+		DWORD n = GetEnvironmentVariableA("SystemDrive", drive, sizeof(drive));
+
+		if (n > 0 && n < sizeof(drive))
+			_snprintf(path, sizeof(path), "%s\\MoCoLinux\\cogpu-daemon.log",
+				  drive);
+		else
+			_snprintf(path, sizeof(path), "cogpu-daemon.log");
+		path[sizeof(path) - 1] = '\0';
+
+		g_log = fopen(path, "w");
+		if (!g_log)
+			g_log = fopen("cogpu-daemon.log", "w");
+	}
 
 	/*
 	 * virglrenderer's own diagnostics.
