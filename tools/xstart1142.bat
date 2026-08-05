@@ -62,12 +62,14 @@ rem  %~dp0 ends in a backslash and an ini value does not; normalise so the
 rem  path below is built the same way whichever source answered.
 if "%PROG:~-1%"=="\" set PROG=%PROG:~0,-1%
 
+rem  Beside this script and nowhere else. There were two fallbacks here
+rem  naming this development box's staging directories; on any other machine
+rem  they are absent, and on this one they held an older build -- so a broken
+rem  install silently started somebody else's X server instead of saying so.
 set XEXE=%PROG%\vcxsrv1142\vcxsrv.exe
-if not exist "%XEXE%" set XEXE=F:\xfer\mocolinux-m2\vcxsrv1142\vcxsrv.exe
-if not exist "%XEXE%" set XEXE=E:\xfer\mocolinux-m2\vcxsrv1142\vcxsrv.exe
 
 if not exist "%XEXE%" (
-	echo xstart1142: no vcxsrv.exe under "%PROG%" or on the fallback paths
+	echo xstart1142: no vcxsrv.exe under "%PROG%"
 	exit /b 1
 )
 

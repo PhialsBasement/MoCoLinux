@@ -29,17 +29,32 @@ Const WAIT = True
 Const NOWAIT = False
 
 ' Where things are. The shortcuts pass both directories, because only the
-' installer knows where the user chose to put them; the fallbacks are this
-' development box's layout so this is still runnable by hand.
+' installer knows where the user chose to put them.
+'
+' The fallbacks used to be this development box's own layout --
+' F:\xfer\mocolinux-m2 and E:\MoCoLinux -- which is fine on the machine that
+' wrote them and quietly wrong everywhere else. Run without arguments on a
+' real install it went looking for the binaries in a stale staging directory:
+' on the XP side that path still held a pre-GPU build, so the guest and the
+' network bridge started from OLD executables and the GPU daemon failed with
+' 'the system cannot find the file specified' -- leaving a guest that ran with
+' no virtio-gpu device and no obvious reason why.
+'
+' This script is installed beside the binaries it launches, so it can simply
+' ask where it is; and the images live under the system drive, which is what
+' mocolinux.ini already assumes. Neither fallback can now name another
+' machine's layout.
 If WScript.Arguments.Count >= 1 Then
 	moco = WScript.Arguments(0)
 Else
-	moco = "F:\xfer\mocolinux-m2"
+	moco = Left(WScript.ScriptFullName, _
+	            InStrRev(WScript.ScriptFullName, "\") - 1)
 End If
 If WScript.Arguments.Count >= 2 Then
 	linux = WScript.Arguments(1)
 Else
-	linux = "E:\MoCoLinux"
+	linux = CreateObject("WScript.Shell") _
+	        .ExpandEnvironmentStrings("%SystemDrive%") & "\MoCoLinux"
 End If
 
 Set shell = CreateObject("WScript.Shell")
@@ -80,13 +95,17 @@ shell.CurrentDirectory = moco
 shell.Run "cmd /c """ & moco & "\colinux-daemon.exe"" --install-driver", HIDDEN, WAIT
 shell.Run "cmd /c sc start CoLinuxDriver", HIDDEN, WAIT
 
-If Running("colinux-daemon.exe") Then
-	' Already up. Still make sure the X server is there, because it can be
-	' closed independently of the guest and an X client with no server
-	' produces no error at all -- it simply never appears.
-	StartX moco
-	WScript.Quit 0
-End If
+' Whether the guest itself is already up.
+'
+' Only the guest launch is skipped when it is -- everything below is checked
+' individually. This used to quit outright here, ensuring nothing but the X
+' server, and that is a real failure rather than a tidiness point: every one of
+' these can be absent while the guest runs. The GPU daemon can die, or never
+' have started, or the guest can have been launched by hand; re-running this
+' script then looked like it had done its job and left the machine with no
+' virtio-gpu device at all. Seen on XP, where the guest came up at logon with
+' no cogpu-daemon.exe in the task list, and re-launching never repaired it.
+guest_up = Running("colinux-daemon.exe")
 
 ' Linux. No switch limit and no deadline: this is a session somebody is using,
 ' and it ends when the guest powers off or stop.bat asks it to.
@@ -104,16 +123,20 @@ End If
 ' and the attach fails with "cannot attach cobd0 to '\root.img'". It only bites
 ' when a match exists, which is why F: paths worked for days and the first C:
 ' one did not.
-shell.Run """" & moco & "\colinux-daemon.exe"" --boot-kernel vmlinux" & _
-	" --max-switches none" & _
-	" --cobd0 \DosDevices\" & linux & "\root.img" & _
-	" --cobd1 \DosDevices\" & linux & "\root-arch.img" & _
-	" --init /sbin/init", SHOWN, NOWAIT
+If Not guest_up Then
+	shell.Run """" & moco & "\colinux-daemon.exe"" --boot-kernel vmlinux" & _
+		" --max-switches none" & _
+		" --cobd0 \DosDevices\" & linux & "\root.img" & _
+		" --cobd1 \DosDevices\" & linux & "\root-arch.img" & _
+		" --init /sbin/init", SHOWN, NOWAIT
+End If
 
 ' The network bridge and the terminal server. Both may be started before the
 ' guest has finished booting -- they wait for it -- and both exit on their own
 ' once it is gone, so nothing here has to clean them up.
-shell.Run """" & moco & "\colinux-slirp-net-daemon.exe"" -R", HIDDEN, NOWAIT
+If Not Running("colinux-slirp-net-daemon.exe") Then
+	shell.Run """" & moco & "\colinux-slirp-net-daemon.exe"" -R", HIDDEN, NOWAIT
+End If
 
 ' The GPU daemon: the host side of the guest's virtio-gpu device. Hidden like
 ' the other two -- nothing for a person to read, and it writes its own log
@@ -121,8 +144,15 @@ shell.Run """" & moco & "\colinux-slirp-net-daemon.exe"" -R", HIDDEN, NOWAIT
 ' does not exist until the boot daemon has allocated it. The transport
 ' tolerates a late daemon by design, so this ordering is safe rather than
 ' merely convenient.
-shell.Run """" & moco & "\cogpu-daemon.exe"" --verbose", HIDDEN, NOWAIT
-shell.Run """" & moco & "\colinux-daemon.exe"" --console 2323", HIDDEN, NOWAIT
+If Not Running("cogpu-daemon.exe") Then
+	shell.Run """" & moco & "\cogpu-daemon.exe"" --verbose", HIDDEN, NOWAIT
+End If
+' The terminal server shares an image name with the guest, so Running()
+' cannot tell them apart; started only on a cold run. A second one would
+' find port 2323 taken and exit anyway.
+If Not guest_up Then
+	shell.Run """" & moco & "\colinux-daemon.exe"" --console 2323", HIDDEN, NOWAIT
+End If
 
 ' The X server last, so the guest's windows have somewhere to go. It checks for
 ' itself whether one is already running on :0.

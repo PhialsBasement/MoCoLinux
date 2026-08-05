@@ -28,12 +28,19 @@ Set fso   = CreateObject("Scripting.FileSystemObject")
 If WScript.Arguments.Count >= 1 Then
 	moco = WScript.Arguments(0)
 Else
-	moco = "F:\xfer\mocolinux-m2"
+	' This script is installed beside the binaries the shortcuts point at, so
+	' it asks where it is. The old fallback named this development box's own
+	' staging directory, which on another machine is either absent or -- worse,
+	' and seen on the XP side -- a stale build, so the shortcuts were written
+	' aiming at binaries nobody meant to run.
+	moco = Left(WScript.ScriptFullName, _
+	            InStrRev(WScript.ScriptFullName, "\") - 1)
 End If
 If WScript.Arguments.Count >= 2 Then
 	linuxdir = WScript.Arguments(1)
 Else
-	linuxdir = "E:\MoCoLinux"
+	linuxdir = CreateObject("WScript.Shell") _
+	           .ExpandEnvironmentStrings("%SystemDrive%") & "\MoCoLinux"
 End If
 
 desktop = shell.SpecialFolders("AllUsersDesktop")
