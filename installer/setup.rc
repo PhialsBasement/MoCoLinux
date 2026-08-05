@@ -1,0 +1,5 @@
+/* The manifest, as resource 1 (CREATEPROCESS_MANIFEST_RESOURCE_ID) of type 24
+ * (RT_MANIFEST) -- the ids Windows looks for when deciding whether to elevate.
+ * Linked in rather than shipped beside the exe so a copied or renamed setup
+ * cannot lose it. */
+1 24 "setup.manifest"
