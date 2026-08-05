@@ -1,5 +1,37 @@
-/* The manifest, as resource 1 (CREATEPROCESS_MANIFEST_RESOURCE_ID) of type 24
+/*
+ * The manifest, as resource 1 (CREATEPROCESS_MANIFEST_RESOURCE_ID) of type 24
  * (RT_MANIFEST) -- the ids Windows looks for when deciding whether to elevate.
  * Linked in rather than shipped beside the exe so a copied or renamed setup
- * cannot lose it. */
+ * cannot lose it.
+ *
+ * Why setup.manifest carries no comments of its own, and must not:
+ *
+ *   XML forbids "--" anywhere inside a comment body. The first version of that
+ *   file explained itself in prose full of em-dash pairs, which is invalid XML;
+ *   Windows would not parse it, and refused to start the program at all with
+ *   "the application has failed to start because its side-by-side
+ *   configuration is incorrect" -- a message that says nothing about which of
+ *   the many things it covers went wrong. The manifest is now data only and
+ *   the reasoning lives here, where C comments have no such rule.
+ *
+ * What it asks for:
+ *
+ *   requireAdministrator. Everything setup does needs it: creating the driver
+ *   service, bcdedit, writing under Program Files, and the scheduled task that
+ *   starts the guest at logon. Without a manifest, NT 6 and later start it
+ *   unelevated even for an administrator account, because a double-click is
+ *   not an elevated launch, so it would get most of the way in and fail at the
+ *   service.
+ *
+ * What it deliberately omits:
+ *
+ *   Any <compatibility> / <supportedOS> block. GetVersionEx reports 6.2 on
+ *   Windows 8.1 and later unless an executable claims support for the newer
+ *   versions, and setup.c depends on that being harmless: host_is_nt6() only
+ *   asks whether this is NT 6 or later, and everything that lies about being
+ *   6.2 has the three properties it cares about, which are UAC, kernel-mode
+ *   code signing and Task Scheduler 2.0. Declaring supportedOS would make
+ *   GetVersionEx tell the truth, change no answer, and invalidate the
+ *   reasoning written beside that function.
+ */
 1 24 "setup.manifest"

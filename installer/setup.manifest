@@ -1,32 +1,8 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity
-      type="win32"
-      name="MoCoLinux.Setup"
-      version="0.2.1.0"
-      processorArchitecture="amd64" />
+  <assemblyIdentity type="win32" name="MoCoLinux.Setup" version="0.2.1.0"
+                    processorArchitecture="amd64" />
   <description>MoCoLinux setup</description>
-
-  <!--
-    Ask for elevation up front.
-
-    Everything this program does needs it: creating the driver service,
-    bcdedit, writing under Program Files, and the scheduled task that starts
-    the guest at logon. Without a manifest, NT 6 and later start it
-    unelevated even for an administrator account -- a normal double-click is
-    not an elevated one -- so it would get most of the way in and fail at the
-    service. Requesting it here means Windows asks once, before anything has
-    been written.
-
-    Deliberately NOT declaring a <compatibility> / <supportedOS> block.
-    GetVersionEx reports 6.2 on 8.1 and later unless an executable claims
-    support for the newer versions, and setup.c depends on that: it only ever
-    asks "is this NT 6 or later" (host_is_nt6), and everything that lies about
-    being 6.2 has the three properties it cares about -- UAC, kernel-mode code
-    signing, Task Scheduler 2.0. Adding supportedOS entries would make
-    GetVersionEx tell the truth, which changes nothing useful and invalidates
-    the reasoning written beside that function.
-  -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
