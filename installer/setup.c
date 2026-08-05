@@ -1812,6 +1812,7 @@ static BOOL build_linux(void)
 	 */
 	{
 	int log_missing = 0;
+	int said_slow = 0;
 
 	for (;;) {
 		char stage[240] = {0};
@@ -1880,8 +1881,39 @@ static BOOL build_linux(void)
 				return FALSE;
 			}
 
-			if (!strncmp(p, "==>", 3))
+			if (!strncmp(p, "==>", 3)) {
 				work_at(7, -1, p + 4);
+
+				/*
+				 * Say that this one is the long wait, once.
+				 *
+				 * The package install is the single longest
+				 * stretch of the build and the only one where
+				 * the stage line stops moving: every package
+				 * comes down one at a time through a
+				 * single-threaded NAT and is unpacked by a
+				 * guest with one processor. From outside, a
+				 * progress line that has not changed for ten
+				 * minutes is indistinguishable from a hang --
+				 * and what somebody does about a hung installer
+				 * is kill it, half way through writing a
+				 * filesystem.
+				 *
+				 * Matched on the builder's own wording rather
+				 * than on a stage number, because the stage
+				 * numbering belongs to the script and this file
+				 * should not have to be edited when the script
+				 * gains a step.
+				 */
+				if (!said_slow && StrStrIA(p, "package groups")) {
+					said_slow = 1;
+					work_say("this is the slow part:"
+						 " roughly 15 minutes and 2.5 GB,"
+						 " and this line will not change"
+						 " until it finishes -- it has not"
+						 " stopped");
+				}
+			}
 			/* Anything else is a command echo or console noise,
 			 * not a builder line -- ignore it and poll again. */
 		}
