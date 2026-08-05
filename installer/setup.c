@@ -28,6 +28,7 @@
  */
 
 #include <windows.h>
+#include <cpuid.h>		/* __get_cpuid, for the hypervisor-present bit */
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <winsvc.h>
@@ -370,6 +371,83 @@ static BOOL secure_boot_on(void)
 
 	RegCloseKey(key);
 	return on;
+}
+
+/*
+ * Is a hypervisor already running on this processor?
+ *
+ * The one condition this port cannot work around. Both kernels here run at
+ * ring 0 on the bare processor and the world switch swaps CPU context between
+ * them; if Windows is itself a guest of Hyper-V -- which is what VBS,
+ * Memory Integrity, Credential Guard, WSL2, Sandbox and Device Guard all
+ * quietly turn on -- then the processor is in VMX root mode, Windows is in a
+ * partition, and there is no bare ring 0 left to switch to.
+ *
+ * CPUID leaf 1, ECX bit 31 is the hypervisor-present bit. It is architecturally
+ * reserved-zero on real hardware and set by every hypervisor by convention, so
+ * it answers the question that matters -- "is something already underneath this
+ * Windows" -- rather than the question the registry answers, which is what the
+ * settings say they want. The two differ: DeviceGuard keys can read enabled
+ * while the feature is not running, and vice versa after a settings change but
+ * before the restart that applies it.
+ *
+ * Present on this box's XP and 7 installs as well, where it reads zero, which
+ * is what a legacy boot on bare metal should say.
+ */
+static BOOL hypervisor_present(void)
+{
+	unsigned int a = 0, b = 0, c = 0, d = 0;
+
+	if (!__get_cpuid(1, &a, &b, &c, &d))
+		return FALSE;	/* no CPUID leaf 1: far too old to be virtual */
+
+	return (c & (1u << 31)) != 0;
+}
+
+/*
+ * Refuse under a hypervisor, and say which switch turns it off.
+ *
+ * Written for Windows 10 and 11, where this is the usual reason an install
+ * fails: Memory Integrity is on by default on many machines, and it enables
+ * the hypervisor without ever using the word. Nothing on the screen tells the
+ * person their PC is virtualised, so the failure is otherwise inexplicable.
+ *
+ * Like the Secure Boot check this runs before anything is written, and like
+ * that one it is deliberately verbose: the settings live in three different
+ * places depending on the Windows version, and naming only one of them is how
+ * somebody concludes the check is wrong.
+ */
+static BOOL check_hypervisor(char *why, int n)
+{
+	if (!hypervisor_present())
+		return TRUE;
+
+	lstrcpyn(why,
+		 "This copy of Windows is running on top of a hypervisor, and "
+		 "MoCoLinux cannot install while it is.\r\n\r\n"
+		 "MoCoLinux runs Linux directly on the processor, side by side "
+		 "with Windows. That is only possible when nothing else is "
+		 "underneath Windows already. Features like Memory Integrity, "
+		 "Core Isolation, Credential Guard, Virtualization-Based "
+		 "Security, Windows Sandbox, WSL 2 and Hyper-V all switch that "
+		 "hypervisor on, usually without saying so.\r\n\r\n"
+		 "Turn off whichever of these you have, then restart:\r\n\r\n"
+		 "  Memory Integrity  --  open Windows Security, choose Device "
+		 "security, then Core isolation details, and set Memory "
+		 "integrity to Off.\r\n\r\n"
+		 "  Hyper-V, Sandbox, WSL  --  press the Windows key, type "
+		 "\"Turn Windows features on or off\", and clear the tick "
+		 "beside Hyper-V, Windows Sandbox, Virtual Machine Platform "
+		 "and Windows Subsystem for Linux.\r\n\r\n"
+		 "  If it still will not go  --  open Command Prompt as an "
+		 "administrator and run:  bcdedit /set hypervisorlaunchtype "
+		 "off\r\n\r\n"
+		 "Restart the computer after any of these, then run this Setup "
+		 "again. A restart is required -- the setting does not take "
+		 "effect until the machine boots.\r\n\r\n"
+		 "Nothing has been installed or changed on your computer.",
+		 n);
+	return FALSE;
 }
 
 /*
@@ -2071,6 +2149,7 @@ static DWORD WINAPI worker(LPVOID unused)
 	if (!check_x64(why, sizeof(why)) ||
 	    !check_version(why, sizeof(why)) ||
 	    !check_secure_boot(why, sizeof(why)) ||
+	    !check_hypervisor(why, sizeof(why)) ||
 	    !check_admin(why, sizeof(why)) ||
 	    !check_no_foreign_driver(why, sizeof(why)) ||
 	    !check_nothing_running(why, sizeof(why)) ||
