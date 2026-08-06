@@ -397,6 +397,29 @@ asm(".text                                                          \n"
     CO_SAVE_MSR(MSR_IA32_SYSENTER_CS, CO_ARCH_STATE_SYSENTER_CS)
     CO_SAVE_MSR(MSR_IA32_SYSENTER_ESP, CO_ARCH_STATE_SYSENTER_ESP)
     CO_SAVE_MSR(MSR_IA32_SYSENTER_EIP, CO_ARCH_STATE_SYSENTER_EIP)
+    /*
+     * TSC_AUX (0xC0000103): the auxiliary value RDTSCP returns alongside the
+     * timestamp. Windows 10 stores the logical processor number here, and
+     * PatchGuard verifies it has not been modified (arg4 = 0x7, "critical MSR
+     * modification").
+     *
+     * The guest's cpu_init() writes its own CPU ID, and the switch never
+     * saved or restored it, so the guest's value bled back into Windows.
+     * XP through 8.1 either do not use TSC_AUX or do not check it; Win10
+     * does both, and the bugcheck fires minutes later on PatchGuard's
+     * randomized timer -- confirmed from a minidump with arg3 = 0xC0000103
+     * naming the register exactly.
+     *
+     * Saved into the leaving side's state block at the existing temp_cr3
+     * union at offset 0xc0, which is unused during the crossing proper.
+     * This avoids growing co_arch_state_stack_t, which would shift every
+     * passage-page offset after it and require a guest kernel rebuild.
+     */
+    "    mov $0xc0000103, %ecx                                      \n"
+    "    rdmsr                                                      \n"
+    "    shl $32, %rdx                                              \n"
+    "    or %rdx, %rax                                              \n"
+    "    mov %rax, " CO_ARCH_STATE_STACK_TEMP_CR3 "(%r11)           \n"
     /* XGETBV exists only while this side has CR4.OSXSAVE set. */
     "    mov %cr4, %rax                                             \n"
     "    bt $18, %rax                                               \n"
@@ -531,10 +554,46 @@ asm(".text                                                          \n"
      * recognise for it.
      */
     "    cli                                                        \n"
+    /*
+     * CR4 before CR3, and this ordering is not negotiable.
+     *
+     * CR4.PCIDE (bit 17) controls whether bits 11:0 of CR3 are a PCID and
+     * bit 63 is the NOFLUSH flag. When PCIDE is clear those bits are
+     * reserved, and writing them raises #GP.
+     *
+     * Windows 10 with KVA Shadow (KPTI) sets PCIDE and puts a PCID in
+     * CR3. The guest clears PCIDE (Linux boots with nopcid here, and
+     * init_mem_mapping writes CR4 without it). So the leaving side's CR4
+     * has PCIDE off, and the entering host's CR3 has PCID bits set. If CR3
+     * is written first -- as it was -- the processor sees reserved bits in
+     * a CR3 write and raises #GP. That fires with IF clear, in the passage
+     * page, with the guest's IDT still loaded: #GP → #PF (unmapped gate)
+     * → #DF → triple fault → machine freeze with no dump.
+     *
+     * Confirmed on Windows 10 IoT Enterprise LTSC 21H2 (19044.1288):
+     * instant CLOCK_WATCHDOG_TIMEOUT freeze on starting the guest, fixed
+     * by disabling KVA Shadow (FeatureSettingsOverride = 3). The watchdog
+     * is secondary -- every core is dead because a triple fault on one
+     * core during the switch means the host IDT is never restored, so
+     * every subsequent interrupt on every core hits an unmapped gate.
+     *
+     * PGE (bit 7) is still cleared, for the same reason it always was:
+     * global TLB entries survive a CR3 write and must be flushed. btr $7
+     * was already done on the leaving side's CR4 (save path above), but
+     * the entering side may also have PGE set, and its CR4 is what we are
+     * loading. So clear it, write CR4, write CR3, then put PGE back.
+     *
+     * The sequence is: load entering CR4 with PGE cleared → write CR3 →
+     * restore PGE in CR4. PCIDE is set before CR3 touches it, and PGE is
+     * off during the CR3 write that needs the flush.
+     */
+    "    mov " CO_ARCH_STATE_STACK_CR4 "(%rdx), %rax                \n"
+    "    btr $7, %rax                           /* clear PGE */     \n"
+    "    mov %rax, %cr4                                             \n"
     "    mov " CO_ARCH_STATE_STACK_CR3 "(%rdx), %rax                \n"
     "    mov %rax, %cr3                                             \n"
     "    mov " CO_ARCH_STATE_STACK_CR4 "(%rdx), %rax                \n"
-    "    mov %rax, %cr4                                             \n"
+    "    mov %rax, %cr4                         /* PGE back */      \n"
     "    mov " CO_ARCH_STATE_CR8 "(%rdx), %rax                       \n"
     "    mov %rax, %cr8                                             \n"
     /*
@@ -804,6 +863,11 @@ asm(".text                                                          \n"
     "    wrmsr                                                      \n"
     "    mov $" MSR_IA32_SYSENTER_EIP ", %ecx /* SYSENTER_EIP */    \n"
     "    mov " CO_ARCH_STATE_SYSENTER_EIP "(%r11), %rax             \n"
+    "    mov %rax, %rdx                                             \n"
+    "    shr $32, %rdx                                              \n"
+    "    wrmsr                                                      \n"
+    "    mov $0xc0000103, %ecx         /* TSC_AUX */                \n"
+    "    mov " CO_ARCH_STATE_STACK_TEMP_CR3 "(%r11), %rax           \n"
     "    mov %rax, %rdx                                             \n"
     "    shr $32, %rdx                                              \n"
     "    wrmsr                                                      \n"
