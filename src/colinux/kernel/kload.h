@@ -141,6 +141,18 @@ extern co_rc_t co_kload_read(co_manager_t* manager, unsigned long long va,
 			     unsigned char* buf, unsigned long size);
 
 /*
+ * One aligned 32-bit word, in a single indivisible access.
+ *
+ * For words the guest is changing underneath us -- ring counters -- where the
+ * byte-at-a-time freedom memcpy has is a correctness bug rather than a detail.
+ * See the comment on the definitions.
+ */
+extern co_rc_t co_kload_read_u32(co_manager_t* manager, unsigned long long va,
+				 unsigned int* out);
+extern co_rc_t co_kload_write_u32(co_manager_t* manager, unsigned long long va,
+				  unsigned int value);
+
+/*
  * The same read, holding the teardown lock, for callers outside the driver.
  *
  * Use this from any ioctl handler. co_kload_read is for the in-driver callers

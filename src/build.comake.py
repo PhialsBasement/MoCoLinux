@@ -122,6 +122,37 @@ settings.cflags = os.getenv('COLINUX_CFLAGS')
 if not settings.cflags:
     settings.cflags = ''
 
+#
+# The cross prefix that holds virglrenderer and libepoxy, found rather than
+# demanded.
+#
+# cogpu-daemon includes <virgl/virglrenderer.h> and <epoxy/gl.h>, and the LINK
+# side of that dependency is already spelled out below (VIRGL_PREFIX in
+# os/winnt/build/build.comake.py names the import libraries outright). The
+# include side used to travel only through COLINUX_CFLAGS, so a build that did
+# not happen to set it compiled 170 targets and then died on a missing header
+# -- a build system that knows where the libraries are but not the headers is
+# only half a build system.
+#
+# COLINUX_VIRGL_PREFIX overrides; otherwise the default location is used if it
+# exists. If it does not, nothing is added and the failure is the same missing
+# header as before, which is the honest outcome for a tree without the prefix.
+# __file__ is not defined here: comake exec's this file with its own globals,
+# so the tree is located from the working directory instead. make.py is run
+# from src/, and the candidates below cover that and one level either side.
+_virgl_prefix = os.getenv('COLINUX_VIRGL_PREFIX')
+if not _virgl_prefix:
+    for _c in ('../../download/prefix-mingw',
+               '../download/prefix-mingw',
+               '../../../download/prefix-mingw'):
+        if os.path.isdir(os.path.join(_c, 'include')):
+            _virgl_prefix = _c
+            break
+
+if _virgl_prefix and os.path.isdir(os.path.join(_virgl_prefix, 'include')):
+    settings.cflags += ' -I' + os.path.abspath(
+        os.path.join(_virgl_prefix, 'include'))
+
 settings.lflags = os.getenv('COLINUX_LFLAGS')
 if not settings.lflags:
     settings.lflags = ''

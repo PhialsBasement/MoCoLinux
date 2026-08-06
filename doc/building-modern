@@ -59,21 +59,38 @@ All 29 patches apply cleanly. Confirm the shared ABI header landed:
 compiler whose version matches the host compiler's (see section 6), so drive
 comake directly:
 
+    tools/build.sh                    build, sign, stage into dist-x64
+    tools/build.sh --release 0.5.0    ...and assemble release/MoCoLinux-0.5.0
+
+That is the recipe to use. It runs the build below, builds the installer from
+installer/README's recipe, signs the driver, and stages a set that is checked
+for completeness rather than collected by hand -- the binaries, the renderer
+DLLs from the cross prefix, the launchers, and the guest-side X shim built for
+the target's ISA rather than the build host's. It reports vmlinux and
+root-arch.img rather than building them; both are slow, change rarely, and
+have their own tools.
+
+comake directly, if something needs driving by hand:
+
     cd src
     export COLINUX_ARCH=i386
     export COLINUX_HOST_OS=winnt
     export COLINUX_TARGET_KERNEL_SOURCE=$PWD/../../build/linux-2.6.33.7-source
     export COLINUX_TARGET_KERNEL_BUILD=$PWD/../../build/linux-2.6.33.7-build
-    export COLINUX_CFLAGS=-I$PWD/../../download/prefix-mingw/include
     python3 ../bin/make.py colinux
 
-COLINUX_CFLAGS is not optional on x86_64: cogpu-daemon includes
-<virgl/virglrenderer.h> and <epoxy/gl.h> from the cross-built prefix in
-download/prefix-mingw. The *link* side of that dependency is spelled out in
-src/colinux/os/winnt/build/build.comake.py (VIRGL_PREFIX names the import
-libraries outright), but the include path travels only through this variable,
-and without it the build dies at cogpu-daemon.o with a missing header after
-building 170 other targets first.
+cogpu-daemon includes <virgl/virglrenderer.h> and <epoxy/gl.h> from the
+cross-built prefix in download/prefix-mingw. That path is now found by
+src/build.comake.py rather than demanded through COLINUX_CFLAGS, which is what
+it used to be: a build that did not set it compiled 170 targets and then died
+on a missing header, while the *link* side of the same dependency was already
+spelled out in src/colinux/os/winnt/build/build.comake.py. Set
+COLINUX_VIRGL_PREFIX to override the location.
+
+Note what the raw comake build still does NOT give you: linux.sys comes out
+unsigned (tools/sign-driver.sh signs the copy in dist-x64, and NT 6 and later
+refuse the unsigned one), the renderer DLLs are not beside the daemon that
+needs them, and no launcher is staged. That is why tools/build.sh exists.
 
 COLINUX_TARGET_KERNEL_BUILD does not have to exist. Set it to something other
 than the source directory: it selects the out-of-tree include list. (Both lists

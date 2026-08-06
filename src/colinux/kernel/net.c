@@ -73,11 +73,31 @@ void co_net_set_address(unsigned long long va)
 	co_os_mutex_release(net_lock);
 }
 
+/*
+ * Ring counters, read and written one word at a time and indivisibly.
+ *
+ * Not co_kload_read/co_kload_write: those end in memcpy, which may move four
+ * bytes as four byte moves, and the guest is changing these words from its own
+ * processor as we look at them. A torn read of tx_head yields a value that
+ * never existed and makes head - tail exceed the ring, which the daemon
+ * reports -- correctly, on the evidence it has -- as a corrupt ring before
+ * shutting the network down. A torn write of tx_tail is worse: the guest's
+ * fullness check then permits a transmit that really does overwrite frames the
+ * host has not read.
+ *
+ * The window is only open while a counter is moving, so this is invisible on
+ * an idle guest and reliably fatal partway through a package install.
+ */
 static co_rc_t co_net_read_u32(co_manager_t* manager, unsigned long offset,
 			       unsigned int* out)
 {
-	return co_kload_read(manager, net_io_va + offset,
-			     (unsigned char*)out, sizeof(*out));
+	return co_kload_read_u32(manager, net_io_va + offset, out);
+}
+
+static co_rc_t co_net_write_u32(co_manager_t* manager, unsigned long offset,
+				unsigned int value)
+{
+	return co_kload_write_u32(manager, net_io_va + offset, value);
 }
 
 /*
@@ -125,9 +145,7 @@ co_rc_t co_net_take(co_manager_t* manager, unsigned int new_tail,
 	}
 
 	if (new_tail != tail &&
-	    !CO_OK(co_kload_write(manager, net_io_va + CO_NIO_TX_TAIL,
-				  (const unsigned char*)&new_tail,
-				  sizeof(new_tail)))) {
+	    !CO_OK(co_net_write_u32(manager, CO_NIO_TX_TAIL, new_tail))) {
 		rc = CO_RC(ERROR);
 		goto out;
 	}
@@ -266,8 +284,7 @@ co_rc_t co_net_put(co_manager_t* manager, const unsigned char* data,
 	 * Publish once. If nothing fit, rx_head is not touched at all -- there
 	 * is nothing to announce and no reason to write to the guest.
 	 */
-	if (n && !CO_OK(co_kload_write(manager, net_io_va + CO_NIO_RX_HEAD,
-				       (const unsigned char*)&head, 4)))
+	if (n && !CO_OK(co_net_write_u32(manager, CO_NIO_RX_HEAD, head)))
 		rc = CO_RC(ERROR);
 
 	if (CO_OK(rc)) {

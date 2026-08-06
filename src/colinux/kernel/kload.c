@@ -1144,6 +1144,60 @@ co_rc_t co_kload_write(co_manager_t* manager, unsigned long long va,
 }
 
 /*
+ * One 32-bit word, in a single access.
+ *
+ * co_kload_read and co_kload_write end in memcpy, and memcpy is free to move
+ * four bytes as four byte moves. For an image being loaded that is irrelevant.
+ * For a ring counter it is not: the guest advances tx_head from its own
+ * processor while the host reads it, so a byte-wise read can return a value
+ * that never existed -- high half new, low half old. The daemon then computes
+ * head - tail, gets something larger than the ring, and correctly concludes
+ * the ring is corrupt, which it is not. The same tearing on the write side
+ * hands the guest a tx_tail that never existed, and its fullness arithmetic
+ * then permits a write that really does overwrite unread frames.
+ *
+ * Both windows are open only while a counter is changing, so they scale with
+ * traffic: invisible on an idle guest, and reliably fatal partway through a
+ * package install or a bulk copy.
+ *
+ * The ABI already assigns each of these words a single writer. What it needs
+ * from this side is that the access is indivisible, which on x86 an aligned
+ * 32-bit load or store is. Alignment is required rather than assumed -- an
+ * unaligned access is only atomic by accident of not crossing a cache line.
+ */
+co_rc_t co_kload_read_u32(co_manager_t* manager, unsigned long long va,
+			  unsigned int* out)
+{
+	volatile unsigned int* p;
+
+	if (va & 3)
+		return CO_RC(INVALID_PARAMETER);
+
+	p = (volatile unsigned int*)co_kload_host_ptr(manager, va);
+	if (p == NULL)
+		return CO_RC(NOT_FOUND);
+
+	*out = *p;
+	return CO_RC(OK);
+}
+
+co_rc_t co_kload_write_u32(co_manager_t* manager, unsigned long long va,
+			   unsigned int value)
+{
+	volatile unsigned int* p;
+
+	if (va & 3)
+		return CO_RC(INVALID_PARAMETER);
+
+	p = (volatile unsigned int*)co_kload_host_ptr(manager, va);
+	if (p == NULL)
+		return CO_RC(NOT_FOUND);
+
+	*p = value;
+	return CO_RC(OK);
+}
+
+/*
  * A checksum of what is actually in guest memory, read back through the guest's
  * own page tables.
  *
