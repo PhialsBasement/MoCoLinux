@@ -186,8 +186,8 @@ Not yet:
 - A repaired incremental patch series: `patch/7.1.5/current-tree-snapshot.diff`
   is the authoritative guest-side diff and is deliberately not in `series`
 
-Known issue: the first boot after a host reboot is reliable, the second is
-not. Guest RAM is allocated per run from `MmAllocateContiguousMemory` in 32 MB
+Known issue: the first boot after a host reboot is reliable, ~~the second is
+not~~ more like the 15th if your on Windows 7 at least. Guest RAM is allocated per run from `MmAllocateContiguousMemory` in 32 MB
 runs, and a run's churn fragments host physical memory, so the next boot's
 allocations grind the machine. Allocate-once-per-driver-load is the
 workaround; pseudo-physical memory is the fix. Both are in `TODO`.
