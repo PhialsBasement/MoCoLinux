@@ -128,7 +128,8 @@ PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 	  xorg-xauth xorg-xhost xorg-xrandr xterm \
 	  xcb-util-cursor \
 	  virtualgl mesa-utils openssh \
-	  lib32-glibc lib32-gcc-libs"
+	  lib32-glibc lib32-gcc-libs \
+	  lib32-virtualgl lib32-libjpeg-turbo lib32-mesa"
 
 # virtualgl is what makes the GPU reachable, and it is the whole reason this
 # release exists. The guest has no display of its own: applications draw 2D
@@ -138,6 +139,17 @@ PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 # redirects the GL onto /dev/dri/renderD128, which is virgl, which is the
 # host's real card; the finished frames are pushed into the same X windows. So
 # windows stay native and rootless while the drawing happens on the GPU.
+#
+# lib32-virtualgl and its 32-bit libjpeg-turbo/mesa are not optional the moment
+# a 32-bit GL program is run -- Steam's client is the one everybody reaches for.
+# vglrun preloads a faker matching the target's word size, so a 32-bit process
+# needs the 32-bit libvglfaker/libdlfaker (lib32-virtualgl) and the 32-bit
+# libturbojpeg its proxy transport uses (lib32-libjpeg-turbo). Without them the
+# preload silently fails, the program falls through to indirect GLX against the
+# Windows X server, and dies with the same GLXBadDrawable VirtualGL exists to
+# avoid -- which is exactly how it presented: "libturbojpeg.so.0 cannot open",
+# "libvglfaker from LD_PRELOAD cannot be preloaded", then GLXBadDrawable. The
+# 64-bit set alone shipped in every release before this one.
 #
 # mesa-utils is glxinfo and glxgears: how anyone checks whether that actually
 # happened, rather than trusting it. openssh because a serial console is the
