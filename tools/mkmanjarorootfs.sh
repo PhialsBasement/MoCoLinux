@@ -357,7 +357,14 @@ inside "pacman-mirrors --api --set-branch stable" >/dev/null 2>&1 || true
 # is a server that has actually answered here regardless of what ranking says.
 if ! inside "pacman-mirrors --geoip" >/dev/null 2>&1; then
 	say "  geoip could not place this machine; ranking by speed instead"
-	inside "pacman-mirrors --fasttrack 5" >/dev/null 2>&1 || \
+	# -t 1: one second per mirror, not the default two.
+	#
+	# The cost of --fasttrack is not the download, it is the dead servers:
+	# each one that does not resolve or does not answer is paid for at the
+	# full timeout before the next is tried, and this list has several. The
+	# timeout is the only knob that bounds that, because --fasttrack fetches
+	# the whole list regardless of any country filter.
+	inside "pacman-mirrors --fasttrack 5 -t 1" >/dev/null 2>&1 || \
 		say "  pacman-mirrors could not rank mirrors; keeping the bootstrap servers"
 fi
 
@@ -375,6 +382,32 @@ fi
 if [ -f "$MNT/etc/pacman.d/mirrorlist" ]; then
 	sed -i "1i Server = $MIRROR1/\$repo/\$arch" \
 		"$MNT/etc/pacman.d/mirrorlist"
+
+	#
+	# And then keep only the first few.
+	#
+	# Ranking leaves around 125 Server lines, and the length of that list is
+	# not free: pacman walks it on every failure, spending a connection
+	# timeout on each dead entry, and it gives up on the sync entirely after
+	# enough consecutive failures -- which is the documented reason the
+	# re-verification step above once never ran at all. A shorter list is
+	# strictly better here: the first entry is a mirror that has actually
+	# answered on this machine, the next few are the ranked survivors, and
+	# nothing after that was ever going to be reached before pacman quit.
+	#
+	# Comment lines are kept: the file explains itself to whoever opens it
+	# later, and pacman ignores them.
+	#
+	# MOCO_MIRRORS overrides the count for anyone who wants the whole list.
+	awk -v keep="${MOCO_MIRRORS:-8}" '
+		/^[[:space:]]*Server[[:space:]]*=/ { if (++n > keep) next }
+		{ print }
+	' "$MNT/etc/pacman.d/mirrorlist" > "$MNT/etc/pacman.d/mirrorlist.trimmed" &&
+		mv "$MNT/etc/pacman.d/mirrorlist.trimmed" \
+		   "$MNT/etc/pacman.d/mirrorlist"
+
+	say "  mirrorlist: $(grep -c '^[[:space:]]*Server[[:space:]]*=' \
+		"$MNT/etc/pacman.d/mirrorlist") servers"
 fi
 
 say "re-verifying against the populated keyring"
