@@ -52,7 +52,11 @@ mkdir -p "$OUT"
 #   installer older than its own source.
 find_src() {
 	case $1 in
-	linux.sys)		[ -f "$DIST/$1" ] && { printf '%s\n' "$DIST/$1"; return 0; }
+	linux.sys)		# the build's own signed product first, then the
+				# staged copy sign-driver.sh makes by hand
+				[ -f "$BUILD/linux-signed.sys" ] &&
+					{ printf '%s\n' "$BUILD/linux-signed.sys"; return 0; }
+				[ -f "$DIST/$1" ] && { printf '%s\n' "$DIST/$1"; return 0; }
 				return 1 ;;
 	mocolinux-setup.exe)	[ -f "$HERE/installer/$1" ] &&
 					{ printf '%s\n' "$HERE/installer/$1"; return 0; }
@@ -116,9 +120,17 @@ calc=$(printf '%s\n' "$sig" | sed -n 's/^ *Calculated message digest *: *//p' | 
 [ -n "$cur" ] && [ "$cur" = "$calc" ] ||
 	die "linux.sys was modified after signing -- run tools/sign-driver.sh"
 
-# ...and it is the driver this tree just built, not an older signed one.
-[ "$DIST/linux.sys" -nt "$BUILD/linux.sys" ] ||
-	die "dist-x64/linux.sys is older than the build -- run tools/sign-driver.sh"
+# ...and it is the driver this tree just built, not an older signed one. The
+# build signs as a target now (linux-signed.sys), so this is normally already
+# true; it still catches a release cut from a hand-signed copy left behind by
+# an earlier build.
+if [ -f "$BUILD/linux-signed.sys" ]; then
+	[ "$BUILD/linux-signed.sys" -nt "$BUILD/linux.sys" ] ||
+		die "linux-signed.sys is older than the driver -- rebuild"
+else
+	[ "$DIST/linux.sys" -nt "$BUILD/linux.sys" ] ||
+		die "dist-x64/linux.sys is older than the build -- run tools/sign-driver.sh"
+fi
 
 # The Universal CRT check from installer/README, applied to every PE that
 # ships. A binary linked against api-ms-win-crt-* does not start on XP at all

@@ -16,6 +16,96 @@ def optional_targets():
         optional.append(Input('colinux-bridged-net-daemon.exe'))
     return optional
 
+#
+# What the build has to leave behind, beyond the binaries.
+#
+# `executables` used to be the end of it, and what it produced was not a
+# working install: linux.sys came out UNSIGNED, which loads on XP -- which
+# ignores embedded signatures -- and is refused by every later Windows; the
+# renderer DLLs cogpu-daemon needs were in the cross prefix rather than beside
+# it, so the daemon the build had just produced could not start; and the
+# launchers were still in tools/. Each of those was collected by hand
+# afterwards, and each has been forgotten at least once.
+#
+# So they are targets. `colinux` depends on this, and a build that cannot sign
+# or cannot find a DLL fails there rather than at install time on the box.
+# Registered at top level, not from a function: this file is exec'd with
+# separate globals and locals, `targets` lives in the locals, and a function
+# body cannot see it. A first attempt did this in a function, silently
+# registered nothing, and the build reported the same target count as before.
+#
+# Paths come from current_dirname -- the directory of this file, which comake
+# provides -- rather than from the working directory, which is not where this
+# file lives and which the same first attempt guessed wrong.
+import os as _os
+
+_build_dir = current_dirname				# src/colinux/os/winnt/build
+_tree = _os.path.abspath(_os.path.join(_build_dir, '..', '..', '..', '..', '..'))
+_prefix = getenv('COLINUX_VIRGL_PREFIX') or \
+    _os.path.abspath(_os.path.join(_tree, '..', 'download', 'prefix-mingw'))
+_keys = _os.path.abspath(_os.path.join(_tree, '..', 'keys'))
+
+_staged = []
+
+# One flat loop and no helper function, for the same reason: a def here cannot
+# see _os or targets either. The list is (name, source) pairs --
+#
+#   the renderer, beside the daemon that loads it, without which cogpu-daemon
+#   does not start and the loader says nothing about why; and the launchers,
+#   taken from the tree rather than from whatever was last edited in a staging
+#   directory.
+_to_copy = [(_d, _os.path.join(_prefix, 'bin', _d))
+            for _d in ('libvirglrenderer-1.dll', 'libepoxy-0.dll')]
+_to_copy += [(_f, _os.path.join(_tree, 'tools', _f))
+             for _f in ('moco-boot.vbs', 'moco-icons.vbs', 'moco-term.bat',
+                        'stop.bat', 'xstart1142.bat')]
+
+for _name, _src in _to_copy:
+    if not _os.path.exists(_src):
+        continue
+    targets[_name] = Target(
+        inputs = [],
+        tool = Script(lambda tool, tri, _s=_src:
+                      "cp -p '%s' '%s'" % (_s, tri.target.pathname)),
+    )
+    _staged.append(Input(_name))
+
+# The guest-side X shim, built for the target's ISA rather than this
+# machine's: a host defaulting to x86-64-v3 produces a binary that dies with
+# "CPU ISA level is lower than required" before main() on the Ivy Bridge this
+# runs on, because the loader checks the glibc note.
+_shim = _os.path.join(_tree, 'src', 'colinux', 'user', 'coxwire',
+                      'coxwire-guest.c')
+if _os.path.exists(_shim):
+    targets['coxwire'] = Target(
+        inputs = [],
+        tool = Script(lambda tool, tri, _s=_shim:
+                      "cc -O2 -march=x86-64 -mtune=generic -o '%s' '%s'"
+                      " -lpthread && objcopy --remove-section="
+                      ".note.gnu.property '%s'"
+                      % (tri.target.pathname, _s, tri.target.pathname)),
+    )
+    _staged.append(Input('coxwire'))
+
+# The signed driver.
+#
+# A separate file from linux.sys deliberately: signing in place would leave the
+# target newer than its own recipe every run, and the unsigned image is still
+# what the linker produced. NT 6 and later refuse the unsigned one, so this
+# being a build product rather than a manual step is what stops a release
+# being cut from a driver that cannot load.
+if _os.path.exists(_os.path.join(_keys, 'moco-test.crt')):
+    targets['linux-signed.sys'] = Target(
+        inputs = [Input('linux.sys')],
+        tool = Script(lambda tool, tri, _k=_keys:
+                      "osslsigncode sign -certs '%s/moco-test.crt'"
+                      " -key '%s/moco-test.key' -h sha1 -n MoCoLinux"
+                      " -in '%s' -out '%s' > /dev/null"
+                      % (_k, _k, tri.target.get_actual_inputs()[0].pathname,
+                         tri.target.pathname)),
+    )
+    _staged.append(Input('linux-signed.sys'))
+
 targets['executables'] = Target(
     inputs=[
     Input('colinux-daemon.exe'),
@@ -29,7 +119,7 @@ targets['executables'] = Target(
     Input('kmap-test.exe'),
     Input('cogpu-daemon.exe'),
     Input('linux.sys'),
-    ] + optional_targets(),
+    ] + optional_targets() + _staged,
     tool = Empty(),
 )
 

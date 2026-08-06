@@ -87,10 +87,15 @@ on a missing header, while the *link* side of the same dependency was already
 spelled out in src/colinux/os/winnt/build/build.comake.py. Set
 COLINUX_VIRGL_PREFIX to override the location.
 
-Note what the raw comake build still does NOT give you: linux.sys comes out
-unsigned (tools/sign-driver.sh signs the copy in dist-x64, and NT 6 and later
-refuse the unsigned one), the renderer DLLs are not beside the daemon that
-needs them, and no launcher is staged. That is why tools/build.sh exists.
+That build is now complete in itself: src/colinux/os/winnt/build ends up with
+the binaries, linux-signed.sys (signed with the test cert, because NT 6 and
+later refuse the unsigned one), the renderer DLLs beside the daemon that loads
+them, the launchers, and the guest-side coxwire shim built for the target's
+ISA. Those are build targets, so a build that cannot sign or cannot find a DLL
+fails there rather than at install time on the box.
+
+tools/build.sh adds only what is outside comake's world: the installer
+executable, staging into dist-x64, and --release.
 
 COLINUX_TARGET_KERNEL_BUILD does not have to exist. Set it to something other
 than the source directory: it selects the out-of-tree include list. (Both lists
