@@ -82,7 +82,10 @@ static int verbose;
  */
 static FILE *g_log;
 
-static void logline(const char *fmt, ...)
+/* The X wire (xwire.c) shares this daemon's log and its guest-RAM windows. */
+int cogpu_xwire_start(void);
+
+void logline(const char *fmt, ...)
 {
 	va_list ap;
 
@@ -146,7 +149,7 @@ static uint32_t resolve_run(uint64_t gpa, uint32_t len)
 	return 0;
 }
 
-static void *resolve_gpa(void *ctx, uint64_t gpa, uint32_t len)
+void *resolve_gpa(void *ctx, uint64_t gpa, uint32_t len)
 {
 	int i, n;
 
@@ -1330,6 +1333,16 @@ int main(int argc, char **argv)
 
 	logline("transport at guest va 0x%llx, status 0x%x\n\n",
 	       vgpu_va, io->status);
+
+	/*
+	 * The X wire, if it can be had.
+	 *
+	 * Only started once guest RAM is mapped, because a channel's first act
+	 * is to turn guest-physical pages into pointers through that mapping.
+	 * A failure here is not fatal to anything: the guest's shim falls back
+	 * to reaching the X server over slirp exactly as it did before, slowly.
+	 */
+	cogpu_xwire_start();
 
 	memset(vq, 0, sizeof(vq));
 	io->enabled = 1;
