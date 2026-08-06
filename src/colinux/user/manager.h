@@ -75,6 +75,7 @@ extern co_rc_t co_manager_kunmap(co_manager_handle_t handle,
 				 unsigned long* released_out);
 extern co_rc_t co_manager_vgpu_address(co_manager_handle_t handle,
 				       unsigned long long* va_out);
+extern co_rc_t co_manager_vgpu_wake(co_manager_handle_t handle);
 extern co_rc_t co_manager_kvirt_to_phys(co_manager_handle_t handle,
 					unsigned long long va,
 					unsigned long long* pa_out);

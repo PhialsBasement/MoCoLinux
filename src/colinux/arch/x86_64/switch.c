@@ -4329,9 +4329,36 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 					}
 					rx_spins = 0;
 
+					/*
+					 * The sleep is now a wait: same
+					 * bounded backoff, but the GPU daemon
+					 * can cut it short through the
+					 * VGPU_WAKE ioctl the moment it
+					 * publishes a completion. This is the
+					 * completion doorbell -- the fix the
+					 * failed experiments pointed at: an
+					 * event the daemon signals through
+					 * the driver, not a re-entry loop.
+					 * Measured before it: every fence a
+					 * guest waited on cost a full backoff
+					 * tick (~10 ms flat, offscreen EGL,
+					 * any resolution) because the
+					 * completion is a plain store into
+					 * guest RAM that nothing here can
+					 * see. The guest reaps at its
+					 * idle-boundary drain even when no
+					 * tick is due, so re-entering on the
+					 * wake is sufficient; the timeout
+					 * path is byte-for-byte the old
+					 * behaviour, so the anti-freeze
+					 * property this sleep exists for is
+					 * untouched. The banked tick stays
+					 * timeout-only: a wake re-entry took
+					 * no time worth accounting.
+					 */
 					idle_run++;
-					co_os_msleep(idle_run > 100 ? 10 : 1);
-					pp->params[48] += 1;
+					if (!co_os_idle_wait(idle_run > 100 ? 10 : 1))
+						pp->params[48] += 1;
 
 					/*
 					 * Idle forever is correct cooperative

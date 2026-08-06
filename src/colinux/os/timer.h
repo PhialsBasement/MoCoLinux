@@ -23,6 +23,22 @@ extern void co_os_timer_deactivate(co_os_timer_t timer);
 extern void co_os_timer_destroy(co_os_timer_t timer);
 extern void co_os_msleep(unsigned int msecs);
 
+/*
+ * The monitor loop's idle sleep, as something another process can cut short.
+ *
+ * co_os_msleep is a blind timeout: whatever happens during it waits for it.
+ * That made the backoff tick the floor under every GPU fence -- the daemon
+ * completes work with plain stores the monitor cannot see, so the guest slept
+ * a full tick per completion. co_os_idle_wait sleeps the same bounded time but
+ * wakes early when co_os_idle_wake is rung (from the daemon, through an
+ * ioctl). Returns PTRUE if woken, PFALSE on timeout. The event is auto-reset:
+ * one wake releases one wait, a wake with no waiter arms the next wait, and
+ * nothing accumulates.
+ */
+extern void   co_os_idle_wake_init(void);
+extern void   co_os_idle_wake(void);
+extern bool_t co_os_idle_wait(unsigned int msecs);
+
 typedef struct {
 	union {
 		struct {

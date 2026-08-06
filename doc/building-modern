@@ -64,7 +64,16 @@ comake directly:
     export COLINUX_HOST_OS=winnt
     export COLINUX_TARGET_KERNEL_SOURCE=$PWD/../../build/linux-2.6.33.7-source
     export COLINUX_TARGET_KERNEL_BUILD=$PWD/../../build/linux-2.6.33.7-build
+    export COLINUX_CFLAGS=-I$PWD/../../download/prefix-mingw/include
     python3 ../bin/make.py colinux
+
+COLINUX_CFLAGS is not optional on x86_64: cogpu-daemon includes
+<virgl/virglrenderer.h> and <epoxy/gl.h> from the cross-built prefix in
+download/prefix-mingw. The *link* side of that dependency is spelled out in
+src/colinux/os/winnt/build/build.comake.py (VIRGL_PREFIX names the import
+libraries outright), but the include path travels only through this variable,
+and without it the build dies at cogpu-daemon.o with a missing header after
+building 170 other targets first.
 
 COLINUX_TARGET_KERNEL_BUILD does not have to exist. Set it to something other
 than the source directory: it selects the out-of-tree include list. (Both lists

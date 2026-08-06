@@ -17,6 +17,7 @@
 #include <colinux/os/kernel/manager.h>
 #include <colinux/os/kernel/misc.h>
 #include <colinux/os/kernel/mutex.h>
+#include <colinux/os/timer.h>
 #include <colinux/arch/mmu.h>
 #include <colinux/arch/probe.h>
 #include <colinux/arch/state.h>
@@ -144,6 +145,8 @@ co_rc_t co_manager_load(co_manager_t *manager)
 	rc = co_vgpu_init();
 	if (!CO_OK(rc))
 		goto out_err_os;
+
+	co_os_idle_wake_init();
 
 	rc = co_cobd_async_init();
 	if (!CO_OK(rc))
@@ -974,6 +977,24 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 				params->rc = CO_RC(NOT_FOUND);
 		}
 
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_VGPU_WAKE: {
+		co_manager_ioctl_vgpu_wake_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		/*
+		 * The daemon has just published completions into guest RAM.
+		 * Cut the monitor's idle sleep short so the guest reaps them
+		 * now instead of at the end of a backoff tick.
+		 */
+		co_os_idle_wake();
+
+		params->rc = CO_RC(OK);
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}

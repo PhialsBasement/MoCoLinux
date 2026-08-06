@@ -1435,6 +1435,20 @@ int main(int argc, char **argv)
 			 */
 			__atomic_thread_fence(__ATOMIC_RELEASE);
 			io->used_pending++;
+
+			/*
+			 * The other half of the doorbell. The bump above is a
+			 * plain store the monitor loop cannot see, and a guest
+			 * waiting on a fence is idle by definition -- without
+			 * this it slept a whole backoff tick (~10 ms, measured
+			 * offscreen at every resolution) per completion. The
+			 * ioctl cuts that sleep short; the guest drains at the
+			 * idle boundary and wakes the fence waiter. Once per
+			 * service pass, not per request, and nothing to do if
+			 * it fails -- the tick it would have saved still
+			 * happens.
+			 */
+			co_manager_vgpu_wake(handle);
 			idle = 0;
 
 			if (once) {

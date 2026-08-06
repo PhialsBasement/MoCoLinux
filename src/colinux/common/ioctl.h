@@ -58,6 +58,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KMAP,
 	CO_MANAGER_IOCTL_KUNMAP,
 	CO_MANAGER_IOCTL_VGPU,
+	CO_MANAGER_IOCTL_VGPU_WAKE,
 } co_manager_ioctl_t;
 
 /*
@@ -380,6 +381,20 @@ typedef struct {
 	unsigned long long query_va;	/* in:  a guest virtual address, or 0 */
 	unsigned long long query_pa;	/* out: what it resolves to */
 } co_manager_ioctl_vgpu_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_VGPU_WAKE: the completion doorbell.
+ *
+ * The GPU daemon publishes results as plain stores into guest RAM, which the
+ * monitor loop cannot see -- so a guest idle-waiting on a fence slept a whole
+ * backoff tick for every completion. This ioctl is the missing half of the
+ * doorbell: the daemon rings it after bumping used_pending, and the monitor's
+ * idle sleep wakes and re-enters the guest, whose idle-boundary drain does the
+ * rest. No payload; the completion itself is already in guest memory.
+ */
+typedef struct {
+	co_rc_t rc;
+} co_manager_ioctl_vgpu_wake_t;
 
 /*
  * interface for CO_MANAGER_IOCTL_COBD: attach a backing store to a unit.

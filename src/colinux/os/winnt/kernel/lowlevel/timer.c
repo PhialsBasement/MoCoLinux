@@ -89,6 +89,51 @@ void co_os_msleep(unsigned int msecs)
 }
 
 /*
+ * The idle sleep's wake event. Driver-lifetime, initialised at manager load,
+ * so there is no per-run state to retire. SynchronizationEvent: setting it
+ * releases exactly one wait and clears itself, so a wake that arrives while
+ * the monitor is still inside the crossing is not lost -- it is consumed by
+ * the next wait, immediately -- and repeated wakes do not accumulate into a
+ * burst of re-entries later.
+ */
+static KEVENT co_idle_wake_event;
+static int    co_idle_wake_ready;
+
+void co_os_idle_wake_init(void)
+{
+	KeInitializeEvent(&co_idle_wake_event, SynchronizationEvent, FALSE);
+	co_idle_wake_ready = 1;
+}
+
+void co_os_idle_wake(void)
+{
+	if (!co_idle_wake_ready)
+		return;
+	/*
+	 * The increment of 1 boosts the waiting monitor thread so it runs now
+	 * rather than at the end of the scheduler's queue -- this call exists
+	 * to shave latency, and a wake that waits its turn is half a fix.
+	 */
+	KeSetEvent(&co_idle_wake_event, 1, FALSE);
+}
+
+bool_t co_os_idle_wait(unsigned int msecs)
+{
+	LARGE_INTEGER DueTime;
+	NTSTATUS      status;
+
+	if (!co_idle_wake_ready) {
+		co_os_msleep(msecs);
+		return PFALSE;
+	}
+
+	DueTime.QuadPart = (long long)msecs * 10000 * (-1);
+	status = KeWaitForSingleObject(&co_idle_wake_event, Executive,
+				       KernelMode, FALSE, &DueTime);
+	return status == STATUS_SUCCESS ? PTRUE : PFALSE;
+}
+
+/*
  * Ask Windows for a finer clock while a guest is running.
  *
  * co_os_msleep above is KeDelayExecutionThread with a relative interval, and

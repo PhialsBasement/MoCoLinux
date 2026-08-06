@@ -363,6 +363,27 @@ co_rc_t co_manager_vgpu_address(co_manager_handle_t handle, unsigned long long* 
 	return rc;
 }
 
+/*
+ * Ring the completion doorbell: the monitor's idle sleep wakes and re-enters
+ * the guest, whose idle-boundary drain reaps what was just published. Called
+ * by the GPU daemon once per service pass that produced completions, so the
+ * cost -- one DeviceIoControl -- is per batch, not per request.
+ */
+co_rc_t co_manager_vgpu_wake(co_manager_handle_t handle)
+{
+	co_manager_ioctl_vgpu_wake_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_VGPU_WAKE,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+
+	return rc;
+}
+
 co_rc_t co_manager_kvirt_to_phys(co_manager_handle_t handle,
 				 unsigned long long va, unsigned long long* pa_out)
 {
