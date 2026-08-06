@@ -1,7 +1,8 @@
 # MoCoLinux
 
 Cooperative Linux for x86-64: a modern Linux kernel running as a guest inside
-Windows XP x64, Windows 7 x64 and Windows 8.1 x64 on real hardware, without a
+Windows XP x64, Windows 7 x64, Windows 8.1 x64 and Windows 10 x64 on real
+hardware, without a
 hypervisor, emulation, or virtualization extensions. It is a port of
 [coLinux](http://colinux.org/) (i386, unmaintained since ~2011) to x86-64,
 against a 2026 kernel.
@@ -36,10 +37,16 @@ ThinkCentre's own i5-3470.
 ![The same guest again on Windows 8.1 x64, with cmd.exe reporting 6.3.9600 beside it](doc/img/mocolinux-win81-desktop.png)
 
 And the same again on Windows 8.1 x64, `cmd.exe` reporting 6.3.9600 next to
-KDE's own report of the card. One binary serves all three hosts: XP ignores
-embedded signatures, while Windows 7 and 8.1 accept the same test-signed driver
-once `bcdedit /set testsigning on` is in force, which Setup does for you. 8.1
-asks for a little more besides — see [Windows 8 and 8.1](#windows-8-and-81).
+KDE's own report of the card.
+
+![And on Windows 10 IoT Enterprise LTSC, with KDE, Dolphin and fastfetch reporting virgl on the GT 730](doc/img/mocolinux-win10-desktop.png)
+
+And on Windows 10 IoT Enterprise LTSC (10.0.19044), with KVA Shadow (KPTI)
+active. One binary serves all four hosts: XP ignores embedded signatures, while
+Windows 7, 8.1 and 10 accept the same test-signed driver once
+`bcdedit /set testsigning on` is in force, which Setup does for you. 8.1 and 10
+ask for a little more — see [Windows 8 and 8.1](#windows-8-and-81) and
+[Windows 10](#windows-10).
 
 ## How it works
 
@@ -128,8 +135,9 @@ no GL call loses nothing, and one that does never falls back to llvmpipe.
 ## Status
 
 Working, verified on hardware (Lenovo ThinkCentre M92p, i5-3470) under Windows
-XP x64, Windows 7 x64 and Windows 8.1 x64 — see [Windows 8 and
-8.1](#windows-8-and-81) for what that host asks for:
+XP x64, Windows 7 x64, Windows 8.1 x64 and Windows 10 x64 — see [Windows 8
+and 8.1](#windows-8-and-81) and [Windows 10](#windows-10) for what those hosts
+ask for:
 
 - Boots Manjaro with systemd to multi-user target, no failed units, from an
   image the tree builds (`tools/mkmanjarorootfs.sh`)
@@ -319,6 +327,33 @@ Two smaller differences from XP:
 
 Windows 8 (6.2) shares all of the above and is expected to work, but has not
 been run on hardware.
+
+## Windows 10
+
+Supported and verified on hardware (Windows 10 IoT Enterprise LTSC 21H2,
+build 19044) with GPU acceleration. Everything the earlier hosts do, plus two
+world-switch fixes that only this version needs:
+
+- **CR4 before CR3 at the crossing.** Windows 10 with KVA Shadow sets
+  `CR4.PCIDE`, which makes bits 11:0 of CR3 a PCID and bit 63 the NOFLUSH
+  flag. The guest clears PCIDE (`nopcid`). Writing the host's PCID-encoded CR3
+  while PCIDE is still off writes reserved bits: `#GP` in the passage page with
+  IF clear, triple fault, instant machine freeze. The crossing now loads the
+  entering side's CR4 (with PGE cleared for the TLB flush) before writing CR3.
+- **`MSR_TSC_AUX` (0xC0000103) saved and restored per crossing.** Windows 10
+  stores the logical processor number here for `RDTSCP`. PatchGuard verifies it
+  has not been modified. The guest's `cpu_init()` overwrites it; without the
+  save/restore, PatchGuard trips with bugcheck `0x109`
+  (`CRITICAL_STRUCTURE_CORRUPTION`, arg4 = 0x7, arg3 = 0xC0000103) on its
+  randomized timer, minutes after boot. Confirmed from a minidump. Saved into
+  the existing `temp_cr3` slot to avoid growing the shared state struct.
+
+Neither fix has any effect on XP, 7 or 8.1 — PCIDE is not set and TSC_AUX is
+not checked on those hosts — so the same binary runs on all four.
+
+Requirements are the same as 8.1 (test signing, no hypervisor, elevation) with
+no additions. Windows 10 enables KVA Shadow by default on affected hardware,
+which the switch now handles; it does **not** need to be disabled.
 
 ## Porting notes
 
