@@ -338,43 +338,20 @@ say "writing a real mirrorlist"
 # it leaves what is already there, which still works.
 inside "pacman-mirrors --api --set-branch stable" >/dev/null 2>&1 || true
 
-# --geoip, not --fasttrack.
+# At most ten servers are ever contacted, and that is enforced here rather
+# than asked of pacman-mirrors, which has no option for it.
 #
-# --fasttrack ranks by measurement, and it deliberately ignores any country
-# filter: it fetches the whole list -- around 125 servers -- and connects to
-# every one to time it. Each mirror that is dead or does not resolve costs a
-# full connection timeout first, and this list has several of those, so through
-# slirp on a single-processor guest the step takes minutes of doing nothing but
-# waiting. It is the slowest thing in the build that produces no output.
+# --method random is the whole trick: pacman-mirrors' default is to connect to
+# every mirror in the pool and time it, and --geoip does not change that -- it
+# changes which pool. --method random writes the list without contacting
+# anything at all. --geoip still chooses the country, so the pool is local
+# rather than a Jamaican mirror picked by a stopwatch.
 #
-# --geoip asks the API which country this machine is in and keeps that
-# country's mirrors, which is both faster (no probing at all) and a better
-# answer for whoever ends up running the image -- a mirror on the same
-# continent beats one that happened to time well from the build host.
-#
-# Nothing probes the whole list. Ever.
-#
-# --fasttrack is gone rather than kept as a fallback. It cannot be bounded:
-# it fetches all ~125 servers and connects to every one, ignoring any country
-# filter, and -t only discounts each dead mirror instead of skipping it. On a
-# single-processor guest behind slirp that is minutes of silence, and it was
-# the slowest step in the build.
-#
-# If geoip cannot place the machine, the fallback is a small fixed pool of
-# large, long-lived mirrors passed to --country, which restricts the list
-# BEFORE anything is contacted. Naming countries rather than taking whatever
-# geolocation guessed also avoids the other failure this had: a machine placed
-# somewhere with one small mirror ends up with a list that is geographically
-# correct and useless.
-#
-# Either way the prepend below means none of this is load-bearing -- the first
-# entry is a server that has actually answered on this machine.
-if ! inside "pacman-mirrors --geoip" >/dev/null 2>&1; then
-	say "  geoip could not place this machine; using the default mirror pool"
-	inside "pacman-mirrors --country Germany,Netherlands,France,United_Kingdom" \
-		>/dev/null 2>&1 || \
-		say "  pacman-mirrors could not set mirrors; keeping the bootstrap servers"
-fi
+# The list is then cut to MOCO_MIRRORS (default 10) BEFORE pacman ever runs,
+# so ten is the most that can be contacted by anything downstream either.
+inside "pacman-mirrors --geoip --method random" >/dev/null 2>&1 ||
+	inside "pacman-mirrors --method random" >/dev/null 2>&1 ||
+	say "  pacman-mirrors could not set mirrors; keeping the bootstrap servers"
 
 # Put the mirror we measured back at the top of whatever pacman-mirrors chose.
 #
@@ -407,7 +384,7 @@ if [ -f "$MNT/etc/pacman.d/mirrorlist" ]; then
 	# later, and pacman ignores them.
 	#
 	# MOCO_MIRRORS overrides the count for anyone who wants the whole list.
-	awk -v keep="${MOCO_MIRRORS:-8}" '
+	awk -v keep="${MOCO_MIRRORS:-10}" '
 		/^[[:space:]]*Server[[:space:]]*=/ { if (++n > keep) next }
 		{ print }
 	' "$MNT/etc/pacman.d/mirrorlist" > "$MNT/etc/pacman.d/mirrorlist.trimmed" &&
