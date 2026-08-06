@@ -352,20 +352,28 @@ inside "pacman-mirrors --api --set-branch stable" >/dev/null 2>&1 || true
 # answer for whoever ends up running the image -- a mirror on the same
 # continent beats one that happened to time well from the build host.
 #
-# --fasttrack stays as the fallback for a machine geolocation cannot place,
-# and the prepend below means neither of them is load-bearing: the first entry
-# is a server that has actually answered here regardless of what ranking says.
+# Nothing probes the whole list. Ever.
+#
+# --fasttrack is gone rather than kept as a fallback. It cannot be bounded:
+# it fetches all ~125 servers and connects to every one, ignoring any country
+# filter, and -t only discounts each dead mirror instead of skipping it. On a
+# single-processor guest behind slirp that is minutes of silence, and it was
+# the slowest step in the build.
+#
+# If geoip cannot place the machine, the fallback is a small fixed pool of
+# large, long-lived mirrors passed to --country, which restricts the list
+# BEFORE anything is contacted. Naming countries rather than taking whatever
+# geolocation guessed also avoids the other failure this had: a machine placed
+# somewhere with one small mirror ends up with a list that is geographically
+# correct and useless.
+#
+# Either way the prepend below means none of this is load-bearing -- the first
+# entry is a server that has actually answered on this machine.
 if ! inside "pacman-mirrors --geoip" >/dev/null 2>&1; then
-	say "  geoip could not place this machine; ranking by speed instead"
-	# -t 1: one second per mirror, not the default two.
-	#
-	# The cost of --fasttrack is not the download, it is the dead servers:
-	# each one that does not resolve or does not answer is paid for at the
-	# full timeout before the next is tried, and this list has several. The
-	# timeout is the only knob that bounds that, because --fasttrack fetches
-	# the whole list regardless of any country filter.
-	inside "pacman-mirrors --fasttrack 5 -t 1" >/dev/null 2>&1 || \
-		say "  pacman-mirrors could not rank mirrors; keeping the bootstrap servers"
+	say "  geoip could not place this machine; using the default mirror pool"
+	inside "pacman-mirrors --country Germany,Netherlands,France,United_Kingdom" \
+		>/dev/null 2>&1 || \
+		say "  pacman-mirrors could not set mirrors; keeping the bootstrap servers"
 fi
 
 # Put the mirror we measured back at the top of whatever pacman-mirrors chose.
