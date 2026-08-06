@@ -604,6 +604,29 @@ net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 EOF
 
+# Keep memory compaction away from the X wire's rings.
+#
+# coxwire pins its ring region with mlock and hands the host the *physical*
+# pages, which the host then reads and writes directly through its mappings.
+# mlock stops those pages being swapped -- but not being MIGRATED. Under memory
+# pressure the compactor relocates pages to defragment, and by default it is
+# allowed to move mlocked (unevictable) ones too. When it moves a ring page the
+# guest keeps using the new physical frame while the host still reads the old
+# one, so the host ships stale bytes: the X protocol stream desynchronises and
+# the server throws BadLength / BadGC / BadRequest on whatever it misparses.
+# It only bites under sustained allocation (a package install, Steam), which is
+# why light use looked fine and heavy use corrupted.
+#
+# compact_unevictable_allowed = 0 tells the compactor to leave mlocked pages
+# where they are, which is exactly the guarantee coxwire's design assumed it
+# already had. Proactive compaction is turned down too, so there is less reason
+# to move anything at all. The real fix is pinning the pages against migration
+# from a driver; this is the correct, low-risk mitigation until then.
+cat > "$MNT/etc/sysctl.d/45-coxwire-nocompact.conf" <<'EOF'
+vm.compact_unevictable_allowed = 0
+vm.compaction_proactiveness = 0
+EOF
+
 # Rootless X, the way the i386 port did it: an X server on the Windows side in
 # multiwindow mode, with guest applications appearing as ordinary Windows
 # windows. 10.0.2.2 is slirp's gateway alias, and tcp_fconnect() rewrites a
