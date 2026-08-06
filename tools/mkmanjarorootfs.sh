@@ -747,6 +747,74 @@ MOCOGL
 inside "systemctl enable sshd" >/dev/null 2>&1 || \
 	say "  WARNING: could not enable sshd"
 
+# ------------------------------------------------------------------- the wire
+#
+# CoXWire: the X connection carried through guest RAM instead of slirp. The
+# shim owns /tmp/.X11-unix/X0, so an application only has to use DISPLAY=:0 --
+# libX11, VirtualGL and the application itself are unchanged. Measured on the
+# M92p, glxgears 1024x768 with VGL_SPOIL=0: 5.08 fps over slirp, 44 over this.
+#
+# The binary is COPIED, never compiled here.
+#
+# This script's most important caller is the seed image building the machine's
+# real root filesystem on first boot, and that guest has no compiler -- so a
+# build step would mean every installed system silently ends up without the
+# wire. It propagates the same way this script propagates itself: the running
+# system's own /usr/local/bin/coxwire goes into the image it is building, so
+# each generation carries the next one's copy.
+#
+# Compiling is the last resort, for a developer seeding the very first image
+# on a machine that has the source and a compiler. -march=x86-64 with the
+# glibc note stripped, both deliberate: a build host newer than the target (a
+# CachyOS box defaults to x86-64-v3) otherwise produces a binary that dies
+# with "CPU ISA level is lower than required" before main() on the Ivy Bridge
+# this runs on.
+COXWIRE_BIN=""
+for b in /usr/local/bin/coxwire \
+	 "$(dirname "$SELF")/../../dist-x64/coxwire"; do
+	[ -x "$b" ] && { COXWIRE_BIN=$b; break; }
+done
+
+if [ -z "$COXWIRE_BIN" ]; then
+	COXWIRE_SRC="$(dirname "$SELF")/../src/colinux/user/coxwire/coxwire-guest.c"
+	if [ -f "$COXWIRE_SRC" ] && command -v cc >/dev/null 2>&1; then
+		say "no prebuilt X wire shim; building one"
+		if cc -O2 -march=x86-64 -mtune=generic -o "$MNT/usr/local/bin/coxwire" \
+		      "$COXWIRE_SRC" -lpthread 2>/dev/null; then
+			objcopy --remove-section=.note.gnu.property \
+				"$MNT/usr/local/bin/coxwire" 2>/dev/null || true
+			COXWIRE_BIN=$MNT/usr/local/bin/coxwire
+		fi
+	fi
+fi
+
+if [ -n "$COXWIRE_BIN" ]; then
+	install -Dm 0755 "$COXWIRE_BIN" "$MNT/usr/local/bin/coxwire"
+	say "installed the X wire's guest shim"
+
+	cat > "$MNT/etc/systemd/system/coxwire.service" <<'COXWIRE'
+[Unit]
+Description=CoXWire: the X connection over guest RAM
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/coxwire
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+COXWIRE
+	inside "systemctl enable coxwire" >/dev/null 2>&1 || \
+		say "  WARNING: could not enable coxwire"
+else
+	# Loud, because the symptom otherwise appears much later and looks
+	# like something else entirely: X clients still work over slirp, so
+	# the desktop comes up and is simply eight times slower.
+	say "  WARNING: no coxwire binary found -- X will fall back to slirp"
+fi
+
 say "installing the builder and its first-boot unit"
 
 # This script, inside the image it just built. The system that gets installed
