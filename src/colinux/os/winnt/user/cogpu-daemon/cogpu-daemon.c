@@ -85,6 +85,26 @@ static FILE *g_log;
 /* The X wire (xwire.c) shares this daemon's log and its guest-RAM windows. */
 int cogpu_xwire_start(void);
 
+/*
+ * The completion doorbell, shared with the X wire.
+ *
+ * co_manager_vgpu_wake cuts the monitor's idle sleep short so the guest
+ * re-enters promptly instead of waiting out its backoff. It was built for GPU
+ * completions, but the effect is generic -- "there is work, re-enter now" --
+ * and the X wire needs exactly that: when a reply or an input event lands in
+ * the guest's RX ring while the guest is idle waiting for it, nothing else
+ * wakes it, so an interactive app pays a whole backoff tick per event and
+ * feels like single-digit fps while throughput is fine. xwire.c rings this
+ * from fill_rx. The handle is the daemon's, captured once at startup.
+ */
+static co_manager_handle_t g_wake_handle;
+
+void cogpu_ring_doorbell(void)
+{
+	if (g_wake_handle)
+		co_manager_vgpu_wake(g_wake_handle);
+}
+
 void logline(const char *fmt, ...)
 {
 	va_list ap;
@@ -987,6 +1007,7 @@ int main(int argc, char **argv)
 	}
 
 	handle = co_os_manager_open();
+	g_wake_handle = handle;		/* for cogpu_ring_doorbell(), incl. the X wire */
 	if (!handle) {
 		logline("cannot open the driver -- is it started?\n");
 		return 1;

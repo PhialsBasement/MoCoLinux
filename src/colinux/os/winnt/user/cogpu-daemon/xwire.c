@@ -36,6 +36,16 @@
 extern void *resolve_gpa(void *ctx, uint64_t gpa, uint32_t len);
 extern void logline(const char *fmt, ...);
 
+/*
+ * Ring the monitor's wake, so a guest idle-waiting on the RX ring re-enters
+ * at once instead of sleeping out a backoff tick. This is the whole reason an
+ * interactive app -- Firefox, the desktop -- churned at single-digit fps while
+ * a continuously-drawing one (glxgears never idles) held 40: every reply and
+ * every input event that arrived while the guest slept waited for the tick.
+ * Provided by cogpu-daemon.c, backed by the GPU completion doorbell.
+ */
+extern void cogpu_ring_doorbell(void);
+
 /* Where VcXsrv listens. Loopback on this machine -- the whole point. */
 #define XSERVER_PORT	6000
 
@@ -247,6 +257,14 @@ static int fill_rx(struct xchan *c)
 
 	MemoryBarrier();
 	h->rx_head = head + (uint32_t)r;
+
+	/*
+	 * There is something in the RX ring for the guest now. If it is idle
+	 * waiting for it -- a reply, a keypress, a scroll -- wake the monitor
+	 * so it re-enters rather than sleeping the backoff. Only when data
+	 * actually arrived (r > 0), so this is per-batch, not per spin.
+	 */
+	cogpu_ring_doorbell();
 	return r;
 }
 
