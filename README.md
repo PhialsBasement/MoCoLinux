@@ -219,28 +219,39 @@ workaround; pseudo-physical memory is the fix. Both are in `TODO`.
 
 ## Building
 
-Requires a cross toolchain (`mingw-w64-gcc`, `binutils`) and two kernel trees:
-the Windows side builds against 2.6.33 headers (the passage-page ABI is a
-header inside the guest kernel tree), while the guest kernel is 7.1.5. The
-2.6.33 tree is used for headers only — nothing in it is built or run.
+Requires a cross toolchain (`mingw-w64-gcc`, `binutils`), `osslsigncode` for
+the driver signature, and two kernel trees: the Windows side builds against
+2.6.33 headers (the passage-page ABI is a header inside the guest kernel
+tree), while the guest kernel is 7.1.5. The 2.6.33 tree is used for headers
+only — nothing in it is built or run.
 
-See `doc/building-modern` for the full recipe; briefly:
+The Windows side, driver through release, is one script:
 
 ```sh
-# the Windows side -- driver and daemons
-cd src
-COLINUX_ARCH=x86_64 \
-COLINUX_TARGET_KERNEL_PATH=/path/to/linux-2.6.33.7-source \
-COLINUX_TARGET_KERNEL_SOURCE=/path/to/linux-2.6.33.7-source \
-COLINUX_TARGET_KERNEL_BUILD=/path/to/linux-2.6.33.7-build \
-    python3 ../bin/make.py colinux
-
-# the guest kernel: apply patch/7.1.5/current-tree-snapshot.diff to a
-# 7.1.5 tree, then build vmlinux normally
+tools/build.sh                    # build, sign, stage into dist-x64/
+tools/build.sh --release 0.5.0    # ...and assemble release/MoCoLinux-0.5.0/
 ```
 
-`CONFIG_KASAN` must be off — the host's allocation lands in PML4 slot 501,
-inside Linux's KASAN shadow region.
+`build.sh` compiles the driver and daemons, builds the installer, signs the
+driver with the test cert (NT 6 and later refuse the unsigned image the linker
+emits), and stages a set it checks for completeness — the binaries, the
+`virglrenderer`/`libepoxy` DLLs the GPU daemon loads, the launchers, and the
+guest-side `coxwire` shim. `--release` then assembles a directory whose
+manifest is read out of the installer's own payload list, refusing to finish
+if anything is missing, links the Universal CRT (it will not start on XP), or
+depends on a DLL the release does not carry.
+
+It finds the 2.6.33 header tree and the `download/prefix-mingw` cross prefix by
+their default locations; `COLINUX_TARGET_KERNEL_SOURCE` and
+`COLINUX_VIRGL_PREFIX` override. It does **not** build `vmlinux` or
+`root-arch.img` — both are slow and change rarely — and reports whether the
+staged copies are present.
+
+To drive `comake` directly, or for the underlying recipe and every
+environment variable, see `doc/building-modern`. The guest kernel is separate:
+apply `patch/7.1.5/current-tree-snapshot.diff` to a 7.1.5 tree and build
+`vmlinux` normally. `CONFIG_KASAN` must be off — the host's allocation lands
+in PML4 slot 501, inside Linux's KASAN shadow region.
 
 ## Running
 
