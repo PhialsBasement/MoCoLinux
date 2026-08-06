@@ -560,8 +560,24 @@ exec moco-gl "$@"
 EOF
 chmod 0755 "$MNT/usr/local/bin/glhw"
 
+#
+# :0, not 10.0.2.2:0.
+#
+# :0 is the coxwire shim's unix socket, which carries the X connection through
+# guest RAM to the same VcXsrv on the Windows side. 10.0.2.2:0 is the same X
+# server reached over slirp instead, and it is eight times slower at a real
+# window size -- glxgears 1024x768 measured 5.08 fps that way against 44 over
+# the wire, because a 3 MB frame does not fit under slirp's single-stream
+# ceiling.
+#
+# If the shim is ever not running, :0 fails outright rather than falling back.
+# That is deliberate: coxwire.service has Restart=always, and a hard failure
+# is diagnosable in a way that "the desktop is mysteriously slow" is not.
+# Reach the X server directly with DISPLAY=10.0.2.2:0 to prove the difference
+# or to work while the shim is down.
+#
 cat > "$MNT/etc/environment" <<'EOF'
-DISPLAY=10.0.2.2:0
+DISPLAY=:0
 # OpenGL: run a program through `moco-gl` to render on the host's graphics
 # card (virgl on the real GPU, full GL 4.2). Without it a program gets
 # llvmpipe in this guest's CPU, or no GL at all -- software GLX against the
@@ -596,11 +612,11 @@ mkdir -p "$MNT/etc/skel"
 cat > "$MNT/etc/skel/.zshenv" <<'SKEL'
 # Read by every zsh, including non-interactive ones. Environment only.
 
-# The X server is on the Windows side. slirp rewrites this address to the host's
-# own loopback, so the connection never leaves the machine. /etc/environment
-# carries it too, but only reaches sessions that go through PAM, and `su -` here
-# does not.
-export DISPLAY=10.0.2.2:0
+# The X server is on the Windows side, reached through the coxwire shim's
+# socket rather than over slirp -- see the note on /etc/environment above for
+# what that is worth. /etc/environment carries it too, but only reaches
+# sessions that go through PAM, and `su -` here does not.
+export DISPLAY=:0
 
 export EDITOR=nano
 export PATH="$HOME/.local/bin:$PATH"
@@ -666,7 +682,7 @@ inside "echo 'mocolinux:mocolinux' | chpasswd" >/dev/null 2>&1 || true
 # bash stays installed and still works, so it gets DISPLAY too: `bash -lc`
 # should not find a different environment from the login shell.
 for rc in "$MNT/home/mocolinux/.bashrc" "$MNT/root/.bashrc"; do
-	echo 'export DISPLAY=10.0.2.2:0' >> "$rc"
+	echo 'export DISPLAY=:0' >> "$rc"
 done
 
 # root reads the same zsh files but keeps bash as its login shell. A broken
@@ -735,7 +751,7 @@ if [ $# -eq 0 ]; then
 	exit 2
 fi
 
-: "${DISPLAY:=10.0.2.2:0}"
+: "${DISPLAY:=:0}"
 export DISPLAY
 
 exec env VGL_PROBEGLX=0 VGL_COMPRESS=proxy vglrun -d egl0 "$@"

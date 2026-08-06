@@ -220,8 +220,13 @@ End If
 ' The network bridge and the terminal server. Both may be started before the
 ' guest has finished booting -- they wait for it -- and both exit on their own
 ' once it is gone, so nothing here has to clean them up.
+'
+' -r tcp:2222:22 exposes the guest's sshd on host port 2222. The terminal on
+' 2323 stays the recovery path; ssh is the everyday one -- scp, keys, exit
+' codes, and none of the console's line-echo mangling.
 If Not Running("colinux-slirp-net-daemon.exe") Then
-	shell.Run """" & moco & "\colinux-slirp-net-daemon.exe"" -R", HIDDEN, NOWAIT
+	shell.Run """" & moco & "\colinux-slirp-net-daemon.exe"" -R" & _
+		" -r tcp:2222:22", HIDDEN, NOWAIT
 End If
 
 ' The GPU daemon: the host side of the guest's virtio-gpu device. Hidden like

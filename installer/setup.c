@@ -46,6 +46,13 @@
  * machine is unsuitable, and most of these are things they can fix in a minute.
  */
 
+/*
+ * Shown in the wizard's heading, so a running installer says which release it
+ * is. The release directory and zip are named from the same string by hand;
+ * nothing reads it back, so keep the two in step.
+ */
+#define MOCO_VERSION "0.5.0"
+
 #define PAYLOAD_MAX 20
 
 /* Laid down beside each other; the image goes to the Linux directory instead. */
@@ -80,17 +87,23 @@ static const char *payload[PAYLOAD_MAX] = {
 	 * rings, maps guest memory, and drives virglrenderer. moco-boot.vbs
 	 * already starts it, so the only thing missing was the file.
 	 *
-	 * The DLLs are its dependencies and none are optional. virglrenderer
-	 * is the renderer, libepoxy resolves the GL entry points, and the two
-	 * mingw runtimes are what the toolchain links against -- an install
-	 * without libgcc_s_seh-1.dll produces a daemon that will not start and
-	 * says nothing about why, because the loader fails before main().
+	 * The DLLs are its dependencies and neither is optional: virglrenderer
+	 * is the renderer and libepoxy resolves the GL entry points. Both
+	 * import nothing but KERNEL32 and msvcrt.
+	 *
+	 * libgcc_s_seh-1.dll and libwinpthread-1.dll used to be here too, and
+	 * they were an XP defect nobody had noticed. The toolchain builds those
+	 * two against the Universal CRT whatever this tree does, so shipping
+	 * them dragged api-ms-win-crt-* dependencies into a release that is
+	 * supposed to run on a machine with no UCRT at all -- the GPU daemon
+	 * would have failed to load on XP with nothing said about why, and the
+	 * guest would have fallen back to software rendering. virglrenderer now
+	 * links both statically (download/mingw64-cross.ini), so neither file
+	 * is needed and neither ships.
 	 */
 	"cogpu-daemon.exe",
 	"libvirglrenderer-1.dll",
 	"libepoxy-0.dll",
-	"libgcc_s_seh-1.dll",
-	"libwinpthread-1.dll",
 	/* The licence travels with the program, and the licence page reads it from
 	 * beside Setup rather than from a compiled-in copy that could drift. */
 	"COPYING",
@@ -3116,7 +3129,7 @@ static void draw_rail(HDC dc, RECT *client)
 		t.top = S(PAD_BASE);
 		t.right = rail.right - S(12);
 		t.bottom = t.top + S(28);
-		draw_text(dc, f_h1, COL_TEXT, &t, "MoCoLinux",
+		draw_text(dc, f_h1, COL_TEXT, &t, "MoCoLinux " MOCO_VERSION,
 			  DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
 	}
 
