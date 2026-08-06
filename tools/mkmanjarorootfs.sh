@@ -565,6 +565,37 @@ cat > "$MNT/etc/fstab" <<'EOF'
 /dev/cobd0	/	ext4	rw,relatime		0	1
 EOF
 
+# A swapfile, on disks big enough to spare it.
+#
+# With no swap the guest cannot evict anything under memory pressure, so it
+# sits in permanent direct reclaim -- which is where the 97% system time and
+# the "everything feels miserable" on a busy desktop came from. 3 GB turns that
+# from unusable into merely slow.
+#
+# Only when the target is larger than 8 GB, so a deliberately small image is
+# not left with too little room for the system itself. The size is the target
+# filesystem's own, measured here rather than passed in, so it is right whether
+# the disk was the installer default or a hand-picked size. fallocate is instant
+# and leaves no holes on ext4 (so swapon accepts it); dd is the fallback.
+swap_kb=$(df -P "$MNT" | awk 'NR==2 {print $2}')
+if [ "${swap_kb:-0}" -gt $((8 * 1024 * 1024)) ]; then
+	say "adding a 3 GB swapfile"
+	if fallocate -l 3G "$MNT/swapfile" 2>/dev/null ||
+	   dd if=/dev/zero of="$MNT/swapfile" bs=1M count=3072 status=none 2>/dev/null; then
+		chmod 600 "$MNT/swapfile"
+		if mkswap "$MNT/swapfile" >/dev/null 2>&1; then
+			printf '/swapfile\tnone\tswap\tdefaults\t0\t0\n' >> "$MNT/etc/fstab"
+		else
+			say "  WARNING: mkswap failed; no swap"
+			rm -f "$MNT/swapfile"
+		fi
+	else
+		say "  WARNING: could not create the swapfile; no swap"
+	fi
+else
+	say "target is 8 GB or smaller; skipping swapfile"
+fi
+
 # hvc0, not a tty. The guest's console is a hypervisor byte stream -- there is
 # no UART and no framebuffer -- so this is the only place a login can appear.
 mkdir -p "$MNT/etc/systemd/system/serial-getty@hvc0.service.d"
