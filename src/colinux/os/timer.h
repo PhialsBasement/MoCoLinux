@@ -34,10 +34,18 @@ extern void co_os_msleep(unsigned int msecs);
  * ioctl). Returns PTRUE if woken, PFALSE on timeout. The event is auto-reset:
  * one wake releases one wait, a wake with no waiter arms the next wait, and
  * nothing accumulates.
+ *
+ * One event per vCPU, because the event is auto-reset: a single event shared
+ * by two sleeping vCPUs would release exactly one of them per ring, and which
+ * one is the scheduler's business. That is not a fairness wrinkle, it is a
+ * lost wake -- the vCPU with the work to do goes on sleeping. So a waiter
+ * names itself, and a doorbell that does not know which vCPU wants the news
+ * rings co_os_idle_wake_all().
  */
 extern void   co_os_idle_wake_init(void);
-extern void   co_os_idle_wake(void);
-extern bool_t co_os_idle_wait(unsigned int msecs);
+extern void   co_os_idle_wake(unsigned long vcpu);
+extern void   co_os_idle_wake_all(void);
+extern bool_t co_os_idle_wait(unsigned long vcpu, unsigned int msecs);
 
 typedef struct {
 	union {

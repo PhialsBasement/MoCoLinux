@@ -244,24 +244,6 @@ void co_manager_unload(co_manager_t* manager)
 	}
 
 	/*
-	 * The SMP test lanes hold ioctl threads inside the driver the same way
-	 * the boot loop does, and freeing state under them ends the same way.
-	 * Same flag mechanism, same bounded wait.
-	 */
-	if (co_arch_smp_test_running()) {
-		int spins;
-
-		co_debug("unload: SMP test lanes still running -- asking them to stop");
-		co_arch_smp_test_abort();
-
-		for (spins = 0; spins < 1000 && co_arch_smp_test_running(); spins++)
-			co_os_msleep(10);
-
-		if (co_arch_smp_test_running())
-			co_debug_error("unload: an SMP test lane did not stop");
-	}
-
-	/*
 	 * The console next, and before co_kload_free: it reaches guest memory
 	 * by walking the guest's page tables, and a console client is a
 	 * different process that has no idea this is happening. Retiring the
@@ -1009,8 +991,14 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		 * The daemon has just published completions into guest RAM.
 		 * Cut the monitor's idle sleep short so the guest reaps them
 		 * now instead of at the end of a backoff tick.
+		 *
+		 * Every vCPU, because the daemon has no idea which one is
+		 * waiting on the fence -- and the ones that are not simply
+		 * wake, find nothing and sleep again. Waking the wrong one
+		 * costs a re-entry; waking none costs the whole tick this
+		 * doorbell exists to avoid.
 		 */
-		co_os_idle_wake();
+		co_os_idle_wake_all();
 
 		params->rc = CO_RC(OK);
 		*return_size = sizeof(*params);
@@ -1437,13 +1425,6 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->was_running = co_arch_boot_running();
 		if (params->was_running)
 			co_arch_boot_abort();
-
-		/*
-		 * SMP test lanes stop the same way. Unconditional: the flag is
-		 * self-clearing when the next test starts, and setting it with
-		 * no lanes running is a no-op.
-		 */
-		co_arch_smp_test_abort();
 
 		params->rc   = CO_RC(OK);
 		*return_size = sizeof(*params);

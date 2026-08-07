@@ -3476,17 +3476,92 @@ bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long vector)
  *
  * So unload asks the loop to stop and waits for it to say it has.
  */
-static volatile int boot_loop_active;
-static volatile int boot_loop_abort;
+/*
+ * A guest processor.
+ *
+ * Everything a crossing owns, gathered in one place and indexed, so that the
+ * step from one guest CPU to several is adding entries rather than finding
+ * the globals. The rule that decides membership is simple: if the switch
+ * saves it, restores it, or writes it while the guest runs, it belongs to
+ * exactly one vCPU and belongs here.
+ *
+ * What is deliberately NOT here is the monitor loop's own locals -- deadline,
+ * tick_last, idle_run, the frame buffer, the counters. Those live on the
+ * stack of the thread running the loop, and a second vCPU is a second thread
+ * with a stack of its own, so they are already per-vCPU for free. Moving them
+ * into this struct would make them look shared and buy nothing.
+ *
+ * The guest address space is NOT here either, and that is not an oversight:
+ * one guest has one CR3, and vCPUs of the same guest share it. Per-vCPU is
+ * the passage page, not the space it is mapped into.
+ */
+typedef struct {
+	int			index;		/* which vCPU this is */
+	volatile int		active;		/* inside a crossing loop right now */
+	unsigned long		host_cpu;	/* the processor it is pinned to */
+	co_arch_passage_page_t*	pp;		/* its own passage page */
+	/*
+	 * Every distinct host vector this vCPU has replayed, once. Per-vCPU
+	 * rather than shared because the question it answers -- was this
+	 * processor handed something the host never raises -- is asked of a
+	 * processor. A shared table would let the first vCPU to see a vector
+	 * silence the report for every other one.
+	 */
+	unsigned char		seen_vector[256];
+} co_vcpu_t;
+
+static co_vcpu_t	   co_vcpu[CO_MAX_VCPUS];
+/*
+ * Broadcast, not per-vCPU: KSTOP and driver unload mean "all of you, now".
+ * Monotonic within a run and read by volatile loads on every crossing, so it
+ * needs no lock -- the same arrangement the single boot loop always had.
+ */
+static volatile int	   vcpu_abort_all;
+
+static co_vcpu_t* co_vcpu_claim(int index)
+{
+	co_vcpu_t* vcpu;
+
+	if (index < 0 || index >= CO_MAX_VCPUS)
+		return NULL;
+
+	vcpu = &co_vcpu[index];
+	co_memset(vcpu, 0, sizeof(*vcpu));
+	vcpu->index    = index;
+	vcpu->host_cpu = co_os_current_cpu();
+
+	/*
+	 * The first vCPU in clears a stale abort. A vCPU joining a run that
+	 * is already going must not, or it would revive a guest that KSTOP is
+	 * in the middle of ending.
+	 */
+	if (!co_arch_boot_running())
+		vcpu_abort_all = 0;
+
+	vcpu->active = 1;
+	return vcpu;
+}
+
+static void co_vcpu_release(co_vcpu_t* vcpu)
+{
+	vcpu->active = 0;
+	vcpu->pp     = NULL;
+}
 
 void co_arch_boot_abort(void)
 {
-	boot_loop_abort = 1;
+	vcpu_abort_all = 1;
 }
 
 int co_arch_boot_running(void)
 {
-	return boot_loop_active;
+	int i;
+
+	for (i = 0; i < CO_MAX_VCPUS; i++)
+		if (co_vcpu[i].active)
+			return 1;
+
+	return 0;
 }
 
 /*
@@ -3514,19 +3589,6 @@ int co_arch_boot_running(void)
  * separate check: co_host_verify already compares the live MSRs against a
  * snapshot taken before every crossing, per lane, on the lane's own stack.
  */
-static volatile int smp_test_lanes;
-static volatile int smp_test_abort;
-
-void co_arch_smp_test_abort(void)
-{
-	smp_test_abort = 1;
-}
-
-int co_arch_smp_test_running(void)
-{
-	return smp_test_lanes;
-}
-
 static unsigned long long co_smp_sentinel(int lane, int which)
 {
 	/*
@@ -3545,16 +3607,15 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 {
 	co_arch_switch_test_t setup;
 	co_arch_passage_page_t* pp;
+	co_vcpu_t* vcpu;
 	co_switch_full_fn fn;
 	co_host_snapshot_t host_was;
 	unsigned long long resume_rip, ist_top, loop_va;
 	unsigned long long host_flags;
-	unsigned char seen_vector[256];
 	long long done;
 	int pages = sizeof(co_arch_passage_page_t) / CO_ARCH_PAGE_SIZE;
 
 	co_memset(out, 0, sizeof(*out));
-	co_memset(seen_vector, 0, sizeof(seen_vector));
 	out->supported = PTRUE;
 	out->lane      = lane;
 
@@ -3563,20 +3624,25 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	out->iterations = iterations;
 
 	/*
-	 * The first lane in clears a stale abort; a lane arriving while other
-	 * lanes are already running must NOT clear it, or it would revive a
-	 * test that KSTOP is in the middle of ending.
+	 * A lane IS a vCPU: same slot, same claim, same abort flag, same
+	 * per-vCPU replayed-vector table as the monitor loop uses. That is
+	 * deliberate rather than tidy -- it means this test exercises the
+	 * structure a second guest processor will run on, concurrently, and
+	 * that KSTOP and driver unload need to know about one kind of thing
+	 * holding a thread inside the driver rather than two.
 	 */
-	if (__sync_fetch_and_add(&smp_test_lanes, 1) == 0)
-		smp_test_abort = 0;
+	vcpu = co_vcpu_claim(lane);
+	if (vcpu == NULL)
+		return CO_RC(INVALID_PARAMETER);
 
 	co_memset(&setup, 0, sizeof(setup));
 	pp = co_setup_guest_page(&setup,
 		(unsigned long)(&co_boot_shim - &co_switch_full));
 	if (pp == NULL) {
-		__sync_fetch_and_sub(&smp_test_lanes, 1);
+		co_vcpu_release(vcpu);
 		return CO_RC(ERROR);
 	}
+	vcpu->pp = pp;
 
 	/*
 	 * co_boot_shim executes sti and jumps to params[20]; step (params[29])
@@ -3598,7 +3664,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		out->preflight_level  = setup.preflight_level;
 		out->preflight_va     = setup.preflight_va;
 		co_os_free_exec_pages(pp, pages);
-		__sync_fetch_and_sub(&smp_test_lanes, 1);
+		co_vcpu_release(vcpu);
 		return CO_RC(ERROR);
 	}
 
@@ -3608,11 +3674,11 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	ist_top    = (unsigned long long)(size_t)&pp->host_temp
 		+ (CO_PP_ISTSTACK_PAGE + 1) * CO_ARCH_PAGE_SIZE;
 
-	out->host_cpu = co_os_current_cpu();
+	out->host_cpu = vcpu->host_cpu;
 	out->msr_ok   = PTRUE;
 
 	for (done = 0; done < iterations; ) {
-		if (smp_test_abort) {
+		if (vcpu_abort_all) {
 			out->aborted = PTRUE;
 			break;
 		}
@@ -3689,8 +3755,8 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		{
 			unsigned v = (unsigned)(out->vector & 0xff);
 
-			if (!seen_vector[v]) {
-				seen_vector[v] = 1;
+			if (!vcpu->seen_vector[v]) {
+				vcpu->seen_vector[v] = 1;
 				co_debug("smp lane %d: replaying host vector "
 					 "0x%x, after %lld crossings",
 					 lane, v, done);
@@ -3757,7 +3823,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 			  !out->unforwardable && !out->aborted) ? PTRUE : PFALSE;
 
 	co_os_free_exec_pages(pp, pages);
-	__sync_fetch_and_sub(&smp_test_lanes, 1);
+	co_vcpu_release(vcpu);
 
 	return CO_RC(OK);
 }
@@ -4055,8 +4121,19 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		unsigned long granted;
 		int i;
 
-		boot_loop_abort  = 0;
-		boot_loop_active = 1;
+		/*
+		 * vCPU 0. The boot processor is the one that comes up through
+		 * KBOOT, and today it is the only one -- but the crossing
+		 * state it owns is reached through the vCPU from here on, so
+		 * the second one is an index rather than a rewrite.
+		 */
+		co_vcpu_t* vcpu = co_vcpu_claim(0);
+
+		if (vcpu == NULL) {
+			rc = CO_RC(ERROR);
+			goto out_free_stack;
+		}
+		vcpu->pp = pp;
 
 		/*
 		 * Start the async block workers before the guest runs. If it
@@ -4101,7 +4178,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 * it. Stop now, before the next co_debug writes into a
 			 * debug system that is being torn down.
 			 */
-			if (boot_loop_abort) {
+			if (vcpu_abort_all) {
 				out->hit_deadline = PTRUE;
 				break;
 			}
@@ -4630,7 +4707,8 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 					 * no time worth accounting.
 					 */
 					idle_run++;
-					if (!co_os_idle_wait(idle_run > 100 ? 10 : 1))
+					if (!co_os_idle_wait(vcpu->index,
+							     idle_run > 100 ? 10 : 1))
 						pp->params[48] += 1;
 
 					/*
@@ -5052,15 +5130,14 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			 * inside Windows' own dispatch leaves you with.
 			 */
 			{
-				static unsigned char seen_vector[256];
 				unsigned v = (unsigned)(out->vector & 0xff);
 
-				if (!seen_vector[v]) {
-					seen_vector[v] = 1;
-					co_debug("boot: replaying host interrupt vector "
-						 "0x%x (%u) through the live Windows IDT, "
-						 "after %ld switches",
-						 v, v, out->switches);
+				if (!vcpu->seen_vector[v]) {
+					vcpu->seen_vector[v] = 1;
+					co_debug("boot: vcpu %d replaying host interrupt "
+						 "vector 0x%x (%u) through the live Windows "
+						 "IDT, after %ld switches",
+						 vcpu->index, v, v, out->switches);
 				}
 			}
 
@@ -5124,12 +5201,12 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		out->guest_switches = guest_crossings;
 
 		/*
-		 * Join the async workers before clearing boot_loop_active, and
+		 * Join the async workers before the vCPU goes inactive, and
 		 * before this function frees the stack and passage page below --
 		 * and well before guest RAM is freed at KLOAD_END. A worker's
 		 * page-table walk can then never outlive the memory it walks.
-		 * Clearing boot_loop_active only after the join means a driver
-		 * unload waiting on co_arch_boot_running cannot proceed until the
+		 * Releasing the vCPU only after the join means a driver unload
+		 * waiting on co_arch_boot_running cannot proceed until the
 		 * workers are gone either.
 		 */
 		if (in->async_cobd && in->cobd_io_va) {
@@ -5137,7 +5214,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			out->block_errors += co_cobd_async_errors();
 		}
 
-		boot_loop_active    = 0;
+		co_vcpu_release(vcpu);
 
 		/*
 		 * Give the clock back. Paired with the acquire above: the host

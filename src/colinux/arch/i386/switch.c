@@ -82,12 +82,3 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	out->supported = PFALSE;
 	return CO_RC(OK);
 }
-
-void co_arch_smp_test_abort(void)
-{
-}
-
-int co_arch_smp_test_running(void)
-{
-	return 0;
-}

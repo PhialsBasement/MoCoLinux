@@ -427,14 +427,12 @@ typedef struct {
 	unsigned long long preflight_va;
 } co_arch_smp_test_t;
 
+/*
+ * A lane is a vCPU and takes the vCPU slot of its own number, so a running
+ * lane answers co_arch_boot_running() and is ended by co_arch_boot_abort() --
+ * KSTOP and driver unload need no separate mechanism for it.
+ */
 extern co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 				     int lane, long long iterations);
-
-/*
- * End all running SMP test lanes, the way co_arch_boot_abort ends the boot
- * loop. Called from KSTOP and from driver unload; a flag write, nothing more.
- */
-extern void co_arch_smp_test_abort(void);
-extern int  co_arch_smp_test_running(void);
 
 #endif
