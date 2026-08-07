@@ -39,6 +39,10 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("                                   report vector, error code and CR2\n");
 	co_terminal_print("      --test-resume                Enter the guest repeatedly and require\n");
 	co_terminal_print("                                   it to continue where it stopped\n");
+	co_terminal_print("      --test-smp N                 Two threads, two processors, two guests:\n");
+	co_terminal_print("                                   concurrent world switches with per-lane\n");
+	co_terminal_print("                                   MSR sentinels. N crossings per lane\n");
+	co_terminal_print("                                   (default 2000000). SMP groundwork.\n");
 	co_terminal_print("      --test-space                 Build a guest address space and verify\n");
 	co_terminal_print("                                   it by walking it. Never enters it.\n");
 	co_terminal_print("      --test-roundtrip             Enter the guest address space and return\n");
@@ -225,6 +229,15 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		cmdline,
 		"--test-space",
 		&winnt_parameters->test_space);
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--test-smp",
+		&winnt_parameters->test_smp,
+		winnt_parameters->test_smp_arg,
+		sizeof(winnt_parameters->test_smp_arg));
 
 	if (!CO_OK(rc))
 		return rc;

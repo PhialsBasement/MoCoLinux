@@ -3489,6 +3489,279 @@ int co_arch_boot_running(void)
 	return boot_loop_active;
 }
 
+/*
+ * The SMP spike: one lane of the concurrent crossing test.
+ *
+ * Two callers run this at once, each pinned to a different processor by the
+ * ioctl handler, each with a passage page of its own from co_setup_guest_page
+ * -- which already builds everything per-call: tables, GDT, TSS, IST stack,
+ * stubs, IDT. Nothing here is shared between lanes on purpose; the test
+ * exists to prove that nothing needs to be.
+ *
+ * The guest is co_switch_guest_loop entered through co_boot_shim, so it runs
+ * with real IF set, exactly as the booted kernel does. That is the point:
+ * hardware interrupts on both processors then vector through two different
+ * guest IDTs into two different stubs and are replayed into the live Windows
+ * IDT from two threads at once -- the concurrency the boot path has never
+ * once exercised, bought here for the price of a test ioctl.
+ *
+ * The MSR sentinels are the other half. Each lane plants lane-distinct values
+ * in its guest state's FS_BASE/GS_BASE/KERNEL_GS_BASE/LSTAR; the switch loads
+ * them entering the guest and saves the live values back leaving it. The
+ * guest never writes those MSRs, so any drift means one lane's crossing
+ * touched the other lane's state -- the exact failure that would surface as
+ * unexplainable corruption under a real second vCPU. The host side needs no
+ * separate check: co_host_verify already compares the live MSRs against a
+ * snapshot taken before every crossing, per lane, on the lane's own stack.
+ */
+static volatile int smp_test_lanes;
+static volatile int smp_test_abort;
+
+void co_arch_smp_test_abort(void)
+{
+	smp_test_abort = 1;
+}
+
+int co_arch_smp_test_running(void)
+{
+	return smp_test_lanes;
+}
+
+static unsigned long long co_smp_sentinel(int lane, int which)
+{
+	/*
+	 * Canonical by construction (bit 47 clear), distinct per lane and per
+	 * MSR, and unlike anything Windows or the host driver would ever put
+	 * in a segment base -- so a bleed cannot be mistaken for a legitimate
+	 * value, and a legitimate value cannot be mistaken for a bleed.
+	 */
+	return 0x0000500000000000ULL |
+	       ((unsigned long long)(lane + 1) << 36) |
+	       ((unsigned long long)(which + 1) << 20);
+}
+
+co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
+			      int lane, long long iterations)
+{
+	co_arch_switch_test_t setup;
+	co_arch_passage_page_t* pp;
+	co_switch_full_fn fn;
+	co_host_snapshot_t host_was;
+	unsigned long long resume_rip, ist_top, loop_va;
+	unsigned long long host_flags;
+	unsigned char seen_vector[256];
+	long long done;
+	int pages = sizeof(co_arch_passage_page_t) / CO_ARCH_PAGE_SIZE;
+
+	co_memset(out, 0, sizeof(*out));
+	co_memset(seen_vector, 0, sizeof(seen_vector));
+	out->supported = PTRUE;
+	out->lane      = lane;
+
+	if (iterations < 1 || iterations > 100000000LL)
+		iterations = 1000000;
+	out->iterations = iterations;
+
+	/*
+	 * The first lane in clears a stale abort; a lane arriving while other
+	 * lanes are already running must NOT clear it, or it would revive a
+	 * test that KSTOP is in the middle of ending.
+	 */
+	if (__sync_fetch_and_add(&smp_test_lanes, 1) == 0)
+		smp_test_abort = 0;
+
+	co_memset(&setup, 0, sizeof(setup));
+	pp = co_setup_guest_page(&setup,
+		(unsigned long)(&co_boot_shim - &co_switch_full));
+	if (pp == NULL) {
+		__sync_fetch_and_sub(&smp_test_lanes, 1);
+		return CO_RC(ERROR);
+	}
+
+	/*
+	 * co_boot_shim executes sti and jumps to params[20]; step (params[29])
+	 * is zero, so TF stays clear and the guest free-runs with interrupts
+	 * on -- which is what routes this processor's clock through the guest
+	 * IDT while the loop runs.
+	 */
+	loop_va = (unsigned long long)(size_t)pp->code
+		+ (unsigned long)(&co_switch_guest_loop - &co_switch_full);
+	pp->params[20] = loop_va;
+
+	pp->linuxvm_state.fs_base        = co_smp_sentinel(lane, 0);
+	pp->linuxvm_state.gs_base        = co_smp_sentinel(lane, 1);
+	pp->linuxvm_state.kernel_gs_base = co_smp_sentinel(lane, 2);
+	pp->linuxvm_state.lstar          = co_smp_sentinel(lane, 3);
+
+	if (!co_preflight_guest(pp, setup.passage_va, &setup)) {
+		out->preflight_failed = setup.preflight_failed;
+		out->preflight_level  = setup.preflight_level;
+		out->preflight_va     = setup.preflight_va;
+		co_os_free_exec_pages(pp, pages);
+		__sync_fetch_and_sub(&smp_test_lanes, 1);
+		return CO_RC(ERROR);
+	}
+
+	fn         = (co_switch_full_fn)(void*)pp->code;
+	resume_rip = (unsigned long long)(size_t)pp->code
+		+ (unsigned long)(&co_guest_resume - &co_switch_full);
+	ist_top    = (unsigned long long)(size_t)&pp->host_temp
+		+ (CO_PP_ISTSTACK_PAGE + 1) * CO_ARCH_PAGE_SIZE;
+
+	out->host_cpu = co_os_current_cpu();
+	out->msr_ok   = PTRUE;
+
+	for (done = 0; done < iterations; ) {
+		if (smp_test_abort) {
+			out->aborted = PTRUE;
+			break;
+		}
+
+		/*
+		 * The pin is the ground the whole crossing stands on; a lane
+		 * that moved is not a data point, it is a broken experiment.
+		 */
+		if (co_os_current_cpu() != out->host_cpu) {
+			out->migrated = PTRUE;
+			break;
+		}
+
+		pp->params[4] = 0;	/* faulted */
+
+		/* Crossing is uninterruptible: real IF clear across it. */
+		asm volatile("pushfq; popq %0; cli"
+			     : "=r"(host_flags) : : "memory", "cc");
+		co_host_snapshot(&host_was);
+		fn(&pp->host_state, &pp->linuxvm_state, NULL, 0);
+
+		{
+			co_host_field_t bad =
+				co_host_verify(&host_was, &out->msr_want,
+					       &out->msr_got);
+
+			if (bad != CO_HOST_FIELD_NONE) {
+				/*
+				 * Report and repair the benign four the way
+				 * the boot loop does; anything else means the
+				 * other lane is a suspect and the run must
+				 * stop with the evidence intact.
+				 */
+				co_host_repair(&host_was, bad);
+				asm volatile("pushq %0; popfq" : : "r"(host_flags)
+					     : "memory", "cc");
+				if (bad != CO_HOST_FIELD_CR8 &&
+				    bad != CO_HOST_FIELD_PAT &&
+				    bad != CO_HOST_FIELD_MTRR_DEF &&
+				    bad != CO_HOST_FIELD_DR7) {
+					out->msr_ok  = PFALSE;
+					out->msr_bad = (unsigned long)bad;
+					co_debug_error("smp lane %d: host state "
+						       "field %d damaged after %lld "
+						       "crossings: 0x%llx -> 0x%llx",
+						       lane, (int)bad, done,
+						       out->msr_want, out->msr_got);
+					break;
+				}
+			} else {
+				asm volatile("pushq %0; popfq" : : "r"(host_flags)
+					     : "memory", "cc");
+			}
+		}
+
+		if (!pp->params[4]) {
+			/* the guest's own loop crossing: one iteration */
+			done++;
+			continue;
+		}
+
+		out->vector     = pp->params[16];
+		out->error_code = pp->params[17];
+		out->fault_rip  = pp->params[5];
+
+		if (out->vector < 32) {
+			out->faulted = PTRUE;
+			co_debug_error("smp lane %d: guest exception vector %lld "
+				       "at rip 0x%llx after %lld crossings",
+				       lane, out->vector, out->fault_rip, done);
+			break;
+		}
+
+		{
+			unsigned v = (unsigned)(out->vector & 0xff);
+
+			if (!seen_vector[v]) {
+				seen_vector[v] = 1;
+				co_debug("smp lane %d: replaying host vector "
+					 "0x%x, after %lld crossings",
+					 lane, v, done);
+			}
+		}
+
+		if (!co_arch_forward_host_interrupt(pp->host_state.idt.table,
+						    out->vector)) {
+			out->unforwardable = PTRUE;
+			break;
+		}
+		out->interrupts++;
+
+		/*
+		 * Back in exactly where it was: co_guest_resume replaces the
+		 * scratch rsp with the frame the stub recorded. ist_top-0x200
+		 * keeps the switch's own CS/RIP pushes clear of that frame.
+		 */
+		pp->linuxvm_state.return_rip = resume_rip;
+		pp->linuxvm_state.rsp        = ist_top - 0x200;
+	}
+
+	out->completed = done;
+	out->counter   = pp->params[6];
+	out->reg_accum = pp->params[7];
+
+	/*
+	 * The guest never writes its segment-base MSRs, so the values the
+	 * switch saved back on the final exit must be the sentinels planted
+	 * before the first entry. Anything else is cross-lane bleed.
+	 */
+	if (out->msr_ok) {
+		struct { unsigned long msr; unsigned long long want, got; } chk[4] = {
+			{ CO_MSR_IA32_FS_BASE,        co_smp_sentinel(lane, 0),
+			  pp->linuxvm_state.fs_base },
+			{ CO_MSR_IA32_GS_BASE,        co_smp_sentinel(lane, 1),
+			  pp->linuxvm_state.gs_base },
+			{ CO_MSR_IA32_KERNEL_GS_BASE, co_smp_sentinel(lane, 2),
+			  pp->linuxvm_state.kernel_gs_base },
+			{ CO_MSR_IA32_LSTAR,          co_smp_sentinel(lane, 3),
+			  pp->linuxvm_state.lstar },
+		};
+		int i;
+
+		for (i = 0; i < 4; i++) {
+			if (chk[i].got != chk[i].want) {
+				out->msr_ok   = PFALSE;
+				out->msr_bad  = chk[i].msr;
+				out->msr_want = chk[i].want;
+				out->msr_got  = chk[i].got;
+				co_debug_error("smp lane %d: guest MSR 0x%lx "
+					       "sentinel 0x%llx came back 0x%llx",
+					       lane, chk[i].msr,
+					       chk[i].want, chk[i].got);
+				break;
+			}
+		}
+	}
+
+	out->succeeded = (out->completed == out->iterations &&
+			  out->counter   == (unsigned long long)out->completed &&
+			  out->reg_accum == (unsigned long long)out->completed &&
+			  out->msr_ok && !out->faulted && !out->migrated &&
+			  !out->unforwardable && !out->aborted) ? PTRUE : PFALSE;
+
+	co_os_free_exec_pages(pp, pages);
+	__sync_fetch_and_sub(&smp_test_lanes, 1);
+
+	return CO_RC(OK);
+}
+
 co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			    co_arch_boot_t* in, co_arch_boot_result_t* out)
 {

@@ -244,6 +244,24 @@ void co_manager_unload(co_manager_t* manager)
 	}
 
 	/*
+	 * The SMP test lanes hold ioctl threads inside the driver the same way
+	 * the boot loop does, and freeing state under them ends the same way.
+	 * Same flag mechanism, same bounded wait.
+	 */
+	if (co_arch_smp_test_running()) {
+		int spins;
+
+		co_debug("unload: SMP test lanes still running -- asking them to stop");
+		co_arch_smp_test_abort();
+
+		for (spins = 0; spins < 1000 && co_arch_smp_test_running(); spins++)
+			co_os_msleep(10);
+
+		if (co_arch_smp_test_running())
+			co_debug_error("unload: an SMP test lane did not stop");
+	}
+
+	/*
 	 * The console next, and before co_kload_free: it reaches guest memory
 	 * by walking the guest's page tables, and a console client is a
 	 * different process that has no idea this is happening. Retiring the
@@ -1420,6 +1438,13 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		if (params->was_running)
 			co_arch_boot_abort();
 
+		/*
+		 * SMP test lanes stop the same way. Unconditional: the flag is
+		 * self-clearing when the next test starts, and setting it with
+		 * no lanes running is a no-op.
+		 */
+		co_arch_smp_test_abort();
+
 		params->rc   = CO_RC(OK);
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
@@ -1592,6 +1617,86 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->fault_rip  = result.fault_rip;
 		params->faulted    = result.faulted;
 		params->code_size  = result.code_size;
+
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_TEST_SMP: {
+		co_manager_ioctl_test_smp_t* params;
+		co_arch_smp_test_t result;
+		co_rc_t trc;
+		int req_lane;
+		long long req_iterations;
+
+		params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		/* input fields are not output fields: read before the clear */
+		req_lane       = params->lane;
+		req_iterations = params->iterations;
+
+		co_memset(params, 0, sizeof(*params));
+		params->lane = req_lane;
+
+		if (manager->state < CO_MANAGER_STATE_INITIALIZED) {
+			params->rc   = CO_RC(ERROR);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		if (req_lane < 0 ||
+		    (unsigned long)req_lane >= co_os_cpu_count()) {
+			co_debug_error("TEST_SMP: lane %d does not name an "
+				       "active processor (%lu active)",
+				       req_lane, co_os_cpu_count());
+			params->rc   = CO_RC(INVALID_PARAMETER);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		/*
+		 * Pinned to the *named* processor, not the current one --
+		 * distinctness of the lanes is the whole experiment. The
+		 * refusal above means a failure here is a race with hot
+		 * remove, which the host does not do; report it anyway.
+		 */
+		if (!co_os_pin_cpu_to((unsigned long)req_lane)) {
+			params->rc   = CO_RC(ERROR);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		trc = co_arch_test_smp_lane(manager, &result, req_lane,
+					    req_iterations);
+
+		co_os_unpin_cpu();
+
+		params->rc               = trc;
+		params->supported        = result.supported;
+		params->succeeded        = result.succeeded;
+		params->host_cpu         = result.host_cpu;
+		params->iterations       = result.iterations;
+		params->completed        = result.completed;
+		params->interrupts       = result.interrupts;
+		params->counter          = result.counter;
+		params->reg_accum        = result.reg_accum;
+		params->faulted          = result.faulted;
+		params->vector           = result.vector;
+		params->error_code       = result.error_code;
+		params->fault_rip        = result.fault_rip;
+		params->unforwardable    = result.unforwardable;
+		params->aborted          = result.aborted;
+		params->migrated         = result.migrated;
+		params->msr_ok           = result.msr_ok;
+		params->msr_bad          = result.msr_bad;
+		params->msr_want         = result.msr_want;
+		params->msr_got          = result.msr_got;
+		params->preflight_failed = result.preflight_failed;
+		params->preflight_level  = result.preflight_level;
+		params->preflight_va     = result.preflight_va;
 
 		*return_size = sizeof(*params);
 		return CO_RC(OK);

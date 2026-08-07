@@ -120,6 +120,8 @@ typedef struct co_winnt_parameters {
 	bool_t test_fault;
 	bool_t test_resume;
 	bool_t test_space;
+	bool_t test_smp;
+	char   test_smp_arg[0x20];
 	bool_t test_pagefault;
 	bool_t test_badstack;
 	bool_t test_guest;

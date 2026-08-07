@@ -807,6 +807,158 @@ co_rc_t co_winnt_test_switch(int mode)
 	return CO_RC(OK);
 }
 
+/*
+ * The SMP spike: two threads, two processors, two guests, at the same time.
+ *
+ * Each lane is a thread of this process holding its own driver handle inside
+ * a blocking TEST_SMP ioctl -- the exact shape N vCPUs will have, minus the
+ * Linux. The driver pins lane N to processor N and refuses lanes the host
+ * does not have, so running this on a uniprocessor box reports rather than
+ * pretends.
+ */
+struct co_smp_lane_ctx {
+	co_manager_ioctl_test_smp_t r;
+	co_rc_t rc;
+};
+
+static void co_winnt_smp_lane_thread(void* arg)
+{
+	struct co_smp_lane_ctx* ctx = arg;
+	co_manager_handle_t handle;
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		ctx->rc = CO_RC(ERROR_ACCESSING_DRIVER);
+		return;
+	}
+
+	ctx->rc = co_manager_test_smp(handle, &ctx->r);
+	co_os_manager_close(handle);
+}
+
+co_rc_t co_winnt_test_smp(const char* iterations_arg)
+{
+	co_rc_t rc;
+	bool_t installed = PFALSE;
+	struct co_smp_lane_ctx lane[2];
+	void* thread[2];
+	long long iterations;
+	int i, ok;
+
+	rc = co_win32_manager_is_installed(&installed);
+	if (!CO_OK(rc))
+		return rc;
+	if (!installed) {
+		co_terminal_print("driver not installed\n");
+		return CO_RC(ERROR_ACCESSING_DRIVER);
+	}
+
+	iterations = (iterations_arg && iterations_arg[0])
+		? (long long)strtoul(iterations_arg, NULL, 0) : 2000000LL;
+
+	co_terminal_print("two threads, each pinned to its own processor, each crossing\n");
+	co_terminal_print("into a guest of its own %lld times over -- concurrently, with\n",
+			  iterations);
+	co_terminal_print("lane-distinct MSR sentinels that must never meet\n\n");
+
+	for (i = 0; i < 2; i++) {
+		memset(&lane[i], 0, sizeof(lane[i]));
+		lane[i].r.lane       = i;
+		lane[i].r.iterations = iterations;
+		lane[i].rc           = CO_RC(ERROR);
+	}
+
+	thread[0] = co_os_thread_start(co_winnt_smp_lane_thread, &lane[0]);
+	thread[1] = co_os_thread_start(co_winnt_smp_lane_thread, &lane[1]);
+	if (!thread[0] || !thread[1]) {
+		co_terminal_print("could not start the lane threads\n");
+		if (thread[0]) co_os_thread_join(thread[0]);
+		if (thread[1]) co_os_thread_join(thread[1]);
+		return CO_RC(ERROR);
+	}
+
+	co_os_thread_join(thread[0]);
+	co_os_thread_join(thread[1]);
+
+	ok = 1;
+	for (i = 0; i < 2; i++) {
+		co_manager_ioctl_test_smp_t* r = &lane[i].r;
+
+		co_terminal_print("lane %d (processor %lu):\n", i, r->host_cpu);
+
+		if (!CO_OK(lane[i].rc)) {
+			co_terminal_print("  ioctl failed (rc %x)\n", (int)lane[i].rc);
+			ok = 0;
+			continue;
+		}
+		if (!CO_OK(r->rc)) {
+			co_terminal_print("  driver refused the lane (rc %x) -- a "
+					  "uniprocessor host reports here\n", (int)r->rc);
+			ok = 0;
+			continue;
+		}
+		if (!r->supported) {
+			co_terminal_print("  not implemented on this architecture\n");
+			ok = 0;
+			continue;
+		}
+		if (r->preflight_failed) {
+			co_terminal_print("  PREFLIGHT REFUSED THE ENTRY at 0x%016llx "
+					  "(level %d)\n", r->preflight_va,
+					  r->preflight_level);
+			ok = 0;
+			continue;
+		}
+
+		co_terminal_print("  crossings  %lld of %lld  (counter %llu, rbx %llu)\n",
+				  r->completed, r->iterations, r->counter, r->reg_accum);
+		co_terminal_print("  replayed   %lld host interrupts from inside the guest\n",
+				  r->interrupts);
+
+		if (r->faulted) {
+			co_terminal_print("  FAULTED: vector %llu at rip 0x%016llx, "
+					  "err 0x%llx\n", r->vector, r->fault_rip,
+					  r->error_code);
+			ok = 0;
+		}
+		if (r->migrated) {
+			co_terminal_print("  MIGRATED off its processor mid-run -- "
+					  "the pin did not hold\n");
+			ok = 0;
+		}
+		if (r->unforwardable) {
+			co_terminal_print("  hit an unforwardable host vector %llu\n",
+					  r->vector);
+			ok = 0;
+		}
+		if (r->aborted) {
+			co_terminal_print("  aborted early (KSTOP or driver unload)\n");
+			ok = 0;
+		}
+		if (!r->msr_ok) {
+			co_terminal_print("  MSR STATE CROSSED LANES: msr 0x%lx was "
+					  "0x%016llx, came back 0x%016llx\n",
+					  r->msr_bad, r->msr_want, r->msr_got);
+			ok = 0;
+		}
+		if (!r->succeeded)
+			ok = 0;
+		co_terminal_print("\n");
+	}
+
+	if (ok) {
+		co_terminal_print("  CONCURRENT CROSSINGS HELD. Two processors switched worlds\n");
+		co_terminal_print("  independently -- descriptor tables, MSRs and FPU state stayed\n");
+		co_terminal_print("  per-lane throughout, and host interrupts were replayed from\n");
+		co_terminal_print("  both sides at once. The ground the SMP work stands on.\n");
+	} else {
+		co_terminal_print("  THE LANES DID NOT BOTH SURVIVE INTACT -- see above. Fix this\n");
+		co_terminal_print("  before any per-vCPU work builds on it.\n");
+	}
+
+	return ok ? CO_RC(OK) : CO_RC(ERROR);
+}
+
 static co_rc_t co_winnt_install_driver_lowlevel(IN SC_HANDLE SchSCManager, IN LPCTSTR  DriverName, IN LPCTSTR ServiceExe)
 {
 	SC_HANDLE  schService;

@@ -50,6 +50,18 @@ extern void co_os_pin_cpu(void);
 extern void co_os_unpin_cpu(void);
 
 /*
+ * Pin this thread to a processor chosen by the caller, not the one it happens
+ * to be on. The SMP work needs N monitor threads on N *distinct* processors,
+ * and "wherever the scheduler left me" cannot promise distinct. Returns false
+ * if the processor does not exist or is not active; unpin with
+ * co_os_unpin_cpu() as usual.
+ */
+extern bool_t co_os_pin_cpu_to(unsigned long cpu);
+
+/* How many processors the host has active. */
+extern unsigned long co_os_cpu_count(void);
+
+/*
  * A kernel system thread, for the cooperative block device's async workers.
  *
  * The block transfer runs in the driver (ZwReadFile against a kernel handle),

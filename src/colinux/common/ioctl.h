@@ -59,6 +59,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KUNMAP,
 	CO_MANAGER_IOCTL_VGPU,
 	CO_MANAGER_IOCTL_VGPU_WAKE,
+	CO_MANAGER_IOCTL_TEST_SMP,
 } co_manager_ioctl_t;
 
 /*
@@ -278,6 +279,44 @@ typedef struct {
 	int		   preflight_level;
 	unsigned long long preflight_va;
 } co_manager_ioctl_test_switch_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_TEST_SMP
+ *
+ * One lane of the concurrent crossing test: two of these ioctls run at once
+ * from two threads, each pinned by the driver to the processor named by its
+ * lane, each crossing into a guest context of its own. Mirrors
+ * co_arch_smp_test_t in arch/switch.h.
+ *
+ * lane and iterations travel inwards and are read before the driver clears
+ * the struct for the reply -- input fields are not output fields.
+ */
+typedef struct {
+	co_rc_t		   rc;
+	int		   lane;	/* in: 0 or 1; also the processor to pin to */
+	long long	   iterations;	/* in: voluntary crossings to perform */
+	int		   supported;
+	int		   succeeded;
+	unsigned long	   host_cpu;
+	long long	   completed;
+	long long	   interrupts;
+	unsigned long long counter;
+	unsigned long long reg_accum;
+	int		   faulted;
+	unsigned long long vector;
+	unsigned long long error_code;
+	unsigned long long fault_rip;
+	int		   unforwardable;
+	int		   aborted;
+	int		   migrated;
+	int		   msr_ok;
+	unsigned long	   msr_bad;
+	unsigned long long msr_want;
+	unsigned long long msr_got;
+	int		   preflight_failed;
+	int		   preflight_level;
+	unsigned long long preflight_va;
+} co_manager_ioctl_test_smp_t;
 
 /* interface for the CO_MANAGER_IOCTL_KLOAD_* family */
 typedef struct {
