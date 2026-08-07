@@ -789,6 +789,26 @@
      - The gate is closed too: the "unexplained #GP in trap_init" was the ltr
        race, fixed 2026-08-04, recorded 2026-08-02, never joined up. See the
        CLOSED entry below. adopt_traps() also runs clean under SMP=y.
+   * S3a DONE 2026-08-07 (9458af3c): --cpus N, capped at host cores minus two
+     (Windows and the GPU daemon's spin-poller need one each), passed to the
+     guest as the kernel's own possible_cpus= -- no patch needed. Before it
+     the guest counted the host firmware's MP table and sized its per-CPU
+     areas, cpumasks and RCU geometry for the HOST's processors, then tried
+     to start them. Verified: --cpus 2 gives "Limiting to 2 possible CPUs",
+     nr_cpu_ids 2, one refused AP attempt instead of two, boots to
+     /sbin/init. The daemon prints the core map, which the entry below asked
+     for.
+   * S3b, the rest of S3 and where the risk actually is: KVCPU_RUN (AP thread
+     blocks in its own ioctl, pinned to its own core), START_VCPU (the BSP
+     hands the host an AP initial-state block -- rip, rsp, CR3, GS_BASE,
+     per-vCPU GDT/IDT/TSS, virtual-IF slot starting blocked; structurally
+     co_arch_boot_result_t again, which the host already builds once for the
+     boot CPU), KICK_VCPU doorbell, and guest-side co_kick_ap +
+     co_cpu_bringup per Xen smp_pv.c. Do it the S0 way: point START_VCPU at a
+     trivial spin-loop context FIRST and only then at the real bringup -- a
+     wrong initial state is a triple fault on core 1 with nothing to read.
+     co_colinux_kick_ap() is the thing to replace, and until it is replaced
+     it is what stops an INIT-SIPI reaching a host processor.
    * Remaining rungs: S3 second vCPU
      to idle (KVCPU_RUN + START_VCPU/KICK_VCPU ops, cpu_bringup per Xen
      smp_pv.c); S4 IPIs + per-CPU timer + shootdown under TLB-torture and
