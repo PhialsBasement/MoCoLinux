@@ -762,9 +762,34 @@
      The guest-side snapshot was regenerated against the released tarball and
      reverse-apply checked; it now covers 34 files, including the two the
      README recorded as missing.
-   * Remaining rungs: S2 SMP=y kernel with one CPU (fake apic, topology, drop
-     nolapic, and implement co_colinux_vcpu_id() for real; gate:
-     explain the one-off #GP in co_colinux_adopt_traps first); S3 second vCPU
+   * S2 DONE 2026-08-07 (54603af5 and 9806e2fe), verified on the M92p under
+     Windows 10. An SMP=y guest boots to /sbin/init with three possible CPUs
+     and the local APIC never touched.
+     - co_colinux_vcpu_id() is raw_cpu_read(cpu_number). GS is valid before
+       any C runs: the guest enters at co_arch_start_kernel, falls into
+       common_startup_64, and writes MSR_GS_BASE from __per_cpu_offset[0];
+       the boot CPU reads cpu_number out of the init image (0) until
+       setup_per_cpu_areas() and its own area (0) after. Booting is what
+       proves it -- every cli/sti/save_fl in the kernel is now a GS-relative
+       per-CPU read.
+     - **nolapic STAYS**, which reverses the plan and is the safer direction.
+       The kernel ties "APIC disabled" to "one CPU" in
+       topology_apply_cmdline_limits_early() and restrict_to_up(); that is a
+       true fact about hardware (no APIC, no INIT-SIPI) and false here, where
+       the host starts processors. Both sites now exempt a cooperative guest,
+       next to the exemption XEN PV already has for the same reason. So the
+       inference changes and the fact does not: the APIC is still the host's
+       chip and the guest still never touches it.
+     - smp_ops: co_colinux_smp_prepare_cpus() replaces the native one, which
+       reads apic_intr_mode and answers disable_smp(). co_colinux_kick_ap()
+       refuses, and is a safety belt rather than a stub -- native kick_ap
+       reaches do_boot_cpu() and sends INIT-SIPI-SIPI to a real processor of
+       the host machine. It fired on the first boot: three possible CPUs
+       meant the kernel tried to start two of them.
+     - The gate is closed too: the "unexplained #GP in trap_init" was the ltr
+       race, fixed 2026-08-04, recorded 2026-08-02, never joined up. See the
+       CLOSED entry below. adopt_traps() also runs clean under SMP=y.
+   * Remaining rungs: S3 second vCPU
      to idle (KVCPU_RUN + START_VCPU/KICK_VCPU ops, cpu_bringup per Xen
      smp_pv.c); S4 IPIs + per-CPU timer + shootdown under TLB-torture and
      make -j2; S5 device-ring locking + desktop/Steam soak; S6 --cpus 3 and
