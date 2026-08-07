@@ -3548,6 +3548,26 @@ static void co_vcpu_release(co_vcpu_t* vcpu)
 	vcpu->pp     = NULL;
 }
 
+/*
+ * Is a host processor already carrying a vCPU?
+ *
+ * Two vCPUs pinned to one core is not slow, it is a deadlock: a crossing
+ * loop holds its processor for as long as the guest runs, so the second
+ * thread never gets to run and the first waits for work the second was
+ * supposed to do. The core map is small and read while a run is starting,
+ * which is not a hot path, so a linear scan is the whole mechanism.
+ */
+int co_arch_vcpu_core_taken(unsigned long cpu)
+{
+	int i;
+
+	for (i = 0; i < CO_MAX_VCPUS; i++)
+		if (co_vcpu[i].active && co_vcpu[i].host_cpu == cpu)
+			return 1;
+
+	return 0;
+}
+
 void co_arch_boot_abort(void)
 {
 	vcpu_abort_all = 1;

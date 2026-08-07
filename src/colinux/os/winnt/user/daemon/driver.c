@@ -959,6 +959,97 @@ co_rc_t co_winnt_test_smp(const char* iterations_arg)
 	return ok ? CO_RC(OK) : CO_RC(ERROR);
 }
 
+/*
+ * Run a secondary vCPU alongside whatever else the driver is doing.
+ *
+ * Unlike --test-smp, this is meant to be issued WHILE a guest is booting on
+ * vCPU 0: it is the first time the real monitor loop and a second guest
+ * processor exist at the same time. The driver picks a host core no other
+ * vCPU holds, so it cannot land on the boot processor's -- two vCPUs on one
+ * core is a deadlock, not a slowdown.
+ *
+ * The payload is still the trivial crossing loop. Entering the kernel needs
+ * an initial state only the guest can supply, which is the next rung.
+ */
+co_rc_t co_winnt_test_vcpu(const char* arg)
+{
+	co_rc_t rc;
+	bool_t installed = PFALSE;
+	co_manager_handle_t handle;
+	co_manager_ioctl_kvcpu_run_t r;
+
+	rc = co_win32_manager_is_installed(&installed);
+	if (!CO_OK(rc))
+		return rc;
+	if (!installed) {
+		co_terminal_print("driver not installed\n");
+		return CO_RC(ERROR_ACCESSING_DRIVER);
+	}
+
+	handle = co_os_manager_open();
+	if (!handle) {
+		co_terminal_print("couldn't get driver handle\n");
+		return CO_RC(ERROR_MONITOR_NOT_LOADED);
+	}
+
+	memset(&r, 0, sizeof(r));
+	r.vcpu       = 1;
+	r.iterations = (arg && arg[0]) ? (long long)strtoul(arg, NULL, 0) : 2000000LL;
+
+	co_terminal_print("running vcpu %d for %lld crossings, on whichever host\n",
+			  r.vcpu, r.iterations);
+	co_terminal_print("processor no other vCPU is holding\n\n");
+
+	rc = co_manager_kvcpu_run(handle, &r);
+	co_os_manager_close(handle);
+
+	if (!CO_OK(rc)) {
+		co_terminal_print("vcpu run: ioctl failed (rc %x)\n", (int)rc);
+		return rc;
+	}
+	if (r.no_free_core) {
+		co_terminal_print("  EVERY HOST PROCESSOR ALREADY CARRIES A vCPU.\n");
+		co_terminal_print("  Nothing was started -- two vCPUs on one core deadlock.\n");
+		return CO_RC(ERROR);
+	}
+	if (!CO_OK(r.rc)) {
+		co_terminal_print("vcpu run: driver refused (rc %x)\n", (int)r.rc);
+		return r.rc;
+	}
+	if (!r.supported) {
+		co_terminal_print("  not implemented on this architecture\n");
+		return CO_RC(OK);
+	}
+
+	co_terminal_print("vcpu %d (host processor %lu):\n", r.vcpu, r.host_cpu);
+	co_terminal_print("  crossings  %lld of %lld  (counter %llu, rbx %llu)\n",
+			  r.completed, r.iterations, r.counter, r.reg_accum);
+	co_terminal_print("  replayed   %lld host interrupts from inside the guest\n",
+			  r.interrupts);
+
+	if (r.faulted)
+		co_terminal_print("  FAULTED: vector %llu at rip 0x%016llx\n",
+				  r.vector, r.fault_rip);
+	if (r.migrated)
+		co_terminal_print("  MIGRATED off its processor -- the pin did not hold\n");
+	if (!r.msr_ok)
+		co_terminal_print("  MSR STATE CROSSED: msr 0x%lx wanted 0x%016llx, got 0x%016llx\n",
+				  r.msr_bad, r.msr_want, r.msr_got);
+	if (r.aborted)
+		co_terminal_print("  aborted early (KSTOP or driver unload)\n");
+
+	co_terminal_print("\n");
+	if (r.succeeded) {
+		co_terminal_print("  A SECOND vCPU RAN. It took a core of its own, crossed\n");
+		co_terminal_print("  and returned without disturbing whatever vCPU 0 was\n");
+		co_terminal_print("  doing, and its saved state stayed its own throughout.\n");
+	} else {
+		co_terminal_print("  THE vCPU DID NOT COMPLETE INTACT -- see above.\n");
+	}
+
+	return r.succeeded ? CO_RC(OK) : CO_RC(ERROR);
+}
+
 static co_rc_t co_winnt_install_driver_lowlevel(IN SC_HANDLE SchSCManager, IN LPCTSTR  DriverName, IN LPCTSTR ServiceExe)
 {
 	SC_HANDLE  schService;

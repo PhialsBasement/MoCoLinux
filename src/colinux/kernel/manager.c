@@ -1683,6 +1683,99 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_KVCPU_RUN: {
+		co_manager_ioctl_kvcpu_run_t* params;
+		co_arch_smp_test_t result;
+		co_rc_t trc;
+		int req_vcpu;
+		long long req_iterations;
+		unsigned long cores, cpu, chosen;
+
+		params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		req_vcpu       = params->vcpu;
+		req_iterations = params->iterations;
+
+		co_memset(params, 0, sizeof(*params));
+		params->vcpu = req_vcpu;
+
+		if (manager->state < CO_MANAGER_STATE_INITIALIZED) {
+			params->rc   = CO_RC(ERROR);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		/*
+		 * vCPU 0 is the boot processor and belongs to the boot loop.
+		 * A secondary is 1 and up.
+		 */
+		if (req_vcpu < 1 || req_vcpu >= CO_MAX_VCPUS) {
+			params->rc   = CO_RC(INVALID_PARAMETER);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		/*
+		 * A core nobody else is holding. Not "the one I am on" and not
+		 * "the one whose number matches", because the boot processor
+		 * took whichever core the scheduler had it on and the answer
+		 * has to work while that run is in progress.
+		 */
+		cores  = co_os_cpu_count();
+		chosen = cores;
+		for (cpu = 0; cpu < cores; cpu++) {
+			if (!co_arch_vcpu_core_taken(cpu)) {
+				chosen = cpu;
+				break;
+			}
+		}
+
+		if (chosen >= cores || !co_os_pin_cpu_to(chosen)) {
+			co_debug_error("KVCPU_RUN: no free host processor for vcpu %d "
+				       "(%lu cores, all carrying a vCPU)",
+				       req_vcpu, cores);
+			params->no_free_core = PTRUE;
+			params->rc           = CO_RC(ERROR);
+			*return_size         = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		co_debug("KVCPU_RUN: vcpu %d on host processor %lu of %lu",
+			 req_vcpu, chosen, cores);
+
+		trc = co_arch_test_smp_lane(manager, &result, req_vcpu,
+					    req_iterations);
+
+		co_os_unpin_cpu();
+
+		params->rc            = trc;
+		params->supported     = result.supported;
+		params->succeeded     = result.succeeded;
+		params->host_cpu      = result.host_cpu;
+		params->iterations    = result.iterations;
+		params->completed     = result.completed;
+		params->interrupts    = result.interrupts;
+		params->counter       = result.counter;
+		params->reg_accum     = result.reg_accum;
+		params->faulted       = result.faulted;
+		params->vector        = result.vector;
+		params->error_code    = result.error_code;
+		params->fault_rip     = result.fault_rip;
+		params->unforwardable = result.unforwardable;
+		params->aborted       = result.aborted;
+		params->migrated      = result.migrated;
+		params->msr_ok        = result.msr_ok;
+		params->msr_bad       = result.msr_bad;
+		params->msr_want      = result.msr_want;
+		params->msr_got       = result.msr_got;
+
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_INFO: {
 		co_manager_ioctl_info_t* params;
 

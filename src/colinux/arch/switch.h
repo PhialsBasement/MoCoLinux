@@ -435,4 +435,11 @@ typedef struct {
 extern co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 				     int lane, long long iterations);
 
+/*
+ * Whether a host processor already carries a vCPU. Two vCPUs on one core
+ * deadlock -- each crossing loop holds its processor for as long as its
+ * guest runs -- so a vCPU about to start has to pick a core nobody holds.
+ */
+extern int co_arch_vcpu_core_taken(unsigned long cpu);
+
 #endif

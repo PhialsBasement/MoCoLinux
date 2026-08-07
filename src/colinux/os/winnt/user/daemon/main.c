@@ -243,6 +243,9 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 	if (winnt_parameters.test_smp)
 		return co_winnt_test_smp(winnt_parameters.test_smp_arg);
 
+	if (winnt_parameters.test_vcpu)
+		return co_winnt_test_vcpu(winnt_parameters.test_vcpu_arg);
+
 	if (winnt_parameters.test_resume)
 		return co_winnt_test_switch(3);
 

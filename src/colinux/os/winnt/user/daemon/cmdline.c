@@ -247,6 +247,15 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		return rc;
 
 	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--test-vcpu",
+		&winnt_parameters->test_vcpu,
+		winnt_parameters->test_vcpu_arg,
+		sizeof(winnt_parameters->test_vcpu_arg));
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
 		cmdline, "--cpus",
 		&winnt_parameters->cpus,
 		winnt_parameters->cpus_arg,

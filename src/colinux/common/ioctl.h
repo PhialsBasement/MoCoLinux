@@ -60,6 +60,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_VGPU,
 	CO_MANAGER_IOCTL_VGPU_WAKE,
 	CO_MANAGER_IOCTL_TEST_SMP,
+	CO_MANAGER_IOCTL_KVCPU_RUN,
 } co_manager_ioctl_t;
 
 /*
@@ -317,6 +318,47 @@ typedef struct {
 	int		   preflight_level;
 	unsigned long long preflight_va;
 } co_manager_ioctl_test_smp_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_KVCPU_RUN
+ *
+ * A secondary guest processor: one thread, blocking here for the life of the
+ * run, pinned to a host core no other vCPU holds. This is the shape a real AP
+ * will have -- what it does NOT yet do is enter the kernel. Until the guest
+ * can hand over an initial state (START_VCPU), the payload is the same
+ * trivial crossing loop --test-smp uses, so what this exercises is the thread
+ * and its lifecycle rather than Linux on a second processor.
+ *
+ * Runnable while the boot loop is running, which is the point: it is the
+ * first time the real monitor loop and a second vCPU exist at once.
+ *
+ * vcpu and iterations travel inwards and are read before the driver clears
+ * the struct for the reply.
+ */
+typedef struct {
+	co_rc_t		   rc;
+	int		   vcpu;	/* in: 1..CO_MAX_VCPUS-1 */
+	long long	   iterations;	/* in: crossings before returning */
+	int		   supported;
+	int		   succeeded;
+	unsigned long	   host_cpu;	/* the core it was actually given */
+	long long	   completed;
+	long long	   interrupts;
+	unsigned long long counter;
+	unsigned long long reg_accum;
+	int		   faulted;
+	unsigned long long vector;
+	unsigned long long error_code;
+	unsigned long long fault_rip;
+	int		   unforwardable;
+	int		   aborted;
+	int		   migrated;
+	int		   msr_ok;
+	unsigned long	   msr_bad;
+	unsigned long long msr_want;
+	unsigned long long msr_got;
+	int		   no_free_core;	/* every core already carries a vCPU */
+} co_manager_ioctl_kvcpu_run_t;
 
 /* interface for the CO_MANAGER_IOCTL_KLOAD_* family */
 typedef struct {
