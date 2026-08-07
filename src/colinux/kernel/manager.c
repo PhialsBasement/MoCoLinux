@@ -1204,6 +1204,22 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 					     params->in, offered, &params->in_taken,
 					     params->out, wanted,
 					     &params->out_len);
+
+		/*
+		 * Keystrokes are in the ring; ring the doorbell.
+		 *
+		 * A shell at a prompt IS idle by definition, so without this the
+		 * first character of every command waited out whatever the
+		 * monitor's backoff happened to be -- and with the wait now
+		 * indefinite it would wait forever. Only when something was
+		 * actually taken: the console server probes with a zero-length
+		 * call every 200 ms whenever no client is attached, and waking
+		 * every vCPU for that would be a poll wearing a doorbell's
+		 * clothes.
+		 */
+		if (CO_OK(params->rc) && params->in_taken)
+			co_os_idle_wake_all();
+
 		return CO_RC(OK);
 	}
 
@@ -1391,6 +1407,23 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 
 		params->rc = co_net_put(manager, params->data, params->size,
 					params->frames, &params->taken);
+
+		/*
+		 * Frames are in the RX ring; wake whoever is parked.
+		 *
+		 * The guest's conet-rx kthread runs on whichever processor the
+		 * scheduler put it on, so every doorbell rather than a guess.
+		 *
+		 * This is what the rx_spins re-entry in the monitor loop was
+		 * standing in for: it noticed pending frames only when a vCPU
+		 * happened to reach an idle yield, only on the vCPU that got
+		 * there, and at the cost of a mutex and two guest page-table
+		 * walks on every yield. A doorbell is the mechanism; the spin
+		 * was the symptom of not having one.
+		 */
+		if (CO_OK(params->rc) && params->taken)
+			co_os_idle_wake_all();
+
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}
@@ -1800,8 +1833,33 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		 * does not depend on that ordering at all, and costs nothing --
 		 * the core budget already reserves a processor for the host.
 		 */
+		/*
+		 * A preference, not a rule, and never a refusal.
+		 *
+		 * The old scan started at the top and stopped BEFORE processor
+		 * 0, on the theory that two vCPUs on one core is a deadlock.
+		 * That theory belongs to the era when the guest ran with real
+		 * interrupts off. Today it free-runs with them on: every host
+		 * clock tick vectors through this vCPU's own IDT stub and
+		 * crosses back, and the loop restores the host's flags on every
+		 * iteration -- so a vCPU thread is preemptible sub-millisecond
+		 * and two of them on one core time-share rather than wedge.
+		 *
+		 * The failure that was blamed on this is recorded a few lines
+		 * below: the guest died after 11 switches instead of 1641 when
+		 * the AP thread was left unpinned. That thread was WAITING
+		 * inside the driver at the time, which is the failure that was
+		 * fixed by moving the wait out to the daemon -- not by where the
+		 * thread sat.
+		 *
+		 * So take a core nobody else is carrying if there is one, take
+		 * processor 0 otherwise, and never turn placement into an error.
+		 * Processor 0 is last choice because Windows schedules its own
+		 * work and most device ISRs there, which is a performance
+		 * argument and is treated as one.
+		 */
 		cores  = co_os_cpu_count();
-		chosen = cores;
+		chosen = 0;
 		for (cpu = cores; cpu-- > 1; ) {
 			if (!co_arch_vcpu_core_taken(cpu)) {
 				chosen = cpu;
@@ -1810,28 +1868,27 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		}
 
 		/*
-		 * Pinned immediately, and this is not optional.
+		 * Placed immediately, and placement failing is not fatal.
 		 *
-		 * Deferring the affinity until the guest asks for the processor
-		 * looked tidier -- the thread has nothing to do until then --
-		 * and made it far worse: unpinned, the scheduler puts this
-		 * thread on processor 0 alongside the boot processor, and the
-		 * guest died after 11 switches instead of 1641. Whatever this
-		 * thread costs the boot processor while it waits, it costs far
-		 * less from a core of its own.
+		 * Placing it early is still right: deferring the affinity until
+		 * the guest asks for the processor looked tidier and made it far
+		 * worse, because an unplaced thread lands on processor 0
+		 * alongside the boot processor while it waits.
+		 *
+		 * But a thread that cannot be placed is slower, not broken.
+		 * Every register the crossing needs is saved and restored per
+		 * crossing, from the live processor, so a vCPU that ends up
+		 * sharing a core -- or moving between cores -- is correct and
+		 * merely contended. Refusing to start it left the guest a
+		 * processor short for a scheduling reason.
 		 */
-		if (chosen >= cores || !co_os_pin_cpu_to(chosen)) {
-			co_debug_error("KVCPU_RUN: no free host processor for vcpu %d "
-				       "(%lu cores, all carrying a vCPU)",
-				       req_vcpu, cores);
-			params->no_free_core = PTRUE;
-			params->rc           = CO_RC(ERROR);
-			*return_size         = sizeof(*params);
-			return CO_RC(OK);
-		}
-
-		co_debug("KVCPU_RUN: vcpu %d on host processor %lu of %lu",
-			 req_vcpu, chosen, cores);
+		if (chosen >= cores || !co_os_pin_cpu_to(chosen))
+			co_debug("KVCPU_RUN: vcpu %d could not be placed on host "
+				 "processor %lu of %lu -- running unplaced, which "
+				 "is slower and not wrong", req_vcpu, chosen, cores);
+		else
+			co_debug("KVCPU_RUN: vcpu %d on host processor %lu of %lu",
+				 req_vcpu, chosen, cores);
 
 		/*
 		 * Into the running guest's own address space. That is the

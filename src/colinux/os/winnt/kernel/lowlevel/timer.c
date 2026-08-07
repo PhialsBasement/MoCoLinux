@@ -137,8 +137,27 @@ bool_t co_os_idle_wait(unsigned long vcpu, unsigned int msecs)
 	NTSTATUS      status;
 
 	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS) {
-		co_os_msleep(msecs);
+		co_os_msleep(msecs ? msecs : 1);
 		return PFALSE;
+	}
+
+	/*
+	 * Zero means no timeout at all. No caller passes it today -- see the
+	 * contract in os/timer.h.
+	 *
+	 * The temptation is obvious: every producer rings the doorbell now, so a
+	 * timeout looks like a pure poll, and a poll here is a full world switch
+	 * -- CR3, GDT, IDT, TR, fourteen MSRs, FXSAVE -- taken to find an empty
+	 * operation slot. But the monitor's timeout is also the guest's clock:
+	 * ticks are synthesised from elapsed host time only when a vCPU wakes and
+	 * re-enters, so removing it stops time on that processor. This path
+	 * exists for the day the guest publishes its next expiry instead of
+	 * asking for a periodic tick.
+	 */
+	if (msecs == 0) {
+		status = KeWaitForSingleObject(&co_idle_wake_event[vcpu],
+					       Executive, KernelMode, FALSE, NULL);
+		return status == STATUS_SUCCESS ? PTRUE : PFALSE;
 	}
 
 	DueTime.QuadPart = (long long)msecs * 10000 * (-1);

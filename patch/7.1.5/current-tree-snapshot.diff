@@ -95,6 +95,49 @@ Over the previous snapshot:
     secondary lanes before stopping the block workers, since a secondary
     answers BLOCK_IO out of its own lane.
 
+
+  * SMP integration, uncommitted-until-now half of rung S3. Two processors
+    boot to userspace; what surrounded them still assumed one.
+
+    A secondary runs the boot processor's monitor loop, not the S0 test lane.
+    co_arch_boot_loaded splits into co_arch_boot_prepare and
+    co_arch_vcpu_run; both processors run the second. That gives a secondary
+    the extable fixups, the WARN step-over, the text_poke INT3 windows,
+    START_VCPU, tick injection and the deadline it never had -- the lane had
+    been growing one operation per production failure.
+
+    A secondary adopts kernel exception handling with a hybrid IDT of its own:
+    kernel gates 0-31, NMI and 32-255 re-pointed at THIS vCPU's passage stubs.
+    idt_table's external gates carry vCPU 0's stubs, and a stub is a crossing
+    through its own saved state. Until this, the first extable-covered fault
+    on CPU 1 stopped its lane -- measured as the rdmsr in perf_msr_probe,
+    surfacing only as an RCU stall twenty-one seconds later.
+
+    The passage page is resolved INSIDE the preempt_disable that spans the
+    crossing, in cobd and in the switch helpers. It was read one line above,
+    which is the same as not having one: a task that migrated there wrote its
+    request into vCPU 0's params and executed vCPU 0's switch blob, restoring
+    the boot core's GDTR, IDTR, TR and MSRs onto another host core.
+
+    The cobd completion ring and the console out ring are claimed rather than
+    walked. Two processors reaching a drain boundary at once ended one request
+    twice -- blk_update_request on a request already recycled, in userspace,
+    seconds after /sbin/init. hvc_push and hvc_console_print hold different
+    locks, so console output had two unsynchronised producers.
+
+    Each vCPU carries a clock event device and a host-clock baseline of its
+    own, and CR4 and XCR0 travel from the boot processor to a secondary at
+    START_VCPU. CR4 bit 18 is OSXSAVE and CPUID.1:ECX.27 mirrors it, so a task
+    that asked for AVX on one processor and was migrated to another executed
+    vzeroupper into #UD -- libcrypto, libgnutls and libQt6Core, the three that
+    dispatch on CPU features at run time.
+
+    csd_lock_wait polls this processor's posted vectors. Nothing preempts
+    kernel mode here, so two processors cross-calling each other -- a
+    text_poke_sync against a TLB shootdown is enough -- starved forever with
+    no fault, no tick and no watchdog. The poll runs the drain without
+    irq_exit's softirq pass, because it executes under the vmap purge lock.
+
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
 --- a/arch/x86/include/asm/desc.h	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/include/asm/desc.h	2026-08-08 01:56:05.954030300 +1000
@@ -1587,7 +1630,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
   */
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 --- a/arch/x86/kernel/process.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/process.c	2026-08-08 02:13:52.762390400 +1000
++++ b/arch/x86/kernel/process.c	2026-08-08 04:15:22.359513600 +1000
 @@ -50,10 +50,16 @@
  #include <asm/proto.h>
  #include <asm/frame.h>
@@ -1605,7 +1648,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  
  #include "process.h"
  
-@@ -773,6 +779,763 @@
+@@ -773,6 +779,907 @@
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -1734,12 +1777,24 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 + */
 +void co_colinux_terminate(unsigned long reason)
 +{
-+	unsigned char *pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
++	unsigned char *pp;
++
++	/*
++	 * Under preemption like every other crossing site, even though this one
++	 * does not return: the reason word and the switch must go into the same
++	 * processor's page, and a shutdown that crossed through a peer's blob
++	 * would take the machine down instead of the guest.
++	 */
++	preempt_disable();
++	pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
 +
 +	if (pp) {
 +		*(volatile unsigned long long *)(pp + CO_PP_PARAMS) = reason;
 +		co_colinux_switch(CO_OPERATION_TERMINATE);
 +	}
++	/* _no_resched: see co_colinux_switch_op(). Nothing after this point
++	 * wants the scheduler -- the guest has just been told it is over. */
++	preempt_enable_no_resched();
 +
 +	for (;;)
 +		native_halt();
@@ -1763,8 +1818,36 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 + */
 +void co_colinux_switch_op(unsigned long long operation)
 +{
++	/*
++	 * The index and the crossing under one preemption section.
++	 *
++	 * co_colinux_switch() resolves co_colinux_passage_page[] from the
++	 * processor it is inlined on, and then calls the switch blob inside
++	 * that page -- which restores the host state saved in it. A caller
++	 * migrated between the read and the call crosses through another
++	 * processor's blob and loads that processor's saved host GDTR, IDTR, TR
++	 * and MSRs onto this core, which is a reset with no bugcheck.
++	 *
++	 * This is the form co_colinux_kick_ap() in smpboot.c already uses, for
++	 * the same reason and with the same words; callers that already hold
++	 * preemption nest harmlessly.
++	 *
++	 * _no_resched on the way out, and that is not a detail.
++	 *
++	 * preempt_enable() ends in "if (--count == 0 && need_resched())
++	 * __preempt_schedule()", so pairing a plain enable with the disable
++	 * above INTRODUCES a preemption point where this function never had
++	 * one. Its callers are not places that were expecting to be able to
++	 * schedule -- co_colinux_stop_this_cpu() is looping over a dead
++	 * processor, and co_kick_ap() is mid-bringup. Restoring the count
++	 * without the reschedule check leaves the caller exactly as it was
++	 * found; whatever needed rescheduling is picked up at the next real
++	 * preemption point, which is at most one tick away.
++	 */
++	preempt_disable();
 +	if (co_colinux_passage_page[co_colinux_vcpu_id()])
 +		co_colinux_switch(operation);
++	preempt_enable_no_resched();
 +}
 +EXPORT_SYMBOL(co_colinux_switch_op);
 +
@@ -1905,21 +1988,113 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +	if (!co_colinux_guest || irqs_disabled())
 +		return;
 +
++	/*
++	 * Posted vectors ONLY. Not time, and not the device rings.
++	 *
++	 * This runs from inside an arbitrary busy wait -- csd_lock_wait, which
++	 * is reached from flush_tlb_kernel_range under the vmap purge lock,
++	 * from text_poke, from anywhere on_each_cpu() is called. Draining time
++	 * here also runs the clockevent handler (the scheduler tick, and the
++	 * locks it takes) and co_cobd_drain_completions() -> blk_mq_end_request().
++	 * Running the block layer and the scheduler tick underneath a TLB
++	 * shootdown is a lock inversion, and it wedged: every seccomp filter
++	 * install goes set_memory_ro -> vmap purge -> flush_tlb_kernel_range,
++	 * so nothing that sandboxes itself could start at all.
++	 *
++	 * Servicing the pending set is all this needs to do -- the peer is
++	 * spinning on a csd that one of these vectors unlocks. Jiffies are
++	 * not this path's problem: every vCPU now has a tick device of its own
++	 * and takes ticks at its own idle boundary.
++	 */
 +	local_irq_save(flags);
 +	if (find_first_bit(co_colinux_ipi_pending[co_colinux_vcpu_id()], 256) < 256) {
-+		irq_enter();
++		/*
++		 * The raw hardirq bracket, NOT irq_enter()/irq_exit().
++		 *
++		 * The handlers below genuinely need two things: RCU watching, so
++		 * that sched_ttwu_pending() and the call-function handlers may
++		 * walk RCU-protected data, and in_interrupt() true, because
++		 * __flush_smp_call_function_queue() expects to be running in
++		 * interrupt context. Both are supplied here.
++		 *
++		 * What irq_exit() ADDS is the problem. It ends in
++		 *
++		 *	if (!in_interrupt() && local_softirq_pending())
++		 *		invoke_softirq();
++		 *
++		 * (kernel/softirq.c, __irq_exit_rcu) -- so it runs the pending
++		 * softirqs, from here. And here is inside an arbitrary busy
++		 * wait: csd_lock_wait(), reached from flush_tlb_kernel_range()
++		 * while __purge_vmap_area_lazy() holds vmap_purge_lock. A
++		 * softirq that touches vmalloc from underneath that lock is the
++		 * inversion, and the path is not hypothetical -- every seccomp
++		 * filter install goes bpf_prog_select_runtime -> set_memory_ro
++		 * -> _vm_unmap_aliases -> __purge_vmap_area_lazy ->
++		 * flush_tlb_kernel_range, which is why sshd, which sandboxes
++		 * itself per connection, is the thing that shows it. Removing
++		 * co_colinux_drain_time() from this function earlier took the
++		 * scheduler tick and blk_mq_end_request() out of the same spot
++		 * for the same reason; irq_exit()'s softirq run was the half
++		 * left behind.
++		 *
++		 * tick_irq_enter() is NOT the hazard, contrary to the obvious
++		 * reading: irq_enter_rcu() gates it on
++		 * tick_nohz_full_cpu(cpu) || is_idle_task(current), and a
++		 * processor spinning in csd_lock_wait() on behalf of a real task
++		 * is neither. So jiffies_lock was never taken from here. It is
++		 * bracketed out anyway, because relying on that gate is relying
++		 * on who happens to be spinning.
++		 *
++		 * ct_irq_enter/exit is the RCU half by itself; __irq_enter_raw()
++		 * is the count and the lockdep annotation by themselves. Between
++		 * them they are everything the handlers require and nothing they
++		 * do not.
++		 */
++		ct_irq_enter();
++		__irq_enter_raw();
++
 +		co_colinux_ipi_drain();
-+		irq_exit();
++
++		preempt_count_sub(HARDIRQ_OFFSET);
++		ct_irq_exit();
++		lockdep_hardirq_exit();
 +	}
-+	co_colinux_drain_time();
 +	local_irq_restore(flags);
 +}
 +EXPORT_SYMBOL(co_colinux_ipi_poll);
 +
 +noinstr void co_colinux_yield(void)
 +{
++	/*
++	 * Reached from conet's xmit, hvc's put_chars and the early console, and
++	 * at least one of those runs fully preemptible: hvc_console_print()
++	 * calls put_chars holding the printk console lock and NOT hp->lock, so
++	 * nothing there pins the processor. Same rule as co_colinux_switch_op --
++	 * resolve the page and cross without letting the scheduler move us in
++	 * between, or the crossing goes through another processor's blob and
++	 * restores its saved host state onto this core.
++	 *
++	 * The _notrace forms because this is noinstr: the traced variants carry
++	 * instrumentation that must not appear on the crossing boundary, which
++	 * is the same reason this function is out-of-line and noinstr at all.
++	 *
++	 * And _no_resched, which matters more here than anywhere else.
++	 *
++	 * preempt_enable_notrace() ends in __preempt_schedule_notrace(), so the
++	 * plain pairing would put a preemption point inside a yield that is
++	 * called from hvc_co_put_chars() -- which printk reaches through
++	 * hvc_console_print() holding the console lock and NOT hp->lock, so
++	 * preempt_count can genuinely be zero there -- from early_colinux_write()
++	 * on the same path, and from co_net_xmit(). None of those were
++	 * preemption points before, none of them are expecting to schedule, and
++	 * a yield is the one call in the kernel that has just handed the
++	 * processor to the host and come back. Restoring the count without the
++	 * reschedule check leaves every caller exactly as it was found.
++	 */
++	preempt_disable_notrace();
 +	if (co_colinux_passage_page[co_colinux_vcpu_id()])
 +		co_colinux_switch(CO_OPERATION_YIELD);
++	preempt_enable_no_resched_notrace();
 +}
 +
 +/*
@@ -2002,11 +2177,23 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 + */
 +static unsigned int co_colinux_take_ticks(void)
 +{
-+	unsigned char *pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
-+	struct clock_event_device *evt = &co_colinux_clockevent[co_colinux_vcpu_id()];
++	/*
++	 * The index once, not three times.
++	 *
++	 * All three of these must name the SAME processor -- the passage page
++	 * the clock is read from, the tick device the events are delivered to,
++	 * and the baseline they are measured against. Reading co_colinux_vcpu_id()
++	 * separately for each is correct today only because every caller reaches
++	 * here with interrupts off, and it invites somebody to move one of them
++	 * somewhere that is not. One read makes the requirement visible instead
++	 * of relying on all three landing in the same section.
++	 */
++	const unsigned int cpu = co_colinux_vcpu_id();
++	unsigned char *pp = (unsigned char *)co_colinux_passage_page[cpu];
++	struct clock_event_device *evt = &co_colinux_clockevent[cpu];
 +	const u64 per_tick = 10000000 / HZ;	/* 100 ns units */
 +	static u64 last_mono[CO_COLINUX_NR_VCPUS];
-+	u64 *lm = &last_mono[co_colinux_vcpu_id()];
++	u64 *lm = &last_mono[cpu];
 +	u64 now;
 +	unsigned int n;
 +
@@ -2369,7 +2556,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +1699,18 @@
+@@ -936,6 +1843,18 @@
  
  void __init select_idle_routine(void)
  {
@@ -2390,7 +2577,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  			pr_warn_once("WARNING: polling idle and HT enabled, performance may degrade\n");
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
 --- a/arch/x86/kernel/reboot.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/reboot.c	2026-08-01 15:30:12.318556600 +1000
++++ b/arch/x86/kernel/reboot.c	2026-08-08 03:22:51.495064100 +1000
 @@ -1,6 +1,7 @@
  // SPDX-License-Identifier: GPL-2.0
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -2618,7 +2805,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  		max_pfn = e820__end_of_ram_pfn();
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
 --- a/arch/x86/kernel/smpboot.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/smpboot.c	2026-08-08 01:56:20.788867100 +1000
++++ b/arch/x86/kernel/smpboot.c	2026-08-08 04:15:48.817057500 +1000
 @@ -40,6 +40,8 @@
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
  
@@ -2628,7 +2815,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  #include <linux/smp.h>
  #include <linux/export.h>
  #include <linux/sched.h>
-@@ -1152,6 +1154,835 @@
+@@ -1152,6 +1154,850 @@
  	cpumask_set_cpu(0, topology_die_cpumask(0));
  }
  
@@ -3390,8 +3577,23 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +	 * To itself, and therefore without a crossing: this processor is
 +	 * plainly running, so there is nobody to wake. Post it and let the
 +	 * next drain pick it up.
++	 *
++	 * "Itself" is the whole content of the message, so the index has to
++	 * still be this processor's when the bit lands. Migrating between the
++	 * read and the set_bit posts the vector into the pending set of the
++	 * processor we came from, where nothing is waiting for it, and this
++	 * processor never runs the handler it just asked for. Callers happen to
++	 * hold preemption today; nothing in the apic->send_IPI_self contract
++	 * says they must.
++	 *
++	 * _no_resched, because this is reached from arch_irq_work_raise() and
++	 * irq_work_queue() is callable from ANY context. A plain
++	 * preempt_enable() would put a reschedule check inside it, which is not
++	 * something an irq_work caller can be asked to tolerate.
 +	 */
++	preempt_disable();
 +	set_bit(vector, co_colinux_ipi_pending[co_colinux_vcpu_id()]);
++	preempt_enable_no_resched();
 +}
 +#endif
 +
@@ -3627,8 +3829,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  	 * pci_legacy_init should be invoked.
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/block/cobd.c b/drivers/block/cobd.c
 --- a/drivers/block/cobd.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/block/cobd.c	2026-08-08 02:19:18.655920500 +1000
-@@ -0,0 +1,616 @@
++++ b/drivers/block/cobd.c	2026-08-08 03:20:29.084530100 +1000
+@@ -0,0 +1,657 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * cobd -- the cooperative block device.
@@ -3676,9 +3878,14 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +#define CO_OPERATION_BLOCK_IO		18
 +
 +/*
-+ * One per guest processor -- see arch/x86/kernel/process.c. Every use here
-+ * is already inside the preempt_disable() that the params[] protocol needs,
-+ * so the index cannot go stale between reading it and the crossing.
++ * One per guest processor -- see arch/x86/kernel/process.c.
++ *
++ * Every use below reads the index INSIDE the preempt_disable() that spans the
++ * crossing. That is a correction, not a description of how it always was: the
++ * reads used to sit one line ABOVE the section, which is the same as not
++ * having one. The pointer and the switch blob it names must come from the same
++ * processor, because the blob restores the saved host state stored in that
++ * page -- see cobd_io_sg() for what a migrated task did with it.
 + */
 +extern unsigned long long co_colinux_passage_page[CO_COLINUX_NR_VCPUS];
 +
@@ -3845,6 +4052,14 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 + * traced, and it is called from block submission context where a detour
 + * through the tracer would be a poor idea.
 + */
++/*
++ * Every caller is already inside preempt_disable(), so this second read of the
++ * index resolves to the same processor's page as the params writes did. That
++ * is the only reason it is allowed to re-read rather than be handed the
++ * pointer: called from outside such a section it would be free to cross
++ * through a different processor's blob than the one the request was written
++ * into.
++ */
 +static void cobd_switch(unsigned long long operation)
 +{
 +	unsigned char *pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
@@ -3884,15 +4099,15 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +static int cobd_io_sg(int unit, u64 offset, phys_addr_t sg_pa, u32 count,
 +		      bool write)
 +{
-+	unsigned char *pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
++	unsigned char *pp;
 +	int ret;
 +
 +	/*
 +	 * The parameters and the crossing are one operation and must not be
 +	 * split by the scheduler.
 +	 *
-+	 * There is exactly one passage page. These six words are not this
-+	 * request's -- they are the machine's only set, and they stay meaningful
++	 * There is one passage page PER PROCESSOR. These six words are not this
++	 * request's -- they are that processor's only set, and they stay meaningful
 +	 * for precisely as long as it takes to get from the last store to the
 +	 * call below. queue_rq runs in fully preemptible process context:
 +	 * BLK_MQ_F_BLOCKING says it may sleep, and blk_mq_submit_bio issues
@@ -3918,14 +4133,34 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +	 * cannot race itself. Nothing is logged when this fires: both crossings
 +	 * succeed and the corruption is delivered as data.
 +	 *
-+	 * preempt_disable is the whole fix and the right size of it. It is not
-+	 * an SMP question -- the guest has one processor -- and interrupts do
-+	 * not need masking either, because vectors 32-255 belong to the host and
++	 * preempt_disable is the whole fix and the right size of it. Interrupts
++	 * do not need masking, because vectors 32-255 belong to the host and
 +	 * never run guest code. What has to be prevented is the guest's own
 +	 * scheduler putting another task on the processor in the middle, and
 +	 * that is exactly what the preemption count prevents.
++	 *
++	 * AND THE PASSAGE PAGE IS RESOLVED INSIDE THE SECTION, not above it.
++	 *
++	 * That was wrong for as long as there was one processor and became
++	 * fatal with two. There is no longer a single passage page: there is
++	 * one per guest processor, selected by co_colinux_vcpu_id(). Reading it
++	 * before disabling preemption lets a task resolve vCPU 0's page, get
++	 * migrated to CPU 1, and then write its request into vCPU 0's params and
++	 * call vCPU 0's switch blob -- and that blob restores the host state
++	 * saved in vCPU 0's page: the boot core's GDTR, IDTR, TR, CR3, CR4 and
++	 * MSRs, loaded onto host core 1. That is the "a passage page built on
++	 * one core and entered from another" case exactly, and it is an instant
++	 * machine reset with no bugcheck and nothing in any log. It also
++	 * rewrites the saved state of a processor that is still running on it.
++	 *
++	 * preempt_disable() is legal and sufficient here, unlike in
++	 * asm/irqflags.h where the same question cannot be answered this way:
++	 * this is ordinary driver code and nothing it calls is built on the
++	 * preemption count.
 +	 */
 +	preempt_disable();
++
++	pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
 +
 +	*(volatile u64 *)(pp + CO_PP_PARAM(51)) = unit;
 +	*(volatile u64 *)(pp + CO_PP_PARAM(52)) = offset;
@@ -3957,10 +4192,15 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +static bool cobd_submit_async(int unit, u64 offset, phys_addr_t sg_pa, u32 count,
 +			      bool write, unsigned int tag)
 +{
-+	unsigned char *pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
++	unsigned char *pp;
 +	bool accepted;
 +
++	/* Index inside the section, params inside the section, crossing inside
++	 * the section -- see cobd_io_sg() for what happens when the first of
++	 * those is left outside it. */
 +	preempt_disable();
++
++	pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
 +
 +	*(volatile u64 *)(pp + CO_PP_PARAM(51)) = unit;
 +	*(volatile u64 *)(pp + CO_PP_PARAM(52)) = offset;
@@ -3981,13 +4221,16 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +
 +static u64 cobd_probe(int unit)
 +{
-+	unsigned char *pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
++	unsigned char *pp;
 +	u64 size;
 +
 +	/* Same page, same rule -- see cobd_io_sg(). This one runs at init with
 +	 * nothing else to race, which is a fact about today rather than a
-+	 * property of the code. */
++	 * property of the code, so it gets the same treatment as the two
++	 * request paths rather than an argument about why it need not. */
 +	preempt_disable();
++
++	pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
 +
 +	*(volatile u64 *)(pp + CO_PP_PARAM(51)) = unit;
 +	*(volatile u64 *)(pp + CO_PP_PARAM(52)) = 0;
@@ -4566,8 +4809,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
  obj-$(CONFIG_NETKIT) += netkit.o
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/tty/hvc/hvc_colinux.c b/drivers/tty/hvc/hvc_colinux.c
 --- a/drivers/tty/hvc/hvc_colinux.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/tty/hvc/hvc_colinux.c	2026-08-01 11:55:42.897917800 +1000
-@@ -0,0 +1,141 @@
++++ b/drivers/tty/hvc/hvc_colinux.c	2026-08-08 03:21:39.989303000 +1000
+@@ -0,0 +1,176 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * An interactive console for a cooperative Linux guest.
@@ -4593,6 +4836,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +#include <linux/export.h>
 +#include <linux/init.h>
 +#include <linux/moduleparam.h>
++#include <linux/spinlock.h>
 +#include <linux/types.h>
 +
 +#include "hvc_console.h"
@@ -4625,12 +4869,37 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 + * The early console still has the boot log, and that is the thing worth
 + * keeping.
 + */
++/*
++ * The out ring has TWO producers, and the hvc core does not serialise them.
++ *
++ * hvc_push() calls put_chars holding hp->lock; hvc_console_print() -- the
++ * printk path -- calls it holding the printk console lock and nothing else.
++ * Those are different locks, so one processor printing a warning while another
++ * writes to /dev/hvc0 gives two read-modify-writes of out_head over the same
++ * ring slots: interleaved output, lost bytes, and an out_head that can move
++ * backwards. The host resyncs from a backwards head (kernel/console.c skips
++ * forward when head - tail exceeds the ring), so nothing over there breaks --
++ * what breaks is the record of what the guest said, which is the one thing a
++ * console is for.
++ *
++ * One processor could never hit this, because hp->lock is taken with
++ * interrupts off and printk on the same CPU could not interleave. Two can.
++ * Every hvc backend reachable from both paths carries a lock of its own for
++ * exactly this reason.
++ */
++static DEFINE_SPINLOCK(hvc_co_out_lock);
++
 +static ssize_t hvc_co_put_chars(u32 vtermno, const u8 *buf, size_t count)
 +{
 +	struct co_console_io *io = &co_colinux_console_io;
-+	unsigned int head = io->out_head;
-+	unsigned int tail = io->out_tail;
++	unsigned int head, tail;
++	unsigned long flags;
 +	size_t i;
++
++	spin_lock_irqsave(&hvc_co_out_lock, flags);
++
++	head = io->out_head;
++	tail = io->out_tail;
 +
 +	for (i = 0; i < count; i++) {
 +		if (head - tail >= CO_CONSOLE_OUT_SIZE)
@@ -4645,6 +4914,15 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +	 */
 +	smp_wmb();
 +	io->out_head = head;
++
++	/*
++	 * Released before the yield below, which is a world switch and must
++	 * never be taken with a spinlock held: the host runs a whole monitor
++	 * loop iteration inside that call, and a second processor arriving at
++	 * put_chars meanwhile would spin on this lock with no way to make
++	 * progress until the host chose to re-enter us.
++	 */
++	spin_unlock_irqrestore(&hvc_co_out_lock, flags);
 +
 +	/*
 +	 * Hand the host the CPU so it can drain promptly. Without this the
@@ -4756,8 +5034,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
  virtio_pci-$(CONFIG_VIRTIO_PCI_LEGACY) += virtio_pci_legacy.o
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/virtio/virtio_colinux.c b/drivers/virtio/virtio_colinux.c
 --- a/drivers/virtio/virtio_colinux.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/virtio/virtio_colinux.c	2026-08-05 18:55:08.343734600 +1000
-@@ -0,0 +1,604 @@
++++ b/drivers/virtio/virtio_colinux.c	2026-08-08 03:44:23.127284500 +1000
+@@ -0,0 +1,650 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * virtio over a cooperative-Linux ring, with no registers and no traps.
@@ -5010,6 +5288,14 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 + */
 +static atomic_t co_vgpu_inflight = ATOMIC_INIT(0);
 +
++/*
++ * NOT CALLED BY ANYTHING. The idle path's poll-before-crossing experiment that
++ * this was written for was measured (50 fps unchanged, then 35/30 fps when the
++ * poll really ran) and reverted -- see the note above co_cpu_idle() in
++ * arch/x86/kernel/process.c. Kept because the flag it reads is still
++ * maintained and a monitor-side fix may want to ask the question, but a reader
++ * should not conclude that anything currently waits on the GPU.
++ */
 +bool co_vgpu_busy(void)
 +{
 +	return atomic_read(&co_vgpu_inflight) != 0;
@@ -5158,10 +5444,40 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +	 * for nothing. That is exactly what the first version of this did, and
 +	 * it measured as no change at all.
 +	 */
-+	if (pending == READ_ONCE(co_colinux_vgpu_io.reaped))
-+		return;
-+
-+	WRITE_ONCE(co_colinux_vgpu_io.reaped, pending);
++	/*
++	 * Unconditional, and that is the correct mechanism rather than a
++	 * weakening of the previous one -- because the previous one was not a
++	 * claim.
++	 *
++	 * A cmpxchg on `reaped` used to guard this, described as stopping two
++	 * processors running vring_interrupt() over the same used entries. It
++	 * cannot do that, for three reasons. vring_interrupt() consumes nothing:
++	 * it tests more_used() and calls the callback, which for virtio-gpu is
++	 * schedule_work(). The used ring is actually drained in
++	 * virtio_gpu_dequeue_ctrl_func, a work item the workqueue will not run
++	 * concurrently with itself and which holds ctrlq.qlock throughout -- so
++	 * consumption was already single-threaded and calling this twice for one
++	 * completion is a no-op. And it did not even serialise: two callers that
++	 * read different values of `reaped`, which is what happens the moment
++	 * one commits, both proceed.
++	 *
++	 * It could also lose a drain. The winner published `reaped` BEFORE
++	 * calling vring_interrupt(), so a drain arriving in that window saw
++	 * pending == reaped and returned, and the ring then waited for the next
++	 * kick.
++	 *
++	 * What it did change is how OFTEN the guest reaps, which is why
++	 * "virtio_gpu_dequeue_ctrl_func: response 0x1200 (command 0x106)" went
++	 * away when it landed. That is the signature of hiding a rate-dependent
++	 * problem rather than removing one, and the remaining places to look are
++	 * both on the host: whether the daemon can publish a used entry twice
++	 * for one descriptor, and whether vrend.c can write a response buffer
++	 * after the used index that names it. Nothing on this side explains it.
++	 *
++	 * pending/reaped stay, as the in-flight bookkeeping they are good for --
++	 * and `reaped` is published AFTER the ring has been poked, not before,
++	 * so the window that could lose a drain does not exist either.
++	 */
 +	smp_rmb();
 +
 +	for (i = 0; i < CO_VGPU_NUM_VQS; i++) {
@@ -5169,13 +5485,21 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +			vring_interrupt(0, co_vgpu->vqs[i]);
 +	}
 +
-+	/*
-+	 * Completions have been handed to the ring, so the wait is over as far
-+	 * as this transport is concerned -- what remains is the guest's own
-+	 * work queue signalling the fence, which needs the scheduler and so
-+	 * needs the idle path to return anyway.
-+	 */
-+	atomic_set(&co_vgpu_inflight, 0);
++	if (pending != READ_ONCE(co_colinux_vgpu_io.reaped)) {
++		WRITE_ONCE(co_colinux_vgpu_io.reaped, pending);
++		/*
++		 * Completions have been handed to the ring, so the wait is over
++		 * as far as this transport is concerned -- what remains is the
++		 * guest's own work queue signalling the fence, which needs the
++		 * scheduler and so needs the idle path to return anyway.
++		 *
++		 * Only when something actually arrived, which is the point the
++		 * comment above the pending read is making: clearing this on a
++		 * drain that reaped nothing tells the idle path the GPU has
++		 * finished the instant it starts waiting.
++		 */
++		atomic_set(&co_vgpu_inflight, 0);
++	}
 +}
 +EXPORT_SYMBOL(co_vgpu_drain);
 +
