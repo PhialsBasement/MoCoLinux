@@ -809,7 +809,22 @@
      booting on vCPU 0, then 3,000,000 crossings on vCPU 1 on another core,
      counters exact, 8886 host interrupts replayed from inside it, no MSR
      bleed, while vCPU 0 reached /sbin/init and kept running.
-   * S3b-2, where the risk actually is: START_VCPU (the BSP
+   * TWO vCPUs IN ONE ADDRESS SPACE, 2026-08-07 (bac33be7). The property
+     --test-smp could not show: its lanes each had a space of their own, so
+     it proved two crossings can run at once, not that two processors can
+     share a guest. KVCPU_RUN now enters the running guest's CR3 -- each vCPU
+     keeps its own passage page (state, params, FPU area, IST stack, TSS,
+     GDT) and they share the page tables. Reachability is free: the boot
+     path already grafts kload_space's top-level entries into the kernel's
+     table, so a passage page mapped into kload_space under a grafted slot is
+     visible from the kernel's CR3. The preflight therefore walks the GUEST's
+     space, not the passage page's own tables -- the wrong walk answers the
+     wrong question. vCPU 0 publishes the adopted kernel root, not its live
+     CR3, which follows whatever process Linux last scheduled and can be
+     freed underneath a secondary. Verified both ways: 3,000,000 crossings on
+     vCPU 1 with the guest at /sbin/init, and a refusal when no guest is
+     running -- which is what makes the positive mean something.
+   * S3b-2, STILL OPEN and where the remaining risk is: START_VCPU (the BSP
      hands the host an AP initial-state block -- rip, rsp, CR3, GS_BASE,
      per-vCPU GDT/IDT/TSS, virtual-IF slot starting blocked; structurally
      co_arch_boot_result_t again, which the host already builds once for the
