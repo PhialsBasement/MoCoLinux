@@ -703,6 +703,42 @@
      with "manager open: The system cannot find the file specified" on every
      subsequent run. It should start the service, or say that it did not.
 
+ * SMP -- the milestone the swap and OpenGL entries defer to. Staged plan
+   agreed 2026-08-07; rungs are S0..S6, each hardware-verified and committed
+   before the next starts.
+   * S0 DONE 2026-08-07 (commit 26638a3d), verified on the M92p under Windows
+     10: --test-smp runs two threads pinned to two processors, each crossing
+     into a guest of its own, concurrently. 10M crossings per lane in 54 s
+     (~2.7 us each), counters and rbx exact both lanes, 5671 host interrupts
+     replayed from inside the guests on both cores at once, lane-distinct MSR
+     sentinels (FS_BASE/GS_BASE/KERNEL_GS_BASE/LSTAR) intact throughout, zero
+     host-verify escalations, zero migrations. KSTOP mid-run ends both lanes
+     cleanly; the boot regression after it is clean. The central claim --
+     per-crossing state is fully per-passage-page and two cores can switch
+     worlds independently -- is now measured, not argued.
+   * The design in one paragraph: each vCPU is a daemon thread in a blocking
+     per-vCPU ioctl, pinned to its own core, with a passage block of its own
+     (incl. GDT/TSS/IDT/stubs/FXSAVE). Guest-side machine globals
+     (co_colinux_virtual_if, co_colinux_passage_page) become fixed arrays
+     indexed by a raw GS read of cpu_number -- host-visible, so never percpu.
+     APIC cannot be config'd out on x86-64: an inert struct apic (Xen PV's
+     xen_pv_apic shape), fake topology, and an smp_prepare_cpus override
+     replace nolapic. AP bringup is the BSP's kick_ap crossing handing the
+     host an explicit initial-state block (the KBOOT shape, once per AP).
+     IPIs are shared-memory pending bitmaps + an idle doorbell + opportunistic
+     ring-3 frame surgery; reschedule is arrival-only. TLB shootdown needs no
+     IPI at all: every crossing already clears CR4.PGE around the CR3 write
+     (full flush, globals included, nopcid), so a sequence counter + in-host
+     flag per vCPU answers "has it flushed" -- kick and wait for the counter.
+   * Remaining rungs: S1 mechanical per-vCPU refactor under SMP=n (parity);
+     S2 SMP=y kernel with one CPU (fake apic, topology, drop nolapic; gate:
+     explain the one-off #GP in co_colinux_adopt_traps first); S3 second vCPU
+     to idle (KVCPU_RUN + START_VCPU/KICK_VCPU ops, cpu_bringup per Xen
+     smp_pv.c); S4 IPIs + per-CPU timer + shootdown under TLB-torture and
+     make -j2; S5 device-ring locking + desktop/Steam soak; S6 --cpus 3 and
+     oneshot/NO_HZ evaluation. Host core budget: 4 cores = Windows + cogpu
+     spin-poll + 2 vCPUs, zero slack -- the daemon should print the core map.
+
  * Cleanups:
    * Merge console into console-base.
    * Clear out some function naming brain damage and make more use
