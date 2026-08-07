@@ -67,6 +67,10 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("      --no-copic                   Do not interrupt a running guest. Ticks then\n");
 	co_terminal_print("                                   arrive only at idle and at exits to user mode,\n");
 	co_terminal_print("                                   so a userspace spin loop cannot be preempted.\n");
+	co_terminal_print("      --cpus N                     Guest processors (default 1). Each one is a\n");
+	co_terminal_print("                                   host thread pinned to a host core for the\n");
+	co_terminal_print("                                   whole run, so this is capped at cores-2:\n");
+	co_terminal_print("                                   Windows and the GPU daemon need one each.\n");
 	co_terminal_print("      --mem MB                     Guest RAM in megabytes (default 1024). Taken\n");
 	co_terminal_print("                                   as unbroken 32 MB physical runs, so a large\n");
 	co_terminal_print("                                   value on a fragmented host stalls it; short\n");
@@ -238,6 +242,15 @@ co_rc_t co_winnt_daemon_parse_args(co_command_line_params_t cmdline, co_winnt_pa
 		&winnt_parameters->test_smp,
 		winnt_parameters->test_smp_arg,
 		sizeof(winnt_parameters->test_smp_arg));
+
+	if (!CO_OK(rc))
+		return rc;
+
+	rc = co_cmdline_params_one_optional_arugment_parameter(
+		cmdline, "--cpus",
+		&winnt_parameters->cpus,
+		winnt_parameters->cpus_arg,
+		sizeof(winnt_parameters->cpus_arg));
 
 	if (!CO_OK(rc))
 		return rc;

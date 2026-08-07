@@ -388,6 +388,8 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		{
 			const char* cobd[CO_COBD_MAX_UNITS];
 			unsigned long mem_mb = 0;
+			unsigned long ncpus = 1;
+			int cpus;
 			int unit;
 
 			if (winnt_parameters.mem &&
@@ -396,9 +398,48 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 				return CO_RC(INVALID_PARAMETER);
 			}
 
+			if (winnt_parameters.cpus &&
+			    !co_parse_count(winnt_parameters.cpus_arg, &ncpus)) {
+				co_terminal_print("--cpus wants a positive count of processors\n");
+				return CO_RC(INVALID_PARAMETER);
+			}
+			cpus = (int)ncpus;
+
 			for (unit = 0; unit < CO_COBD_MAX_UNITS; unit++)
 				cobd[unit] = winnt_parameters.cobd[unit] ?
 					winnt_parameters.cobd_arg[unit] : NULL;
+
+			/*
+			 * Guest processors, and the core budget behind the
+			 * number.
+			 *
+			 * A vCPU is a host thread pinned to a host processor
+			 * for as long as the guest runs, so asking for more of
+			 * them than the machine can spare does not make the
+			 * guest faster -- it takes cores away from Windows and
+			 * from the GPU daemon, which spin-polls one of its own.
+			 * On the four-core box this port is developed against
+			 * that leaves two. The map is printed rather than
+			 * assumed, because a vCPU landing on the daemon's core
+			 * is a performance mystery with no other symptom.
+			 */
+			{
+				unsigned long cores = co_os_active_cpu_count();
+				unsigned long budget = (cores > 2) ? cores - 2 : 1;
+
+				if (cpus > (int)budget) {
+					co_terminal_print(
+						"--cpus %d: this host has %lu processors, so %lu "
+						"is the most a guest can have without taking a\n"
+						"core from Windows or the GPU daemon. Using %lu.\n",
+						cpus, cores, budget, budget);
+					cpus = (int)budget;
+				}
+				if (cpus > CO_MAX_VCPUS)
+					cpus = CO_MAX_VCPUS;
+				co_terminal_print("cpus: %d guest processor(s) of %lu host cores\n",
+						  cpus, cores);
+			}
 
 			return co_elf_load_into_guest(winnt_parameters.boot_kernel_arg, 3,
 						      limit, batch, cobd,
@@ -406,20 +447,21 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 							winnt_parameters.init_arg : NULL,
 						      mem_mb,
 						      winnt_parameters.no_copic,
-						      winnt_parameters.sync_cobd ? 0 : 1);
+						      winnt_parameters.sync_cobd ? 0 : 1,
+						      cpus);
 		}
 	}
 
 	if (winnt_parameters.call_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0, 0, NULL, NULL, 0, 0, 0);
+		return co_elf_load_into_guest(winnt_parameters.call_kernel_arg, 2, 0, 0, NULL, NULL, 0, 0, 0, 1);
 	}
 
 	if (winnt_parameters.enter_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0, 0, NULL, NULL, 0, 0, 0);
+		return co_elf_load_into_guest(winnt_parameters.enter_kernel_arg, 1, 0, 0, NULL, NULL, 0, 0, 0, 1);
 	}
 
 	if (winnt_parameters.load_kernel) {
-		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0, NULL, NULL, 0, 0, 0);
+		return co_elf_load_into_guest(winnt_parameters.load_kernel_arg, 0, 0, 0, NULL, NULL, 0, 0, 0, 1);
 	}
 
 	if (winnt_parameters.net_dump) {

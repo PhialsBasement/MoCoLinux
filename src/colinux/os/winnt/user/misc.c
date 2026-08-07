@@ -265,3 +265,17 @@ void co_os_thread_join(void* thread)
 	WaitForSingleObject(h, INFINITE);
 	CloseHandle(h);
 }
+
+/*
+ * Host processors, for the vCPU budget. GetSystemInfo rather than the
+ * GetLogicalProcessorInformation family: this daemon still runs on XP x64,
+ * where the newer calls are absent, and a processor group wider than 64 is
+ * not a machine this port targets.
+ */
+unsigned long co_os_active_cpu_count(void)
+{
+	SYSTEM_INFO si;
+
+	GetSystemInfo(&si);
+	return si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1;
+}

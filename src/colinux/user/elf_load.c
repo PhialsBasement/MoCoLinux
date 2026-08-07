@@ -1291,9 +1291,11 @@ static void co_report_bug_at(co_elf_data_t* pl, unsigned long long rip)
 co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			       unsigned long max_switches, unsigned long batch,
 			       const char* const* cobd, const char* init_path,
-			       unsigned long mem_mb, int no_copic, int async_cobd)
+			       unsigned long mem_mb, int no_copic, int async_cobd,
+			       int cpus)
 {
 	const char* cobd0 = cobd ? cobd[0] : NULL;
+	int in_cpus = (cpus >= 1) ? cpus : 1;
 	co_elf_data_t* pl;
 	co_manager_handle_t handle;
 	co_manager_ioctl_kload_verify_t v = {0, };
@@ -2003,6 +2005,32 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 				 * hardware counters.
 				 */
 				" initcall_blacklist=intel_uncore_init");
+
+		/*
+		 * How many processors the guest has, which is the host's answer
+		 * and not the machine's.
+		 *
+		 * Without this the guest counts the host firmware's MP table and
+		 * concludes it has as many processors as the M92p does -- three,
+		 * on a box where the host is going to run one vCPU. That is the
+		 * host's chip inventory describing the host's CPUs, and the guest
+		 * has no claim on any of them: a vCPU exists only where the host
+		 * has a pinned thread to run it, so the count is the host's to
+		 * state. Left to the MP table the kernel sizes its per-CPU areas,
+		 * cpumasks and RCU geometry for processors that will never come
+		 * online, and then tries to start them.
+		 *
+		 * possible_cpus= is the kernel's own parameter for exactly this
+		 * and needs no patch: topology_apply_cmdline_limits_early() takes
+		 * the minimum of it and whatever was enumerated.
+		 */
+		{
+			char cpus_arg[32];
+
+			co_snprintf(cpus_arg, sizeof(cpus_arg), " possible_cpus=%d",
+				    in_cpus);
+			strcat(cmdline, cpus_arg);
+		}
 
 		/*
 		 * A root filesystem, if the host attached one. Without it the
