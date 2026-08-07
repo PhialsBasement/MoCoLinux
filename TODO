@@ -798,8 +798,18 @@
      nr_cpu_ids 2, one refused AP attempt instead of two, boots to
      /sbin/init. The daemon prints the core map, which the entry below asked
      for.
-   * S3b, the rest of S3 and where the risk actually is: KVCPU_RUN (AP thread
-     blocks in its own ioctl, pinned to its own core), START_VCPU (the BSP
+   * S3b-1 DONE 2026-08-07 (b43fb96c): KVCPU_RUN, the ioctl an AP thread
+     blocks in, issued WHILE the boot loop runs -- the first time the real
+     monitor loop and a second guest processor exist at once. The driver
+     picks the core rather than taking the caller's, because two vCPUs on one
+     core is a deadlock and not a slowdown; co_arch_vcpu_core_taken() scans
+     the host_cpu that S1 already records, so the boot processor's core is
+     excluded by construction instead of by the caller guessing which one it
+     landed on. Payload is still the trivial crossing loop. Verified: guest
+     booting on vCPU 0, then 3,000,000 crossings on vCPU 1 on another core,
+     counters exact, 8886 host interrupts replayed from inside it, no MSR
+     bleed, while vCPU 0 reached /sbin/init and kept running.
+   * S3b-2, where the risk actually is: START_VCPU (the BSP
      hands the host an AP initial-state block -- rip, rsp, CR3, GS_BASE,
      per-vCPU GDT/IDT/TSS, virtual-IF slot starting blocked; structurally
      co_arch_boot_result_t again, which the host already builds once for the
