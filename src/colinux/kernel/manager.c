@@ -1650,8 +1650,12 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			return CO_RC(OK);
 		}
 
+		/*
+		 * A private address space: --test-smp is meant to run with no
+		 * guest loaded, so there is nothing to join.
+		 */
 		trc = co_arch_test_smp_lane(manager, &result, req_lane,
-					    req_iterations);
+					    req_iterations, 0);
 
 		co_os_unpin_cpu();
 
@@ -1746,8 +1750,13 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		co_debug("KVCPU_RUN: vcpu %d on host processor %lu of %lu",
 			 req_vcpu, chosen, cores);
 
+		/*
+		 * Into the running guest's own address space. That is the
+		 * point of this ioctl as against a --test-smp lane: one CR3,
+		 * two processors.
+		 */
 		trc = co_arch_test_smp_lane(manager, &result, req_vcpu,
-					    req_iterations);
+					    req_iterations, 1);
 
 		co_os_unpin_cpu();
 

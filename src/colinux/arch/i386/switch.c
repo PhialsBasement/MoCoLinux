@@ -76,7 +76,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, struct co_arch_guest_space* s
 }
 
 co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
-			      int lane, long long iterations)
+			      int lane, long long iterations, int join_guest)
 {
 	co_memset(out, 0, sizeof(*out));
 	out->supported = PFALSE;

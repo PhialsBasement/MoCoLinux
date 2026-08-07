@@ -431,9 +431,16 @@ typedef struct {
  * A lane is a vCPU and takes the vCPU slot of its own number, so a running
  * lane answers co_arch_boot_running() and is ended by co_arch_boot_abort() --
  * KSTOP and driver unload need no separate mechanism for it.
+ *
+ * join_guest: enter the RUNNING guest's address space instead of the private
+ * one built for this passage page. Each vCPU keeps its own passage page --
+ * its own state, params, FPU area, IST stack, TSS and GDT -- but shares the
+ * page tables, which is what makes them processors of one machine rather than
+ * two guests. Requires vCPU 0 to be running.
  */
 extern co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
-				     int lane, long long iterations);
+				     int lane, long long iterations,
+				     int join_guest);
 
 /*
  * Whether a host processor already carries a vCPU. Two vCPUs on one core

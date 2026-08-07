@@ -3501,6 +3501,18 @@ typedef struct {
 	unsigned long		host_cpu;	/* the processor it is pinned to */
 	co_arch_passage_page_t*	pp;		/* its own passage page */
 	/*
+	 * The guest's stable address space, published by vCPU 0 once the
+	 * kernel's own tables have been adopted.
+	 *
+	 * Not the live CR3 out of linuxvm_state: that follows whatever process
+	 * Linux last scheduled, and a secondary processor must not be pointed
+	 * at a per-process table that can be freed underneath it. The adopted
+	 * kernel root is the one that does not move, and every process root
+	 * shares the kernel half with it anyway -- which is what makes the
+	 * passage pages reachable from either.
+	 */
+	unsigned long long	guest_cr3;
+	/*
 	 * Every distinct host vector this vCPU has replayed, once. Per-vCPU
 	 * rather than shared because the question it answers -- was this
 	 * processor handed something the host never raises -- is asked of a
@@ -3623,7 +3635,7 @@ static unsigned long long co_smp_sentinel(int lane, int which)
 }
 
 co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
-			      int lane, long long iterations)
+			      int lane, long long iterations, int join_guest)
 {
 	co_arch_switch_test_t setup;
 	co_arch_passage_page_t* pp;
@@ -3665,6 +3677,60 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	vcpu->pp = pp;
 
 	/*
+	 * Join the running guest's address space, rather than the private one
+	 * co_setup_guest_page built for this passage page.
+	 *
+	 * This is the property a real secondary processor needs and the one
+	 * --test-smp does not exercise: two vCPUs crossing into the SAME CR3.
+	 * Each keeps its own passage page -- its own saved state, params, FPU
+	 * area, IST stack, TSS and GDT -- but they share the page tables, which
+	 * is what makes them processors of one machine instead of two guests.
+	 *
+	 * Mapping into kload_space is what makes it reachable. The boot path
+	 * grafts kload_space's top-level entries into the kernel's own table
+	 * (co_kload_adopt_kernel_tables), so a page added under an
+	 * already-grafted slot is visible from the kernel's CR3 without
+	 * touching the kernel's tables at all. A passage page that landed in a
+	 * slot the graft never saw would NOT be reachable, and the preflight
+	 * below is what catches that rather than the guest discovering it by
+	 * failing to fetch its first instruction.
+	 */
+	if (join_guest) {
+		co_arch_guest_space_t* space = co_kload_space();
+		unsigned long long guest_cr3 = co_vcpu[0].guest_cr3;
+		int page;
+
+		if (space == NULL || !co_vcpu[0].active || guest_cr3 == 0) {
+			co_debug_error("vcpu %d: no running guest to join "
+				       "(space %p, vcpu0 active %d, cr3 0x%llx)",
+				       lane, (void*)space, co_vcpu[0].active,
+				       guest_cr3);
+			co_os_free_exec_pages(pp, pages);
+			co_vcpu_release(vcpu);
+			return CO_RC(ERROR);
+		}
+
+		for (page = 0; page < pages; page++) {
+			unsigned char* q = (unsigned char*)pp + page * CO_ARCH_PAGE_SIZE;
+
+			if (!CO_OK(co_arch_guest_map(manager, space,
+						     (unsigned long long)(size_t)q,
+						     co_os_virt_to_phys(q),
+						     _KERNPG_TABLE))) {
+				co_debug_error("vcpu %d: could not map its passage "
+					       "page into the guest's space", lane);
+				co_os_free_exec_pages(pp, pages);
+				co_vcpu_release(vcpu);
+				return CO_RC(ERROR);
+			}
+		}
+
+		pp->linuxvm_state.cr3 = guest_cr3;
+		co_debug("vcpu %d: joined the guest's address space, cr3 0x%llx",
+			 lane, guest_cr3);
+	}
+
+	/*
 	 * co_boot_shim executes sti and jumps to params[20]; step (params[29])
 	 * is zero, so TF stays clear and the guest free-runs with interrupts
 	 * on -- which is what routes this processor's clock through the guest
@@ -3679,7 +3745,46 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	pp->linuxvm_state.kernel_gs_base = co_smp_sentinel(lane, 2);
 	pp->linuxvm_state.lstar          = co_smp_sentinel(lane, 3);
 
-	if (!co_preflight_guest(pp, setup.passage_va, &setup)) {
+	/*
+	 * Nothing loads CR3 until the addresses this processor cannot run
+	 * without have been resolved in the space it is about to enter. Which
+	 * space that is decides which walk answers: co_preflight_guest reads
+	 * the tables inside the passage page, which are the right ones only
+	 * when the vCPU is using them. Joined to the guest, the question is
+	 * whether the graft made these pages visible from the kernel's root,
+	 * so the walk has to start there.
+	 */
+	if (join_guest) {
+		static const struct { const char* what; int page; } needed[] = {
+			{ "switch code",  0 },
+			{ "vector stubs", 8 + CO_PP_STUBS_PAGE },
+			{ "IST stack",    8 + CO_PP_ISTSTACK_PAGE },
+			{ "TSS",          8 + CO_PP_TSS_PAGE },
+		};
+		co_arch_guest_space_t* space = co_kload_space();
+		int i;
+
+		for (i = 0; i < (int)(sizeof(needed) / sizeof(needed[0])); i++) {
+			unsigned long long va = (unsigned long long)(size_t)pp
+				+ (unsigned long long)needed[i].page * CO_ARCH_PAGE_SIZE;
+			co_pa_t got = 0;
+			int level = -1;
+
+			if (!CO_OK(co_arch_guest_lookup(manager, space, va, &got, &level)) ||
+			    got != (co_os_virt_to_phys((void*)(size_t)va) & CO_ARCH_PAGE_MASK)) {
+				co_debug_error("vcpu %d: %s at 0x%llx is not reachable in "
+					       "the guest's space (absent at level %d) -- "
+					       "refusing to enter", lane, needed[i].what,
+					       va, level);
+				out->preflight_failed = PTRUE;
+				out->preflight_va     = va;
+				out->preflight_level  = level;
+				co_os_free_exec_pages(pp, pages);
+				co_vcpu_release(vcpu);
+				return CO_RC(ERROR);
+			}
+		}
+	} else if (!co_preflight_guest(pp, setup.passage_va, &setup)) {
 		out->preflight_failed = setup.preflight_failed;
 		out->preflight_level  = setup.preflight_level;
 		out->preflight_va     = setup.preflight_va;
@@ -4154,6 +4259,14 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			goto out_free_stack;
 		}
 		vcpu->pp = pp;
+		/*
+		 * Publish the address space for the secondaries. By here CR3 is
+		 * the adopted kernel root, which is the one that stays valid --
+		 * the guest may switch to per-process tables as often as it
+		 * likes afterwards, and they all share the kernel half of this
+		 * one, which is where the passage pages live.
+		 */
+		vcpu->guest_cr3 = pp->linuxvm_state.cr3;
 
 		/*
 		 * Start the async block workers before the guest runs. If it
