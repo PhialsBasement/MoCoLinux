@@ -730,8 +730,30 @@
      IPI at all: every crossing already clears CR4.PGE around the CR3 write
      (full flush, globals included, nopcid), so a sequence counter + in-host
      flag per vCPU answers "has it flushed" -- kick and wait for the counter.
-   * Remaining rungs: S1 mechanical per-vCPU refactor under SMP=n (parity);
-     S2 SMP=y kernel with one CPU (fake apic, topology, drop nolapic; gate:
+   * S1 DONE 2026-08-07 (commits d268bbaf host, 0dd6c60c guest), verified on
+     the M92p under Windows 10. Host: the monitor loop's statics became
+     co_vcpu_t fields (passage page, replayed-vector table, run flag); the
+     abort flag became a broadcast and co_arch_boot_running() now means "any
+     vCPU still inside"; the idle doorbell went from one auto-reset event
+     (which releases exactly ONE waiter -- a lost wake with two vCPUs, a
+     correctness bug not a fairness one) to one per vCPU plus a wake-all for
+     device doorbells. A --test-smp lane is now a vCPU in the slot of its own
+     number, so KSTOP and unload have one mechanism instead of two. Loop
+     locals deliberately stayed locals: a second vCPU is a second thread with
+     its own stack. Guest: co_colinux_virtual_if and co_colinux_passage_page
+     became arrays indexed by co_colinux_vcpu_id(), which is 0 under SMP=n
+     and a deliberate #error under SMP=y.
+     **Parity was measured, not assumed**: the rebuilt vmlinux disassembles
+     to 7,756,149 instructions identical to the previous build, differing
+     only in the version string and one renumbered constant-pool label. Plus
+     5M concurrent crossings per lane, bounded boot regression matching the
+     baseline (vgpu timeout 128.62s vs 128.43s), and the full Manjaro guest
+     booting on the new driver and kernel -- coterm reports #74, load 0.01.
+     The guest-side snapshot was regenerated against the released tarball and
+     reverse-apply checked; it now covers 34 files, including the two the
+     README recorded as missing.
+   * Remaining rungs: S2 SMP=y kernel with one CPU (fake apic, topology, drop
+     nolapic, and implement co_colinux_vcpu_id() for real; gate:
      explain the one-off #GP in co_colinux_adopt_traps first); S3 second vCPU
      to idle (KVCPU_RUN + START_VCPU/KICK_VCPU ops, cpu_bringup per Xen
      smp_pv.c); S4 IPIs + per-CPU timer + shootdown under TLB-torture and
