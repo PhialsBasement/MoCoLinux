@@ -184,7 +184,10 @@ Not yet:
   RAM, the same zero-copy R3 windows the GPU command stream already rides
   (parked on the `r6-window-presentation` branch)
 - A repaired incremental patch series: `patch/7.1.5/current-tree-snapshot.diff`
-  is the authoritative guest-side diff and is deliberately not in `series`
+  is the authoritative guest-side diff and is deliberately not in `series`.
+  It is regenerated against the released tarball and checked by
+  reverse-applying it to `ref/linux-7.1.5`, so "the snapshot is behind the
+  tree" is a thing that gets caught rather than discovered later
 
 Known issue: the first boot after a host reboot is reliable, ~~the second is
 not~~ more like the 15th if your on Windows 7 at least. Guest RAM is allocated per run from `MmAllocateContiguousMemory` in 32 MB
