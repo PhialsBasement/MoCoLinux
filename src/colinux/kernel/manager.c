@@ -1706,6 +1706,23 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		co_memset(params, 0, sizeof(*params));
 		params->vcpu = req_vcpu;
 
+		/*
+		 * "Not started" until something starts it.
+		 *
+		 * The caller polls, and decides whether to ask again from this
+		 * one flag. The struct is cleared just above, so every path
+		 * that returns without entering the guest reports, by default,
+		 * that the processor RAN -- and the daemon retires the thread
+		 * for the rest of the run. That is why the secondary stopped
+		 * asking after two turns, long before the guest requested it:
+		 * the state check and the "no boot processor yet" path both
+		 * meant "too early, try again", and both read as success.
+		 *
+		 * Set it here, once, and clear it only on the path that
+		 * actually enters.
+		 */
+		params->never_started = PTRUE;
+
 		if (manager->state < CO_MANAGER_STATE_INITIALIZED) {
 			params->rc   = CO_RC(ERROR);
 			*return_size = sizeof(*params);
@@ -1723,20 +1740,86 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		}
 
 		/*
+		 * Wait for the boot processor to claim its core before picking
+		 * one, and this ordering is the whole of it.
+		 *
+		 * The picker below avoids cores held by ACTIVE vCPUs. A
+		 * secondary's thread is started before the guest boots -- it
+		 * has to be, because the guest reaches smp_init() within
+		 * milliseconds -- so if it picks immediately, nothing is active
+		 * yet, it takes core 0, and then KBOOT pins the boot processor
+		 * to whichever core the daemon's main thread was on, which can
+		 * be core 0 too.
+		 *
+		 * Two vCPUs on one core is not slow, it is stuck: each crossing
+		 * loop holds its processor for as long as its guest runs, so
+		 * neither ever yields to the other. A core that stops answering
+		 * the clock is CLOCK_WATCHDOG_TIMEOUT, and that is exactly what
+		 * this cost -- bugcheck 0x101 naming processor 1, then two more
+		 * resets that died before Windows could write the dump.
+		 */
+		{
+			int spins;
+
+			for (spins = 0; spins < 3000 && !co_arch_boot_running(); spins++)
+				co_os_msleep(10);
+
+			if (!co_arch_boot_running()) {
+				co_debug_error("KVCPU_RUN: no boot processor appeared, so "
+					       "there is no core map to avoid -- refusing "
+					       "to start vcpu %d", req_vcpu);
+				params->no_free_core = PTRUE;
+				params->rc           = CO_RC(ERROR);
+				*return_size         = sizeof(*params);
+				return CO_RC(OK);
+			}
+		}
+
+		/*
 		 * A core nobody else is holding. Not "the one I am on" and not
 		 * "the one whose number matches", because the boot processor
 		 * took whichever core the scheduler had it on and the answer
 		 * has to work while that run is in progress.
 		 */
+		/*
+		 * From the top down, and never processor 0.
+		 *
+		 * Scanning upwards from 0 handed the first secondary host
+		 * processor 0 -- the one the boot processor is on and the one
+		 * Windows schedules its own work on by preference. Two crossing
+		 * loops there is not slow, it is stuck: each holds its
+		 * processor for as long as its guest runs, so neither yields,
+		 * and a core that stops answering the clock is
+		 * CLOCK_WATCHDOG_TIMEOUT. That is what took the machine down,
+		 * before any secondary had even been started.
+		 *
+		 * co_arch_vcpu_core_taken() is still consulted, but it cannot
+		 * be the only guard: it depends on the boot processor having
+		 * recorded its core before this thread looks, and this thread
+		 * starts before the guest boots. Refusing processor 0 outright
+		 * does not depend on that ordering at all, and costs nothing --
+		 * the core budget already reserves a processor for the host.
+		 */
 		cores  = co_os_cpu_count();
 		chosen = cores;
-		for (cpu = 0; cpu < cores; cpu++) {
+		for (cpu = cores; cpu-- > 1; ) {
 			if (!co_arch_vcpu_core_taken(cpu)) {
 				chosen = cpu;
 				break;
 			}
 		}
 
+		/*
+		 * Pinned immediately, and this is not optional.
+		 *
+		 * Deferring the affinity until the guest asks for the processor
+		 * looked tidier -- the thread has nothing to do until then --
+		 * and made it far worse: unpinned, the scheduler puts this
+		 * thread on processor 0 alongside the boot processor, and the
+		 * guest died after 11 switches instead of 1641. Whatever this
+		 * thread costs the boot processor while it waits, it costs far
+		 * less from a core of its own.
+		 */
 		if (chosen >= cores || !co_os_pin_cpu_to(chosen)) {
 			co_debug_error("KVCPU_RUN: no free host processor for vcpu %d "
 				       "(%lu cores, all carrying a vCPU)",
@@ -1780,6 +1863,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->msr_bad       = result.msr_bad;
 		params->msr_want      = result.msr_want;
 		params->msr_got       = result.msr_got;
+		params->waited_for_start = result.waited_for_start;
+		params->never_started    = result.never_started;
 
 		*return_size = sizeof(*params);
 		return CO_RC(OK);

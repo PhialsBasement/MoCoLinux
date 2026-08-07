@@ -46,21 +46,56 @@ static void co_terminal_file_tee(const char *text)
 	DWORD n;
 
 	if (path_state == 0) {
-		DWORD len = GetModuleFileName(NULL, path, sizeof(path) - 8);
+		DWORD len = GetModuleFileName(NULL, path, sizeof(path) - 40);
+		SYSTEMTIME s;
 
-		if (len == 0 || len >= sizeof(path) - 8) {
+		if (len == 0 || len >= sizeof(path) - 40) {
 			path_state = -1;
 			return;
 		}
-		strcat(path, ".log");
+		/*
+		 * One file per run, named for the moment the run started.
+		 *
+		 * A single shared log cannot answer the question that matters
+		 * when a run takes the machine down: did this run say nothing,
+		 * or is what I am reading the previous run's? Appending to one
+		 * file makes those two indistinguishable, and that is exactly
+		 * the confusion that cost several resets here -- a tail showing
+		 * a healthy boot report that turned out to be from ten minutes
+		 * earlier, while the run under test had written nothing at all.
+		 *
+		 * With the start time in the name, a run that dies before
+		 * printing leaves an empty file with its own timestamp, which
+		 * says "it started and got nowhere" rather than nothing.
+		 */
+		GetLocalTime(&s);
+		snprintf(path + len, sizeof(path) - len,
+			 ".%04u%02u%02u-%02u%02u%02u.log",
+			 s.wYear, s.wMonth, s.wDay,
+			 s.wHour, s.wMinute, s.wSecond);
 		path_state = 1;
 	}
 	if (path_state < 0)
 		return;
 
+	/*
+	 * FILE_FLAG_WRITE_THROUGH, and it is the whole point of this log.
+	 *
+	 * Opening, appending and closing per line is not enough on its own:
+	 * the write lands in the file system cache and stays there. That is
+	 * survivable for a process that is killed -- the cache outlives it --
+	 * and useless for the failure this log exists to explain, where the
+	 * machine resets. A triple fault takes the cache with it, so a run
+	 * that printed twenty lines and then reset leaves a file with none of
+	 * them, which reads exactly like a run that never started.
+	 *
+	 * That is not hypothetical: it is why several resets here produced an
+	 * empty log and were misread as "the daemon never ran".
+	 */
 	h = CreateFile(path, FILE_APPEND_DATA,
 		       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-		       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		       OPEN_ALWAYS,
+		       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
 	if (h == INVALID_HANDLE_VALUE)
 		return;
 
@@ -71,6 +106,8 @@ static void co_terminal_file_tee(const char *text)
 
 	WriteFile(h, head, strlen(head), &n, NULL);
 	WriteFile(h, text, strlen(text), &n, NULL);
+	/* Belt as well as braces: push it past the disk's own write cache. */
+	FlushFileBuffers(h);
 	CloseHandle(h);
 }
 

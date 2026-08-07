@@ -1,72 +1,104 @@
 Authoritative cumulative snapshot of ref/linux-7.1.5: everything the
 cooperative guest needs, as one diff against the released tree.
 
-Generated against download/linux-7.1.5.tar.xz on 2026-08-07, and verified
+Generated against download/linux-7.1.5.tar.xz on 2026-08-08, and verified
 by reverse-applying it to ref/linux-7.1.5 with no rejects.
 
 Over the previous snapshot:
 
-  * SMP rung S2: an SMP=y guest, still on one processor, with the local APIC
-    never touched.
+  * SMP rung S3: a second processor, online. "smp: Brought up 1 node,
+    2 CPUs", verified on the M92p under Windows 10.
 
-    co_colinux_vcpu_id() is implemented for CONFIG_SMP=y as
-    raw_cpu_read(cpu_number). cpu_number is declared in asm/irqflags.h rather
-    than reached through <asm/smp.h>, which that header cannot include without
-    circularity. Not __this_cpu_read: it expands to a preempt check that is
-    static under CONFIG_DEBUG_PREEMPT, and native_save_fl() is a non-static
-    inline, so it does not even compile -- and these helpers are noinstr and
-    want no instrumentation regardless.
+    An inert struct apic replaces reliance on nolapic, installed from
+    parse_smp_cfg time rather than smp_prepare_cpus -- earlier is before
+    apic_setup_apic_calls() has established the APIC static calls, and the
+    guest stops a few lines after the early console. Setting
+    smp_found_config makes init_apic_mappings() skip apic_disable(), so
+    without a driver of our own the static calls stay on apic_physflat and
+    every read and every send_IPI touches an APIC fixmap that was never
+    mapped.
 
-    GS is valid before any C code runs, which is the part that had to be
-    checked rather than assumed. The guest enters at co_arch_start_kernel and
-    falls into common_startup_64, which writes MSR_GS_BASE from
-    __per_cpu_offset[0]. Until setup_per_cpu_areas() the boot processor reads
-    its per-CPU variables out of the init image, where cpu_number is 0, and
-    afterwards out of its own area, where setup_per_cpu_areas() wrote 0. There
-    is no window in which the boot processor gets the wrong answer.
+    co_colinux_smp_config() registers apics from 0, not 1.
+    topology_register_boot_apic() calls topo_register_apic() directly and
+    so never runs check_for_real_bsp(), leaving real_bsp_apic_id unset;
+    starting at 1 made the first secondary the one to run that check, and
+    it concluded this was a crash kernel and rejected the processor.
 
-  * Two topology exemptions, and the reasoning is the whole point.
+    IPIs are shared-memory pending bitmaps plus a doorbell: the sender sets
+    the vector's bit in the target's set and crosses with KICK_VCPU, which
+    only wakes the target -- a processor in the host's idle wait has
+    nothing to re-enter it. Drained at the idle boundary inside
+    irq_enter()/irq_exit(), and gated on a non-empty set: the pairing takes
+    the is_idle_task() branch into tick_irq_enter() and suspends the RCU
+    extended quiescent state, and running that on every idle with nothing
+    to do killed the boot processor.
 
-    The kernel forces possible_cpus to 1 when the local APIC is disabled, in
-    topology_apply_cmdline_limits_early() and again in restrict_to_up(). That
-    encodes a true fact about real hardware -- without a local APIC there is
-    no way to INIT-SIPI another processor, so there can only be one -- and it
-    is not true here. This guest's processors are started by the host, each
-    one a pinned host thread entering through the world switch with a complete
-    initial state, and they signal each other through shared memory. XEN PV is
-    already exempted from restrict_to_up() with a comment describing the same
-    situation; a cooperative guest is exempted alongside it.
+    The AP carries its TSS descriptor across the GDT switch. cpu_init()
+    ends in load_fixmap_gdt(), which on a secondary is no longer skipped --
+    the asm/desc.h guard is "co_colinux_guest && !co_colinux_own_idt" and
+    the boot processor already set that flag. This CPU's gdt_page has no
+    TSS descriptor at all, because set_tss_desc() lives only inside
+    cpu_init_exception_handling(), which this path does not call, while
+    linuxvm_state.tr stays 0x40. The switch reloads TR on every entry with
+    no present or type check, so the first host interrupt afterwards ran
+    ltr against sixteen zero bytes: #GP with CR3 already the guest's, RSP
+    still the host's and TR still Windows' -- because the ltr is what
+    failed. Every passage-page gate is IST1, so delivering it read the TSS
+    through that stale TR, a Windows address unmapped here, and #PF and
+    #DF repeated the identical read. Triple fault, no bugcheck, no dump.
 
-    So nolapic STAYS on the command line. That is the safe direction: the APIC
-    is the host's chip, driving the host's timer, keyboard and disk, and
-    nolapic is how this port keeps the guest's hands off it. What changes is
-    only the inference drawn from it, not the fact.
+    load_fixmap_gdt() never loads the read-only alias in a cooperative
+    guest. The switch writes to the live GDT on every entry -- it clears
+    the TSS busy bit before ltr, and ltr sets it again -- and through the
+    PAGE_KERNEL_RO cpu-entry-area alias each store is a page fault taken
+    inside the crossing.
 
-  * smp_ops, replacing two native operations that would reach real hardware.
+    Also: apic ids are fabricated as CPU numbers in parse_topology because
+    CPUID leaf 1 is not virtualised and reports the host core's id; the
+    MP-table hooks are disabled, because parsing the host's table walked
+    early_memremap over the read-only zero-page alias and WARNed, and WARN
+    is ud2; ticks belong to vCPU 0 until each vCPU has a clock event device
+    of its own, since one shared last_mono and a single evtdev on cpumask 0
+    stop jiffies machine-wide the first time a secondary idles.
 
-    native_smp_prepare_cpus() switches on apic_intr_mode and, with no usable
-    APIC, answers by calling disable_smp() -- correct for the hardware it
-    describes, wrong for this machine. co_colinux_smp_prepare_cpus() does the
-    common preparation and nothing else: no local APIC timer, no UV, no
-    INIT-SIPI delay calibration, no SEV-SNP wakeup.
+    The secondary runs Linux code, which means it needs Linux's exception
+    handling. co_colinux_ap_adopt_traps() builds a hybrid IDT per vCPU --
+    kernel gates 0-31 from idt_table, NMI and 32-255 re-pointed at THIS
+    vCPU's passage stubs, harvested from the IDT live at that moment. The
+    global idt_table cannot be loaded on a secondary: its external gates
+    carry vCPU 0's stubs, and a stub is a crossing through its own passage
+    page's saved state. Until this landed, every extable fixup, every WARN
+    and every text_poke INT3 window on CPU 1 was a vector < 32 that stopped
+    its lane dead -- measured as an rdmsr in perf_msr_probe, which the
+    extable was waiting to fix up, and seen only as an RCU stall 21 seconds
+    later. The TSS descriptor swap that goes with it is a cmpxchg16b,
+    because the direct GDT is already live on a secondary and a crossing
+    can re-enter between any two stores.
 
-    co_colinux_kick_ap() refuses, loudly, and is a safety belt rather than a
-    placeholder. The native version reaches do_boot_cpu(), which sends
-    INIT-SIPI-SIPI to a real physical processor of the machine this guest is a
-    thread on -- it would be trying to boot one of Windows' own CPUs into
-    Linux. It earned its place on the first boot: the guest came up with three
-    possible CPUs and the kernel duly tried to start CPUs 1 and 2.
+    csd_lock_wait() polls this processor's posted vectors. On real hardware
+    that spin is bounded because the incoming CALL_FUNCTION IPI preempts
+    it; nothing preempts kernel mode here, so two processors cross-calling
+    each other -- a text_poke_sync against a TLB shootdown is enough --
+    starved forever with no fault, no tick and no watchdog.
 
-    Measured on the M92p under Windows 10: "CPU topo: Allowing 3 present CPUs",
-    nr_cpu_ids 3, "3 processor(s) possible", both AP attempts refused, "Brought
-    up 1 node, 1 CPU", and the guest booted on to /sbin/init exactly as the
-    uniprocessor build does. co_colinux_adopt_traps() also runs clean under
-    SMP=y, which answers the last open question about it.
+    Each vCPU has a clock event device of its own, and its own baseline
+    against the host clock. One device on cpumask_of(0) left a secondary
+    with no tick at all: nothing expired its timer wheel, so every msleep()
+    that landed there slept forever.
 
-diff -urN a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
+    The cobd completion ring is claimed rather than walked. Two processors
+    reach a drain boundary at once and both used to walk the same slots,
+    ending one request twice -- blk_update_request on a request already
+    ended and recycled, in userspace, seconds after /sbin/init. Each
+    consumer now takes one index with a cmpxchg and owns that slot, so both
+    drain in parallel on different entries. Teardown waits for the
+    secondary lanes before stopping the block workers, since a secondary
+    answers BLOCK_IO out of its own lane.
+
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
 --- a/arch/x86/include/asm/desc.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/include/asm/desc.h	2026-08-01 10:49:13.251537400 +1000
-@@ -205,13 +205,49 @@
++++ b/arch/x86/include/asm/desc.h	2026-08-08 01:56:05.954030300 +1000
+@@ -205,13 +205,50 @@
  	}
  }
  
@@ -99,6 +131,7 @@ diff -urN a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
 +extern int co_colinux_guest;
 +extern int co_colinux_own_idt;
 +void co_colinux_adopt_traps(void);
++void co_colinux_ap_adopt_traps(void);
 +
  static inline void native_load_gdt(const struct desc_ptr *dtr)
  {
@@ -116,7 +149,7 @@ diff -urN a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
  	asm volatile("lidt %0"::"m" (*dtr));
  }
  
-@@ -258,6 +294,16 @@
+@@ -258,6 +295,16 @@
  	bool restore = 0;
  	struct desc_struct *fixmap_gdt;
  
@@ -133,7 +166,7 @@ diff -urN a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
  	native_store_gdt(&gdt);
  	fixmap_gdt = get_cpu_gdt_ro(cpu);
  
-diff -urN a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
 --- a/arch/x86/include/asm/idtentry.h	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/include/asm/idtentry.h	2026-08-02 21:20:21.233964400 +1000
 @@ -736,6 +736,20 @@
@@ -157,7 +190,7 @@ diff -urN a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
  #if IS_ENABLED(CONFIG_KVM)
  DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_VECTOR,		sysvec_kvm_posted_intr_ipi);
  DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_WAKEUP_VECTOR,	sysvec_kvm_posted_intr_wakeup_ipi);
-diff -urN a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
 --- a/arch/x86/include/asm/io.h	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/include/asm/io.h	2026-08-01 07:24:30.152830000 +1000
 @@ -44,6 +44,52 @@
@@ -245,10 +278,10 @@ diff -urN a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
  	if (cc_platform_has(CC_ATTR_GUEST_UNROLL_STRING_IO)) {		\
  		type *value = (type *)addr;				\
  		while (count) {						\
-diff -urN a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
 --- a/arch/x86/include/asm/irqflags.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/include/asm/irqflags.h	2026-08-07 16:21:26.257621900 +1000
-@@ -7,11 +7,108 @@
++++ b/arch/x86/include/asm/irqflags.h	2026-08-08 01:18:31.424756300 +1000
+@@ -7,11 +7,127 @@
  #ifndef __ASSEMBLER__
  
  #include <asm/nospec-branch.h>
@@ -354,10 +387,29 @@ diff -urN a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
 +extern unsigned long co_colinux_virtual_if[CO_COLINUX_NR_VCPUS];
 +extern void co_colinux_yield(void);
 +
++/*
++ * Interprocessor interrupts, as shared memory rather than as a chip.
++ *
++ * One 256-bit pending set per processor, host-visible for the same reason
++ * co_colinux_virtual_if is -- fixed arrays, never percpu, because the host
++ * reads and writes them from outside the guest. A sender sets the vector's
++ * bit in the target's set and rings the host doorbell; the target drains its
++ * own set at a safe point and runs the handlers.
++ *
++ * This replaces a local APIC that does not exist. The alternative, which this
++ * port ran into, is that every send_IPI is an MMIO store to a fixmap nobody
++ * ever mapped.
++ */
++#define CO_COLINUX_IPI_WORDS	4	/* 256 vectors, one bit each */
++extern unsigned long co_colinux_ipi_pending[CO_COLINUX_NR_VCPUS][CO_COLINUX_IPI_WORDS];
++extern void co_colinux_ipi_send(unsigned int cpu, int vector);
++extern void co_colinux_ipi_drain(void);
++extern void co_colinux_ipi_poll(void);
++
  /* Declaration required for gcc < 4.9 to prevent -Werror=missing-prototypes */
  extern inline unsigned long native_save_fl(void);
  extern __always_inline unsigned long native_save_fl(void)
-@@ -29,27 +126,116 @@
+@@ -29,27 +145,116 @@
  		     : /* no input */
  		     : "memory");
  
@@ -474,7 +526,7 @@ diff -urN a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
  	x86_idle_clear_cpu_buffers();
  	asm volatile("hlt": : :"memory");
  }
-diff -urN a/arch/x86/include/asm/irq_vectors.h b/arch/x86/include/asm/irq_vectors.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/irq_vectors.h b/arch/x86/include/asm/irq_vectors.h
 --- a/arch/x86/include/asm/irq_vectors.h	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/include/asm/irq_vectors.h	2026-08-02 21:20:07.541203800 +1000
 @@ -105,6 +105,24 @@
@@ -502,7 +554,7 @@ diff -urN a/arch/x86/include/asm/irq_vectors.h b/arch/x86/include/asm/irq_vector
  #define NR_VECTORS			 256
  
  #ifdef CONFIG_X86_LOCAL_APIC
-diff -urN a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
 --- a/arch/x86/include/asm/special_insns.h	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/include/asm/special_insns.h	2026-08-01 10:28:04.395788700 +1000
 @@ -38,6 +38,39 @@
@@ -545,7 +597,7 @@ diff -urN a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_
  static __always_inline void native_write_cr3(unsigned long val)
  {
  	asm volatile("mov %0,%%cr3": : "r" (val) : "memory");
-diff -urN a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
 --- a/arch/x86/kernel/alternative.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/alternative.c	2026-08-01 20:20:29.391593000 +1000
 @@ -6,6 +6,7 @@
@@ -583,9 +635,9 @@ diff -urN a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
  
  	/*
  	 * The patching is not fully atomic, so try to avoid local
-diff -urN a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
 --- a/arch/x86/kernel/cpu/common.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/cpu/common.c	2026-07-31 21:11:03.943771900 +1000
++++ b/arch/x86/kernel/cpu/common.c	2026-08-08 01:55:31.049403000 +1000
 @@ -6,6 +6,7 @@
  #include <linux/linkage.h>
  #include <linux/bitops.h>
@@ -631,7 +683,103 @@ diff -urN a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
  set_register:
  	asm volatile("mov %0,%%cr4": "+r" (val) : : "memory");
  
-diff -urN a/arch/x86/kernel/cpu/mtrr/mtrr.c b/arch/x86/kernel/cpu/mtrr/mtrr.c
+@@ -775,7 +806,24 @@
+ {
+ 	struct desc_ptr gdt_descr;
+ 
+-	gdt_descr.address = (long)get_cpu_gdt_ro(cpu);
++	/*
++	 * Never the read-only alias in a cooperative guest.
++	 *
++	 * The world switch writes to the live GDT on every entry: it clears
++	 * the TSS busy bit before ltr, and ltr itself sets that bit in
++	 * memory. Both stores go through the base that was sgdt'd on the way
++	 * out. Through the PAGE_KERNEL_RO cpu-entry-area alias each one is a
++	 * page fault taken inside the crossing.
++	 *
++	 * The read-only alias is hardening, not function -- it exists so that
++	 * a stray kernel write to the GDT faults. This port already gives it
++	 * up on the boot processor (co_colinux_adopt_traps() ends in
++	 * load_direct_gdt), and both aliases remap the same page, so the
++	 * contents are identical either way.
++	 */
++	gdt_descr.address = co_colinux_guest
++		? (long)get_cpu_gdt_rw(cpu)
++		: (long)get_cpu_gdt_ro(cpu);
+ 	gdt_descr.size = GDT_SIZE - 1;
+ 	load_gdt(&gdt_descr);
+ }
+@@ -2419,7 +2467,46 @@
+ 	if (!cpu_feature_enabled(X86_FEATURE_FRED))
+ 		tss_setup_ist(tss);
+ 	tss_setup_io_bitmap(tss);
+-	set_tss_desc(cpu, &get_cpu_entry_area(cpu)->tss.x86_tss);
++	if (co_colinux_guest && !boot_cpu) {
++		/*
++		 * The TSS descriptor swap must be one uninterruptible store.
++		 *
++		 * On a cooperative secondary the direct GDT is already live
++		 * (co_colinux_ap_start loaded it, and the world switch writes
++		 * the busy bit through it on every entry), and the switch can
++		 * exit and re-enter between any two instructions here -- real
++		 * IF belongs to the host and is never masked. Re-entry runs
++		 * ltr against whatever GDT_ENTRY_TSS holds at that instant,
++		 * and a pair caught between set_tss_desc()'s two stores is a
++		 * garbage TSS base whose IST the next host-interrupt stub
++		 * dereferences: triple fault, nothing reported.
++		 *
++		 * The boot processor never faced this: its call here wrote a
++		 * gdt_page that was not yet live (its cpu_init()'s lgdt was
++		 * still skipped by the asm/desc.h guard), and
++		 * co_colinux_adopt_traps() later made table, TR and IDT live
++		 * in one single instruction each.
++		 *
++		 * cmpxchg16b is the one store a crossing cannot observe torn.
++		 * The retry only triggers if a crossing's ltr flipped the
++		 * busy bit between the read and the exchange; the exit side
++		 * of the switch clears it again (the descriptor is always
++		 * left available while the guest runs), so the loop is at
++		 * most one lap behind.
++		 */
++		struct { tss_desc t; } __aligned(16) desc;
++		u128 *slot = (u128 *)&get_cpu_gdt_rw(cpu)[GDT_ENTRY_TSS];
++		u128 old = *slot;
++
++		set_tssldt_descriptor(&desc.t,
++			(unsigned long)&get_cpu_entry_area(cpu)->tss.x86_tss,
++			DESC_TSS, __KERNEL_TSS_LIMIT);
++
++		while (!try_cmpxchg128(slot, &old, *(u128 *)&desc))
++			;
++	} else {
++		set_tss_desc(cpu, &get_cpu_entry_area(cpu)->tss.x86_tss);
++	}
+ 
+ 	load_TR_desc();
+ 
+@@ -2444,7 +2531,20 @@
+ 			cpu_init_fred_exceptions();
+ 
+ 		cpu_init_fred_rsps();
+-	} else {
++	} else if (!co_colinux_guest || boot_cpu) {
++		/*
++		 * Not for a cooperative secondary: idt_table's NMI and
++		 * 32-255 gates are the BOOT processor's passage-page stubs
++		 * (co_colinux_adopt_traps copied them from the IDT live on
++		 * vCPU 0), and a host interrupt delivered through another
++		 * vCPU's stub crosses through saved-state that vCPU is
++		 * running on. The secondary loads its own hybrid, with its
++		 * own stubs, in co_colinux_ap_adopt_traps() immediately
++		 * after this returns. On the boot processor this call runs
++		 * before co_colinux_own_idt is set, so the load is a no-op
++		 * through the asm/desc.h guard and adopt_traps performs the
++		 * live lidt -- unchanged.
++		 */
+ 		load_current_idt();
+ 	}
+ }
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/cpu/mtrr/mtrr.c b/arch/x86/kernel/cpu/mtrr/mtrr.c
 --- a/arch/x86/kernel/cpu/mtrr/mtrr.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/cpu/mtrr/mtrr.c	2026-08-03 16:17:50.655995200 +1000
 @@ -42,6 +42,14 @@
@@ -711,10 +859,33 @@ diff -urN a/arch/x86/kernel/cpu/mtrr/mtrr.c b/arch/x86/kernel/cpu/mtrr/mtrr.c
  				changed_by_mtrr_cleanup = mtrr_cleanup();
  				mtrr_build_map();
  			} else {
-diff -urN a/arch/x86/kernel/cpu/topology.c b/arch/x86/kernel/cpu/topology.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/cpu/topology.c b/arch/x86/kernel/cpu/topology.c
 --- a/arch/x86/kernel/cpu/topology.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/cpu/topology.c	2026-08-07 16:32:19.809455800 +1000
-@@ -420,8 +420,22 @@
++++ b/arch/x86/kernel/cpu/topology.c	2026-08-07 20:22:45.613790400 +1000
+@@ -125,7 +125,21 @@
+ 
+ static __init bool check_for_real_bsp(u32 apic_id)
+ {
+-	bool is_bsp = false, has_apic_base = boot_cpu_data.x86 >= 6;
++	/*
++	 * A cooperative guest has no APICBASE worth consulting.
++	 *
++	 * The BSP bit this reads is a fact about the HOST's processors. Our
++	 * boot CPU is whichever core the monitor thread was pinned to, so the
++	 * bit reads clear, and this concludes "crash kernel" and limits the
++	 * machine to one CPU -- to avoid an INIT this guest never sends.
++	 *
++	 * Reporting the MSR as unavailable is exactly true here and selects
++	 * the branch the kernel already has for hardware that cannot report
++	 * it: trust the enumeration order. That enumeration is ours
++	 * (co_colinux_smp_config) and lists the boot processor first.
++	 */
++	bool is_bsp = false;
++	bool has_apic_base = boot_cpu_data.x86 >= 6 && !co_colinux_guest;
+ 	u64 msr;
+ 
+ 	/*
+@@ -420,8 +434,22 @@
  {
  	unsigned int possible = nr_cpu_ids;
  
@@ -739,7 +910,7 @@ diff -urN a/arch/x86/kernel/cpu/topology.c b/arch/x86/kernel/cpu/topology.c
  		possible = 1;
  
  	/* 'possible_cpus=N' */
-@@ -446,6 +460,10 @@
+@@ -446,6 +474,10 @@
  	if (xen_pv_domain())
  		return false;
  
@@ -750,7 +921,68 @@ diff -urN a/arch/x86/kernel/cpu/topology.c b/arch/x86/kernel/cpu/topology.c
  	return apic_is_disabled;
  }
  
-diff -urN a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/cpu/topology_common.c b/arch/x86/kernel/cpu/topology_common.c
+--- a/arch/x86/kernel/cpu/topology_common.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/cpu/topology_common.c	2026-08-07 21:59:29.874644600 +1000
+@@ -1,4 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
++#include <linux/console.h>	/* co_colinux_guest */
+ #include <linux/cpu.h>
+ 
+ #include <xen/xen.h>
+@@ -144,10 +145,49 @@
+ 	 * the APIC is mapped or X2APIC enabled. For establishing the
+ 	 * topology, that's not required. Use the initial APIC ID.
+ 	 */
+-	if (early)
++	/*
++	 * A cooperative guest's APIC ids are its CPU numbers, on both passes.
++	 *
++	 * Two things go wrong otherwise, and they are the same thing. CPUID
++	 * leaf 1 is not virtualised, so ebx.apicid above is the id of whatever
++	 * HOST core the monitor thread happens to be pinned to -- 6 on this
++	 * machine. And read_apic_id() is apic->read(APIC_ID), which with
++	 * nolapic still lands on the native MMIO read and faults on an APIC
++	 * fixmap that was never mapped.
++	 *
++	 * So neither source describes this guest. Its processor list is
++	 * fabricated by co_colinux_smp_config() as 0..n-1, and the ids have to
++	 * agree with that list or nothing lines up: the boot CPU claims id 6
++	 * while the enumeration says 0, check_for_real_bsp() sees a boot APIC
++	 * that is not the first enumerated one, concludes it is a crash kernel
++	 * and refuses every secondary. "Allowing 1 present CPUs", with the
++	 * real reason three lines earlier as an APIC ID mismatch.
++	 *
++	 * Using the CPU number makes the fabricated id true by construction.
++	 * Nothing addresses these ids as hardware -- there is no interrupt
++	 * controller here and IPIs do not go through one -- they exist to
++	 * index the topology maps.
++	 */
++	/*
++	 * The CPU number, both passes, because CPUID leaf 1 is not virtualised
++	 * here: ebx.apicid above is the id of whatever HOST core the monitor
++	 * thread is pinned to, which has nothing to do with this guest. The
++	 * fabricated ids from co_colinux_smp_config() are 0..n-1 and the two
++	 * have to agree, or check_for_real_bsp() sees a boot APIC that is not
++	 * the first enumerated one and refuses every secondary.
++	 *
++	 * read_apic_id() itself is safe now -- the inert driver installed in
++	 * co_colinux_smp_init() returns the id without touching an APIC -- so
++	 * this is about CPUID being wrong, not about the fixmap.
++	 */
++	if (co_colinux_guest) {
++		c->topo.initial_apicid = early ? 0 : smp_processor_id();
++		c->topo.apicid = c->topo.initial_apicid;
++	} else if (early) {
+ 		c->topo.apicid = c->topo.initial_apicid;
+-	else
++	} else {
+ 		c->topo.apicid = read_apic_id();
++	}
+ 
+ 	/* The above is sufficient for UP */
+ 	if (!IS_ENABLED(CONFIG_SMP))
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
 --- a/arch/x86/kernel/early_printk.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/early_printk.c	2026-08-07 15:41:02.798506600 +1000
 @@ -370,6 +370,191 @@
@@ -956,7 +1188,7 @@ diff -urN a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
  		if (!strncmp(buf, "mmio32", 6)) {
  			buf += 6;
  			early_mmio_serial_init(buf);
-diff -urN a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
 --- a/arch/x86/kernel/head64.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/head64.c	2026-07-31 18:22:36.332891600 +1000
 @@ -19,6 +19,7 @@
@@ -994,7 +1226,7 @@ diff -urN a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
  	if (IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT)) {
  		setup_ghcb();
  		handler = vc_boot_ghcb;
-diff -urN a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
 --- a/arch/x86/kernel/head_64.S	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/head_64.S	2026-08-01 08:57:31.492334500 +1000
 @@ -195,6 +195,33 @@
@@ -1095,9 +1327,9 @@ diff -urN a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
  
  	/* Pass the boot_params pointer as first argument */
  	movq	%r15, %rdi
-diff -urN a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
 --- a/arch/x86/kernel/idt.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/idt.c	2026-08-02 15:22:50.297762000 +1000
++++ b/arch/x86/kernel/idt.c	2026-08-08 01:56:00.711087300 +1000
 @@ -3,6 +3,7 @@
   * Interrupt descriptor table related code
   */
@@ -1143,7 +1375,7 @@ diff -urN a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
  	int i = FIRST_EXTERNAL_VECTOR;
  	void *entry;
  
-@@ -324,6 +348,114 @@
+@@ -324,6 +348,209 @@
  	idt_setup_done = true;
  }
  
@@ -1255,12 +1487,107 @@ diff -urN a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
 +		"exceptions are the kernel's, interrupts are the host's\n");
 +}
 +
++/*
++ * The same hybrid, for a secondary -- per-vCPU, because the stubs must be.
++ *
++ * idt_table cannot simply be loaded here: its NMI and 32-255 gates carry the
++ * boot processor's passage-page stubs, and a stub is not just code -- it is a
++ * crossing through its own passage page's saved-state pair. A host interrupt
++ * delivered on this processor through vCPU 0's stub would world-switch
++ * through state vCPU 0 is concurrently running on. So the kernel's half of
++ * the table is copied from idt_table, and the host's half is re-pointed at
++ * THIS vCPU's stubs, harvested from the IDT that is live right now -- the
++ * one the host built into this vCPU's passage page.
++ *
++ * Until this runs, every vector on a secondary -- #PF, #GP, #UD, #BP -- is a
++ * host stub, and the host's lane loop stops the vCPU on any vector < 32
++ * (arch/x86_64/switch.c). Right for bring-up faults, lethal afterwards: the
++ * first extable fixup (rdmsr_safe), WARN, or text_poke INT3 window this
++ * processor walks into freezes it mid-task, silently, which RCU eventually
++ * reports as a stall on an otherwise healthy machine. Measured: CPU 1 died
++ * at "vector 13 at perf_msr_probe+0x81", an rdmsr the extable was waiting to
++ * fix up, and the machine then stalled RCU for 84 seconds without ever
++ * saying so.
++ *
++ * Interrupt-safety is the boot processor's flip argument, one table over:
++ * cpu_init_exception_handling() puts kernel TSS and TR live first (with the
++ * cmpxchg16b swap -- see there), during which the stub IDT's IST1 resolves
++ * through the kernel TSS to the double-fault stack -- guest-mapped, and the
++ * guest side of a stub needs only a guest-mapped stack. The lidt is then a
++ * single instruction from one coherent table to another. GDTR, IDTR and TR
++ * ride this vCPU's crossing afterwards, saved on each exit and restored on
++ * each entry, exactly as on the boot processor.
++ *
++ * Not __init: co_colinux_ap_start is a runtime path (cpu re-onlining), and
++ * on re-online the host has rebuilt the passage page, so the harvest below
++ * reads a fresh stub table again.
++ */
++static gate_desc co_colinux_ap_idt[NR_CPUS][IDT_ENTRIES] __page_aligned_bss;
++
++void co_colinux_ap_adopt_traps(void)
++{
++	unsigned int cpu = raw_smp_processor_id();
++	gate_desc *idt = co_colinux_ap_idt[cpu];
++	struct desc_ptr stub_idt, d;
++	const gate_desc *stub;
++	int i;
++
++	/* This vCPU's own 256 stubs, live in IDTR at this moment. */
++	store_idt(&stub_idt);
++	stub = (const gate_desc *)stub_idt.address;
++
++	/* The kernel's half: 0-31 and the int80 gate, from idt_table. */
++	memcpy(idt, idt_table, sizeof(co_colinux_ap_idt[cpu]));
++
++	/*
++	 * The host's half: NMI and 32-255, re-pointed at THIS vCPU's stubs,
++	 * rebuilt as IST-0 DPL-0 interrupt gates exactly as the boot
++	 * processor's were.
++	 */
++	for (i = 0; i < IDT_ENTRIES; i++) {
++		unsigned long addr;
++		gate_desc g = { };
++
++		if (i != X86_TRAP_NMI && i < FIRST_EXTERNAL_VECTOR)
++			continue;
++
++#ifdef CONFIG_IA32_EMULATION
++		/* Ours, and reachable from ring 3 -- see co_colinux_adopt_traps. */
++		if (i == IA32_SYSCALL_VECTOR)
++			continue;
++#endif
++
++		addr		= gate_offset(&stub[i]);
++		g.offset_low	= (u16)addr;
++		g.segment	= __KERNEL_CS;
++		g.bits.type	= GATE_INTERRUPT;
++		g.bits.p	= 1;
++		g.offset_middle	= (u16)(addr >> 16);
++		g.offset_high	= (u32)(addr >> 32);
++		write_idt_entry(idt, i, &g);
++	}
++
++	/*
++	 * Kernel TSS, IST stacks, getcpu segment and TR -- live before the
++	 * kernel gates are, because those gates need them. Skips the final
++	 * load_current_idt() for a cooperative secondary; idt_table is the
++	 * wrong table here, and ours goes live on the next line.
++	 */
++	cpu_init_exception_handling(false);
++
++	d.address = (unsigned long)idt;
++	d.size	  = sizeof(co_colinux_ap_idt[cpu]) - 1;
++	load_idt(&d);
++
++	pr_info("colinux: CPU %u adopted kernel TSS and hybrid IDT\n", cpu);
++}
++
  /**
   * idt_setup_early_handler - Initializes the idt table with early handlers
   */
-diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 --- a/arch/x86/kernel/process.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/process.c	2026-08-07 15:43:19.557901400 +1000
++++ b/arch/x86/kernel/process.c	2026-08-08 02:13:52.762390400 +1000
 @@ -50,10 +50,16 @@
  #include <asm/proto.h>
  #include <asm/frame.h>
@@ -1278,7 +1605,7 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
  
  #include "process.h"
  
-@@ -773,6 +779,426 @@
+@@ -773,6 +779,763 @@
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -1425,6 +1752,170 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 + * from throughout the kernel and tracing the boundary could recurse back into
 + * the same irqflag path.
 + */
++/*
++ * The crossing, callable from outside this file.
++ *
++ * co_colinux_switch() is __always_inline because every one of its callers
++ * here wants it that way -- the idle path and the terminate path both run
++ * where a call would be awkward. smpboot.c needs the same crossing to ask the
++ * host to start a processor, and once a year is not worth inlining, so it
++ * gets the out-of-line form.
++ */
++void co_colinux_switch_op(unsigned long long operation)
++{
++	if (co_colinux_passage_page[co_colinux_vcpu_id()])
++		co_colinux_switch(operation);
++}
++EXPORT_SYMBOL(co_colinux_switch_op);
++
++/* Ask the host to wake a processor; params[74] names which. */
++#define CO_OPERATION_KICK_VCPU	20
++#define CO_PP_AP_VCPU		74
++
++/*
++ * Run one posted vector.
++ *
++ * Not through the IDT: these are messages, not hardware interrupts, and the
++ * work each vector stands for is a plain function. Going through the gate
++ * would need a pt_regs frame this path does not have and buys nothing.
++ *
++ * Reschedule is arrival-only, as the design says -- being woken and running
++ * the scheduler's normal preemption check is the whole content of a
++ * reschedule IPI, so the bit having arrived is sufficient.
++ */
++void __noreturn co_colinux_stop_this_cpu(void);
++
++static void co_colinux_ipi_dispatch(int vector)
++{
++	switch (vector) {
++	case RESCHEDULE_VECTOR:
++		scheduler_ipi();
++		break;
++	case CALL_FUNCTION_VECTOR:
++	case CALL_FUNCTION_SINGLE_VECTOR:
++		generic_smp_call_function_single_interrupt();
++		break;
++	case REBOOT_VECTOR:
++		/*
++		 * The stop message. Does not return: this processor takes
++		 * itself off the online mask and idles forever, which is what
++		 * the host wants of a vCPU with no work. Reached from the
++		 * drain rather than from a gate, so the sender's bounded wait
++		 * in co_colinux_stop_other_cpus() is what bounds it.
++		 */
++		co_colinux_stop_this_cpu();
++		break;
++	default:
++		pr_warn_once("colinux: no handler for posted vector %d\n",
++			     vector);
++		break;
++	}
++}
++
++/*
++ * The IPI pending sets. Host-visible, so a fixed array and never percpu --
++ * the host has to be able to find another processor's set from outside the
++ * guest to know whether that processor has work waiting.
++ */
++unsigned long co_colinux_ipi_pending[CO_COLINUX_NR_VCPUS][CO_COLINUX_IPI_WORDS];
++EXPORT_SYMBOL(co_colinux_ipi_pending);
++
++/*
++ * Post a vector to another processor and ring its doorbell.
++ *
++ * Two halves, and both are needed. The bit is the message: it survives
++ * whatever the target is doing and is drained when the target is next in a
++ * position to run handlers. The crossing is only the wake -- the target may be
++ * sitting in the host's idle wait with nothing to re-enter it, and a message
++ * nobody is told about is a hang.
++ *
++ * Set the bit before crossing, or the target can drain an empty set and go
++ * back to sleep with the bit arriving just behind it.
++ */
++void co_colinux_ipi_send(unsigned int cpu, int vector)
++{
++	unsigned long long *params;
++	unsigned char *pp;
++
++	if (cpu >= CO_COLINUX_NR_VCPUS || vector < 0 || vector > 255)
++		return;
++
++	set_bit(vector, co_colinux_ipi_pending[cpu]);
++	smp_mb__after_atomic();
++
++	preempt_disable();
++	pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
++	if (pp) {
++		params = (unsigned long long *)(pp + CO_PP_PARAMS);
++		params[CO_PP_AP_VCPU] = cpu;
++		co_colinux_switch(CO_OPERATION_KICK_VCPU);
++	}
++	preempt_enable();
++}
++EXPORT_SYMBOL(co_colinux_ipi_send);
++
++/*
++ * Run whatever was posted to this processor.
++ *
++ * Called where the guest can safely take an interrupt-like callback. Each bit
++ * is cleared before its handler runs, so a handler that posts to itself is not
++ * lost and not repeated.
++ */
++void co_colinux_ipi_drain(void)
++{
++	unsigned long *set = co_colinux_ipi_pending[co_colinux_vcpu_id()];
++	int vector;
++
++	for (;;) {
++		vector = find_first_bit(set, 256);
++		if (vector >= 256)
++			return;
++		clear_bit(vector, set);
++		co_colinux_ipi_dispatch(vector);
++	}
++}
++EXPORT_SYMBOL(co_colinux_ipi_drain);
++
++/*
++ * Service this processor's posted vectors and its share of time from inside
++ * a busy wait -- the cooperative substitute for a hardware IPI or timer
++ * interrupt preempting a spin.
++ *
++ * On real hardware, a CPU spinning with IF=1 in csd_lock_wait() is bounded
++ * because the incoming CALL_FUNCTION vector preempts the spin. This guest is
++ * never preempted in kernel mode: the COPIC is ring-3-only by design (the
++ * host cannot tell a safe kernel instant from an entry sequence with GS not
++ * yet swapped), so kernel-mode delivery has to be synchronous, from the
++ * spinning side, at a point the guest knows is safe. A spin with virtual
++ * interrupts enabled is exactly the set of points hardware would have
++ * delivered to.
++ *
++ * Time is drained too, for the sender who owns the tick: two processors can
++ * wedge with one in csd_lock_wait() and the other waiting on jiffies, which
++ * only advance at boundaries the spinner is now not reaching.
++ *
++ * A no-op when virtual interrupts are off: hardware would not deliver there
++ * either, and a caller spinning with interrupts off is relying only on the
++ * target's own progress, exactly as native does.
++ */
++void co_colinux_ipi_poll(void)
++{
++	unsigned long flags;
++
++	if (!co_colinux_guest || irqs_disabled())
++		return;
++
++	local_irq_save(flags);
++	if (find_first_bit(co_colinux_ipi_pending[co_colinux_vcpu_id()], 256) < 256) {
++		irq_enter();
++		co_colinux_ipi_drain();
++		irq_exit();
++	}
++	co_colinux_drain_time();
++	local_irq_restore(flags);
++}
++EXPORT_SYMBOL(co_colinux_ipi_poll);
++
 +noinstr void co_colinux_yield(void)
 +{
 +	if (co_colinux_passage_page[co_colinux_vcpu_id()])
@@ -1457,19 +1948,45 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 +	return 0;
 +}
 +
-+static struct clock_event_device co_colinux_clockevent = {
-+	.name			= "cotimer",
-+	.features		= CLOCK_EVT_FEAT_PERIODIC,
-+	.set_state_periodic	= co_colinux_ce_state_noop,
-+	.set_state_shutdown	= co_colinux_ce_state_noop,
-+	.rating			= 300,
-+};
++static struct clock_event_device co_colinux_clockevent[CO_COLINUX_NR_VCPUS];
++
++/*
++ * Each vCPU registers its own device, on itself -- the tick core adopts a
++ * device only for the processor registering it. CPU 0 registers first, so
++ * tick_do_timer_cpu stays 0 and only its ticks advance jiffies; a
++ * secondary's tick_periodic() runs update_process_times() -- the timer
++ * wheel, hrtimers, RCU and the scheduler tick. Without this a secondary's
++ * wheel is never serviced by anyone: timers enqueue on the local CPU
++ * (nohz never activates on a periodic-only device, so timers_nohz_active
++ * stays false and remote expiry is off), and run_local_timers() only runs
++ * from a tick this processor was never going to receive. Every msleep()
++ * that lands on a secondary is a task that never wakes.
++ */
++static void co_colinux_clockevent_register(unsigned int cpu)
++{
++	struct clock_event_device *evt = &co_colinux_clockevent[cpu];
++
++	evt->name		= "cotimer";
++	evt->features		= CLOCK_EVT_FEAT_PERIODIC;
++	evt->set_state_periodic	= co_colinux_ce_state_noop;
++	evt->set_state_shutdown	= co_colinux_ce_state_noop;
++	evt->rating		= 300;
++	evt->cpumask		= cpumask_of(cpu);
++	clockevents_register_device(evt);
++}
 +
 +void __init co_colinux_timer_init(void)
 +{
-+	co_colinux_clockevent.cpumask = cpumask_of(0);
-+	clockevents_register_device(&co_colinux_clockevent);
++	co_colinux_clockevent_register(0);
 +	pr_info("cotimer: cooperative tick device registered, HZ=%d\n", HZ);
++}
++
++/* A secondary's tick device, registered by co_colinux_ap_start on itself. */
++void co_colinux_ap_timer_init(void);
++
++void co_colinux_ap_timer_init(void)
++{
++	co_colinux_clockevent_register(smp_processor_id());
 +}
 +
 +/*
@@ -1486,21 +2003,32 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 +static unsigned int co_colinux_take_ticks(void)
 +{
 +	unsigned char *pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
++	struct clock_event_device *evt = &co_colinux_clockevent[co_colinux_vcpu_id()];
 +	const u64 per_tick = 10000000 / HZ;	/* 100 ns units */
-+	static u64 last_mono;
++	static u64 last_mono[CO_COLINUX_NR_VCPUS];
++	u64 *lm = &last_mono[co_colinux_vcpu_id()];
 +	u64 now;
 +	unsigned int n;
 +
-+	if (!pp || !co_colinux_clockevent.event_handler)
++	if (!pp || !evt->event_handler)
 +		return 0;
 +
++	/*
++	 * Per-processor accounting against the shared host clock. The two
++	 * hazards that made ticks CPU 0's alone (rung S4 note, formerly here)
++	 * are both gone: every vCPU now has an evtdev of its own, so a tick
++	 * delivered here runs tick_periodic(this cpu) -- which touches
++	 * jiffies only on tick_do_timer_cpu, i.e. CPU 0 -- and the baseline
++	 * is per-vCPU, so a secondary consuming its elapsed time no longer
++	 * moves the boot processor's.
++	 */
 +	now = *(volatile u64 *)(pp + CO_PP_HOST_MONO);
-+	if (!last_mono)
-+		last_mono = now;
-+	if (now <= last_mono)
++	if (!*lm)
++		*lm = now;
++	if (now <= *lm)
 +		return 0;
 +
-+	n = (now - last_mono) / per_tick;
++	n = (now - *lm) / per_tick;
 +	if (!n)
 +		return 0;
 +
@@ -1510,9 +2038,9 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 +	 */
 +	if (n > HZ) {
 +		n = HZ;
-+		last_mono = now - (u64)n * per_tick;
++		*lm = now - (u64)n * per_tick;
 +	}
-+	last_mono += (u64)n * per_tick;
++	*lm += (u64)n * per_tick;
 +
 +	return n;
 +}
@@ -1551,6 +2079,21 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 + * arrives on one of them can be delayed arbitrarily by a guest that happens
 + * not to take that path, which is how a fence turns into a hang.
 + */
++/*
++ * The device rings, reaped at whichever boundary is reached first.
++ *
++ * One place rather than three call sites, so the pair cannot drift apart --
++ * and every vCPU drains. Restricting this to vCPU 0 was tried and is wrong:
++ * a secondary that never reaps leaves completions sitting until the boot
++ * processor next passes a boundary, and the waiter they belong to sleeps
++ * through it.
++ */
++static inline void co_colinux_drain_devices(void)
++{
++	co_cobd_drain_completions();
++	co_vgpu_drain();
++}
++
 +void __weak co_vgpu_drain(void)
 +{
 +}
@@ -1566,13 +2109,38 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 +DEFINE_IDTENTRY_SYSVEC(sysvec_co_timer)
 +{
 +	struct pt_regs *old = set_irq_regs(regs);
-+	unsigned int n = co_colinux_take_ticks();
++	unsigned int n;
 +
-+	while (n--)
-+		co_colinux_clockevent.event_handler(&co_colinux_clockevent);
++	/*
++	 * Posted vectors first, and this is the important one of the three
++	 * drain points.
++	 *
++	 * Idle and return-to-userspace both require the target to be doing
++	 * something in particular. A processor running a kernel thread is
++	 * doing neither, and the sender of a cross-processor call is spinning
++	 * in csd_lock_wait() until the target answers -- on_each_cpu() is what
++	 * every text_poke does, which is every static-key flip, which includes
++	 * the one sched_cpu_activate() performs during bring-up itself.
++	 *
++	 * This is a stock idtentry, so irq_enter_rcu() has already run and RCU
++	 * is watching. That is what makes it a legal place to run
++	 * sched_ttwu_pending() and the call-function handlers, and it is why
++	 * the drain does not belong in co_colinux_switch() or
++	 * co_colinux_yield(): both of those are reached with rq->lock held.
++	 */
++	co_colinux_ipi_drain();
 +
-+	co_cobd_drain_completions();
-+	co_vgpu_drain();
++	n = co_colinux_take_ticks();
++
++	{
++		struct clock_event_device *evt =
++			&co_colinux_clockevent[co_colinux_vcpu_id()];
++
++		while (n--)
++			evt->event_handler(evt);
++	}
++
++	co_colinux_drain_devices();
 +
 +	set_irq_regs(old);
 +}
@@ -1589,8 +2157,7 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 +		 * sleeping on a read drove the guest to idle, and this is the
 +		 * boundary where its I/O comes back and wakes it.
 +		 */
-+		co_cobd_drain_completions();
-+		co_vgpu_drain();
++		co_colinux_drain_devices();
 +		return;
 +	}
 +
@@ -1617,10 +2184,14 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 +
 +	irq_enter();
 +	old = set_irq_regs(&regs);
-+	while (n--)
-+		co_colinux_clockevent.event_handler(&co_colinux_clockevent);
-+	co_cobd_drain_completions();
-+	co_vgpu_drain();
++	{
++		struct clock_event_device *evt =
++			&co_colinux_clockevent[co_colinux_vcpu_id()];
++
++		while (n--)
++			evt->event_handler(evt);
++	}
++	co_colinux_drain_devices();
 +	set_irq_regs(old);
 +	irq_exit();
 +}
@@ -1684,6 +2255,99 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 +	 * emulate hardirq entry, and irq_exit expects to be entered that way.
 +	 */
 +	raw_local_irq_disable();
++	/*
++	 * Anything posted to this processor while it was out, before the ticks.
++	 * This is the boundary a woken processor comes back through, so it is
++	 * where a reschedule or a cross-processor call has to be noticed --
++	 * smp_call_function's caller is spinning on a completion until it is.
++	 *
++	 * Inside irq_enter()/irq_exit(), and both halves are load-bearing.
++	 *
++	 * RCU is NOT watching here: default_idle_call() wraps arch_cpu_idle()
++	 * in ct_cpuidle_enter()/ct_cpuidle_exit(), so this processor is in an
++	 * extended quiescent state for the whole of the crossing. The handlers
++	 * that run below -- sched_ttwu_pending() above all -- take rq->lock,
++	 * walk RCU-protected cgroup and sched-domain data and fire
++	 * tracepoints. Running them while RCU is told this CPU is quiescent is
++	 * how a grace period completes underneath a live dereference.
++	 * ct_irq_enter(), inside irq_enter(), is what suspends the EQS, and it
++	 * is the same pairing co_colinux_drain_time() already uses one line
++	 * below.
++	 *
++	 * And irq_exit() is what runs the softirqs the wakeup raised. On a
++	 * secondary that matters more than on the boot processor: a secondary
++	 * has no clock event device of its own, so no tick ever delivers here
++	 * and this is the ONLY place its softirqs would ever run.
++	 */
++	/*
++	 * Only when something is actually posted, and that is a correctness
++	 * gate rather than an optimisation.
++	 *
++	 * irq_enter() is not bookkeeping. current is the idle task and this is
++	 * the outermost count, so it takes the is_idle_task() branch into
++	 * tick_irq_enter() -- ktime_get(), and tick_do_update_jiffies64() under
++	 * jiffies_lock -- and ct_irq_enter() suspends the RCU extended
++	 * quiescent state that default_idle_call() established one frame up.
++	 * irq_exit() then runs whatever softirqs that raised. Around an EMPTY
++	 * drain, all of it runs and none of it is wanted.
++	 *
++	 * And on the boot processor it is always empty until smp_init(): the
++	 * only writers of this bitmap are co_colinux_ipi_send() and the
++	 * kick_ap path, and until a secondary exists there is no one to post.
++	 * So this ran on every idle from the first one, thousands of times
++	 * before the machine had a second processor at all.
++	 *
++	 * One load restores the boot processor's idle path to exactly what it
++	 * was before IPIs existed, and keeps the interrupt context for the case
++	 * it was added for -- a processor coming back through this boundary
++	 * with a reschedule or a cross-processor call waiting, where
++	 * smp_call_function's caller is spinning on a completion until it runs.
++	 */
++	if (find_first_bit(co_colinux_ipi_pending[co_colinux_vcpu_id()], 256) < 256) {
++		/*
++		 * BISECT, one variable: the drain and its dispatch stay, the
++		 * hardirq-entry emulation goes.
++		 *
++		 * Gating this block on a non-empty set took the boot processor
++		 * from dying on every idle to dying at smp_init -- which is the
++		 * first moment anything can post into this processor's own set.
++		 * That is the gate working and the mechanism still being lethal,
++		 * not the mechanism being fixed.
++		 *
++		 * irq_enter() is the suspect half: current is the idle task and
++		 * this is the outermost count, so it takes the is_idle_task()
++		 * branch into tick_irq_enter() -- ktime_get() and
++		 * tick_do_update_jiffies64() under jiffies_lock -- and
++		 * ct_irq_enter() suspends the RCU extended quiescent state that
++		 * default_idle_call() established one frame up. irq_exit() then
++		 * runs whatever softirqs that raised.
++		 *
++		 * Interrupts are already disabled here, so the dispatched
++		 * handlers keep that much of their contract; what they lose is
++		 * in_interrupt(), which may WARN. A WARN the host steps over is
++		 * a result. A reset is not.
++		 *
++		 * BISECT CONCLUDED, and it proved nothing -- restored.
++		 *
++		 * While no secondary existed this set was always empty, so the
++		 * gated block never executed in either build. That is why
++		 * removing the pairing produced a byte-identical failure: there
++		 * was nothing to run. That regime has ended. With a secondary
++		 * up, co_colinux_ipi_send() and co_apic_send_IPI_self() post
++		 * real bits, this block really runs, and scheduler_ipi() and
++		 * generic_smp_call_function_single_interrupt() genuinely
++		 * require interrupt context -- dispatching them without it is
++		 * now the more dangerous of the two.
++		 *
++		 * What made the pairing lethal before was the absence of the
++		 * gate: it ran on every idle from the first, with nothing to
++		 * do. co_colinux_drain_time() has used this same pairing for
++		 * the whole life of the port.
++		 */
++		irq_enter();
++		co_colinux_ipi_drain();
++		irq_exit();
++	}
 +	co_colinux_drain_time();
 +	/*
 +	 * And on again, because that is this function's contract: the generic
@@ -1705,7 +2369,7 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +1362,18 @@
+@@ -936,6 +1699,18 @@
  
  void __init select_idle_routine(void)
  {
@@ -1724,7 +2388,7 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
  	if (boot_option_idle_override == IDLE_POLL) {
  		if (IS_ENABLED(CONFIG_SMP) && __max_threads_per_core > 1)
  			pr_warn_once("WARNING: polling idle and HT enabled, performance may degrade\n");
-diff -urN a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
 --- a/arch/x86/kernel/reboot.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/reboot.c	2026-08-01 15:30:12.318556600 +1000
 @@ -1,6 +1,7 @@
@@ -1808,9 +2472,9 @@ diff -urN a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
  	if (kernel_can_power_off()) {
  		if (!reboot_force)
  			machine_shutdown();
-diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
 --- a/arch/x86/kernel/setup.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/setup.c	2026-08-07 16:32:50.246951100 +1000
++++ b/arch/x86/kernel/setup.c	2026-08-07 19:49:57.995154400 +1000
 @@ -55,6 +55,7 @@
  #include <asm/proto.h>
  #include <asm/realmode.h>
@@ -1819,7 +2483,7 @@ diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
  #include <asm/unwind.h>
  #include <asm/vsyscall.h>
  
-@@ -933,6 +934,83 @@
+@@ -933,6 +934,115 @@
  	 */
  	olpc_ofw_detect();
  
@@ -1891,6 +2555,38 @@ diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
 +
 +#ifdef CONFIG_SMP
 +		/*
++		 * The host's MP table is not ours to read.
++		 *
++		 * It describes the host's processors, sits in the host's
++		 * firmware area, and is found by scanning the first megabyte --
++		 * which this guest does not have. The host maps 0..1 MB as a
++		 * single zeroed frame aliased read-only, so the scan finds a
++		 * signature in a page that is not a table, and the parse then
++		 * early_memremap()s over that alias. The kernel's own mapping
++		 * of that range afterwards hits set_pud_safe(), which finds a
++		 * PUD already present with a different value and WARNs -- and a
++		 * WARN is a ud2, which for a guest whose exceptions still
++		 * belong to the host is the end of the boot. It stopped with
++		 * vector 6 in set_pud_init, and it took a long time to see
++		 * because nothing about the message says "MP table".
++		 *
++		 * This never ran before because restrict_to_up() short-circuited
++		 * it whenever the local APIC was disabled. Exempting a
++		 * cooperative guest from that rule -- correct in itself, since
++		 * the host starts our processors -- is what let the parse
++		 * through, so the parse has to be switched off explicitly. Xen
++		 * PV disables exactly these three for exactly this reason.
++		 *
++		 * The processor count comes from the host instead, on the
++		 * command line as possible_cpus=, and
++		 * topology_init_possible_cpus() fabricates the boot APIC entry
++		 * when nothing registered one.
++		 */
++		x86_init.mpparse.find_mptable       = x86_init_noop;
++		x86_init.mpparse.early_parse_smp_cfg = x86_init_noop;
++		/* parse_smp_cfg is replaced, not disabled -- see smpboot.c. */
++
++		/*
 +		 * Secondary processors are the host's to start, so the native
 +		 * preparation -- which reads apic_intr_mode and gives up when
 +		 * there is no usable local APIC -- is replaced wholesale. See
@@ -1903,7 +2599,7 @@ diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
  	idt_setup_early_traps();
  	early_cpu_init();
  	jump_label_init();
-@@ -1033,7 +1111,15 @@
+@@ -1033,7 +1143,15 @@
  	 */
  	max_pfn = e820__end_of_ram_pfn();
  
@@ -1920,18 +2616,19 @@ diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
  	cache_bp_init();
  	if (mtrr_trim_uncached_memory(max_pfn))
  		max_pfn = e820__end_of_ram_pfn();
-diff -urN a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
 --- a/arch/x86/kernel/smpboot.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/smpboot.c	2026-08-07 16:34:34.493210800 +1000
-@@ -40,6 +40,7 @@
++++ b/arch/x86/kernel/smpboot.c	2026-08-08 01:56:20.788867100 +1000
+@@ -40,6 +40,8 @@
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
  
  #include <linux/init.h>
++#include <linux/delay.h>
 +#include <linux/console.h>	/* co_colinux_guest, co_colinux_smp_init */
  #include <linux/smp.h>
  #include <linux/export.h>
  #include <linux/sched.h>
-@@ -1152,6 +1153,58 @@
+@@ -1152,6 +1154,835 @@
  	cpumask_set_cpu(0, topology_die_cpumask(0));
  }
  
@@ -1955,42 +2652,819 @@ diff -urN a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
 + * no INIT-SIPI delay calibration, no SEV-SNP wakeup -- all of them describe
 + * hardware that is not here.
 + */
++/*
++ * Rung A of the secondary-processor bring-up: can the host enter a second
++ * vCPU at all?
++ *
++ * Deliberately nothing to do with cpuhp, smp_ops or the topology. Those decide
++ * whether Linux *wants* another processor; this asks whether the machinery
++ * underneath -- the START_VCPU handshake, the passage page the host made for
++ * vCPU 1, the shared address space, and the entry contract through the boot
++ * shim -- actually works. Testing both at once is what made every failure
++ * indistinguishable: the box reset and there was no way to tell which half
++ * did it.
++ *
++ * So the payload is a loop that touches one global and nothing else. No
++ * per-CPU data (GS is left zero), no kernel bring-up, no rendezvous. If the
++ * counter moves, the host put a processor into guest code at an address we
++ * chose, on a stack we chose, in the kernel's address space. If it does not
++ * move, exactly one of a very short list is wrong.
++ */
++/*
++ * The passage-page offsets and the operation the host is watching for. These
++ * mirror the host's CO_PP_* in arch/x86_64/switch.c. params[64..73] is the
++ * guest GDT, so the secondary's state starts at 74.
++ */
++#define CO_PP_PARAMS		0x9c8
++#define CO_PP_AP_VCPU		74
++#define CO_PP_AP_RIP		75
++#define CO_PP_AP_RSP		76
++#define CO_PP_AP_CR3		77
++#define CO_PP_AP_GS_BASE	78
++#define CO_OPERATION_START_VCPU	19
++
++extern unsigned long long co_colinux_passage_page[];
++extern void co_colinux_switch_op(unsigned long long operation);
++asmlinkage void co_colinux_ap_start(void);
++
++static unsigned long co_ap_probe_stack[2048] __aligned(16);
++unsigned long co_colinux_ap_alive;
++
++static void co_colinux_ap_spin(void)
++{
++	for (;;) {
++		WRITE_ONCE(co_colinux_ap_alive, READ_ONCE(co_colinux_ap_alive) + 1);
++		cpu_relax();
++	}
++}
++
++/*
++ * Kept compiled but not called: it is the plan's step A, and step A must be a
++ * boot of its own. Wire it to an early-param before using it.
++ */
++static void __init __maybe_unused co_colinux_probe_vcpu1(void)
++{
++	unsigned long long *params;
++	unsigned char *pp;
++	int ms;
++
++	/*
++	 * The params live in THIS processor's passage page, and the crossing
++	 * that delivers them is this processor's too, so the pair must not be
++	 * split by a migration.
++	 */
++	preempt_disable();
++	pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
++	if (!pp) {
++		preempt_enable();
++		pr_err("colinux: vcpu 1 probe: no passage page\n");
++		return;
++	}
++
++	params = (unsigned long long *)(pp + CO_PP_PARAMS);
++	params[CO_PP_AP_VCPU]	 = 1;
++	params[CO_PP_AP_RIP]	 = (unsigned long long)(unsigned long)co_colinux_ap_spin;
++	/* Room to spare below the top, and 16-byte aligned as the ABI wants. */
++	params[CO_PP_AP_RSP]	 = (unsigned long long)(unsigned long)
++		&co_ap_probe_stack[ARRAY_SIZE(co_ap_probe_stack) - 4];
++	params[CO_PP_AP_CR3]	 = __pa_nodebug(init_mm.pgd);
++	params[CO_PP_AP_GS_BASE] = 0;
++
++	co_colinux_switch_op(CO_OPERATION_START_VCPU);
++	preempt_enable();
++
++	for (ms = 0; ms < 1000 && !READ_ONCE(co_colinux_ap_alive); ms += 5)
++		mdelay(5);
++
++	if (READ_ONCE(co_colinux_ap_alive))
++		pr_info("colinux: vcpu 1 RAN -- counter %lu after %d ms\n",
++			READ_ONCE(co_colinux_ap_alive), ms);
++	else
++		pr_err("colinux: vcpu 1 never ran -- counter still 0 after %d ms\n",
++		       ms);
++}
++
++static void __init co_colinux_smp_cpus_done(unsigned int max_cpus)
++{
++	pr_info("colinux: %u processor(s) online\n", num_online_cpus());
++}
++
++#ifdef CONFIG_SMP
++/*
++ * Sending, without an interrupt controller in the path.
++ *
++ * The natives already reach co_colinux_ipi_send() through the inert apic's
++ * .send_IPI hooks, so these are not strictly required -- but
++ * native_send_call_func_ipi() takes the apic_use_ipi_shorthand branch and calls
++ * __apic_send_IPI_all(), and co_apic_send_IPI_all() iterates cpu_online_mask
++ * INCLUDING the sender. Every on_each_cpu() then posts a vector to this
++ * processor and rings this processor's own doorbell, leaving its idle event
++ * signalled and costing it one spurious re-entry. Going straight to the
++ * doorbell removes the shorthand and one layer of static calls with it.
++ */
++static void co_colinux_send_reschedule(int cpu)
++{
++	co_colinux_ipi_send(cpu, RESCHEDULE_VECTOR);
++}
++
++static void co_colinux_send_call_func_single_ipi(int cpu)
++{
++	co_colinux_ipi_send(cpu, CALL_FUNCTION_SINGLE_VECTOR);
++}
++
++static void co_colinux_send_call_func_ipi(const struct cpumask *mask)
++{
++	unsigned int cpu;
++
++	for_each_cpu(cpu, mask)
++		co_colinux_ipi_send(cpu, CALL_FUNCTION_VECTOR);
++}
++
++/*
++ * Where a cooperative processor goes to stop.
++ *
++ * Not stop_this_cpu(): it ends in native_halt(), which in this port emits the
++ * ud2 pair the host reads as "the guest has halted" -- so one secondary going
++ * offline would tell the host the whole machine died. And not a spin either:
++ * this thread still holds a host processor, and a processor held under a spin
++ * is a processor Windows does not get its clock on.
++ *
++ * Off the online mask first, so nothing new is aimed here, then idle forever --
++ * which is exactly what the host wants of a vCPU with no work to do.
++ */
++void __noreturn co_colinux_stop_this_cpu(void);
++
++void __noreturn co_colinux_stop_this_cpu(void)
++{
++	local_irq_disable();
++	set_cpu_online(smp_processor_id(), false);
++
++	for (;;)
++		co_colinux_switch_op(2 /* CO_OPERATION_IDLE */);
++}
++
++/*
++ * native_stop_other_cpus() cannot be used here, and the failure is a hang
++ * rather than a misbehaviour.
++ *
++ * It sends REBOOT_VECTOR, waits a second, then sends NMI_VECTOR and waits
++ * again -- and when the caller is stop_other_cpus() (wait = 1, which is what
++ * machine_shutdown() uses) the second wait has no timeout at all:
++ *
++ *	while (!cpumask_empty(&cpus_stop_mask) && (wait || timeout--))
++ *
++ * Neither vector reaches a handler through the shared-memory doorbell, so
++ * cpus_stop_mask never empties and every reboot and every poweroff stands
++ * there forever. It also calls disable_local_APIC() on a chip that is the
++ * host's.
++ *
++ * The cooperative version is the doorbell and a bounded wait. A vCPU that does
++ * not answer is a vCPU whose host thread has already left the driver, which is
++ * not a reason for this one to stand still.
++ */
++static void co_colinux_stop_other_cpus(int wait)
++{
++	unsigned int cpu, self = smp_processor_id();
++	int ms;
++
++	for_each_online_cpu(cpu)
++		if (cpu != self)
++			co_colinux_ipi_send(cpu, REBOOT_VECTOR);
++
++	for (ms = 0; ms < 500 && num_online_cpus() > 1; ms++)
++		mdelay(1);
++
++	if (num_online_cpus() > 1)
++		pr_warn("colinux: %u processor(s) did not stop\n",
++			num_online_cpus() - 1);
++}
++
++/*
++ * Offlining. native_cpu_disable() calls lapic_can_unplug_cpu() and
++ * apic_soft_disable() -- both about a chip this guest does not own. The
++ * generic half, which moves timers, interrupts and tasks off this processor,
++ * is all that applies.
++ */
++static int co_colinux_cpu_disable(void)
++{
++	cpu_disable_common();
++	return 0;
++}
++
++static void __noreturn co_colinux_play_dead(void)
++{
++	co_colinux_stop_this_cpu();
++}
++#endif /* CONFIG_SMP */
++
 +static void __init co_colinux_smp_prepare_cpus(unsigned int max_cpus)
 +{
 +	smp_prepare_cpus_common();
 +
 +	pr_info("colinux: %u processor(s) possible; the host starts them, "
 +		"not INIT-SIPI\n", num_possible_cpus());
++
++	/*
++	 * The spin-loop probe is NOT called here, and must never be called in
++	 * a boot that also runs smp_init().
++	 *
++	 * co_colinux_ap_spin() never returns and never crosses back, so a
++	 * probe leaves vCPU 1's host thread inside the guest permanently. This
++	 * function runs immediately before smp_init(), so the very next thing
++	 * that happens is co_colinux_kick_ap(1) issuing START_VCPU at a thread
++	 * that is no longer waiting for it -- and the host then rewrites the
++	 * state of a vCPU that is currently executing from it.
++	 *
++	 * The plan's step A and step B were meant to be separate runs, gated
++	 * by a knob, not two things in one boot.
++	 */
 +}
 +
 +/*
-+ * Refuse to start a secondary processor, loudly, until the host can.
++ * Where a cooperative secondary begins.
 + *
-+ * This is a safety belt and not a placeholder. The native version reaches
-+ * do_boot_cpu(), which sends INIT-SIPI-SIPI to a real physical processor of
-+ * the machine this guest is a thread on -- it would be trying to boot one of
-+ * Windows' own CPUs into Linux. Nothing about that is recoverable. Until the
-+ * host-side bringup exists, anything that decides a second CPU is present
-+ * must fail here rather than reach the hardware, and say so.
++ * The host enters here through the world switch with the stack, address
++ * space and per-CPU base that co_colinux_kick_ap() chose, which is the state
++ * start_secondary() would have arrived with had there been a trampoline. What
++ * follows is start_secondary()'s work with the hardware steps removed: no
++ * APIC to bring online, no TSC sync against a processor that shares this
++ * one's clock, no microcode to load into a CPU the host already owns.
++ */
++/*
++ * Not __init: kick_ap_alive is a runtime smp_ops callback, so this address
++ * outlives free_initmem(). Bringing a CPU back online through sysfs after
++ * boot would otherwise enter freed and poisoned text on a processor that has
++ * no IDT yet. Xen's cpu_bringup_and_idle is deliberately not __init either.
++ */
++asmlinkage __visible void co_colinux_ap_start(void)
++{
++	unsigned int cpu;
++
++	/*
++	 * Nothing touches the descriptor tables before cpu_init().
++	 *
++	 * This processor arrives on the tables the host built into its passage
++	 * page -- a Linux-shaped GDT, a TSS with IST stacks, and an IDT of 256
++	 * host stubs -- all loaded by the world switch, and all valid. The
++	 * shim enables real interrupts before jumping here, so an interrupt
++	 * can arrive at any moment from the first instruction; landing it on a
++	 * host stub backed by the passage page's own IST is exactly what that
++	 * arrangement is for, and it is how the boot processor runs too.
++	 *
++	 * An earlier version called load_current_idt() here, reasoning that
++	 * the kernel's IDT should be in place before anything could fault.
++	 * That was backwards and reset the machine every time: it installs
++	 * handlers that expect this CPU's kernel TSS and IST stacks, which
++	 * cpu_init() below has not loaded yet, so the first interrupt
++	 * stack-switched through a TSS that was never there. The window it was
++	 * meant to close did not exist; the window it opened was fatal.
++	 */
++	cr4_init();
++	cpuhp_ap_sync_alive();
++
++	/*
++	 * The descriptor tables, in the order native does it -- and this port
++	 * is native on this axis, not Xen.
++	 *
++	 * Xen PV omits this because a PV guest has no IDT and no TSS of its
++	 * own: traps are registered with the hypervisor and ring transitions
++	 * use the hypervisor's kernel_ss/kernel_sp. This guest OWNS its IDT
++	 * (see co_colinux_adopt_traps), so a secondary that skips this runs
++	 * forever on the host's 256 stub gates with no #PF handler, with TR
++	 * still pointing at the host's passage-page TSS, with ist[] zero so
++	 * #DF stack-switches to zero -- and, worst, without
++	 * cr4_set_bits(X86_CR4_FSGSBASE).
++	 *
++	 * That last one is fatal and silent: alternatives were patched
++	 * globally long before this processor existed, so paranoid_entry here
++	 * is already RDGSBASE/WRGSBASE. Without the CR4 bit the first NMI or
++	 * #DB on this CPU executes an instruction the CPU will not permit,
++	 * takes #UD inside the entry path, and triples. No bugcheck, no dump.
++	 *
++	 * cpu_init_exception_handling() does the whole sequence in the one
++	 * order that works: setup_getcpu, tss_setup_ist, set_tss_desc,
++	 * load_TR_desc, the FSGSBASE bit, then load_current_idt. Calling
++	 * load_current_idt() alone -- as an earlier version here did --
++	 * installs handlers that need a TSS which has not been loaded yet,
++	 * which is why that attempt reset the machine every time.
++	 */
++	/*
++	 * CR4.FSGSBASE, and for now ONLY that.
++	 *
++	 * cpu_init_exception_handling() is what native calls here and what
++	 * this processor ultimately needs -- but it ends in
++	 * load_current_idt(), which replaces the host's 256 stub gates with
++	 * the kernel's. Those stubs are the only reason a fault on this
++	 * processor arrives as a report rather than a triple fault, and
++	 * everything after this line is still unproven. Take the one piece
++	 * that is fatal on its own and keep the reporting.
++	 *
++	 * Fatal on its own because alternatives were patched globally long
++	 * before this processor existed: paranoid_entry is already
++	 * RDGSBASE/WRGSBASE. Without the CR4 bit the first NMI or #DB here
++	 * executes an instruction the CPU refuses, takes #UD inside the entry
++	 * path, and triples -- with no bugcheck and nothing written, which is
++	 * the signature this bring-up has been producing.
++	 *
++	 * The rest of cpu_init_exception_handling -- setup_getcpu,
++	 * tss_setup_ist, set_tss_desc, load_TR_desc, load_current_idt -- goes
++	 * in with the desc.h redirection the plan calls for, so the writes
++	 * land in this vCPU's crossing-carried descriptor images instead of
++	 * on the hardware this thread shares with Windows.
++	 */
++	if (boot_cpu_has(X86_FEATURE_FSGSBASE))
++		cr4_set_bits(X86_CR4_FSGSBASE);
++
++	cpu = raw_smp_processor_id();
++
++	/*
++	 * Carry the live TSS descriptor across the GDT switch, BEFORE
++	 * cpu_init() makes this CPU's own GDT live.
++	 *
++	 * GDTR is still the passage page's ten-entry table, whose entry 8 is
++	 * a valid 64-bit TSS descriptor for the passage page's TSS -- the one
++	 * whose IST1 stack all 256 host stub gates use. TR is 0x40 and names
++	 * it.
++	 *
++	 * This CPU's gdt_page is a copy of a template that has NO TSS
++	 * descriptor at all on x86_64 (cpu/common.c: only entries 1-6 are
++	 * initialised), and nothing on this path writes one -- set_tss_desc()
++	 * lives solely inside cpu_init_exception_handling(), which this
++	 * processor deliberately does not call. TR is never reloaded here
++	 * either.
++	 *
++	 * cpu_init() ends in load_fixmap_gdt(cpu), and load_direct_gdt(cpu)
++	 * follows; on a secondary neither is skipped, because the asm/desc.h
++	 * guard is "co_colinux_guest && !co_colinux_own_idt" and the BOOT
++	 * processor already set co_colinux_own_idt. So from cpu_init()
++	 * onwards GDTR names a table whose entry 8 is sixteen zero bytes
++	 * while TR is still 0x40.
++	 *
++	 * The world switch reloads TR from the saved guest state on EVERY
++	 * entry, against whatever GDT it has just lgdt'd, with no present or
++	 * type check (arch/x86_64/switch.c: "andl $0xfffffdff" then "ltr").
++	 * The first host interrupt after this line therefore runs ltr $0x40
++	 * against a null descriptor: #GP, raised with CR3 already the
++	 * guest's, RSP still the host's, and TR still Windows' -- because the
++	 * ltr is what failed. Every passage-page gate is IST1, so delivering
++	 * it reads the TSS through that stale TR, a Windows kernel address
++	 * unmapped here: #PF, whose gate is also IST1, repeats the identical
++	 * read, and so does #DF's. Triple fault: instant reset, no bugcheck,
++	 * no dump, nothing in any log.
++	 *
++	 * So the descriptor travels with the table. Copying the LIVE one,
++	 * rather than calling set_tss_desc(), is the point: this processor
++	 * goes on running on the passage page's TSS, its IST stack and its
++	 * stub IDT, which is the arrangement that makes a fault here arrive
++	 * as a report at all. set_tss_desc() would point TR at this CPU's
++	 * kernel TSS, whose ist[] is still all zero because tss_setup_ist()
++	 * sits in the same function this path does not call.
++	 */
++	{
++		struct desc_ptr live;
++		const struct desc_struct *from;
++		struct desc_struct *to;
++
++		native_store_gdt(&live);
++		from = (const struct desc_struct *)live.address;
++		to   = get_cpu_gdt_rw(cpu);
++
++		to[GDT_ENTRY_TSS]     = from[GDT_ENTRY_TSS];
++		to[GDT_ENTRY_TSS + 1] = from[GDT_ENTRY_TSS + 1];
++	}
++
++	cpu_init();
++
++	/*
++	 * Back onto the WRITABLE GDT alias, and immediately -- nothing may
++	 * cross between cpu_init() and this line.
++	 *
++	 * cpu_init() ends in load_fixmap_gdt(cpu), and on a secondary that
++	 * call is no longer skipped. The guard in asm/desc.h is
++	 * "co_colinux_guest && !co_colinux_own_idt", and co_colinux_own_idt is
++	 * one global that co_colinux_adopt_traps() set during the BOOT
++	 * processor's trap_init(). The boot processor never reached this
++	 * because its own cpu_init() ran while the guard was still closed;
++	 * every processor started afterwards runs it wide open.
++	 *
++	 * GDTR then points at get_cpu_gdt_ro(cpu), the cpu-entry-area alias,
++	 * which is PAGE_KERNEL_RO -- and the world switch writes through it.
++	 * arch/x86_64/switch.c clears the TSS busy bit in the entering side's
++	 * live GDT ("andl $0xfffffdff, 4(%rax)") before every ltr, using the
++	 * base it sgdt'd on the way out. Through a read-only mapping that
++	 * store is a page fault inside the crossing, with real IF clear and
++	 * CR3 already switched: triple fault, no bugcheck, nothing to read.
++	 *
++	 * This is the same line, for the same reason, that
++	 * co_colinux_adopt_traps() runs for the boot processor.
++	 */
++	load_direct_gdt(cpu);
++
++	/*
++	 * Exceptions become the kernel's, before this processor runs any
++	 * code that treats faulting as normal -- and everything after this
++	 * line does: identify_secondary_cpu() and the perf cpuhp callbacks
++	 * use rdmsr_safe and the extable, any WARN is a ud2 that expects
++	 * #UD to step over it, and every text_poke_bp() in the machine
++	 * opens an INT3 window this processor can walk into. On the host's
++	 * stub gates each of those is a vector < 32 crossing that stops
++	 * this vCPU's lane dead (arch/x86_64/switch.c) -- a silent mid-task
++	 * freeze the guest only ever sees as an RCU stall. Measured: CPU 1
++	 * died on the rdmsr in perf_msr_probe, which the extable was
++	 * waiting to fix up.
++	 *
++	 * NMI and interrupts 32-255 keep crossing to the host through THIS
++	 * vCPU's own stubs. See co_colinux_ap_adopt_traps().
++	 */
++	co_colinux_ap_adopt_traps();
++
++	fpu__init_cpu();
++
++	/*
++	 * RCU has to be watching this processor before anything that walks an
++	 * RCU-protected structure, and native does it here for that reason
++	 * (start_secondary, immediately after fpu__init_cpu). Deferring it to
++	 * notify_cpu_starting() below leaves identify_secondary_cpu(),
++	 * set_cpu_sibling_map() and calibrate_delay() running in an extended
++	 * quiescent state: a grace period elsewhere can complete underneath a
++	 * live dereference here. notify_cpu_starting() calls this again and
++	 * that is fine -- native calls it twice for the same reason.
++	 */
++	rcutree_report_cpu_starting(cpu);
++
++	/*
++	 * Before anything slow: this processor has no tick device of its own
++	 * yet, so the watchdog has no idea it is alive. Xen touches it here for
++	 * the same reason.
++	 */
++	touch_softlockup_watchdog();
++
++	identify_secondary_cpu(cpu);
++	set_cpu_sibling_map(cpu);
++	calibrate_delay();
++	cpu_data(cpu).loops_per_jiffy = loops_per_jiffy;
++
++	speculative_store_bypass_ht_init();
++
++	notify_cpu_starting(cpu);
++	set_cpu_online(cpu, true);
++	smp_mb();
++
++	pr_info("colinux: CPU %u is up\n", cpu);
++
++	/*
++	 * Virtual, not real: the host owns the hardware flag and keeps it set
++	 * for as long as this processor is executing.
++	 */
++	local_irq_enable();
++
++	/*
++	 * This processor's own tick device (rung S4). Registered here, on
++	 * this processor, in the slot native uses for setup_percpu_clockev:
++	 * the tick core adopts a device only for the CPU registering it.
++	 * Without it this CPU's timer wheel, hrtimers and RCU callbacks are
++	 * never serviced by anyone, and the first boot-critical msleep()
++	 * scheduled here sleeps forever.
++	 */
++	co_colinux_ap_timer_init();
++
++	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
++}
++
++/*
++ * The cooperative stand-in for INIT-SIPI-SIPI.
++ *
++ * The native path reaches do_boot_cpu(), which resets a real physical
++ * processor of the machine this guest is a thread on and points it at a
++ * real-mode trampoline -- it would be trying to boot one of Windows' own CPUs
++ * into Linux. There is no trampoline here and no processor to reset: a vCPU
++ * is a host thread already parked in the driver, waiting to be told where to
++ * begin. So instead of resetting hardware, hand the host a complete initial
++ * state and let it enter the new processor through the world switch, exactly
++ * as it entered the boot processor.
++ *
++ * The state is the same set Xen's cpu_initialize_context() hands its
++ * hypervisor, minus the pieces that describe a machine we do not have:
++ *
++ *   rip	 where to begin -- co_colinux_ap_start below
++ *   rsp	 the idle task's kernel stack, which is what start_secondary
++ *		 would have been given
++ *   cr3	 the kernel's own tables. Not current->mm's: a processor that
++ *		 has not run yet has no user context, and swapper_pg_dir is
++ *		 the root every other one shares its kernel half with.
++ *   gs_base	 the AP's per-CPU offset. The one field that cannot be
++ *		 guessed and cannot be set later: every per-CPU access the new
++ *		 processor makes resolves through it, from its first
++ *		 instruction, including co_colinux_vcpu_id() -- which is how
++ *		 it works out which passage page is its own.
++ *
++ * common_cpu_up() first, and it is not optional: it publishes the idle task
++ * as this CPU's current_task, sets up its IRQ stacks and stack canary, and
++ * calls alternatives_enable_smp(). The new processor reads all of those
++ * before it has run a single instruction of its own.
 + */
 +static int co_colinux_kick_ap(unsigned int cpu, struct task_struct *tidle)
 +{
-+	pr_err("colinux: refusing to start CPU %u -- a cooperative guest's "
-+	       "processors are started by the host, and INIT-SIPI would be "
-+	       "aimed at the host's own\n", cpu);
-+	return -ENOSYS;
++	unsigned long long *params;
++	unsigned char *pp;
++	int rc;
++
++	rc = common_cpu_up(cpu, tidle);
++	if (rc)
++		return rc;
++
++	/*
++	 * Preemption off across filling the parameters and the crossing: they
++	 * live in THIS processor's passage page, and migrating between the two
++	 * would write one processor's request and issue another's.
++	 */
++	preempt_disable();
++	pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
++	if (!pp) {
++		preempt_enable();
++		return -ENODEV;
++	}
++
++	/*
++	 * Interrupts blocked on arrival, as the state block specifies.
++	 *
++	 * Correct by accident on a first bringup because the array is BSS, and
++	 * wrong on every re-online: the slot still holds EFLAGS.IF from this
++	 * CPU's previous life, so cpu_init(), identify_secondary_cpu() and
++	 * notify_cpu_starting() would run with irqs_disabled() reporting false
++	 * while nothing had enabled anything -- which lockdep and every
++	 * local_irq_save/restore balance check asserts on.
++	 */
++	co_colinux_virtual_if[cpu] = 0;
++
++	params = (unsigned long long *)(pp + CO_PP_PARAMS);
++	params[CO_PP_AP_VCPU]	 = cpu;
++	params[CO_PP_AP_RIP]	 = (unsigned long long)(unsigned long)co_colinux_ap_start;
++	params[CO_PP_AP_RSP]	 = (unsigned long long)(unsigned long)task_pt_regs(tidle);
++	params[CO_PP_AP_CR3]	 = __pa_nodebug(init_mm.pgd);
++	params[CO_PP_AP_GS_BASE] = (unsigned long long)per_cpu_offset(cpu);
++
++	co_colinux_switch_op(CO_OPERATION_START_VCPU);
++	preempt_enable();
++
++	pr_info("colinux: asked the host to start CPU %u\n", cpu);
++	return 0;
 +}
++
++/*
++ * The processor list, invented rather than read.
++ *
++ * With the host's MP table left alone (setup.c) nothing enumerates any
++ * processor, so topology_init_possible_cpus() would fabricate a boot APIC and
++ * stop at one. The count belongs to the host anyway -- a vCPU exists where the
++ * host has a thread to run it -- and it arrives as possible_cpus= on the
++ * command line, which topology_apply_cmdline_limits_early() has already turned
++ * into nr_cpu_ids by the time this runs.
++ *
++ * So: register that many, with APIC ids that are simply their CPU numbers.
++ * Nothing reads those ids as hardware -- there is no APIC to address and IPIs
++ * do not go through one -- they exist so the topology bitmaps are populated
++ * and the generic code can be used unmodified. Xen PV fabricates its list the
++ * same way and for the same reason.
++ */
++/* Defined below, installed here -- see the comment on the struct. */
++static struct apic co_colinux_apic;
++
++static void __init co_colinux_smp_config(void)
++{
++	unsigned int i;
++
++	/*
++	 * The inert APIC goes in here, and the placement is measured, not
++	 * chosen.
++	 *
++	 * It has to be installed before anything reads or writes an APIC
++	 * register -- without it, setting smp_found_config below makes
++	 * init_apic_mappings() skip apic_disable(), apic_noop is never
++	 * installed, and the static calls keep pointing at apic_physflat,
++	 * whose accessors touch a fixmap register_lapic_address() never
++	 * mapped. A secondary hit exactly that: #PF in
++	 * default_send_IPI_single_phys.
++	 *
++	 * But installing it from co_colinux_smp_init(), which is where it
++	 * belongs by rights, does not work: that runs near the top of
++	 * setup_arch, before apic_setup_apic_calls() has established the APIC
++	 * static calls, and rewriting call sites that machinery has not
++	 * finished setting up stops the guest a few lines after the early
++	 * console comes up. Measured: kernel #21 hung there.
++	 *
++	 * parse_smp_cfg is late in setup_arch, after the static calls exist,
++	 * still before topology_init_possible_cpus() decides anything, and
++	 * still before any secondary exists to send an IPI.
++	 */
++	apic_install_driver(&co_colinux_apic);
++
++	topology_register_boot_apic(0);
++
++	/*
++	 * From 0, not 1 -- Xen's loop, verbatim, and the one character that
++	 * was rejecting every secondary.
++	 *
++	 * topology_register_boot_apic() calls topo_register_apic() directly
++	 * and so never runs check_for_real_bsp(), leaving real_bsp_apic_id
++	 * unset. Starting at 1 made the FIRST secondary the one to run that
++	 * check: its id is not the boot APIC's, no real BSP can be confirmed,
++	 * and it concludes this is a crash kernel and rejects the processor --
++	 * "Allowing 1 present CPUs" however many were registered.
++	 *
++	 * Registering apic 0 again through the public entry settles it first:
++	 * the ids match, a cooperative guest reports no APICBASE, so the
++	 * enumeration order is trusted and real_bsp_apic_id is set. Every
++	 * secondary after that passes on the early return. Double registration
++	 * of the boot APIC is explicitly supported -- firmware enumeration
++	 * does exactly this on real hardware.
++	 */
++	for (i = 0; i < nr_cpu_ids; i++)
++		topology_register_apic(i, CPU_ACPIID_INVALID, true);
++
++	smp_found_config = 1;
++	pr_info("colinux: %u processor(s), as the host says -- no MP table read\n",
++		nr_cpu_ids);
++}
++
++/*
++ * An inert local APIC, because there is no local APIC.
++ *
++ * This is what the plan specified from the start -- "an inert struct apic
++ * (Xen PV's xen_pv_apic shape), fake topology, and an smp_prepare_cpus
++ * override replace nolapic" -- and skipping it is what produced a long line
++ * of APIC-shaped failures patched one call site at a time.
++ *
++ * The mechanism: setting smp_found_config (co_colinux_smp_config) makes
++ * init_apic_mappings() skip apic_disable(), so apic_noop is never installed
++ * and the static calls keep pointing at apic_physflat. Every apic_read is
++ * then a load from the APIC fixmap, which was never mapped because
++ * register_lapic_address() never ran -- and every send_IPI is a store to it.
++ * A secondary processor reached exactly that and took #PF in
++ * default_send_IPI_single_phys.
++ *
++ * Installing a driver whose accessors touch nothing removes the whole class:
++ * the read patch in parse_topology becomes unnecessary, the fixmap fault
++ * disappears, and send_IPI has somewhere to live -- the shared-memory
++ * doorbell, which is where IPIs belong in a guest whose processors are host
++ * threads.
++ */
++static u32 co_apic_get_id(u32 x)
++{
++	/*
++	 * Ids are CPU numbers here, fabricated by co_colinux_smp_config().
++	 * Nothing addresses them as hardware.
++	 */
++	return x;
++}
++
++static u32 co_apic_read(u32 reg)
++{
++	return 0;
++}
++
++static void co_apic_write(u32 reg, u32 val)
++{
++}
++
++static void co_apic_eoi(void)
++{
++}
++
++static u64 co_apic_icr_read(void)
++{
++	return 0;
++}
++
++static void co_apic_icr_write(u32 low, u32 id)
++{
++}
++
++static int co_apic_probe(void)
++{
++	return co_colinux_guest;
++}
++
++#ifdef CONFIG_SMP
++/*
++ * Every one of these is the shared-memory doorbell: set the vector's bit in
++ * the target's pending set and cross to have the host wake it. There is no
++ * interrupt controller to address, so "send" is a store and a wake.
++ */
++static void co_apic_send_IPI(int cpu, int vector)
++{
++	co_colinux_ipi_send(cpu, vector);
++}
++
++static void co_apic_send_IPI_mask(const struct cpumask *mask, int vector)
++{
++	unsigned int cpu;
++
++	for_each_cpu(cpu, mask)
++		co_colinux_ipi_send(cpu, vector);
++}
++
++static void co_apic_send_IPI_mask_allbutself(const struct cpumask *mask,
++					     int vector)
++{
++	unsigned int cpu, self = smp_processor_id();
++
++	for_each_cpu(cpu, mask)
++		if (cpu != self)
++			co_colinux_ipi_send(cpu, vector);
++}
++
++static void co_apic_send_IPI_allbutself(int vector)
++{
++	co_apic_send_IPI_mask_allbutself(cpu_online_mask, vector);
++}
++
++static void co_apic_send_IPI_all(int vector)
++{
++	co_apic_send_IPI_mask(cpu_online_mask, vector);
++}
++
++static void co_apic_send_IPI_self(int vector)
++{
++	/*
++	 * To itself, and therefore without a crossing: this processor is
++	 * plainly running, so there is nobody to wake. Post it and let the
++	 * next drain pick it up.
++	 */
++	set_bit(vector, co_colinux_ipi_pending[co_colinux_vcpu_id()]);
++}
++#endif
++
++static struct apic co_colinux_apic __ro_after_init = {
++	.name				= "colinux",
++	.probe				= co_apic_probe,
++
++	.disable_esr			= 1,
++
++	.max_apic_id			= UINT_MAX,
++	.get_apic_id			= co_apic_get_id,
++
++	.calc_dest_apicid		= apic_flat_calc_apicid,
++
++#ifdef CONFIG_SMP
++	.send_IPI			= co_apic_send_IPI,
++	.send_IPI_mask			= co_apic_send_IPI_mask,
++	.send_IPI_mask_allbutself	= co_apic_send_IPI_mask_allbutself,
++	.send_IPI_allbutself		= co_apic_send_IPI_allbutself,
++	.send_IPI_all			= co_apic_send_IPI_all,
++	.send_IPI_self			= co_apic_send_IPI_self,
++#endif
++	.read				= co_apic_read,
++	.write				= co_apic_write,
++	.eoi				= co_apic_eoi,
++
++	.icr_read			= co_apic_icr_read,
++	.icr_write			= co_apic_icr_write,
++};
 +
 +void __init co_colinux_smp_init(void)
 +{
++
 +	smp_ops.smp_prepare_cpus = co_colinux_smp_prepare_cpus;
 +	smp_ops.kick_ap_alive    = co_colinux_kick_ap;
++
++	/*
++	 * native_smp_cpus_done() runs nmi_selftest() and cache_aps_init(),
++	 * which are an NMI IPI and a stop_machine across every processor.
++	 * There is no NMI to send here and no MTRR/PAT state of our own to
++	 * synchronise -- the host owns both -- so the native version can only
++	 * wedge the end of bring-up.
++	 */
++	smp_ops.smp_cpus_done     = co_colinux_smp_cpus_done;
++
++#ifdef CONFIG_SMP
++	smp_ops.smp_send_reschedule       = co_colinux_send_reschedule;
++	smp_ops.send_call_func_ipi        = co_colinux_send_call_func_ipi;
++	smp_ops.send_call_func_single_ipi = co_colinux_send_call_func_single_ipi;
++	smp_ops.stop_other_cpus           = co_colinux_stop_other_cpus;
++	smp_ops.cpu_disable               = co_colinux_cpu_disable;
++	smp_ops.play_dead                 = co_colinux_play_dead;
++	/*
++	 * cpu_die and cleanup_dead_cpu stay NULL: both are optional and both
++	 * describe hardware teardown that does not exist here.
++	 */
++#endif
++
++	/*
++	 * Otherwise the boot processor spins in bare cpu_relax() waiting for a
++	 * secondary to come alive and never hands the processor back to the
++	 * host. A cooperative guest has to yield; Xen sets this hook to a
++	 * hypervisor yield for the same reason.
++	 */
++	smp_ops.poll_sync_state  = co_colinux_yield;
++
++	x86_init.mpparse.parse_smp_cfg = co_colinux_smp_config;
 +}
 +
  void __init smp_prepare_cpus_common(void)
  {
  	unsigned int cpu, node;
-diff -urN a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
 --- a/arch/x86/kernel/traps.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/traps.c	2026-08-07 15:41:18.533206800 +1000
 @@ -404,6 +404,21 @@
@@ -2040,7 +3514,7 @@ diff -urN a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
 +	if (co_colinux_guest)
 +		co_colinux_adopt_traps();
  }
-diff -urN a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
 --- a/arch/x86/mm/ioremap.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/mm/ioremap.c	2026-08-01 07:24:53.274427400 +1000
 @@ -31,6 +31,8 @@
@@ -2071,7 +3545,7 @@ diff -urN a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
  	/* Don't allow wraparound or zero size */
  	last_addr = phys_addr + size - 1;
  	if (!size || last_addr < phys_addr)
-diff -urN a/arch/x86/mm/pat/memtype.c b/arch/x86/mm/pat/memtype.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/mm/pat/memtype.c b/arch/x86/mm/pat/memtype.c
 --- a/arch/x86/mm/pat/memtype.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/mm/pat/memtype.c	2026-08-01 07:25:11.393111900 +1000
 @@ -225,6 +225,10 @@
@@ -2101,7 +3575,7 @@ diff -urN a/arch/x86/mm/pat/memtype.c b/arch/x86/mm/pat/memtype.c
  	if (!IS_ENABLED(CONFIG_X86_PAT))
  		pr_info_once("x86/PAT: PAT support disabled because CONFIG_X86_PAT is disabled in the kernel.\n");
  
-diff -urN a/arch/x86/pci/init.c b/arch/x86/pci/init.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/pci/init.c b/arch/x86/pci/init.c
 --- a/arch/x86/pci/init.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/pci/init.c	2026-08-01 07:25:22.983910100 +1000
 @@ -5,12 +5,24 @@
@@ -2129,7 +3603,7 @@ diff -urN a/arch/x86/pci/init.c b/arch/x86/pci/init.c
  	type = pci_direct_probe();
  
  	if (!(pci_probe & PCI_PROBE_NOEARLY))
-diff -urN a/arch/x86/pci/legacy.c b/arch/x86/pci/legacy.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/pci/legacy.c b/arch/x86/pci/legacy.c
 --- a/arch/x86/pci/legacy.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/pci/legacy.c	2026-08-01 07:25:23.057908800 +1000
 @@ -8,6 +8,8 @@
@@ -2151,10 +3625,10 @@ diff -urN a/arch/x86/pci/legacy.c b/arch/x86/pci/legacy.c
  	/*
  	 * The init function returns an non zero value when
  	 * pci_legacy_init should be invoked.
-diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/block/cobd.c b/drivers/block/cobd.c
 --- a/drivers/block/cobd.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/block/cobd.c	2026-08-07 15:43:35.907590000 +1000
-@@ -0,0 +1,587 @@
++++ b/drivers/block/cobd.c	2026-08-08 02:19:18.655920500 +1000
+@@ -0,0 +1,616 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * cobd -- the cooperative block device.
@@ -2293,26 +3767,58 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +void co_cobd_drain_completions(void)
 +{
 +	struct co_cobd_io *io = &co_colinux_cobd_io;
-+	__u32 head = io->comp_head;
-+	__u32 tail = io->comp_tail;
-+
-+	if (head == tail)
-+		return;
 +
 +	/*
-+	 * A gap wider than the ring, or a nonsense unit, means the producer and
-+	 * consumer have lost sync -- a bug, not weather. Resync rather than walk
-+	 * garbage, matching conet's stance.
++	 * Every processor reaps, and each slot is claimed by exactly one of
++	 * them.
++	 *
++	 * This used to read comp_tail, walk to comp_head, and write the tail
++	 * back at the end -- a single-consumer loop, which is what it was when
++	 * the guest had one processor. With two, both reach a drain boundary
++	 * at once (the tick, the idle crossing, and every return to userspace
++	 * are all drains) and both walk the SAME slots: two calls to
++	 * blk_mq_end_request() for one request, the second landing in
++	 * blk_update_request on a request that has already been ended and
++	 * recycled. Measured, in userspace, seconds after /sbin/init started:
++	 *
++	 *   blk_update_request <- blk_mq_end_request
++	 *     <- co_cobd_drain_completions <- co_colinux_drain_time
++	 *     <- irqentry_exit <- asm_exc_page_fault
++	 *
++	 * blk_mq_request_started() was meant to be the guard, and cannot be:
++	 * both consumers test it before either ends the request.
++	 *
++	 * The answer is not to give the ring back to one processor. Two cores
++	 * are two cores; the ring just has to be claimed rather than walked.
++	 * Each consumer takes ONE index with a cmpxchg and owns that slot
++	 * outright, so both drain at the same time on different entries and
++	 * neither can see the other's. Contention costs a retry, not a wait.
 +	 */
-+	if ((__u32)(head - tail) > CO_COBD_COMP_SLOTS) {
-+		io->comp_tail = head;
-+		return;
-+	}
-+
-+	while (tail != head) {
++	for (;;) {
 +		struct co_cobd_comp *c;
 +		struct cobd_dev *dev;
 +		struct request *rq;
++		__u32 tail = READ_ONCE(io->comp_tail);
++		__u32 head = READ_ONCE(io->comp_head);
++
++		if (tail == head)
++			return;
++
++		/*
++		 * A gap wider than the ring, or a nonsense unit, means the
++		 * producer and consumer have lost sync -- a bug, not weather.
++		 * Resync rather than walk garbage, matching conet's stance.
++		 * Claimed the same way, so a concurrent reaper cannot resync
++		 * on top of a slot this one is holding.
++		 */
++		if ((__u32)(head - tail) > CO_COBD_COMP_SLOTS) {
++			cmpxchg(&io->comp_tail, tail, head);
++			continue;
++		}
++
++		/* Claim exactly this slot, or lose the race and look again. */
++		if (cmpxchg(&io->comp_tail, tail, tail + 1) != tail)
++			continue;
 +
 +		smp_rmb();		/* pairs with the host's store order */
 +		c = &io->comp[tail & (CO_COBD_COMP_SLOTS - 1)];
@@ -2327,10 +3833,7 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +							  : BLK_STS_OK);
 +			}
 +		}
-+		tail++;
 +	}
-+
-+	io->comp_tail = tail;		/* x86 store order: after the reads above */
 +}
 +EXPORT_SYMBOL(co_cobd_drain_completions);
 +
@@ -2742,7 +4245,7 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 + * initialises later.
 + */
 +device_initcall(cobd_init);
-diff -urN a/drivers/block/Makefile b/drivers/block/Makefile
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/block/Makefile b/drivers/block/Makefile
 --- a/drivers/block/Makefile	2026-07-25 00:21:27.000000000 +1000
 +++ b/drivers/block/Makefile	2026-08-01 09:34:31.955400800 +1000
 @@ -20,6 +20,9 @@
@@ -2755,7 +4258,7 @@ diff -urN a/drivers/block/Makefile b/drivers/block/Makefile
  obj-$(CONFIG_SUNVDC)		+= sunvdc.o
  
  obj-$(CONFIG_BLK_DEV_NBD)	+= nbd.o
-diff -urN a/drivers/net/conet_colinux.c b/drivers/net/conet_colinux.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/net/conet_colinux.c b/drivers/net/conet_colinux.c
 --- a/drivers/net/conet_colinux.c	1970-01-01 10:00:00.000000000 +1000
 +++ b/drivers/net/conet_colinux.c	2026-08-02 17:08:57.432206200 +1000
 @@ -0,0 +1,289 @@
@@ -3048,7 +4551,7 @@ diff -urN a/drivers/net/conet_colinux.c b/drivers/net/conet_colinux.c
 +	return 0;
 +}
 +device_initcall(co_net_init);
-diff -urN a/drivers/net/Makefile b/drivers/net/Makefile
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/net/Makefile b/drivers/net/Makefile
 --- a/drivers/net/Makefile	2026-07-25 00:21:27.000000000 +1000
 +++ b/drivers/net/Makefile	2026-08-01 19:11:02.915838100 +1000
 @@ -21,6 +21,9 @@
@@ -3061,7 +4564,7 @@ diff -urN a/drivers/net/Makefile b/drivers/net/Makefile
  obj-$(CONFIG_NETDEV_LEGACY_INIT) += Space.o
  obj-$(CONFIG_NETCONSOLE) += netconsole.o
  obj-$(CONFIG_NETKIT) += netkit.o
-diff -urN a/drivers/tty/hvc/hvc_colinux.c b/drivers/tty/hvc/hvc_colinux.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/tty/hvc/hvc_colinux.c b/drivers/tty/hvc/hvc_colinux.c
 --- a/drivers/tty/hvc/hvc_colinux.c	1970-01-01 10:00:00.000000000 +1000
 +++ b/drivers/tty/hvc/hvc_colinux.c	2026-08-01 11:55:42.897917800 +1000
 @@ -0,0 +1,141 @@
@@ -3206,7 +4709,7 @@ diff -urN a/drivers/tty/hvc/hvc_colinux.c b/drivers/tty/hvc/hvc_colinux.c
 +	return 0;
 +}
 +device_initcall(hvc_co_init);
-diff -urN a/drivers/tty/hvc/Makefile b/drivers/tty/hvc/Makefile
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/tty/hvc/Makefile b/drivers/tty/hvc/Makefile
 --- a/drivers/tty/hvc/Makefile	2026-07-25 00:21:27.000000000 +1000
 +++ b/drivers/tty/hvc/Makefile	2026-08-01 11:56:01.050604000 +1000
 @@ -5,6 +5,7 @@
@@ -3217,7 +4720,7 @@ diff -urN a/drivers/tty/hvc/Makefile b/drivers/tty/hvc/Makefile
  obj-$(CONFIG_HVC_IRQ)		+= hvc_irq.o
  obj-$(CONFIG_HVC_XEN)		+= hvc_xen.o
  obj-$(CONFIG_HVC_IUCV)		+= hvc_iucv.o
-diff -urN a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
 --- a/drivers/virtio/Kconfig	2026-07-25 00:21:27.000000000 +1000
 +++ b/drivers/virtio/Kconfig	2026-08-04 16:41:50.336794400 +1000
 @@ -150,6 +150,19 @@
@@ -3240,7 +4743,7 @@ diff -urN a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
  config VIRTIO_MMIO
  	tristate "Platform bus driver for memory mapped virtio devices"
  	depends on HAS_IOMEM && HAS_DMA
-diff -urN a/drivers/virtio/Makefile b/drivers/virtio/Makefile
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/virtio/Makefile b/drivers/virtio/Makefile
 --- a/drivers/virtio/Makefile	2026-07-25 00:21:27.000000000 +1000
 +++ b/drivers/virtio/Makefile	2026-08-04 16:41:50.336794400 +1000
 @@ -4,6 +4,7 @@
@@ -3251,7 +4754,7 @@ diff -urN a/drivers/virtio/Makefile b/drivers/virtio/Makefile
  obj-$(CONFIG_VIRTIO_PCI) += virtio_pci.o
  virtio_pci-y := virtio_pci_modern.o virtio_pci_common.o
  virtio_pci-$(CONFIG_VIRTIO_PCI_LEGACY) += virtio_pci_legacy.o
-diff -urN a/drivers/virtio/virtio_colinux.c b/drivers/virtio/virtio_colinux.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/virtio/virtio_colinux.c b/drivers/virtio/virtio_colinux.c
 --- a/drivers/virtio/virtio_colinux.c	1970-01-01 10:00:00.000000000 +1000
 +++ b/drivers/virtio/virtio_colinux.c	2026-08-05 18:55:08.343734600 +1000
 @@ -0,0 +1,604 @@
@@ -3859,10 +5362,10 @@ diff -urN a/drivers/virtio/virtio_colinux.c b/drivers/virtio/virtio_colinux.c
 +	BUILD_BUG_ON(offsetof(struct co_vgpu_io, reaped)	 != 108);
 +	BUILD_BUG_ON(sizeof(struct co_vgpu_io)			 != 120);
 +}
-diff -urN a/include/linux/console.h b/include/linux/console.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/include/linux/console.h b/include/linux/console.h
 --- a/include/linux/console.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/include/linux/console.h	2026-08-07 16:33:16.592513000 +1000
-@@ -741,4 +741,44 @@
++++ b/include/linux/console.h	2026-08-08 01:23:39.665879200 +1000
+@@ -741,4 +741,50 @@
  void dummycon_register_output_notifier(struct notifier_block *nb);
  void dummycon_unregister_output_notifier(struct notifier_block *nb);
  
@@ -3885,6 +5388,9 @@ diff -urN a/include/linux/console.h b/include/linux/console.h
 +#ifdef CONFIG_SMP
 +/* install the cooperative smp_ops -- see smpboot.c */
 +void co_colinux_smp_init(void);
++void co_colinux_ap_timer_init(void);
++/* the world switch, out of line, for smpboot.c's START_VCPU */
++void co_colinux_switch_op(unsigned long long operation);
 +#endif
 +#else
 +static inline void co_colinux_console_init(void) { }
@@ -3903,19 +5409,23 @@ diff -urN a/include/linux/console.h b/include/linux/console.h
 +#ifdef CONFIG_SMP
 +/* install the cooperative smp_ops -- see smpboot.c */
 +void co_colinux_smp_init(void);
++void co_colinux_ap_timer_init(void);
++/* the world switch, out of line, for smpboot.c's START_VCPU */
++void co_colinux_switch_op(unsigned long long operation);
 +#endif
 +#endif
 +
  #endif /* _LINUX_CONSOLE_H */
-diff -urN a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
 --- a/include/linux/irq-entry-common.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/include/linux/irq-entry-common.h	2026-08-07 15:41:59.526426000 +1000
-@@ -194,10 +194,54 @@
++++ b/include/linux/irq-entry-common.h	2026-08-08 00:41:02.885967800 +1000
+@@ -194,10 +194,64 @@
  static __always_inline void __exit_to_user_mode_prepare(struct pt_regs *regs,
  							const unsigned long work_mask)
  {
 +	extern int co_colinux_guest;
 +	extern void co_colinux_drain_time(void);
++	extern void co_colinux_ipi_drain(void);
  	unsigned long ti_work;
  
  	lockdep_assert_irqs_disabled();
@@ -3959,13 +5469,22 @@ diff -urN a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
 +	 * an injected interrupt frame rather than transparently -- the COPIC the
 +	 * port's own notes describe as future work.
 +	 */
-+	if (co_colinux_guest)
++	/*
++	 * Posted vectors as well as time, and for the same reason: this is a
++	 * boundary with interrupts disabled and no locks held, which is the
++	 * only kind of place a cross-processor call may be run. A task that
++	 * spends its life in syscalls would otherwise never notice one until
++	 * its processor went idle.
++	 */
++	if (co_colinux_guest) {
++		co_colinux_ipi_drain();
 +		co_colinux_drain_time();
++	}
 +
  	/* Flush pending rcuog wakeup before the last need_resched() check */
  	tick_nohz_user_enter_prepare();
  
-@@ -266,6 +310,9 @@
+@@ -266,6 +320,9 @@
   */
  static __always_inline void exit_to_user_mode(void)
  {
@@ -3975,7 +5494,7 @@ diff -urN a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
  	instrumentation_begin();
  	unwind_reset_info();
  	trace_hardirqs_on_prepare();
-@@ -275,6 +322,27 @@
+@@ -275,6 +332,27 @@
  	user_enter_irqoff();
  	arch_exit_to_user_mode();
  	lockdep_hardirqs_on(CALLER_ADDR0);
@@ -4003,7 +5522,7 @@ diff -urN a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
  }
  
  /**
-@@ -338,6 +406,18 @@
+@@ -338,6 +416,18 @@
  		bool	exit_rcu;
  		bool	lockdep;
  	};
@@ -4022,7 +5541,7 @@ diff -urN a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
  } irqentry_state_t;
  #endif
  
-diff -urN a/kernel/entry/common.c b/kernel/entry/common.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/kernel/entry/common.c b/kernel/entry/common.c
 --- a/kernel/entry/common.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/kernel/entry/common.c	2026-08-07 15:41:45.036702000 +1000
 @@ -103,18 +103,79 @@
@@ -4141,7 +5660,40 @@ diff -urN a/kernel/entry/common.c b/kernel/entry/common.c
  }
  
  irqentry_state_t noinstr irqentry_nmi_enter(struct pt_regs *regs)
-diff -urN a/kernel/trace/trace.c b/kernel/trace/trace.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/kernel/smp.c b/kernel/smp.c
+--- a/kernel/smp.c	2026-07-25 00:21:27.000000000 +1000
++++ b/kernel/smp.c	2026-08-08 01:18:46.042476900 +1000
+@@ -348,6 +348,29 @@
+ 
+ static __always_inline void csd_lock_wait(call_single_data_t *csd)
+ {
++	/*
++	 * Cooperative guest: this wait is bounded on real hardware because
++	 * the spinner has IF=1 and the incoming CALL_FUNCTION IPI preempts
++	 * the spin. Here, posted vectors are serviced only at cooperative
++	 * boundaries -- the idle crossing and the exit-to-user drain --
++	 * and this spin reaches neither. Two processors cross-calling each
++	 * other (a text_poke_sync against a TLB shootdown is enough) would
++	 * starve forever: no fault, no tick, no watchdog, nothing. So poll
++	 * this CPU's own pending set while spinning -- the exact work a
++	 * hardware IPI would have preempted us for, including the unlock of
++	 * the csd the other processor is spinning on.
++	 */
++	extern int co_colinux_guest;
++
++	if (co_colinux_guest) {
++		while (READ_ONCE(csd->node.u_flags) & CSD_FLAG_LOCK) {
++			co_colinux_ipi_poll();
++			cpu_relax();
++		}
++		smp_acquire__after_ctrl_dep();
++		return;
++	}
++
+ 	smp_cond_load_acquire(&csd->node.u_flags, !(VAL & CSD_FLAG_LOCK));
+ }
+ #endif
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/kernel/trace/trace.c b/kernel/trace/trace.c
 --- a/kernel/trace/trace.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/kernel/trace/trace.c	2026-08-01 01:10:24.598058200 +1000
 @@ -15,6 +15,7 @@

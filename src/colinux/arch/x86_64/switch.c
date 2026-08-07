@@ -59,6 +59,24 @@
 #define CO_OPERATION_YIELD		16
 #define CO_OPERATION_BLOCK_PROBE	17
 #define CO_OPERATION_BLOCK_IO		18
+/*
+ * Start a secondary processor. The guest fills params[74..78] with the state
+ * the new processor is to begin in and crosses; the host hands that to the
+ * thread already waiting for it. The cooperative stand-in for INIT-SIPI.
+ */
+#define CO_OPERATION_START_VCPU		19
+/*
+ * Wake a processor that has a message waiting. The guest has already posted
+ * the vector into that processor's pending set; this only rings the doorbell,
+ * because a target sitting in the host's idle wait has nothing to re-enter it
+ * and a message nobody is told about is a hang. params[74] names the target.
+ */
+#define CO_OPERATION_KICK_VCPU		20
+#define CO_PP_AP_VCPU			74
+#define CO_PP_AP_RIP			75
+#define CO_PP_AP_RSP			76
+#define CO_PP_AP_CR3			77
+#define CO_PP_AP_GS_BASE		78
 
 /*
  * Position independent by construction: no RIP-relative operand, no absolute
@@ -1710,8 +1728,35 @@ static void co_build_guest_idt(struct co_x86_64_gate* idt,
  *
  * Returns the page with *out partly filled in, or NULL.
  */
+/*
+ * reuse: an already-allocated passage page to rebuild in place, or NULL to
+ * allocate one.
+ *
+ * It exists because everything below captures state that belongs to the
+ * processor this runs on -- co_arch_save_state() reads GDTR, IDTR, TR and the
+ * MSRs of the current core, and the guest state is derived from that copy. A
+ * page built on one core and entered from another restores the first core's
+ * descriptor tables onto the second, which is not a fault: it is a reset with
+ * nothing written, or a core that stops answering the clock.
+ *
+ * A secondary's page has to be ALLOCATED early, before the guest adopts its
+ * tables, so the boot-time graft covers it -- and INITIALISED late, on the
+ * thread that will actually enter it. Those are different moments, hence the
+ * split.
+ */
+static co_arch_passage_page_t* co_setup_guest_page_on(co_arch_switch_test_t* out,
+						      unsigned long entry_offset,
+						      co_arch_passage_page_t* reuse);
+
 static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 						   unsigned long entry_offset)
+{
+	return co_setup_guest_page_on(out, entry_offset, NULL);
+}
+
+static co_arch_passage_page_t* co_setup_guest_page_on(co_arch_switch_test_t* out,
+						      unsigned long entry_offset,
+						      co_arch_passage_page_t* reuse)
 {
 	co_arch_passage_page_t* pp;
 	unsigned long long va, guest_cr3;
@@ -1731,7 +1776,7 @@ static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 	if (blob_size > sizeof(pp->code))
 		return NULL;
 
-	pp = co_os_alloc_exec_pages(pages);
+	pp = reuse ? reuse : co_os_alloc_exec_pages(pages);
 	if (pp == NULL)
 		return NULL;
 
@@ -1739,7 +1784,8 @@ static co_arch_passage_page_t* co_setup_guest_page(co_arch_switch_test_t* out,
 
 	va = (unsigned long long)(size_t)pp;
 	if (!co_build_guest_tables(pp, va)) {
-		co_os_free_exec_pages(pp, pages);
+		if (!reuse)
+			co_os_free_exec_pages(pp, pages);
 		return NULL;
 	}
 	guest_cr3 = co_os_virt_to_phys(&pp->guest_temp.pml4);
@@ -3244,6 +3290,34 @@ extern char co_host_interrupt_replay_stubs;
  * already using and has room for -- an interrupt arriving one instruction later
  * would have consumed several times as much.
  */
+/*
+ * Injection is held off by name, and this restores the status quo rather than
+ * deciding anything new.
+ *
+ * The virtual-IF gate below reads co_colinux_virtual_if, a kernel .bss address
+ * -- 0xffffffff83889ee0. mark_rodata_ro() splits text and rodata to 4 KB and
+ * stops at __end_rodata_hpage_align, 0xffffffff82e00000, so .bss is still
+ * covered by level2_kernel_pgt's original 2 MB PSE entries. Until
+ * co_arch_guest_lookup_root learned to add the offset within a large page, that
+ * read did not return the flag at all: it returned the eight bytes of
+ * .call_sites at 0xffffffff83800ee0, which are 0xfea2920cfea29147, and bit 9 of
+ * that is clear. The gate therefore answered "the guest has interrupts off" on
+ * every single call, and this function has never once injected a tick.
+ *
+ * Correcting the walk turned it on for the first time, in the middle of an
+ * unrelated bring-up, and the machine reset instantly with no bugcheck after
+ * 8682 switches -- which is what synthesising an interrupt frame onto a live
+ * guest stack looks like when the code doing it has never executed. The comment
+ * on the function records the same sequence happening once already, one layer
+ * down: "the readiness gate was an accident of a bug".
+ *
+ * So injection gets a rung of its own, with its own hardware verification,
+ * instead of arriving as a side effect of a page-table fix. Every gate above
+ * stays live, so out->ticks_injected now measures how many ticks WOULD be
+ * delivered per run without touching a byte of guest memory.
+ */
+static const bool_t co_tick_injection_enabled = PFALSE;
+
 static void co_arch_inject_tick(co_manager_t* manager,
 				co_arch_passage_page_t* pp,
 				co_arch_boot_t* in,
@@ -3367,6 +3441,13 @@ static void co_arch_inject_tick(co_manager_t* manager,
 	 */
 	if ((f[1] & 3) != 3)			/* saved CS: not ring 3 */
 		return;
+
+	/* Counted, not delivered. See co_tick_injection_enabled above. */
+	if (!co_tick_injection_enabled) {
+		*last = now;
+		out->ticks_injected++;
+		return;
+	}
 
 	newsp = (frame_va - 0x40) & ~0xfULL;
 
@@ -3513,6 +3594,32 @@ typedef struct {
 	 */
 	unsigned long long	guest_cr3;
 	/*
+	 * The initial state a secondary is started with, handed over by the
+	 * guest through CO_OPERATION_START_VCPU. This is the cooperative
+	 * equivalent of INIT-SIPI: instead of a processor being reset and
+	 * fetching from a trampoline, the host is told where to begin, on what
+	 * stack, in which address space and with which per-CPU base -- the
+	 * same set Xen's cpu_initialize_context() hands its hypervisor.
+	 *
+	 * start_pending is written by vCPU 0 inside its crossing loop and read
+	 * by the waiting AP thread, with a doorbell between them, so it needs
+	 * no lock: one writer, one reader, and the reader only ever waits.
+	 */
+	volatile int		start_pending;
+	unsigned long long	start_rip;
+	unsigned long long	start_rsp;
+	unsigned long long	start_cr3;
+	unsigned long long	start_gs_base;
+	/*
+	 * Where the guest's co_colinux_passage_page[] array begins, published
+	 * by vCPU 0. A secondary has to be able to find the crossing before it
+	 * can make one, and it finds it by reading slot N of that array -- so
+	 * the host writes its own passage page into slot N before letting it
+	 * run. There is no other channel: the AP's first instruction is guest
+	 * code, and by then the answer has to already be in memory.
+	 */
+	unsigned long long	passage_symbol_va;
+	/*
 	 * Every distinct host vector this vCPU has replayed, once. Per-vCPU
 	 * rather than shared because the question it answers -- was this
 	 * processor handed something the host never raises -- is asked of a
@@ -3530,6 +3637,54 @@ static co_vcpu_t	   co_vcpu[CO_MAX_VCPUS];
  */
 static volatile int	   vcpu_abort_all;
 
+/*
+ * Secondary passage pages, allocated and mapped before the guest's tables are
+ * adopted so the graft covers them.
+ *
+ * Allocating one when the secondary starts does not work, and the reason is
+ * the graft: co_kload_adopt_kernel_tables copies kload_space's TOP-LEVEL
+ * entries into the kernel's table, once. A passage page mapped into
+ * kload_space afterwards is reachable from the kernel's root only if it
+ * happens to fall in a slot that graft already copied -- and nonpaged pool is
+ * under no obligation to stay in one 512 GB slot. When it did not, the
+ * secondary came up, printed that it was up, and page faulted on the first
+ * instruction that touched its own passage page, in co_cpu_idle.
+ *
+ * The alternative -- writing the missing entry into the live table -- resets
+ * the machine with no bugcheck, because a processor is walking that structure
+ * at the time. So the pages are made before the guest owns anything, which is
+ * the one moment when adding to kload_space is free.
+ */
+static co_arch_passage_page_t* ap_passage[CO_MAX_VCPUS];
+
+/*
+ * The start request, kept outside co_vcpu[].
+ *
+ * A secondary's thread now polls -- it claims a slot, asks whether the guest
+ * has requested this processor, and releases the slot again if not. Claiming
+ * clears the slot, so a request that arrived between two polls would be wiped
+ * by the very next one. The request has to outlive the slot, so it lives here:
+ * written once by the boot processor inside its crossing loop, read by the
+ * thread that will become that processor.
+ */
+/*
+ * The two cobd settings a secondary needs, copied out of the boot block.
+ *
+ * Block requests come from whichever processor the issuing task happens to be
+ * on, so a secondary has to answer BLOCK_IO and BLOCK_PROBE exactly as the
+ * boot loop does -- but co_arch_boot_t belongs to the boot call and the lane
+ * never sees it. These two fields are written once, before any secondary can
+ * run, and only read afterwards.
+ */
+static bool_t		  cobd_async_enabled;
+static unsigned long long cobd_io_va_shared;
+
+static volatile int	  ap_start_pending[CO_MAX_VCPUS];
+static unsigned long long ap_start_rip[CO_MAX_VCPUS];
+static unsigned long long ap_start_rsp[CO_MAX_VCPUS];
+static unsigned long long ap_start_cr3[CO_MAX_VCPUS];
+static unsigned long long ap_start_gs[CO_MAX_VCPUS];
+
 static co_vcpu_t* co_vcpu_claim(int index)
 {
 	co_vcpu_t* vcpu;
@@ -3543,11 +3698,21 @@ static co_vcpu_t* co_vcpu_claim(int index)
 	vcpu->host_cpu = co_os_current_cpu();
 
 	/*
-	 * The first vCPU in clears a stale abort. A vCPU joining a run that
-	 * is already going must not, or it would revive a guest that KSTOP is
-	 * in the middle of ending.
+	 * The BOOT processor clears a stale abort -- not "whoever is first".
+	 *
+	 * "First in" was written when only the boot loop ever claimed a slot.
+	 * A secondary's thread now starts BEFORE the guest boots, so it became
+	 * first, and by the time vCPU 0 claimed slot 0 co_arch_boot_running()
+	 * was already true -- so the boot processor never cleared the abort
+	 * left by the previous run, and died partway through booting with the
+	 * secondary still parked and no guest instruction executed. That is
+	 * the failure that was mistaken for "a thread waiting inside the
+	 * driver destabilises the boot processor".
+	 *
+	 * A secondary must still never clear it: it would revive a guest that
+	 * KSTOP is in the middle of ending.
 	 */
-	if (!co_arch_boot_running())
+	if (index == 0)
 		vcpu_abort_all = 0;
 
 	vcpu->active = 1;
@@ -3651,7 +3816,12 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	out->supported = PTRUE;
 	out->lane      = lane;
 
-	if (iterations < 1 || iterations > 100000000LL)
+	/*
+	 * Zero is not a small number here, it is a different mode: wait for
+	 * the guest to start this processor. Only the trivial loop's count
+	 * gets clamped.
+	 */
+	if (iterations != 0 && (iterations < 1 || iterations > 100000000LL))
 		iterations = 1000000;
 	out->iterations = iterations;
 
@@ -3668,11 +3838,52 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		return CO_RC(INVALID_PARAMETER);
 
 	co_memset(&setup, 0, sizeof(setup));
-	pp = co_setup_guest_page(&setup,
-		(unsigned long)(&co_boot_shim - &co_switch_full));
-	if (pp == NULL) {
-		co_vcpu_release(vcpu);
-		return CO_RC(ERROR);
+
+	/*
+	 * A real secondary uses the passage page the boot path made for it
+	 * before the guest adopted its tables -- that is what makes it
+	 * reachable from the guest's own root. Only the trivial test loop,
+	 * which runs in a space of its own, allocates one here.
+	 */
+	if (join_guest && iterations == 0) {
+		/*
+		 * The page was allocated and mapped at boot so the graft covers
+		 * it, but it must be BUILT here, on this thread, because
+		 * everything co_setup_guest_page_on() captures belongs to the
+		 * processor it runs on. Built on the boot core and entered from
+		 * this one, it restores the boot core's GDTR, IDTR and TR onto
+		 * this core when the guest hands back -- which is not a fault
+		 * that can be reported, it is a reset, or a core that stops
+		 * taking the clock. That is the pinning rule this port already
+		 * has, applied to a second processor for the first time.
+		 */
+		if (ap_passage[lane] == NULL) {
+			co_debug_error("vcpu %d: no passage page was made for it at "
+				       "boot -- refusing to start it", lane);
+			out->never_started = PTRUE;
+			co_vcpu_release(vcpu);
+			return CO_RC(ERROR);
+		}
+		/*
+		 * Taken as-is for now; BUILT after the wait, not before.
+		 *
+		 * Building it here means running co_arch_save_state() and
+		 * rewriting fifteen pages on this core while the boot processor
+		 * is crossing on another -- work this thread has no reason to
+		 * do until it is actually asked to start. Whatever it disturbs,
+		 * it disturbs for the whole length of the wait, which can be
+		 * the entire boot. Doing it after the request keeps this thread
+		 * asleep until the guest wants it, and keeps the build on the
+		 * core that will enter it.
+		 */
+		pp = ap_passage[lane];
+	} else {
+		pp = co_setup_guest_page(&setup,
+			(unsigned long)(&co_boot_shim - &co_switch_full));
+		if (pp == NULL) {
+			co_vcpu_release(vcpu);
+			return CO_RC(ERROR);
+		}
 	}
 	vcpu->pp = pp;
 
@@ -3695,7 +3906,23 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	 * below is what catches that rather than the guest discovering it by
 	 * failing to fetch its first instruction.
 	 */
-	if (join_guest) {
+	/*
+	 * Map before waiting to be started, never after.
+	 *
+	 * Mapping populates kload_space, whose top-level entries the boot path
+	 * grafted into the kernel's table -- so it touches structures the guest
+	 * walks. Doing it here, before this thread parks, means it happens
+	 * while the guest is idling in its own steady state. Doing it after the
+	 * wait means doing it at the instant START_VCPU arrives, which is
+	 * inside smp_init(), with the boot processor mid-crossing. That
+	 * reordering is what turned a working bring-up into a triple fault:
+	 * the last build that reached "CPU 1 is up" mapped first and waited
+	 * second.
+	 *
+	 * A real secondary skips this entirely -- its page was mapped at boot,
+	 * before the graft, so nothing needs touching now at all.
+	 */
+	if (join_guest && iterations != 0) {
 		co_arch_guest_space_t* space = co_kload_space();
 		unsigned long long guest_cr3 = co_vcpu[0].guest_cr3;
 		int page;
@@ -3705,7 +3932,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 				       "(space %p, vcpu0 active %d, cr3 0x%llx)",
 				       lane, (void*)space, co_vcpu[0].active,
 				       guest_cr3);
-			co_os_free_exec_pages(pp, pages);
+			if (pp != ap_passage[lane]) co_os_free_exec_pages(pp, pages);
 			co_vcpu_release(vcpu);
 			return CO_RC(ERROR);
 		}
@@ -3719,7 +3946,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 						     _KERNPG_TABLE))) {
 				co_debug_error("vcpu %d: could not map its passage "
 					       "page into the guest's space", lane);
-				co_os_free_exec_pages(pp, pages);
+				if (pp != ap_passage[lane]) co_os_free_exec_pages(pp, pages);
 				co_vcpu_release(vcpu);
 				return CO_RC(ERROR);
 			}
@@ -3738,12 +3965,266 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	 */
 	loop_va = (unsigned long long)(size_t)pp->code
 		+ (unsigned long)(&co_switch_guest_loop - &co_switch_full);
-	pp->params[20] = loop_va;
+	/*
+	 * The trivial lane's scaffolding, and only for the trivial lane.
+	 *
+	 * params[20] here is co_switch_guest_loop -- the test loop's entry --
+	 * and the four sentinels exist to prove one lane's MSRs never appear in
+	 * another's. A real secondary overwrites all six from ap_start_* once
+	 * the request is seen, so for it these are not merely useless: they run
+	 * on EVERY poll, and a real secondary's page is ap_passage[lane], which
+	 * was mapped into the guest's address space at boot and is walked by the
+	 * live guest. That is a write into a running machine's memory, once per
+	 * poll, for the whole of its boot, to install values that are wrong and
+	 * are then discarded.
+	 *
+	 * iterations == 0 is what distinguishes the two, exactly as it does at
+	 * the passage-page choice above and the wait below.
+	 */
+	if (iterations != 0) {
+		pp->params[20] = loop_va;
 
-	pp->linuxvm_state.fs_base        = co_smp_sentinel(lane, 0);
-	pp->linuxvm_state.gs_base        = co_smp_sentinel(lane, 1);
-	pp->linuxvm_state.kernel_gs_base = co_smp_sentinel(lane, 2);
-	pp->linuxvm_state.lstar          = co_smp_sentinel(lane, 3);
+		pp->linuxvm_state.fs_base        = co_smp_sentinel(lane, 0);
+		pp->linuxvm_state.gs_base        = co_smp_sentinel(lane, 1);
+		pp->linuxvm_state.kernel_gs_base = co_smp_sentinel(lane, 2);
+		pp->linuxvm_state.lstar          = co_smp_sentinel(lane, 3);
+	}
+
+	/*
+	 * Iterations of zero means "this is a real secondary": wait for the
+	 * guest to say where to begin, rather than running the trivial loop.
+	 *
+	 * The wait is bounded. A guest that never issues START_VCPU is the
+	 * normal case for every build before the kernel could -- and an ioctl
+	 * thread parked in the driver forever is the failure this port has
+	 * paid for more than once.
+	 */
+	if (join_guest && iterations == 0) {
+		int spins;
+
+		/*
+		 * Not started yet? Return, and let the caller ask again.
+		 *
+		 * This used to block here for the whole of the guest's boot,
+		 * and that is the thing that was wrong. S0 proved two crossing
+		 * threads coexist happily -- ten million crossings a lane --
+		 * but in S0 each thread entered its ioctl and began work at
+		 * once. Nothing ever sat inside the driver waiting. Here a
+		 * thread claimed a vCPU slot, took a processor and then slept
+		 * in kernel context for seconds on end, and the boot processor
+		 * died partway through booting every single time, without this
+		 * thread having executed one guest instruction.
+		 *
+		 * So the waiting moves out to the daemon, which is where a
+		 * thread with nothing to do belongs. The ioctl now answers one
+		 * question -- has the guest asked for this processor yet --
+		 * and either starts it or returns immediately.
+		 */
+		out->waited_for_start = PTRUE;
+		(void)spins;
+
+		/*
+		 * The one thing the log cannot currently say: did this thread
+		 * survive from the KVCPU_RUN debug to here, and what does it see?
+		 *
+		 * Everything between those two points is invisible -- the claim,
+		 * the pin, taking ap_passage[lane] UNBUILT, and the params[20] and
+		 * sentinel writes above, which go into a page mapped into the live
+		 * guest on every poll. One line separates three cases.
+		 */
+		co_debug("vcpu %d: poll on host processor %lu -- pending %d, pp 0x%llx",
+			 lane, (unsigned long)co_os_current_cpu(),
+			 ap_start_pending[lane],
+			 (unsigned long long)(size_t)pp);
+
+		if (!ap_start_pending[lane]) {
+			out->never_started = PTRUE;
+			if (pp != ap_passage[lane]) co_os_free_exec_pages(pp, pages);
+			co_vcpu_release(vcpu);
+			return CO_RC(OK);
+		}
+
+		/*
+		 * The state the guest chose. gs_base is the AP's per-CPU base
+		 * and is the one field that cannot be guessed: every per-CPU
+		 * access the new processor makes, from its first instruction,
+		 * resolves through it -- including co_colinux_vcpu_id() itself,
+		 * which is how the guest works out which passage page is its
+		 * own.
+		 */
+		/*
+		 * Take the processor now, not while waiting.
+		 *
+		 * co_vcpu_claim() recorded which core this thread was on when
+		 * it claimed the slot, and the manager chose that core for it;
+		 * re-pinning here makes it true again after a wait during which
+		 * the scheduler was free to move this thread anywhere. From
+		 * this point everything below -- building the page, and every
+		 * crossing after it -- happens on one processor, which is the
+		 * property the whole switch depends on.
+		 */
+		/* Pair with the writer's barrier: flag seen, now read payload. */
+		asm volatile("" ::: "memory");
+
+		/*
+		 * From here this call is committed to entering, so it is no
+		 * longer a "not yet" answer. Everything before this point
+		 * leaves never_started set, which is what tells the daemon to
+		 * ask again rather than retire the thread.
+		 */
+		out->never_started = PFALSE;
+
+		/*
+		 * Consumed. A request is served once; leaving it set lets a
+		 * later poll -- or a later run -- enter on it again.
+		 */
+		ap_start_pending[lane] = 0;
+
+		co_debug("vcpu %d: request seen -- rip 0x%llx, rsp 0x%llx, "
+			 "cr3 0x%llx, page 0x%llx", lane, ap_start_rip[lane],
+			 ap_start_rsp[lane], ap_start_cr3[lane],
+			 (unsigned long long)(size_t)pp);
+
+		/*
+		 * Now build it, on this core, having been asked to start.
+		 * co_arch_save_state() inside captures the descriptor tables
+		 * and MSRs of the processor that will actually enter the guest
+		 * and be restored on the way out.
+		 */
+		if (co_setup_guest_page_on(&setup,
+			(unsigned long)(&co_boot_shim - &co_switch_full),
+			pp) == NULL) {
+			co_debug_error("vcpu %d: could not build its passage page",
+				       lane);
+			out->never_started = PTRUE;
+			co_vcpu_release(vcpu);
+			return CO_RC(ERROR);
+		}
+
+		/*
+		 * Through the boot shim, exactly as the boot processor is
+		 * entered -- params[20], not return_rip.
+		 *
+		 * co_setup_guest_page() already pointed return_rip at
+		 * co_boot_shim; the shim executes sti and jumps to params[20].
+		 * Overwriting return_rip with the kernel entry instead skips
+		 * the shim altogether, so the new processor begins with real
+		 * interrupts still masked and none of the entry contract the
+		 * rest of the switch assumes. That is what the resets were:
+		 * the guest reached its first instruction in a state nothing
+		 * downstream was written for.
+		 */
+		/*
+		 * The root vCPU 0 published, not the one the guest named.
+		 *
+		 * bac33be7 settled this and the AP path quietly undid it: a
+		 * secondary must not be pointed at a per-process table, which
+		 * is whatever Linux last scheduled and can be freed underneath
+		 * it. co_vcpu[0].guest_cr3 is the adopted kernel root, which
+		 * does not move. The guest's value is accepted only if it
+		 * agrees; disagreeing means the guest asked for something this
+		 * host will not do, and saying so beats entering it.
+		 */
+		if (ap_start_cr3[lane] != co_vcpu[0].guest_cr3) {
+			co_debug_error("vcpu %d: guest asked for cr3 0x%llx but the "
+				       "published kernel root is 0x%llx -- refusing",
+				       lane, ap_start_cr3[lane], co_vcpu[0].guest_cr3);
+			out->never_started = PTRUE;
+			co_vcpu_release(vcpu);
+			return CO_RC(ERROR);
+		}
+
+		pp->params[20]                   = ap_start_rip[lane];
+		pp->params[29]                   = 0;	/* free-running, not stepped */
+		pp->linuxvm_state.rsp            = ap_start_rsp[lane];
+		pp->linuxvm_state.cr3            = co_vcpu[0].guest_cr3;
+		pp->linuxvm_state.gs_base        = ap_start_gs[lane];
+		pp->linuxvm_state.kernel_gs_base = 0;
+		/*
+		 * And clear the test sentinels planted above. They exist to
+		 * prove one lane's MSRs never appear in another's; a real
+		 * secondary must start with the values a processor entering
+		 * the kernel would have, and cpu_init() writes LSTAR itself.
+		 */
+		pp->linuxvm_state.fs_base        = 0;
+		pp->linuxvm_state.lstar          = 0;
+		out->msr_ok                      = PTRUE;
+
+		/*
+		 * Put this passage page where the new processor will look for
+		 * it: co_colinux_passage_page[lane], written through the
+		 * guest's own tables. Without it the AP's first crossing
+		 * dereferences a null and the machine is gone with nothing to
+		 * read -- it cannot be told any later, because by then it is
+		 * already running guest code.
+		 */
+		co_debug("vcpu %d: page built, publishing its address", lane);
+
+
+
+		{
+			unsigned long long slot = co_vcpu[0].passage_symbol_va
+				+ (unsigned long long)lane * 8;
+			unsigned long long pp_va = (unsigned long long)(size_t)pp;
+
+			/*
+			 * Through kload_space, not the guest's root, and this is
+			 * the mechanism rather than a workaround: the boot
+			 * processor's own slot is published exactly this way (see
+			 * co_write_guest_u64 on in->passage_symbol_va), and it is
+			 * the one path here with a boot's worth of evidence behind
+			 * it. The host mapped the whole image with 4 KB PTEs, so
+			 * this walk never touches the large-page case at all.
+			 *
+			 * Both roots name the same frames for an image VA -- the
+			 * host's PTE is kva - __START_KERNEL_map + phys_base
+			 * (kload_kva_pa) and the fixed-up level2_kernel_pgt leaf
+			 * is the 2 MB-aligned form of the same arithmetic -- so
+			 * what is written here is what the secondary reads.
+			 */
+			if (!co_vcpu[0].passage_symbol_va ||
+			    !CO_OK(co_kload_write(manager, slot,
+						  (const unsigned char*)&pp_va,
+						  sizeof(pp_va)))) {
+				co_debug_error("vcpu %d: could not publish its passage "
+					       "page at 0x%llx -- refusing to start it",
+					       lane, slot);
+				out->never_started = PTRUE;
+				if (pp != ap_passage[lane]) co_os_free_exec_pages(pp, pages);
+				co_vcpu_release(vcpu);
+				return CO_RC(ERROR);
+			}
+		}
+		/*
+		 * TEMPORARY, and AFTER the write -- which is the whole point.
+		 * Sited before it, this read returns the .bss slot's zero and
+		 * the .call_sites bytes behind the truncating guest-root walk,
+		 * which is exactly what a correct pre-publish state looks like
+		 * and was mistaken for a failed publish more than once.
+		 *
+		 * kload_space must now read the page pointer. The guest-root
+		 * line is expected to stay wrong: it is the host's own
+		 * large-page truncation, held in place on purpose, and the
+		 * guest's hardware walk resolves the same VA correctly.
+		 */
+		{
+			unsigned long long s = co_vcpu[0].passage_symbol_va
+				+ (unsigned long long)lane * 8;
+			unsigned long long a = 0, b = 0;
+
+			(void)co_kload_read(manager, s, (unsigned char*)&a, sizeof(a));
+			(void)co_kload_read_cr3(manager, co_vcpu[0].guest_cr3, s,
+						(unsigned char*)&b, sizeof(b));
+			co_debug("vcpu %d: slot 0x%llx -- kload_space reads 0x%llx, "
+				 "guest root reads 0x%llx, page is 0x%llx",
+				 lane, s, a, b, (unsigned long long)(size_t)pp);
+		}
+
+		iterations                       = ~0ULL >> 1;
+		out->iterations                  = iterations;
+		co_debug("vcpu %d: entering the kernel at 0x%llx", lane,
+			 ap_start_rip[lane]);
+	}
 
 	/*
 	 * Nothing loads CR3 until the addresses this processor cannot run
@@ -3761,7 +4242,30 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 			{ "IST stack",    8 + CO_PP_ISTSTACK_PAGE },
 			{ "TSS",          8 + CO_PP_TSS_PAGE },
 		};
-		co_arch_guest_space_t* space = co_kload_space();
+		/*
+		 * Through the root this processor will actually run on. For a
+		 * secondary that is the kernel's table, not kload_space's --
+		 * walking the wrong one answers a question nobody asked and
+		 * passes while the processor is about to fault.
+		 */
+		/*
+		 * A PAGE FRAME NUMBER, not the CR3 value.
+		 *
+		 * co_arch_guest_lookup_root() takes a pfn and maps it to read
+		 * the top-level table; every other caller shifts a physical
+		 * address down first. Handing it the raw CR3 asks it to map a
+		 * physical address four thousand times higher than the one
+		 * meant -- past the end of RAM -- and then to read whatever
+		 * that lands on as a PML4 and follow the entries out of it.
+		 * The check written to turn a bad secondary into a clean
+		 * refusal was itself resetting the machine, before a single
+		 * crossing had happened.
+		 */
+		unsigned long long root_pa = out->waited_for_start
+			? pp->linuxvm_state.cr3
+			: (unsigned long long)co_arch_guest_space_root(co_kload_space());
+		co_pfn_t root = (co_pfn_t)((root_pa & CO_ARCH_PAGE_MASK)
+					   >> CO_ARCH_PAGE_SHIFT);
 		int i;
 
 		for (i = 0; i < (int)(sizeof(needed) / sizeof(needed[0])); i++) {
@@ -3770,7 +4274,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 			co_pa_t got = 0;
 			int level = -1;
 
-			if (!CO_OK(co_arch_guest_lookup(manager, space, va, &got, &level)) ||
+			if (!CO_OK(co_arch_guest_lookup_root(manager, root, va, &got, &level)) ||
 			    got != (co_os_virt_to_phys((void*)(size_t)va) & CO_ARCH_PAGE_MASK)) {
 				co_debug_error("vcpu %d: %s at 0x%llx is not reachable in "
 					       "the guest's space (absent at level %d) -- "
@@ -3779,7 +4283,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 				out->preflight_failed = PTRUE;
 				out->preflight_va     = va;
 				out->preflight_level  = level;
-				co_os_free_exec_pages(pp, pages);
+				if (pp != ap_passage[lane]) co_os_free_exec_pages(pp, pages);
 				co_vcpu_release(vcpu);
 				return CO_RC(ERROR);
 			}
@@ -3816,6 +4320,16 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 			out->migrated = PTRUE;
 			break;
 		}
+
+		/*
+		 * The host's clocks, stamped fresh before every entry -- the
+		 * same pair the boot loop stamps at its own entry. params[49]
+		 * is the monotonic clock this vCPU's cotimer measures elapsed
+		 * time against; left unstamped, a secondary's clock reads as
+		 * time standing still and its tick device delivers nothing.
+		 */
+		pp->params[49] = co_os_monotonic_100ns();
+		pp->params[50] = co_os_get_time();
 
 		pp->params[4] = 0;	/* faulted */
 
@@ -3860,8 +4374,129 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		}
 
 		if (!pp->params[4]) {
-			/* the guest's own loop crossing: one iteration */
 			done++;
+
+			/*
+			 * A voluntary crossing. For the trivial test guest this
+			 * is just one more turn of its own loop, but a real
+					 * secondary crosses to ask for something,
+			 * and until now this counted the crossing and re-entered
+			 * without ever reading params[0]. A processor asking to
+			 * idle was simply spun back into the guest; nothing it
+			 * requested was ever serviced. That is the difference
+			 * between a lane and a vCPU.
+			 *
+			 * Only the operations a secondary can currently reach
+			 * are handled. It has no devices of its own -- no cobd,
+			 * no console -- so anything else is a request this loop
+			 * was never taught, and stopping with the number in the
+			 * report beats silently ignoring it.
+			 */
+			if (out->waited_for_start) {
+				/*
+				 * pp->operation, not params[0]. The guest
+				 * writes the operation at CO_PP_OPERATION
+				 * (0x9c0); params starts at 0x9c8. Reading
+				 * params[0] read an unrelated word, so the
+				 * first voluntary crossing a real secondary
+				 * made matched no operation at all and killed
+				 * it with "unhandled operation 0" -- the boot
+				 * loop reads pp->operation and clears it, and
+				 * so must this one.
+				 */
+				unsigned long long op = pp->operation;
+
+				pp->operation = 0;
+
+				if (op == CO_OPERATION_TERMINATE) {
+					co_debug("vcpu %d: guest asked to terminate "
+						 "after %lld crossings", lane, done);
+					break;
+				}
+				if (op == CO_OPERATION_KICK_VCPU) {
+					int target = (int)pp->params[CO_PP_AP_VCPU];
+
+					/* A secondary can post to another one. */
+					if (target >= 0 && target < CO_MAX_VCPUS)
+						co_os_idle_wake(target);
+					continue;
+				}
+
+				/*
+				 * Block requests, answered here exactly as the
+				 * boot loop answers them.
+				 *
+				 * A crossing for BLOCK_IO comes from whichever
+				 * processor the issuing task is on, and a
+				 * BLOCK_PROBE from wherever the driver's probe
+				 * kworker was scheduled -- neither is the boot
+				 * processor's by right. Left unhandled, this
+				 * loop stopped the vCPU on "unhandled guest
+				 * operation" and the request never completed:
+				 * with the probe it was cobd0 never appearing
+				 * at all, and the boot standing still one line
+				 * after "loop: module loaded", waiting for a
+				 * disk that never registered.
+				 *
+				 * The device rings themselves stay the boot
+				 * processor's to drain (the guest only reaps
+				 * completions on vCPU 0) -- submitting from
+				 * here is safe because co_cobd_async_submit
+				 * queues to the worker threads, which have
+				 * always been separate from either loop.
+				 */
+				if (op == CO_OPERATION_BLOCK_IO) {
+					co_rc_t brc;
+
+					if (cobd_async_enabled && cobd_io_va_shared) {
+						bool_t ok = co_cobd_async_submit(
+							(int)pp->params[51],
+							pp->params[52],
+							pp->params[54],
+							(unsigned int)pp->params[53],
+							pp->params[55] ? PTRUE : PFALSE,
+							(unsigned int)pp->params[57]);
+
+						pp->params[56] = ok ? 0 : 1;
+						continue;
+					}
+
+					brc = co_cobd_request_sg(manager,
+							      (int)pp->params[51],
+							      pp->params[52],
+							      pp->params[54],
+							      (unsigned int)pp->params[53],
+							      pp->params[55] ? PTRUE : PFALSE);
+
+					pp->params[56] = CO_OK(brc) ? 0 : 1;
+					continue;
+				}
+
+				if (op == CO_OPERATION_BLOCK_PROBE) {
+					int unit = (int)pp->params[51];
+
+					pp->params[52] = co_cobd_present(unit)
+						? co_cobd_size(unit) : 0;
+					pp->params[56] = 0;
+					continue;
+				}
+				if (op == CO_OPERATION_IDLE) {
+					/*
+					 * Nothing to run: sleep on this vCPU's
+					 * own doorbell until somebody has work
+					 * for it, then re-enter where it left.
+					 */
+					co_os_idle_wait(vcpu->index, 100);
+					continue;
+				}
+				if (op != CO_OPERATION_YIELD) {
+					co_debug_error("vcpu %d: unhandled guest "
+						       "operation %lld after %lld "
+						       "crossings", lane, op, done);
+					out->stopped_op = (unsigned long)op;
+					break;
+				}
+			}
 			continue;
 		}
 
@@ -3947,7 +4582,8 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 			  out->msr_ok && !out->faulted && !out->migrated &&
 			  !out->unforwardable && !out->aborted) ? PTRUE : PFALSE;
 
-	co_os_free_exec_pages(pp, pages);
+	if (pp != ap_passage[lane])
+		co_os_free_exec_pages(pp, pages);
 	co_vcpu_release(vcpu);
 
 	return CO_RC(OK);
@@ -4023,6 +4659,87 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			       ((co_pa_t)stack_pfn) << CO_ARCH_PAGE_SHIFT, _KERNPG_TABLE);
 	if (!CO_OK(rc))
 		goto out_free_stack;
+
+	/*
+	 * The secondaries' passage pages, here and not when they start. See
+	 * ap_passage. Not fatal if one cannot be made: the guest simply cannot
+	 * start that processor, and the lane refuses rather than entering
+	 * something unreachable.
+	 */
+	{
+		int v;
+
+		/*
+		 * Cleared first, every run.
+		 *
+		 * ap_passage[] is static, so without this it keeps whatever a
+		 * previous run left in it -- a pointer to memory that run
+		 * freed. The secondary's own guard is "was a page made for me
+		 * at boot", and a stale non-NULL pointer answers yes, so it
+		 * builds its passage page on top of somebody else's freed
+		 * memory instead of refusing. That is invisible until the
+		 * machine resets.
+		 */
+		for (v = 0; v < CO_MAX_VCPUS; v++) {
+			ap_passage[v] = NULL;
+			/*
+			 * And the request with it. The reasoning above applies
+			 * word for word to the start block: left set from a
+			 * previous run, a secondary polling early in this one
+			 * finds a request nobody made and enters at the last
+			 * run's rip, on its stack, through its CR3 -- physical
+			 * addresses freed at that run's KLOAD_END and since
+			 * handed to something else.
+			 */
+			ap_start_pending[v] = 0;
+			ap_start_rip[v]     = 0;
+			ap_start_rsp[v]     = 0;
+			ap_start_cr3[v]     = 0;
+			ap_start_gs[v]      = 0;
+		}
+
+		for (v = 1; v < CO_MAX_VCPUS; v++) {
+			co_arch_switch_test_t aps = {0, };
+			co_arch_passage_page_t* app;
+			int q;
+
+			app = co_setup_guest_page(&aps,
+				(unsigned long)(&co_boot_shim - &co_switch_full));
+			if (app == NULL) {
+				/*
+				 * Say so. Fifteen executable pages per secondary,
+				 * asked for after the guest's RAM is already
+				 * committed, is a request that can fail -- and a
+				 * silent break here is what let a stale pointer
+				 * stand in for a page that was never made.
+				 */
+				co_debug_error("boot: no passage page for vcpu %d "
+					       "(%d exec pages unavailable) -- that "
+					       "processor cannot be started", v, pages);
+				break;
+			}
+
+			for (q = 0; q < pages; q++) {
+				unsigned char* w = (unsigned char*)app
+					+ q * CO_ARCH_PAGE_SIZE;
+
+				if (!CO_OK(co_arch_guest_map(manager, space,
+							     (unsigned long long)(size_t)w,
+							     co_os_virt_to_phys(w),
+							     _KERNPG_TABLE))) {
+					co_os_free_exec_pages(app, pages);
+					app = NULL;
+					break;
+				}
+			}
+
+			ap_passage[v] = app;
+			if (app)
+				co_debug("boot: vcpu %d passage page 0x%llx, mapped "
+					 "before the graft", v,
+					 (unsigned long long)(size_t)app);
+		}
+	}
 
 	ring = (struct co_console_ring*)((unsigned char*)&pp->host_temp
 					 + CO_PP_CONSOLE_PAGE * CO_ARCH_PAGE_SIZE);
@@ -4266,7 +4983,8 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		 * likes afterwards, and they all share the kernel half of this
 		 * one, which is where the passage pages live.
 		 */
-		vcpu->guest_cr3 = pp->linuxvm_state.cr3;
+		vcpu->guest_cr3         = pp->linuxvm_state.cr3;
+		vcpu->passage_symbol_va = in->passage_symbol_va;
 
 		/*
 		 * Start the async block workers before the guest runs. If it
@@ -4281,6 +4999,15 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				in->async_cobd = 0;
 			}
 		}
+
+		/*
+		 * Published for the secondaries, after the fallback above has
+		 * settled, so a secondary and the boot processor agree on
+		 * whether async is in effect. Written before any secondary can
+		 * be started, read-only thereafter.
+		 */
+		cobd_async_enabled  = in->async_cobd ? PTRUE : PFALSE;
+		cobd_io_va_shared   = in->cobd_io_va;
 
 		/*
 		 * A finer host clock for the duration of the run.
@@ -4875,6 +5602,77 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 					continue;
 				}
 
+				if (op == CO_OPERATION_KICK_VCPU) {
+					int target = (int)pp->params[CO_PP_AP_VCPU];
+
+					/*
+					 * Only a wake. The message itself is
+					 * already in the target's pending set
+					 * in guest memory; this exists because
+					 * a processor sitting in the host's
+					 * idle wait has nothing to re-enter it.
+					 */
+					if (target >= 0 && target < CO_MAX_VCPUS)
+						co_os_idle_wake(target);
+					continue;
+				}
+
+				if (op == CO_OPERATION_START_VCPU) {
+					int target = (int)pp->params[CO_PP_AP_VCPU];
+
+					/*
+					 * Hand the initial state to the thread
+					 * already waiting in KVCPU_RUN, then
+					 * ring its doorbell. The guest returns
+					 * immediately -- it has a rendezvous of
+					 * its own to wait on (cpuhp_ap_sync_
+					 * alive), and blocking the boot
+					 * processor inside the host would stop
+					 * the very thing the new one is waiting
+					 * for.
+					 */
+					/*
+					 * No "is it active" test: the thread
+					 * that will run this processor polls,
+					 * so it is only briefly claimed and is
+					 * usually not claimed at all when the
+					 * request arrives. The request is
+					 * recorded regardless and waits for it.
+					 */
+					if (target > 0 && target < CO_MAX_VCPUS) {
+						ap_start_rip[target] = pp->params[CO_PP_AP_RIP];
+						ap_start_rsp[target] = pp->params[CO_PP_AP_RSP];
+						ap_start_cr3[target] = pp->params[CO_PP_AP_CR3];
+						ap_start_gs[target]  = pp->params[CO_PP_AP_GS_BASE];
+						/*
+						 * Payload first, then the flag.
+						 * volatile orders volatile
+						 * accesses against each other,
+						 * not plain stores against a
+						 * volatile one -- without this
+						 * the compiler may sink the
+						 * four above past the flag and
+						 * the reader can act on half a
+						 * request.
+						 */
+						asm volatile("" ::: "memory");
+						ap_start_pending[target] = 1;
+						co_os_idle_wake(target);
+						co_debug("boot: starting vcpu %d at rip "
+							 "0x%llx, rsp 0x%llx, cr3 0x%llx, "
+							 "gs 0x%llx", target,
+							 ap_start_rip[target],
+							 ap_start_rsp[target],
+							 ap_start_cr3[target],
+							 ap_start_gs[target]);
+					} else {
+						co_debug_error("boot: vcpu %d cannot be "
+							       "started -- no thread is "
+							       "waiting for it", target);
+					}
+					continue;
+				}
+
 				if (op == CO_OPERATION_YIELD) {
 					out->run_yields++;
 					if (out->run_yields == 1)
@@ -4888,6 +5686,24 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 					out->terminate_reason = pp->params[0];
 					co_debug("boot: guest terminated, reason "
 						 "%lld", pp->params[0]);
+					/*
+					 * And tell the secondaries, or the run
+					 * cannot be shut down.
+					 *
+					 * A secondary's loop exits only on the
+					 * broadcast abort, a fault, or a
+					 * voluntary crossing of its own. The
+					 * guest ending normally set none of
+					 * those, so its threads kept looping on
+					 * replayed host interrupts, pinned,
+					 * inside the driver -- and the daemon's
+					 * join after this call waited on them
+					 * forever. taskkill cannot reach a
+					 * thread in the driver; that is the
+					 * stranded-run failure this port has
+					 * paid for before.
+					 */
+					co_arch_boot_abort();
 					break;
 				}
 
@@ -5342,6 +6158,43 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		 * waiting on co_arch_boot_running cannot proceed until the
 		 * workers are gone either.
 		 */
+		/*
+		 * And the secondaries before the workers, for the same reason
+		 * the workers come before the frees.
+		 *
+		 * A secondary answers BLOCK_IO and BLOCK_PROBE out of its own
+		 * lane, so until its lane has ended it can submit into the
+		 * cobd machinery at any moment. Stopping the workers while one
+		 * is still crossing is a submission into state that is being
+		 * torn down -- a page fault in non-paged memory, taken during
+		 * shutdown, which is exactly what this cost before the wait
+		 * was here.
+		 *
+		 * vcpu_abort_all is already set by the TERMINATE handler, so
+		 * every lane is on its way out; this only declines to proceed
+		 * until they have arrived. Bounded, because a lane that will
+		 * not end is a worse problem than a lane that ended late, and
+		 * pressing on at least leaves a report.
+		 */
+		{
+			int spins, v, live;
+
+			for (spins = 0; spins < 500; spins++) {
+				live = 0;
+				for (v = 1; v < CO_MAX_VCPUS; v++)
+					if (co_vcpu[v].active)
+						live++;
+				if (!live)
+					break;
+				co_os_idle_wake(v);
+				co_os_msleep(10);
+			}
+
+			if (live)
+				co_debug_error("boot: %d secondary lane(s) still "
+					       "running at teardown", live);
+		}
+
 		if (in->async_cobd && in->cobd_io_va) {
 			co_cobd_async_stop();
 			out->block_errors += co_cobd_async_errors();
@@ -5388,6 +6241,24 @@ out_free_stack:
 	if (stack_pfn)
 		co_os_put_page(manager, stack_pfn);
 out_free_pp:
+	/*
+	 * The secondaries' pages too. Nothing else releases them: they are
+	 * reached only through a static array, which the next boot merely
+	 * NULLs. Fifteen executable non-paged pages per secondary leaked per
+	 * run is the strand-memory-per-run failure this port already has a
+	 * scar from.
+	 */
+	{
+		int v;
+
+		for (v = 1; v < CO_MAX_VCPUS; v++) {
+			if (ap_passage[v] == NULL)
+				continue;
+			co_os_free_exec_pages(ap_passage[v], pages);
+			ap_passage[v] = NULL;
+		}
+	}
+
 	co_os_free_exec_pages(pp, pages);
 
 	return rc;

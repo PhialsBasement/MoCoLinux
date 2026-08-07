@@ -358,6 +358,8 @@ typedef struct {
 	unsigned long long msr_want;
 	unsigned long long msr_got;
 	int		   no_free_core;	/* every core already carries a vCPU */
+	int		   waited_for_start;	/* a real secondary, not the test loop */
+	int		   never_started;	/* the guest never issued START_VCPU */
 } co_manager_ioctl_kvcpu_run_t;
 
 /* interface for the CO_MANAGER_IOCTL_KLOAD_* family */

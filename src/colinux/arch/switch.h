@@ -425,6 +425,9 @@ typedef struct {
 	int		   preflight_failed;
 	int		   preflight_level;
 	unsigned long long preflight_va;
+	int		   waited_for_start;	/* real secondary, not the test loop */
+	int		   never_started;	/* the guest never issued START_VCPU */
+	unsigned long	   stopped_op;		/* guest operation this loop cannot serve */
 } co_arch_smp_test_t;
 
 /*
