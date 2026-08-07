@@ -6,45 +6,62 @@ by reverse-applying it to ref/linux-7.1.5 with no rejects.
 
 Over the previous snapshot:
 
-  * SMP rung S1: the two machine-global pieces of per-processor state become
-    arrays, indexed by co_colinux_vcpu_id().
+  * SMP rung S2: an SMP=y guest, still on one processor, with the local APIC
+    never touched.
 
-    co_colinux_virtual_if is the guest's interrupt flag. On real hardware
-    that is a bit in a register, so every processor has its own and every
-    task carries its own copy in the EFLAGS it saved. As a single global it
-    meant one processor's cli would silence another's interrupts, and the
-    idle path's comment already said what that costs: "the guest's flag is
-    one global variable, so leaving it clear ends with the machine."
+    co_colinux_vcpu_id() is implemented for CONFIG_SMP=y as
+    raw_cpu_read(cpu_number). cpu_number is declared in asm/irqflags.h rather
+    than reached through <asm/smp.h>, which that header cannot include without
+    circularity. Not __this_cpu_read: it expands to a preempt check that is
+    static under CONFIG_DEBUG_PREEMPT, and native_save_fl() is a non-static
+    inline, so it does not even compile -- and these helpers are noinstr and
+    want no instrumentation regardless.
 
-    co_colinux_passage_page is the crossing itself -- the switch blob, both
-    saved-state blocks, the params the cooperative protocol writes, the FPU
-    save area, the IST stack and the TSS. Two processors sharing one would
-    interleave their stores into the same params[] and switch through the
-    same state block. drivers/block/cobd.c already documents what that
-    corruption looks like, from a preemption race with only one CPU in play:
-    silent success for a read that never happened, program text and page
-    tables delivered as garbage.
+    GS is valid before any C code runs, which is the part that had to be
+    checked rather than assumed. The guest enters at co_arch_start_kernel and
+    falls into common_startup_64, which writes MSR_GS_BASE from
+    __per_cpu_offset[0]. Until setup_per_cpu_areas() the boot processor reads
+    its per-CPU variables out of the init image, where cpu_number is 0, and
+    afterwards out of its own area, where setup_per_cpu_areas() wrote 0. There
+    is no window in which the boot processor gets the wrong answer.
 
-    Both stay plain arrays at fixed link-time addresses rather than becoming
-    per-CPU variables, and that is not laziness. The host writes both before
-    the guest runs, by symbol, and reads the interrupt flag back through the
-    guest's own CR3 while the guest is running -- it is the gate that decides
-    whether a cooperative timer tick may be injected. A per-CPU variable
-    physically moves when setup_per_cpu_areas() runs, and the host has no way
-    to follow it there. Slot 0 is the boot processor's, so the host's
-    existing symbol lookup is unchanged.
+  * Two topology exemptions, and the reasoning is the whole point.
 
-    co_colinux_vcpu_id() is the single place the answer is decided. Under
-    CONFIG_SMP=n it is the constant 0 and every indexed access folds back to
-    the plain global this port has always compiled -- confirmed, not assumed:
-    the vmlinux built from this snapshot disassembles to 7,756,149
-    instructions that are identical to the previous one, with the only
-    differences being the build-version string and one renumbered
-    compiler-internal constant-pool label. Under CONFIG_SMP=y it is a
-    deliberate #error rather than a plausible guess, because the answer has
-    to be correct in noinstr context and on the boot processor before
-    setup_per_cpu_areas() has run, and that wants a kernel that can be built
-    and booted to check it. That is rung S2.
+    The kernel forces possible_cpus to 1 when the local APIC is disabled, in
+    topology_apply_cmdline_limits_early() and again in restrict_to_up(). That
+    encodes a true fact about real hardware -- without a local APIC there is
+    no way to INIT-SIPI another processor, so there can only be one -- and it
+    is not true here. This guest's processors are started by the host, each
+    one a pinned host thread entering through the world switch with a complete
+    initial state, and they signal each other through shared memory. XEN PV is
+    already exempted from restrict_to_up() with a comment describing the same
+    situation; a cooperative guest is exempted alongside it.
+
+    So nolapic STAYS on the command line. That is the safe direction: the APIC
+    is the host's chip, driving the host's timer, keyboard and disk, and
+    nolapic is how this port keeps the guest's hands off it. What changes is
+    only the inference drawn from it, not the fact.
+
+  * smp_ops, replacing two native operations that would reach real hardware.
+
+    native_smp_prepare_cpus() switches on apic_intr_mode and, with no usable
+    APIC, answers by calling disable_smp() -- correct for the hardware it
+    describes, wrong for this machine. co_colinux_smp_prepare_cpus() does the
+    common preparation and nothing else: no local APIC timer, no UV, no
+    INIT-SIPI delay calibration, no SEV-SNP wakeup.
+
+    co_colinux_kick_ap() refuses, loudly, and is a safety belt rather than a
+    placeholder. The native version reaches do_boot_cpu(), which sends
+    INIT-SIPI-SIPI to a real physical processor of the machine this guest is a
+    thread on -- it would be trying to boot one of Windows' own CPUs into
+    Linux. It earned its place on the first boot: the guest came up with three
+    possible CPUs and the kernel duly tried to start CPUs 1 and 2.
+
+    Measured on the M92p under Windows 10: "CPU topo: Allowing 3 present CPUs",
+    nr_cpu_ids 3, "3 processor(s) possible", both AP attempts refused, "Brought
+    up 1 node, 1 CPU", and the guest booted on to /sbin/init exactly as the
+    uniprocessor build does. co_colinux_adopt_traps() also runs clean under
+    SMP=y, which answers the last open question about it.
 
 diff -urN a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
 --- a/arch/x86/include/asm/desc.h	2026-07-25 00:21:27.000000000 +1000
@@ -230,8 +247,15 @@ diff -urN a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
  		while (count) {						\
 diff -urN a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
 --- a/arch/x86/include/asm/irqflags.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/include/asm/irqflags.h	2026-08-07 15:40:47.117805300 +1000
-@@ -12,6 +12,80 @@
++++ b/arch/x86/include/asm/irqflags.h	2026-08-07 16:21:26.257621900 +1000
+@@ -7,11 +7,108 @@
+ #ifndef __ASSEMBLER__
+ 
+ #include <asm/nospec-branch.h>
++/* co_colinux_vcpu_id() below reads a per-CPU variable under CONFIG_SMP. */
++#include <asm/percpu.h>
+ 
+ /*
   * Interrupt control:
   */
  
@@ -292,18 +316,39 @@ diff -urN a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
 +#define co_colinux_vcpu_id()	0u
 +#else
 +/*
-+ * Deliberately unimplemented rather than guessed.
++ * The Linux CPU number, which this port makes the vCPU index by construction:
++ * the host starts vCPU N as the guest's CPU N, so the two never diverge and
++ * there is no mapping table to keep honest.
 + *
-+ * The answer wants a raw GS-relative read of the per-CPU cpu_number, spelled
-+ * out here rather than reached through <asm/smp.h> -- this header is included
-+ * before almost everything and cannot pull that in. It also has to be correct
-+ * in noinstr context and on the boot processor before setup_per_cpu_areas()
-+ * has run, which is where the interesting failure lives. That is SMP rung S2
-+ * work, and it must be written against a kernel that can be built and booted
-+ * to check it. Code here that merely looks plausible would be worse than none:
-+ * it would compile, and it would be wrong somewhere unfalsifiable.
++ * raw_cpu_read, not raw_smp_processor_id() and not __this_cpu_read. This
++ * header is included before almost everything and cannot reach <asm/smp.h>
++ * without circularity, so cpu_number is declared here -- the same
++ * declaration, which C permits, and asm/percpu.h is self-contained enough to
++ * include. The raw form is the one that carries no debug machinery at all:
++ * __this_cpu_read expands to a __this_cpu_preempt_check() that is static
++ * under CONFIG_DEBUG_PREEMPT, and native_save_fl() below is a non-static
++ * inline, so calling it does not even compile. These helpers are noinstr and
++ * want no instrumentation in them regardless.
++ *
++ * Reading the index without pinning to the CPU is correct for one processor
++ * and is a question again for several: a task that migrated between the read
++ * and the use would touch the slot of the CPU it came from. Real hardware has
++ * the same shape -- IF is per-CPU and a migrating task carries its logical
++ * state in its saved EFLAGS -- but the guest's slot is memory, not a register
++ * the switch restores, so rung S3 has to walk the call sites and say which
++ * ones need preemption held across the pair.
++ *
++ * Valid from the guest's first instruction, which is the part worth checking
++ * rather than assuming: the guest enters at co_arch_start_kernel and falls
++ * into common_startup_64, which writes MSR_GS_BASE from __per_cpu_offset[0]
++ * before any C code runs. Until setup_per_cpu_areas() the boot processor
++ * reads its per-CPU variables out of the init image, where cpu_number is 0 --
++ * correct for the boot CPU -- and afterwards out of its real area, where
++ * setup_per_cpu_areas() has written 0 into it. There is no window in which
++ * this returns the wrong answer for the boot processor.
 + */
-+#error "co_colinux_vcpu_id() is unimplemented for CONFIG_SMP=y -- see SMP rung S2"
++DECLARE_PER_CPU_CACHE_HOT(int, cpu_number);
++#define co_colinux_vcpu_id()	((unsigned int)raw_cpu_read(cpu_number))
 +#endif
 +
 +extern unsigned long co_colinux_virtual_if[CO_COLINUX_NR_VCPUS];
@@ -312,7 +357,7 @@ diff -urN a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
  /* Declaration required for gcc < 4.9 to prevent -Werror=missing-prototypes */
  extern inline unsigned long native_save_fl(void);
  extern __always_inline unsigned long native_save_fl(void)
-@@ -29,27 +103,116 @@
+@@ -29,27 +126,116 @@
  		     : /* no input */
  		     : "memory");
  
@@ -666,6 +711,45 @@ diff -urN a/arch/x86/kernel/cpu/mtrr/mtrr.c b/arch/x86/kernel/cpu/mtrr/mtrr.c
  				changed_by_mtrr_cleanup = mtrr_cleanup();
  				mtrr_build_map();
  			} else {
+diff -urN a/arch/x86/kernel/cpu/topology.c b/arch/x86/kernel/cpu/topology.c
+--- a/arch/x86/kernel/cpu/topology.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/cpu/topology.c	2026-08-07 16:32:19.809455800 +1000
+@@ -420,8 +420,22 @@
+ {
+ 	unsigned int possible = nr_cpu_ids;
+ 
+-	/* 'maxcpus=0' 'nosmp' 'nolapic' */
+-	if (!setup_max_cpus || apic_is_disabled)
++	/*
++	 * 'maxcpus=0' 'nosmp' 'nolapic'
++	 *
++	 * A cooperative guest is exempt from the nolapic half, for the same
++	 * reason XEN PV is exempt in restrict_to_up() below. The rule encodes
++	 * a true fact about real hardware -- without a local APIC there is no
++	 * way to INIT-SIPI another processor, so there can only be one -- and
++	 * that fact does not hold here. This guest's processors are started by
++	 * the host, each one a pinned host thread entering through the world
++	 * switch with a complete initial state, and they signal each other
++	 * through shared memory. The APIC is not merely unnecessary to that,
++	 * it is forbidden: it is the host's chip, driving the host's timer,
++	 * keyboard and disk, and nolapic is how this port keeps the guest's
++	 * hands off it.
++	 */
++	if (!setup_max_cpus || (apic_is_disabled && !co_colinux_guest))
+ 		possible = 1;
+ 
+ 	/* 'possible_cpus=N' */
+@@ -446,6 +460,10 @@
+ 	if (xen_pv_domain())
+ 		return false;
+ 
++	/* And a cooperative guest, for the same reason -- see above. */
++	if (co_colinux_guest)
++		return false;
++
+ 	return apic_is_disabled;
+ }
+ 
 diff -urN a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
 --- a/arch/x86/kernel/early_printk.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/early_printk.c	2026-08-07 15:41:02.798506600 +1000
@@ -1726,7 +1810,7 @@ diff -urN a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
  			machine_shutdown();
 diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
 --- a/arch/x86/kernel/setup.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/setup.c	2026-08-03 16:30:51.027939300 +1000
++++ b/arch/x86/kernel/setup.c	2026-08-07 16:32:50.246951100 +1000
 @@ -55,6 +55,7 @@
  #include <asm/proto.h>
  #include <asm/realmode.h>
@@ -1735,7 +1819,7 @@ diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
  #include <asm/unwind.h>
  #include <asm/vsyscall.h>
  
-@@ -933,6 +934,73 @@
+@@ -933,6 +934,83 @@
  	 */
  	olpc_ofw_detect();
  
@@ -1804,12 +1888,22 @@ diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
 +		 */
 +		x86_init.timers.timer_init = co_colinux_timer_init;
 +		x86_platform.get_wallclock = co_colinux_get_wallclock;
++
++#ifdef CONFIG_SMP
++		/*
++		 * Secondary processors are the host's to start, so the native
++		 * preparation -- which reads apic_intr_mode and gives up when
++		 * there is no usable local APIC -- is replaced wholesale. See
++		 * co_colinux_smp_prepare_cpus() in smpboot.c.
++		 */
++		co_colinux_smp_init();
++#endif
 +	}
 +
  	idt_setup_early_traps();
  	early_cpu_init();
  	jump_label_init();
-@@ -1033,7 +1101,15 @@
+@@ -1033,7 +1111,15 @@
  	 */
  	max_pfn = e820__end_of_ram_pfn();
  
@@ -1826,6 +1920,76 @@ diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
  	cache_bp_init();
  	if (mtrr_trim_uncached_memory(max_pfn))
  		max_pfn = e820__end_of_ram_pfn();
+diff -urN a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+--- a/arch/x86/kernel/smpboot.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/smpboot.c	2026-08-07 16:34:34.493210800 +1000
+@@ -40,6 +40,7 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <linux/init.h>
++#include <linux/console.h>	/* co_colinux_guest, co_colinux_smp_init */
+ #include <linux/smp.h>
+ #include <linux/export.h>
+ #include <linux/sched.h>
+@@ -1152,6 +1153,58 @@
+ 	cpumask_set_cpu(0, topology_die_cpumask(0));
+ }
+ 
++/*
++ * Prepare for secondary processors, cooperatively.
++ *
++ * native_smp_prepare_cpus() below switches on apic_intr_mode, and every arm
++ * of it that does not stop dead assumes a usable local APIC: it is the mode
++ * that says how processors are started and how they interrupt each other. A
++ * cooperative guest runs with nolapic -- the APIC is the host's chip and this
++ * port's rule is that the host's hardware is not ours to touch -- so
++ * apic_intr_mode is APIC_PIC and the native version answers by calling
++ * disable_smp() and returning. That is correct for the hardware it describes
++ * and wrong for this machine, where processors are started by the host: each
++ * vCPU is a pinned host thread that enters through the world switch with an
++ * initial state built for it, and they signal each other through shared
++ * memory rather than through an interrupt controller.
++ *
++ * So: the common preparation, and nothing else. No local APIC timer (the
++ * cooperative clock event is registered from co_colinux_timer_init), no UV,
++ * no INIT-SIPI delay calibration, no SEV-SNP wakeup -- all of them describe
++ * hardware that is not here.
++ */
++static void __init co_colinux_smp_prepare_cpus(unsigned int max_cpus)
++{
++	smp_prepare_cpus_common();
++
++	pr_info("colinux: %u processor(s) possible; the host starts them, "
++		"not INIT-SIPI\n", num_possible_cpus());
++}
++
++/*
++ * Refuse to start a secondary processor, loudly, until the host can.
++ *
++ * This is a safety belt and not a placeholder. The native version reaches
++ * do_boot_cpu(), which sends INIT-SIPI-SIPI to a real physical processor of
++ * the machine this guest is a thread on -- it would be trying to boot one of
++ * Windows' own CPUs into Linux. Nothing about that is recoverable. Until the
++ * host-side bringup exists, anything that decides a second CPU is present
++ * must fail here rather than reach the hardware, and say so.
++ */
++static int co_colinux_kick_ap(unsigned int cpu, struct task_struct *tidle)
++{
++	pr_err("colinux: refusing to start CPU %u -- a cooperative guest's "
++	       "processors are started by the host, and INIT-SIPI would be "
++	       "aimed at the host's own\n", cpu);
++	return -ENOSYS;
++}
++
++void __init co_colinux_smp_init(void)
++{
++	smp_ops.smp_prepare_cpus = co_colinux_smp_prepare_cpus;
++	smp_ops.kick_ap_alive    = co_colinux_kick_ap;
++}
++
+ void __init smp_prepare_cpus_common(void)
+ {
+ 	unsigned int cpu, node;
 diff -urN a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
 --- a/arch/x86/kernel/traps.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/traps.c	2026-08-07 15:41:18.533206800 +1000
@@ -3697,8 +3861,8 @@ diff -urN a/drivers/virtio/virtio_colinux.c b/drivers/virtio/virtio_colinux.c
 +}
 diff -urN a/include/linux/console.h b/include/linux/console.h
 --- a/include/linux/console.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/include/linux/console.h	2026-08-05 18:50:37.763533900 +1000
-@@ -741,4 +741,36 @@
++++ b/include/linux/console.h	2026-08-07 16:33:16.592513000 +1000
+@@ -741,4 +741,44 @@
  void dummycon_register_output_notifier(struct notifier_block *nb);
  void dummycon_unregister_output_notifier(struct notifier_block *nb);
  
@@ -3718,6 +3882,10 @@ diff -urN a/include/linux/console.h b/include/linux/console.h
 +bool co_vgpu_busy(void);
 +void co_colinux_get_wallclock(struct timespec64 *now);
 +void co_colinux_terminate(unsigned long reason);
++#ifdef CONFIG_SMP
++/* install the cooperative smp_ops -- see smpboot.c */
++void co_colinux_smp_init(void);
++#endif
 +#else
 +static inline void co_colinux_console_init(void) { }
 +extern int co_colinux_guest;
@@ -3732,6 +3900,10 @@ diff -urN a/include/linux/console.h b/include/linux/console.h
 +bool co_vgpu_busy(void);
 +void co_colinux_get_wallclock(struct timespec64 *now);
 +void co_colinux_terminate(unsigned long reason);
++#ifdef CONFIG_SMP
++/* install the cooperative smp_ops -- see smpboot.c */
++void co_colinux_smp_init(void);
++#endif
 +#endif
 +
  #endif /* _LINUX_CONSOLE_H */
