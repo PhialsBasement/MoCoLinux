@@ -347,6 +347,24 @@ unsigned long co_os_cpu_count(void)
 	return count;
 }
 
+unsigned long co_os_cpu_nth(unsigned long ordinal)
+{
+	KAFFINITY active = KeQueryActiveProcessors();
+	unsigned long cpu;
+
+	for (cpu = 0; cpu < sizeof(KAFFINITY) * 8; cpu++) {
+		KAFFINITY bit = (KAFFINITY)1 << cpu;
+
+		if (!(active & bit))
+			continue;
+		if (ordinal == 0)
+			return cpu;
+		ordinal--;
+	}
+
+	return (unsigned long)-1;
+}
+
 unsigned long co_os_current_cpu(void)
 {
 	return (unsigned long)KeGetCurrentProcessorNumber();

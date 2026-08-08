@@ -362,6 +362,10 @@ typedef struct {
 	int		   no_free_core;	/* every core already carries a vCPU */
 	int		   waited_for_start;	/* a real secondary, not the test loop */
 	int		   never_started;	/* the guest never issued START_VCPU */
+	int		   preflight_failed;
+	int		   preflight_level;
+	unsigned long long preflight_va;
+	int		   validated_only;	/* diagnostic gate: checked, not entered */
 } co_manager_ioctl_kvcpu_run_t;
 
 /* interface for the CO_MANAGER_IOCTL_KLOAD_* family */

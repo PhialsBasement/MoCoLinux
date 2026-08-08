@@ -1271,11 +1271,13 @@ static void co_report_bug_at(co_elf_data_t* pl, unsigned long long rip)
 struct co_ap_ctx {
 	co_manager_handle_t		handle;
 	co_manager_ioctl_kvcpu_run_t	r;
+	volatile int			stop;
 };
 
 static void co_ap_thread(void* arg)
 {
 	struct co_ap_ctx* ctx = arg;
+	co_rc_t ioctl_rc;
 	int tries;
 
 	if (!ctx->handle)
@@ -1300,11 +1302,62 @@ static void co_ap_thread(void* arg)
 	 * processor nothing in between.
 	 */
 	for (tries = 0; tries < 300; tries++) {
-		co_manager_kvcpu_run(ctx->handle, &ctx->r);
+		if (ctx->stop)
+			return;
+		/*
+		 * KVCPU_RUN's reply contains the number of crossings it performed.
+		 * That is output, not the next request.  A failed AP attempt used to
+		 * feed LLONG_MAX back here on the retry, silently changing the call
+		 * from "wait for START_VCPU" (zero) into the synthetic SMP lane.
+		 */
+		ctx->r.iterations = 0;
+		ioctl_rc = co_manager_kvcpu_run(ctx->handle, &ctx->r);
+
+		/*
+		 * Keep AP-start failures in the ordinary boot log.
+		 *
+		 * The driver's fine-grained trace is deliberately a crash tool;
+		 * a processor that merely refuses to start must explain itself in
+		 * the same colinux-daemon.exe log as the kernel line it stopped
+		 * after.  Report only failures, not the expected "not requested
+		 * yet" polls, so a normal boot remains quiet.
+		 */
+		if (!CO_OK(ioctl_rc)) {
+			co_terminal_print("  vcpu %d: polling ioctl failed (rc %x)\n",
+					  ctx->r.vcpu, (int)ioctl_rc);
+			ctx->r.never_started = 1;
+			return;
+		}
+		if (ctx->r.validated_only) {
+			co_terminal_print("  vcpu %d: stepped AP probe stopped safely "
+					  "after %lld crossings at rip 0x%llx "
+					  "(vector %llu, faulted %d)\n",
+					  ctx->r.vcpu, ctx->r.completed,
+					  ctx->r.fault_rip, ctx->r.vector,
+					  ctx->r.faulted);
+			return;
+		}
+		else if (ctx->r.preflight_failed)
+			co_terminal_print("  vcpu %d: AP preflight refused 0x%llx "
+					  "at page-table level %d (driver rc %x)\n",
+					  ctx->r.vcpu, ctx->r.preflight_va,
+					  ctx->r.preflight_level, (int)ctx->r.rc);
+		else if (ctx->r.never_started && ctx->r.no_free_core && tries == 0)
+			co_terminal_print("  vcpu %d: driver found no safe host core "
+					  "(rc %x)\n", ctx->r.vcpu, (int)ctx->r.rc);
+		else if (ctx->r.never_started && !ctx->r.no_free_core &&
+			 !CO_OK(ctx->r.rc))
+			co_terminal_print("  vcpu %d: START_VCPU attempt was refused "
+					  "(driver rc %x, host processor %lu, waited %d)\n",
+					  ctx->r.vcpu, (int)ctx->r.rc,
+					  ctx->r.host_cpu, ctx->r.waited_for_start);
 
 		if (!ctx->r.never_started)
 			return;			/* ran, or failed for a real reason */
 
+		/* Preserve the result for the main thread's post-run report. */
+		if (tries == 299)
+			break;
 		ctx->r.never_started = 0;
 		co_os_user_msleep(200);
 	}
@@ -2513,6 +2566,10 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		}
 
 		rc = co_manager_kboot(handle, &b);
+
+		/* A failed/finished KBOOT leaves no guest for a polling AP. */
+		for (i = 1; i < in_cpus && i < CO_MAX_VCPUS; i++)
+			ap_ctx[i].stop = 1;
 
 		for (i = 1; i < in_cpus && i < CO_MAX_VCPUS; i++) {
 			if (ap_thread[i]) {

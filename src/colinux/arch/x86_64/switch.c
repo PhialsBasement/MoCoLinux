@@ -335,7 +335,7 @@ asm(".text                                          \n"
 #define CO_PP_GUEST_FRAME_N	0xaa8
 
 /*
- * params[29]: run the guest one instruction at a time.
+ * params[29]: boot-entry interrupt mode.
  *
  * Only three things can take control away from a guest running with interrupts
  * disabled -- an exception, an NMI, or the trap flag. start_kernel disables
@@ -343,8 +343,12 @@ asm(".text                                          \n"
  * setup_arch, so the interrupt path bounds nothing during exactly the stretch
  * that matters. TF does: the CPU raises #DB after every instruction whether or
  * not IF is set, the guest's own IDT sends that to a stub, and the host gets
- * control back. Slow, and unhangeable, which is the trade worth making while
+ * control back. Slow, and unhangable, which is the trade worth making while
  * finding out where a kernel dies.
+ *
+ * Zero is the normal boot (enable real IF), positive enables TF, and negative
+ * is an AP entry that leaves both IF and TF clear until co_colinux_ap_start()
+ * has installed its writable GDT, TSS and hybrid IDT.
  */
 #define CO_PP_STEP		"0xab0"
 #define CO_PP_STEP_N		0xab0
@@ -1336,13 +1340,14 @@ asm(".text                                                          \n"
      * before: interrupts are then delivered in host context between
      * crossings, and the forwarding path stays out of the picture.
      */
-    "    cmpq $0, " CO_PP_STEP "(%rax)                              \n"
-    "    je 4f                                                      \n"
-    "    pushfq                                                     \n"
+    "    cmpb $0, " CO_PP_STEP "(%rax)                              \n"
+    "    js 5f                                                      \n"
+    "    jne 4f                                                     \n"
+    "    sti                                                        \n"
+    "    jmp 5f                                                     \n"
+    "4:  pushfq                                                     \n"
     "    orq $0x100, (%rsp)                                         \n"
     "    popfq                                                      \n"
-    "    jmp 5f                                                     \n"
-    "4:  sti                                                        \n"
     "5:  jmp *%r10                                                  \n"
     ".globl co_call_shim                                            \n"
     "co_call_shim:                                                  \n"
@@ -4307,17 +4312,13 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		}
 
 		/*
-		 * Through the boot shim, exactly as the boot processor is
-		 * entered -- params[20], not return_rip.
+		 * Through the boot shim's AP mode -- params[20], not return_rip.
 		 *
-		 * co_setup_guest_page() already pointed return_rip at
-		 * co_boot_shim; the shim executes sti and jumps to params[20].
-		 * Overwriting return_rip with the kernel entry instead skips
-		 * the shim altogether, so the new processor begins with real
-		 * interrupts still masked and none of the entry contract the
-		 * rest of the switch assumes. That is what the resets were:
-		 * the guest reached its first instruction in a state nothing
-		 * downstream was written for.
+		 * Unlike vCPU 0's boot shim, this one deliberately leaves real IF
+		 * clear. co_colinux_ap_start enables it only after its writable
+		 * GDT, kernel TSS and per-vCPU hybrid IDT are all live. Entering the
+		 * kernel directly would skip both that contract and the diagnostic
+		 * TF setup retained by the shim.
 		 */
 		/*
 		 * The root vCPU 0 published, not the one the guest named.
@@ -4330,17 +4331,46 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		 * agrees; disagreeing means the guest asked for something this
 		 * host will not do, and saying so beats entering it.
 		 */
-		if (ap_start_cr3[lane] != co_vcpu[0].guest_cr3) {
-			co_debug_error("vcpu %d: guest asked for cr3 0x%llx but the "
-				       "published kernel root is 0x%llx -- refusing",
-				       lane, ap_start_cr3[lane], co_vcpu[0].guest_cr3);
-			out->never_started = PTRUE;
-			co_vcpu_release(vcpu);
-			return CO_RC(ERROR);
+		{
+			co_pa_t requested_machine = 0;
+			int cr3_matches =
+				(ap_start_cr3[lane] == co_vcpu[0].guest_cr3);
+
+			/*
+			 * FragRAM split guest physical addresses from machine ones.
+			 *
+			 * __pa_nodebug(init_mm.pgd), which the guest sends in the
+			 * START_VCPU request, is deliberately pseudo-physical now.
+			 * vcpu0.guest_cr3 is the machine address actually loaded by
+			 * hardware.  Before p2m those numbers were identical, so the
+			 * direct comparison below was correct by accident and began
+			 * refusing every AP as soon as fragmented RAM was merged.
+			 *
+			 * Accept the direct form as well: it keeps the handshake valid
+			 * for a guest which explicitly supplies a hardware CR3, while
+			 * the normal path validates the pseudo value through p2m.
+			 */
+			if (!cr3_matches &&
+			    CO_OK(co_kload_pseudo_to_machine(ap_start_cr3[lane],
+							 &requested_machine)) &&
+			    requested_machine == co_vcpu[0].guest_cr3)
+				cr3_matches = 1;
+
+			if (!cr3_matches) {
+				co_debug_error("vcpu %d: guest asked for cr3 0x%llx but the "
+					       "published kernel root is 0x%llx (translated "
+					       "0x%llx) -- refusing",
+					       lane, ap_start_cr3[lane],
+					       co_vcpu[0].guest_cr3,
+					       (unsigned long long)requested_machine);
+				out->never_started = PTRUE;
+				co_vcpu_release(vcpu);
+				return CO_RC(ERROR);
+			}
 		}
 
 		pp->params[20]                   = ap_start_rip[lane];
-		pp->params[29]                   = 0;	/* free-running, not stepped */
+		pp->params[29]                   = (unsigned long long)-1;
 		pp->linuxvm_state.rsp            = ap_start_rsp[lane];
 		pp->linuxvm_state.cr3            = co_vcpu[0].guest_cr3;
 		pp->linuxvm_state.gs_base        = ap_start_gs[lane];
@@ -4482,12 +4512,6 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	 * so the walk has to start there.
 	 */
 	if (join_guest) {
-		static const struct { const char* what; int page; } needed[] = {
-			{ "switch code",  0 },
-			{ "vector stubs", 8 + CO_PP_STUBS_PAGE },
-			{ "IST stack",    8 + CO_PP_ISTSTACK_PAGE },
-			{ "TSS",          8 + CO_PP_TSS_PAGE },
-		};
 		/*
 		 * Through the root this processor will actually run on. For a
 		 * secondary that is the kernel's table, not kload_space's --
@@ -4512,20 +4536,57 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 			: (unsigned long long)co_arch_guest_space_root(co_kload_space());
 		co_pfn_t root = (co_pfn_t)((root_pa & CO_ARCH_PAGE_MASK)
 					   >> CO_ARCH_PAGE_SHIFT);
-		int i;
+		int page;
 
-		for (i = 0; i < (int)(sizeof(needed) / sizeof(needed[0])); i++) {
+		/*
+		 * The two addresses the AP touches before it can report anything.
+		 * A missing entry instruction or idle-task stack used to be left to
+		 * the processor to discover, which means #PF before the new CPU has
+		 * adopted Linux's traps.  That is exactly the shape of a silent
+		 * triple fault, so resolve both while still in Windows.
+		 */
+		{
+			const unsigned long long first_touch[] = {
+				ap_start_rip[lane],
+				ap_start_rsp[lane] - 8,
+				ap_start_rsp[lane] - 64,
+			};
+			int i;
+
+			for (i = 0; i < (int)(sizeof(first_touch) /
+						      sizeof(first_touch[0])); i++) {
+				co_pa_t got = 0;
+				int level = -1;
+
+				if (!CO_OK(co_arch_guest_lookup_root(manager, root,
+								 first_touch[i], &got,
+								 &level)) || !got) {
+					out->preflight_failed = PTRUE;
+					out->preflight_va     = first_touch[i];
+					out->preflight_level  = level;
+					co_vcpu_release(vcpu);
+					return CO_RC(ERROR);
+				}
+			}
+		}
+
+		/*
+		 * Every page, not four samples.  In particular the old list omitted
+		 * the IDT page: co_boot_shim executes sti before jumping to the AP,
+		 * so one bad IDT PTE turns the first pending host interrupt into a
+		 * triple fault even though the stubs, TSS and IST pages all passed.
+		 */
+		for (page = 0; page < pages; page++) {
 			unsigned long long va = (unsigned long long)(size_t)pp
-				+ (unsigned long long)needed[i].page * CO_ARCH_PAGE_SIZE;
+				+ (unsigned long long)page * CO_ARCH_PAGE_SIZE;
 			co_pa_t got = 0;
 			int level = -1;
 
 			if (!CO_OK(co_arch_guest_lookup_root(manager, root, va, &got, &level)) ||
 			    got != (co_os_virt_to_phys((void*)(size_t)va) & CO_ARCH_PAGE_MASK)) {
-				co_debug_error("vcpu %d: %s at 0x%llx is not reachable in "
-					       "the guest's space (absent at level %d) -- "
-					       "refusing to enter", lane, needed[i].what,
-					       va, level);
+				co_debug_error("vcpu %d: passage page %d at 0x%llx is not "
+					       "reachable in the guest's space (level %d) -- "
+					       "refusing to enter", lane, page, va, level);
 				out->preflight_failed = PTRUE;
 				out->preflight_va     = va;
 				out->preflight_level  = level;
@@ -4534,6 +4595,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 				return CO_RC(ERROR);
 			}
 		}
+
 	} else if (!co_preflight_guest(pp, setup.passage_va, &setup)) {
 		out->preflight_failed = setup.preflight_failed;
 		out->preflight_level  = setup.preflight_level;
@@ -5300,7 +5362,7 @@ static co_rc_t co_arch_vcpu_run(co_manager_t* manager, co_vcpu_t* vcpu,
 			 * how long a desktop had been up when pacman started
 			 * writing files and the machine froze.
 			 */
-			if (vcpu->index == 0 && ctl->max_switches &&
+			if ((vcpu->index == 0 || ctl->step) && ctl->max_switches &&
 			    guest_crossings >= ctl->max_switches) {
 				out->hit_limit = PTRUE;
 				break;

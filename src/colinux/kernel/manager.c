@@ -1844,7 +1844,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		co_rc_t trc;
 		int req_vcpu;
 		long long req_iterations;
-		unsigned long cores, cpu, chosen;
+		unsigned long cores, cpu, candidate, chosen;
 
 		params = (typeof(params))(io_buffer);
 
@@ -1891,39 +1891,21 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		}
 
 		/*
-		 * Wait for the boot processor to claim its core before picking
-		 * one, and this ordering is the whole of it.
+		 * The AP polling ioctl must be non-blocking until KBOOT has
+		 * claimed vCPU 0.
 		 *
-		 * The picker below avoids cores held by ACTIVE vCPUs. A
-		 * secondary's thread is started before the guest boots -- it
-		 * has to be, because the guest reaches smp_init() within
-		 * milliseconds -- so if it picks immediately, nothing is active
-		 * yet, it takes core 0, and then KBOOT pins the boot processor
-		 * to whichever core the daemon's main thread was on, which can
-		 * be core 0 too.
-		 *
-		 * Two vCPUs on one core is not slow, it is stuck: each crossing
-		 * loop holds its processor for as long as its guest runs, so
-		 * neither ever yields to the other. A core that stops answering
-		 * the clock is CLOCK_WATCHDOG_TIMEOUT, and that is exactly what
-		 * this cost -- bugcheck 0x101 naming processor 1, then two more
-		 * resets that died before Windows could write the dump.
+		 * Waiting here deadlocks the launch ordering: the daemon starts
+		 * the AP poller just before it submits KBOOT, and manager ioctls
+		 * are serialized.  The poller held that path for 30 seconds
+		 * waiting for a boot ioctl which could not enter, then reported
+		 * the misleading "no safe host core" error.  Userspace already
+		 * retries every 200 ms, so "not booting yet" is an ordinary
+		 * never_started reply, not a placement failure.
 		 */
-		{
-			int spins;
-
-			for (spins = 0; spins < 3000 && !co_arch_boot_running(); spins++)
-				co_os_msleep(10);
-
-			if (!co_arch_boot_running()) {
-				co_debug_error("KVCPU_RUN: no boot processor appeared, so "
-					       "there is no core map to avoid -- refusing "
-					       "to start vcpu %d", req_vcpu);
-				params->no_free_core = PTRUE;
-				params->rc           = CO_RC(ERROR);
-				*return_size         = sizeof(*params);
-				return CO_RC(OK);
-			}
+		if (!co_arch_boot_running()) {
+			params->rc   = CO_RC(OK);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
 		}
 
 		/*
@@ -1996,10 +1978,22 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		 * processor short boots; a host that bugchecks does not.
 		 */
 		cores  = co_os_cpu_count();
-		chosen = cores;
+		chosen = (unsigned long)-1;
 		for (cpu = cores; cpu-- > 1; ) {
-			if (!co_arch_vcpu_core_taken(cpu)) {
-				chosen = cpu;
+			/*
+			 * cpu is an ordinal, not necessarily a processor number.
+			 * KeQueryActiveProcessors() may be sparse after affinity or
+			 * boot configuration (0, 2, 4, 6 is perfectly valid).  The
+			 * old code treated its population count as a dense range,
+			 * selected processor 3 in that example, and then reported
+			 * "no safe host core" despite three usable processors.
+			 */
+			candidate = co_os_cpu_nth(cpu);
+			if (candidate == (unsigned long)-1 ||
+			    co_arch_vcpu_core_taken(candidate))
+				continue;
+			if (co_os_pin_cpu_to(candidate)) {
+				chosen = candidate;
 				break;
 			}
 		}
@@ -2021,7 +2015,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		 * on the first boot after this was relaxed. A guest one
 		 * processor short is a guest that boots.
 		 */
-		if (chosen >= cores || !co_os_pin_cpu_to(chosen)) {
+		if (chosen == (unsigned long)-1) {
 			co_debug_error("KVCPU_RUN: vcpu %d has no free host "
 				       "processor of %lu -- refusing, rather "
 				       "than sharing a core", req_vcpu, cores);
@@ -2067,6 +2061,10 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->msr_got       = result.msr_got;
 		params->waited_for_start = result.waited_for_start;
 		params->never_started    = result.never_started;
+		params->preflight_failed = result.preflight_failed;
+		params->preflight_level  = result.preflight_level;
+		params->preflight_va     = result.preflight_va;
+		params->validated_only   = result.validated_only;
 
 		*return_size = sizeof(*params);
 		return CO_RC(OK);

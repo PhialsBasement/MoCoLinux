@@ -2996,7 +2996,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  #include <linux/smp.h>
  #include <linux/export.h>
  #include <linux/sched.h>
-@@ -1152,6 +1154,850 @@
+@@ -1152,6 +1154,860 @@
  	cpumask_set_cpu(0, topology_die_cpumask(0));
  }
  
@@ -3273,11 +3273,10 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +	 *
 +	 * This processor arrives on the tables the host built into its passage
 +	 * page -- a Linux-shaped GDT, a TSS with IST stacks, and an IDT of 256
-+	 * host stubs -- all loaded by the world switch, and all valid. The
-+	 * shim enables real interrupts before jumping here, so an interrupt
-+	 * can arrive at any moment from the first instruction; landing it on a
-+	 * host stub backed by the passage page's own IST is exactly what that
-+	 * arrangement is for, and it is how the boot processor runs too.
++	 * host stubs -- all loaded by the world switch, and all valid. Unlike
++	 * the boot processor, a secondary arrives with real IF clear. It must
++	 * stay clear across cpu_init()'s temporary read-only GDT alias and until
++	 * the writable GDT, kernel TSS and this vCPU's hybrid IDT are all live.
 +	 *
 +	 * An earlier version called load_current_idt() here, reasoning that
 +	 * the kernel's IDT should be in place before anything could fault.
@@ -3445,6 +3444,14 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +	 * vCPU's own stubs. See co_colinux_ap_adopt_traps().
 +	 */
 +	co_colinux_ap_adopt_traps();
++
++	/*
++	 * Hardware interrupts belong to Windows, not to Linux's virtual IRQ
++	 * state. The AP-specific entry shim kept real IF clear while the
++	 * descriptor tables were being replaced; it is safe to expose this CPU
++	 * to host interrupts only now that every crossing-carried table is live.
++	 */
++	asm volatile("sti" ::: "memory");
 +
 +	fpu__init_cpu();
 +
@@ -3774,6 +3781,9 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +	 */
 +	preempt_disable();
 +	set_bit(vector, co_colinux_ipi_pending[co_colinux_vcpu_id()]);
++	/* After the bit -- see co_colinux_spin_poll(). */
++	smp_mb__after_atomic();
++	WRITE_ONCE(co_colinux_ipi_any, 1);
 +	preempt_enable_no_resched();
 +}
 +#endif
@@ -6192,3 +6202,366 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ke
  	len = __stop_ftrace_eval_maps - __start_ftrace_eval_maps;
  	trace_event_update_with_eval_map(NULL, __start_ftrace_eval_maps, len);
  }
+diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -57,6 +57,7 @@
+ #include <asm/msr.h>
+ #include <asm/shstk.h>
+ #include <linux/console.h>	/* co_colinux_guest */
++#include <linux/irq_work.h>	/* irq_work_run, for the posted IRQ_WORK_VECTOR */
+ #include <linux/clockchips.h>	/* the cooperative tick device */
+ #include <linux/hardirq.h>	/* irq_enter/irq_exit around delivered ticks */
+ #include <asm/irq_regs.h>	/* the register frame the tick handler reads */
+@@ -1005,6 +1006,28 @@
+ 	case CALL_FUNCTION_SINGLE_VECTOR:
+ 		generic_smp_call_function_single_interrupt();
+ 		break;
++	case IRQ_WORK_VECTOR:
++		/*
++		 * Deferred work, and dropping it breaks the console.
++		 *
++		 * This vector is not an SMP thing and it arrives even with one
++		 * processor: arch_irq_work_raise() posts it with
++		 * apic->send_IPI_self(), which the inert apic installed in
++		 * co_colinux_smp_init() routes straight into this processor's
++		 * own pending set. Before that driver existed the core asked
++		 * arch_irq_work_has_interrupt(), got no for a guest with no
++		 * local APIC, and ran irq_work off the tick instead -- so this
++		 * path simply did not exist.
++		 *
++		 * With no case here it fell to the default, which warns once,
++		 * clears the bit and throws the work away. printk uses irq_work
++		 * to flush deferred output, so the visible symptom is a guest
++		 * that runs and says nothing: an installer talking to it over
++		 * the console sees silence and gives up, on a boot with
++		 * cpus: 1, where none of the SMP work is even in the path.
++		 */
++		irq_work_run();
++		break;
+ 	case REBOOT_VECTOR:
+ 		/*
+ 		 * The stop message. Does not return: this processor takes
+@@ -1031,6 +1054,38 @@
+ EXPORT_SYMBOL(co_colinux_ipi_pending);
+ 
+ /*
++ * Non-zero while this processor is already inside co_colinux_ipi_poll().
++ *
++ * The poll is now reached from every structured busy-wait in the kernel
++ * (smp_cond_load_relaxed, asm-generic/barrier.h), and the handlers it runs spin
++ * on locks of their own -- generic_smp_call_function_single_interrupt() walks a
++ * llist and takes rq->lock by way of sched_ttwu_pending(). Without this the
++ * first such spin re-enters the poll, which dispatches the same queue again.
++ *
++ * A plain array rather than a percpu variable, for the same reason the pending
++ * sets are: this is indexed by co_colinux_vcpu_id() from headers that cannot
++ * reach the percpu machinery, and it is only ever written by the processor it
++ * belongs to, under a virtual local_irq_save.
++ */
++static int co_colinux_ipi_polling[CO_COLINUX_NR_VCPUS];
++
++/*
++ * "Somebody, somewhere, has a vector posted."
++ *
++ * The one word every spinning processor reads (asm-generic/barrier.h), so it
++ * gets a cache line to itself: co_colinux_ipi_pending[] is four rows of 32
++ * bytes and therefore shares lines between vCPUs, which means a post to one
++ * processor invalidates the line another is reading in its spin loop. That
++ * ping-pong is what made the unthrottled hook crawl.
++ *
++ * Set after the bit, cleared only by a drain that has checked every set. Never
++ * zero while a bit is set; may be one when nothing is, which costs a poll that
++ * finds nothing.
++ */
++unsigned long co_colinux_ipi_any ____cacheline_aligned;
++EXPORT_SYMBOL(co_colinux_ipi_any);
++
++/*
+  * Post a vector to another processor and ring its doorbell.
+  *
+  * Two halves, and both are needed. The bit is the message: it survives
+@@ -1052,6 +1107,11 @@
+ 
+ 	set_bit(vector, co_colinux_ipi_pending[cpu]);
+ 	smp_mb__after_atomic();
++	/*
++	 * After the bit, so a spinner that sees this is guaranteed to find the
++	 * bit. See co_colinux_spin_poll() in asm-generic/barrier.h.
++	 */
++	WRITE_ONCE(co_colinux_ipi_any, 1);
+ 
+ 	preempt_disable();
+ 	pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
+@@ -1078,8 +1138,31 @@
+ 
+ 	for (;;) {
+ 		vector = find_first_bit(set, 256);
+-		if (vector >= 256)
++		if (vector >= 256) {
++			/*
++			 * This processor is empty; retire the machine-wide
++			 * summary only if every other one is too.
++			 *
++			 * Cleared before the re-scan, so a post that lands
++			 * during the scan either sets it again afterwards or is
++			 * seen by the scan. Getting it wrong in this direction
++			 * -- leaving it one -- costs a poll that finds nothing;
++			 * getting it wrong the other way would lose a
++			 * cross-call, so the clear is never done blind.
++			 */
++			int v;
++
++			WRITE_ONCE(co_colinux_ipi_any, 0);
++			smp_mb();
++
++			for (v = 0; v < CO_COLINUX_NR_VCPUS; v++)
++				if (find_first_bit(co_colinux_ipi_pending[v],
++						   256) < 256) {
++					WRITE_ONCE(co_colinux_ipi_any, 1);
++					break;
++				}
+ 			return;
++		}
+ 		clear_bit(vector, set);
+ 		co_colinux_ipi_dispatch(vector);
+ 	}
+@@ -1112,10 +1195,78 @@
+ {
+ 	unsigned long flags;
+ 
++	/*
++	 * NOT gated on irqs_disabled(), and that is the whole point of this
++	 * function.
++	 *
++	 * irqs_disabled() here is the VIRTUAL flag: native_save_fl()
++	 * substitutes co_colinux_virtual_if[co_colinux_vcpu_id()] for
++	 * X86_EFLAGS_IF (asm/irqflags.h), so every processor inside a
++	 * spin_lock_irqsave() section reads as disabled. Returning early for
++	 * those is what deadlocks two processors:
++	 *
++	 *   CPU A calls on_each_cpu() -- flush_tlb_kernel_range, text_poke,
++	 *   any of them -- and spins in csd_lock_wait() waiting for B.
++	 *   CPU B is inside spin_lock_irqsave(), so its virtual IF is clear,
++	 *   so its poll returned here without dispatching A's request. B is
++	 *   waiting on something A must finish. Neither yields, and neither
++	 *   receives a tick, because ticks arrive only at cooperative
++	 *   boundaries and a spinner reaches none -- which is also why no
++	 *   hung-task warning and no RCU stall ever fires to name it. Both
++	 *   host threads burn 100% for ever.
++	 *
++	 * Hardware does not behave this way, and smp_call_function is built on
++	 * that: cli DELAYS an IPI, it does not cancel it, so a processor with
++	 * interrupts off still takes the cross-call. Declining to poll turns a
++	 * delay into a cancellation, and this port's "interrupt" is this poll.
++	 *
++	 * Running the handlers with the virtual IF clear is exactly what
++	 * hardware would have done at the same instruction, and the vectors
++	 * involved are the ones a hardware IPI runs there anyway --
++	 * flush_tlb_func on the TLB path. What must not follow is irq_exit()'s
++	 * softirq pass, and it does not: the bracket below is deliberately raw.
++	 *
++	 * local_irq_save() below still makes the drain atomic against a real
++	 * interrupt arriving on this processor mid-dispatch.
++	 */
+ 	if (!co_colinux_guest || irqs_disabled())
+ 		return;
+ 
+ 	/*
++	 * The virtual-IF gate is BACK, and removing it was the wrong half of
++	 * the fix.
++	 *
++	 * The reasoning that removed it was that a spinner with the virtual IF
++	 * clear can never service a peer, so gating on it deadlocks. That is
++	 * true and it is not the whole picture: dispatching with the flag clear
++	 * runs the handlers in regions where hardware STRUCTURALLY cannot run
++	 * them, and some of those regions hold the very locks the handlers take.
++	 *
++	 * sched_ttwu_pending() -- reached from
++	 * generic_smp_call_function_single_interrupt() through the call-function
++	 * queue -- does rq_lock_irqsave() (kernel/sched/core.c:3802). So every
++	 * holder of rq->lock holds it with interrupts disabled, which on real
++	 * hardware is exactly why the CALL_FUNCTION gate cannot fire inside that
++	 * region: an interrupt gate never fires while IF is clear. Dispatch
++	 * there anyway and a processor that holds rq->lock and then spins takes
++	 * rq->lock again from inside its own spin. That is a self-deadlock on a
++	 * non-recursive spinlock: one processor pinned at 100%, and the peer
++	 * pinned behind the rq->lock it will never release.
++	 *
++	 * It is also why widening the poll made things worse rather than better
++	 * -- more spin sites meant more chances to dispatch inside an
++	 * interrupts-disabled critical section, and the freeze went from minutes
++	 * to instant.
++	 *
++	 * What the widening DID fix stays fixed: the poll now runs at every
++	 * structured busy-wait (asm-generic/barrier.h) rather than only in
++	 * csd_lock_wait(), so a processor spinning with interrupts ENABLED --
++	 * which is precisely where hardware would have delivered the IPI -- now
++	 * services its peer wherever it spins. That was the real gap. The gate
++	 * only declines the case hardware declines too.
++	 */
++
++	/*
+ 	 * Posted vectors ONLY. Not time, and not the device rings.
+ 	 *
+ 	 * This runs from inside an arbitrary busy wait -- csd_lock_wait, which
+@@ -1134,7 +1285,21 @@
+ 	 * and takes ticks at its own idle boundary.
+ 	 */
+ 	local_irq_save(flags);
+-	if (find_first_bit(co_colinux_ipi_pending[co_colinux_vcpu_id()], 256) < 256) {
++	if (!co_colinux_ipi_polling[co_colinux_vcpu_id()] &&
++	    find_first_bit(co_colinux_ipi_pending[co_colinux_vcpu_id()], 256) < 256) {
++		/*
++		 * Claim this processor before dispatching, because the handlers
++		 * spin and every spin is now a poll.
++		 *
++		 * generic_smp_call_function_single_interrupt() walks a llist and
++		 * reaches rq->lock through sched_ttwu_pending(); the moment that
++		 * contends, queued_spin_lock_slowpath() spins, the spin calls
++		 * back into here, and the same queue is dispatched a second time
++		 * underneath the first. Set before, cleared after, read under the
++		 * same virtual local_irq_save -- one processor, one writer, no
++		 * atomic needed.
++		 */
++		co_colinux_ipi_polling[co_colinux_vcpu_id()] = 1;
+ 		/*
+ 		 * The raw hardirq bracket, NOT irq_enter()/irq_exit().
+ 		 *
+@@ -1185,6 +1350,8 @@
+ 		preempt_count_sub(HARDIRQ_OFFSET);
+ 		ct_irq_exit();
+ 		lockdep_hardirq_exit();
++
++		co_colinux_ipi_polling[co_colinux_vcpu_id()] = 0;
+ 	}
+ 	local_irq_restore(flags);
+ }
+@@ -1419,6 +1586,7 @@
+ {
+ 	return false;
+ }
++
+ DEFINE_IDTENTRY_SYSVEC(sysvec_co_timer)
+ {
+ 	struct pt_regs *old = set_irq_regs(regs);
+
+diff -urN a/include/asm-generic/barrier.h b/include/asm-generic/barrier.h
+--- a/include/asm-generic/barrier.h
++++ b/include/asm-generic/barrier.h
+@@ -242,15 +242,87 @@
+  * Due to C lacking lambda expressions we load the value of *ptr into a
+  * pre-named variable @VAL to be used in @cond.
+  */
++/*
++ * A cooperative guest has no interrupts, so every busy-wait must poll.
++ *
++ * On real hardware a processor spinning here is preempted by the incoming
++ * CALL_FUNCTION IPI and runs the peer's request. This guest takes no
++ * asynchronous entry at all: its "interrupts" are polls at hand-placed call
++ * sites, and a spin that has no such site never services anything. That is a
++ * complete deadlock cycle and it is not hypothetical --
++ *
++ *   A holds lock L, calls on_each_cpu() (a TLB shootdown, a text_poke) and
++ *   waits in csd_lock_wait(), which does poll.
++ *   B waits for L in queued_spin_lock_slowpath(), which did not.
++ *   A waits for B's acknowledgement; B waits for A's lock. Neither reaches a
++ *   cooperative boundary, so neither receives a tick either, and no watchdog
++ *   fires because every watchdog is timer-driven.
++ *
++ * cpu_relax() is the marker Linux uses for "I am spinning", and would be the
++ * obvious hook, but it cannot be one: cpu_relax() lives in
++ * asm/vdso/processor.h and vdso_read_begin() (include/vdso/helpers.h) spins on
++ * it in the vDSO, which is userspace and cannot reference a kernel symbol.
++ *
++ * So the hook goes one level down, here. This macro is kernel-only and it is
++ * where the structured busy-waits actually spin: atomic_cond_read_relaxed,
++ * atomic_cond_read_acquire and smp_cond_load_acquire are all built on it, which
++ * covers four of the five spins in queued_spin_lock_slowpath() (the fifth is a
++ * bare cpu_relax() and is hooked at its own site) as well as csd_lock_wait()'s
++ * native form and every other smp_cond_load_*() wait in the tree.
++ *
++ * The guard is one load of a variable that is false on any non-cooperative
++ * build, so the fast path is a predictable not-taken branch; the pending-set
++ * test lives inside co_colinux_ipi_poll(), which does nothing and returns when
++ * this processor has no posted vectors.
++ */
++#ifndef __ASSEMBLY__
++extern int co_colinux_guest;
++extern unsigned long co_colinux_ipi_any;
++void co_colinux_ipi_poll(void);
++
++/*
++ * TWO plain loads of words that are almost always unchanged, and only once
++ * every 64 spins.
++ *
++ * The first version of this hook called co_colinux_ipi_poll() on every
++ * iteration and the machine crawled. The cost was not the call: the first thing
++ * the poll did was local_irq_save(), which in this guest is a WRITE to
++ * co_colinux_virtual_if[], followed by find_first_bit() over four words of
++ * co_colinux_ipi_pending[] -- a line the PEER writes when it posts. A write and
++ * a shared-line read in the innermost loop of every contended spinlock is a
++ * cacheline ping-pong for the whole duration of every lock wait.
++ *
++ * So nothing is touched until co_colinux_ipi_any says there is something to
++ * find. It is one word on a line of its own, written only when a vector is
++ * posted and when a drain empties every set -- both rare -- so a spinning
++ * processor reads it from L1 with the line unmodified.
++ *
++ * Machine-wide rather than per-vCPU on purpose: it keeps the fast path free of
++ * co_colinux_vcpu_id(), which is a GS-relative read and a header dependency
++ * this file cannot take. The imprecision costs a processor an occasional slow
++ * path for a vector posted to a DIFFERENT processor, which finds nothing of its
++ * own and returns. It is never falsely zero while a bit is set, and that is the
++ * only direction that matters.
++ */
++#define co_colinux_spin_poll()						\
++	do {								\
++		if (co_colinux_guest && READ_ONCE(co_colinux_ipi_any))	\
++			co_colinux_ipi_poll();				\
++	} while (0)
++#endif
++
+ #ifndef smp_cond_load_relaxed
+ #define smp_cond_load_relaxed(ptr, cond_expr) ({		\
+ 	typeof(ptr) __PTR = (ptr);				\
+ 	__unqual_scalar_typeof(*ptr) VAL;			\
++	unsigned int __co_spins = 0;				\
+ 	for (;;) {						\
+ 		VAL = READ_ONCE(*__PTR);			\
+ 		if (cond_expr)					\
+ 			break;					\
+ 		cpu_relax();					\
++		if (!(++__co_spins & 63))			\
++			co_colinux_spin_poll();			\
+ 	}							\
+ 	(typeof(*ptr))VAL;					\
+ })
+
+diff -urN a/kernel/locking/qspinlock.c b/kernel/locking/qspinlock.c
+--- a/kernel/locking/qspinlock.c
++++ b/kernel/locking/qspinlock.c
+@@ -228,9 +228,22 @@
+ 	 * simple enough.
+ 	 */
+ 	if (unlikely(idx >= _Q_MAX_NODES)) {
++		unsigned int __co_spins = 0;
++
+ 		lockevent_inc(lock_no_node);
+-		while (!queued_spin_trylock(lock))
++		while (!queued_spin_trylock(lock)) {
+ 			cpu_relax();
++			/*
++			 * The one spin in this function that is not built on
++			 * smp_cond_load_relaxed(), so it needs the cooperative
++			 * poll spelled out. A guest processor spinning here
++			 * with no way to service a peer's cross-call is half of
++			 * a deadlock -- see the comment on smp_cond_load_relaxed
++			 * in asm-generic/barrier.h.
++			 */
++			if (!(++__co_spins & 63))
++				co_colinux_spin_poll();
++		}
+ 		goto release;
+ 	}
+ 

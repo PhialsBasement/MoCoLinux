@@ -62,6 +62,15 @@ extern bool_t co_os_pin_cpu_to(unsigned long cpu);
 extern unsigned long co_os_cpu_count(void);
 
 /*
+ * Translate an ordinal in the active-processor set into the processor number
+ * used by the affinity API.  Active processor numbers are not guaranteed to
+ * be contiguous (for example, a host affinity mask may expose 0, 2, 4, 6), so
+ * a population count cannot also be used as the largest processor number.
+ * Returns (unsigned long)-1 when ordinal is outside the active set.
+ */
+extern unsigned long co_os_cpu_nth(unsigned long ordinal);
+
+/*
  * A kernel system thread, for the cooperative block device's async workers.
  *
  * The block transfer runs in the driver (ZwReadFile against a kernel handle),

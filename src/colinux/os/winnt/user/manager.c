@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 
 #include <colinux/os/alloc.h>
+#include <colinux/os/user/misc.h>
 #include <colinux/os/user/manager.h>
 #include <colinux/os/current/kernel/driver.h>
 #include <colinux/os/current/os.h>
@@ -97,7 +98,12 @@ co_rc_t co_os_manager_ioctl(
 			     NULL);
 
 	if (rc == FALSE) {
-		return CO_RC(ERROR);
+		DWORD error = GetLastError();
+
+		co_terminal_print("DeviceIoControl 0x%08lx failed (Win32 %lu)\n",
+				  code, error);
+		/* Preserve the OS error for the caller's ordinary-log report. */
+		return error ? -(co_rc_t)error : CO_RC(ERROR);
 	}
 
 	return CO_RC(OK);
