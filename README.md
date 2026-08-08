@@ -1,7 +1,8 @@
 # MoCoLinux
 
-Cooperative Linux for x86-64: a modern Linux kernel running as a guest inside
-Windows XP x64, Windows 7 x64, Windows 8.1 x64 and Windows 10 x64 on real
+Cooperative Linux for x86-64 (Now with 128GB Fragged RAM support): a modern
+Linux kernel running as a guest inside Windows XP x64, Windows 7 x64, Windows
+8.1 x64 and Windows 10 x64 on real
 hardware, without a
 hypervisor, emulation, or virtualization extensions. It is a port of
 [coLinux](http://colinux.org/) (i386, unmaintained since ~2011) to x86-64,
@@ -173,6 +174,10 @@ ask for:
 - Self-installing: `mocolinux-setup.exe` lays down driver, daemons, kernel,
   the GPU daemon with virglrenderer, X server and launchers, then boots Linux
   and builds a Manjaro system on a fresh image over the network
+- The authoritative complete guest-side Linux 7.1.5 diff is
+  [`patch/7.1.5/current-tree-snapshot.diff`](https://github.com/PhialsBasement/MoCoLinux/blob/mocolinux/patch/7.1.5/current-tree-snapshot.diff).
+  It is regenerated against the released tarball and checked by applying and
+  reverse-applying it with zero fuzz and an exact tree comparison
 
 Not yet:
 
@@ -189,11 +194,6 @@ Not yet:
   presentation off TCP entirely and hand frames to the host through guest
   RAM, the same zero-copy R3 windows the GPU command stream already rides
   (parked on the `r6-window-presentation` branch)
-- A repaired incremental patch series: `patch/7.1.5/current-tree-snapshot.diff`
-  is the authoritative guest-side diff and is deliberately not in `series`.
-  It is regenerated against the released tarball and checked by
-  reverse-applying it to `ref/linux-7.1.5`, so "the snapshot is behind the
-  tree" is a thing that gets caught rather than discovered later
 
 ### Cooperative SMP milestone
 
