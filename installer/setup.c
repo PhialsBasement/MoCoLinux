@@ -1356,10 +1356,41 @@ static BOOL guest_exchange(const char *line, char *out, int outn, int timeout_ms
 				e++;
 
 			if (e > d && *e == '\n') {
-				glog("ok: status %.*s after %lu ms, %d bytes",
-				     (int)(e - d), d,
-				     (unsigned long)(GetTickCount() - started),
-				     used);
+				/*
+				 * The reply itself, not just how many bytes of
+				 * it there were.
+				 *
+				 * This line used to record the status, the
+				 * elapsed time and a length, and throw the
+				 * text away -- which meant the one thing worth
+				 * keeping was the one thing never written
+				 * down. The guest's answer to
+				 *
+				 *   grep -a '==>\|MOCO_RC=' /var/log/mocolinux-setup.log
+				 *
+				 * IS the maker script's progress, and its last
+				 * answer carries MOCO_RC=<exit code>, which is
+				 * why the install failed. Every failing install
+				 * had that text in hand and discarded it, and
+				 * the guest's own copy is unreachable
+				 * afterwards: it lives on the image the script
+				 * was building, and the installer powers the
+				 * guest off the moment it reads the code.
+				 *
+				 * Flattened the same way the timeout path
+				 * already flattens its tail, so a multi-line
+				 * reply stays one log line.
+				 */
+				{
+					char shown[512];
+
+					glog_flatten(txt, shown, sizeof(shown));
+					glog("ok: status %.*s after %lu ms, %d bytes"
+					     " -- reply: \"%s\"",
+					     (int)(e - d), d,
+					     (unsigned long)(GetTickCount() - started),
+					     used, shown);
+				}
 				if (out) {
 					/*
 					 * The reply is what sits between the echo
@@ -1828,12 +1859,81 @@ static BOOL build_linux(void)
 	{
 	int log_missing = 0;
 	int said_slow = 0;
+	long seen_lines = 0;
 
 	for (;;) {
 		char stage[240] = {0};
+		char stream[4096] = {0};
 
 		Sleep(3000);
 		log_child_exits();
+
+		/*
+		 * The builder's output itself, streamed into the pane.
+		 *
+		 * The stage marker below moves perhaps four times in fifteen
+		 * minutes, so for most of an install the window said
+		 * "installing 37 package groups" and nothing else, and a
+		 * download that had quietly stopped looked exactly like one
+		 * that was working. Three real failures hid behind that --
+		 * a mirror resetting the connection, a stale database
+		 * answering 404, and a stalled receive ring -- and pacman
+		 * announced every one of them in this output while Setup
+		 * showed a marker that had not changed for minutes.
+		 *
+		 * Everything new since the last poll, not the newest line:
+		 * a line every three seconds would drop most of it, and the
+		 * lines that matter (the error, and the two mirrors it was
+		 * tried against) arrive together.
+		 *
+		 * Counted in RAW lines so the bookmark means the same thing
+		 * on both sides of a poll, then \r is unfolded for display
+		 * only -- pacman redraws its progress bar in place with
+		 * carriage returns, which is one line to the file and a
+		 * screenful to a reader. LINES= comes last so a truncated
+		 * reply loses text rather than the bookmark, and the
+		 * bookmark only advances on a reply that carried it: a
+		 * dropped poll then re-sends rather than skipping ahead.
+		 *
+		 * Failure here is ignored on purpose. This is the window's
+		 * cosmetics; the stage poll below decides whether the install
+		 * lives or dies and must not be made to depend on a nicety.
+		 */
+		_snprintf(cmd, sizeof(cmd) - 1,
+			  "awk 'NR>%ld' /var/log/mocolinux-setup.log"
+			  " | tr '\\r' '\\n' | grep -a . | tail -14;"
+			  " echo LINES=$(wc -l < /var/log/mocolinux-setup.log)",
+			  seen_lines);
+		cmd[sizeof(cmd) - 1] = 0;
+
+		if (guest_run(cmd, stream, sizeof(stream), 20000)) {
+			char *mark = StrStrA(stream, "LINES=");
+			char *p = stream;
+
+			while (p && *p) {
+				char *nl = StrChrA(p, '\n');
+				char line[200];
+
+				if (nl)
+					*nl = 0;
+				if (mark && p >= mark)
+					break;
+				glog_flatten(p, line, sizeof(line));
+				if (line[0])
+					work_say("%s", line);
+				p = nl ? nl + 1 : NULL;
+			}
+
+			if (mark) {
+				long n = 0;
+				char *d = mark + 6;
+
+				while (*d >= '0' && *d <= '9')
+					n = n * 10 + (*d++ - '0');
+				if (n >= seen_lines)
+					seen_lines = n;
+			}
+		}
 
 		if (!guest_run("grep -a '==>\\|MOCO_RC=' /var/log/mocolinux-setup.log"
 			       " | tail -1", stage, sizeof(stage), 20000))
@@ -3435,7 +3535,28 @@ static void draw_page(HDC dc, RECT *client)
 
 		/* The log, always visible here rather than folded away: this is
 		 * the stretch where something goes wrong, and hiding the only
-		 * evidence behind a disclosure triangle serves nobody. */
+		 * evidence behind a disclosure triangle serves nobody.
+		 *
+		 * On its own recessed panel, because it is no longer Setup's
+		 * own commentary -- it is the builder's output, arriving as it
+		 * happens. Giving it a surface of its own says that: the two
+		 * lines above are what Setup believes, and this is what the
+		 * guest is actually saying. */
+		b.left = x - S(6);
+		b.right = client->right - S(PAD_BASE) + S(6);
+		b.top = top + S(118);
+		b.bottom = b.top + S(8) * S(16) + S(12);
+		fill(dc, &b, RGB(0xf5, 0xf6, 0xf8));
+		{
+			RECT e = b;
+
+			e.bottom = e.top + 1;
+			fill(dc, &e, RGB(0xe0, 0xe2, 0xe6));
+			e = b;
+			e.top = e.bottom - 1;
+			fill(dc, &e, RGB(0xe0, 0xe2, 0xe6));
+		}
+
 		r.left = x;
 		r.top = top + S(124);
 		r.right = client->right - S(PAD_BASE);
