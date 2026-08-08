@@ -129,3 +129,19 @@ void co_os_free_exec_pages(void* ptr, unsigned int pages)
 {
 	co_os_free_pages(ptr, pages);
 }
+
+/*
+ * The modern pseudo-physical loader is a Windows-host path today.  Keep the
+ * semantic allocator available to the Linux host build; its existing page
+ * allocator remains the implementation until that host grows a vmap-backed
+ * KMAP path.
+ */
+void* co_os_alloc_cached_pages(unsigned int pages)
+{
+	return co_os_alloc_pages(pages);
+}
+
+void co_os_free_cached_pages(void* ptr, unsigned int pages)
+{
+	co_os_free_pages(ptr, pages);
+}

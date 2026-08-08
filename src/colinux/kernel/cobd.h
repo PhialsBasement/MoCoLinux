@@ -33,11 +33,9 @@ extern unsigned long long co_cobd_size(int unit);
  * `offset` against the unit's backing store, into or out of guest physical
  * memory at `guest_pa`.
  *
- * Guest physical is host physical, so the buffer is memory this driver
- * allocated and can address directly -- there is no bounce buffer and no
- * mapping step. The address is resolved through the same frame lookup the
- * page-table builder uses, which is also what confines the transfer to memory
- * belonging to the guest.
+ * guest_pa is pseudo-physical. The driver resolves each page through the
+ * loader's block index, so there is still no bounce buffer; the lookup also
+ * confines the transfer to memory belonging to this guest.
  */
 /*
  * The most descriptors one request may carry, matching BLK_MAX_SEGMENTS in the

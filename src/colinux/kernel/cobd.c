@@ -168,7 +168,7 @@ co_rc_t co_cobd_request_sg(co_manager_t* manager, int unit,
 			if (part > sizeof(d) - got)
 				part = sizeof(d) - got;
 
-			dva = (unsigned char*)co_kload_frame_va(
+			dva = (unsigned char*)co_kload_pseudo_frame_va(
 				(co_pfn_t)(at >> CO_ARCH_PAGE_SHIFT));
 			if (!dva) {
 				co_debug_error("cobd%d: sg list pa 0x%llx is not"
@@ -269,7 +269,7 @@ co_rc_t co_cobd_request(co_manager_t* manager, int unit,
 		if (chunk > size)
 			chunk = size;
 
-		va = (unsigned char*)co_kload_frame_va(
+		va = (unsigned char*)co_kload_pseudo_frame_va(
 			(co_pfn_t)(guest_pa >> CO_ARCH_PAGE_SHIFT));
 		if (!va) {
 			co_debug_error("cobd%d: guest pa 0x%llx is not guest memory",

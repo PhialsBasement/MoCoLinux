@@ -112,7 +112,8 @@ co_rc_t co_manager_save_state(co_manager_handle_t handle,
 }
 
 co_rc_t co_manager_kload_begin(co_manager_handle_t handle,
-			       unsigned long long min_va, unsigned long long max_va)
+			       unsigned long long min_va, unsigned long long max_va,
+			       unsigned long long ram_bytes)
 {
 	co_manager_ioctl_kload_begin_t params = {0, };
 	unsigned long returned = 0;
@@ -120,6 +121,7 @@ co_rc_t co_manager_kload_begin(co_manager_handle_t handle,
 
 	params.min_va = min_va;
 	params.max_va = max_va;
+	params.ram_bytes = ram_bytes;
 
 	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KLOAD_BEGIN,
 				 &params, sizeof(params), &params, sizeof(params), &returned);

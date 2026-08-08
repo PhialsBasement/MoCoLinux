@@ -24,12 +24,12 @@
  * Read the long comment at the top of virtio_colinux.c for why the transport
  * has no registers: nothing traps in this design, so a "kick" is an increment
  * of a shared counter that the host daemon spin-polls from another core, and
- * VIRTIO_F_ACCESS_PLATFORM is refused so that every vring address stays a
- * guest physical address the host can dereference in place.
+ * VIRTIO_F_ACCESS_PLATFORM is refused so every vring address stays a guest
+ * pseudo-physical address the host can resolve in its persistent KMAP window.
  */
 
 struct co_vgpu_vq {
-	unsigned long long desc_gpa;	/* guest physical == host physical */
+	unsigned long long desc_gpa;	/* guest pseudo-physical */
 	unsigned long long avail_gpa;
 	unsigned long long used_gpa;
 	unsigned int	   num;
@@ -61,10 +61,10 @@ struct co_vgpu_io {
  * virtio, and VIRTIO_GPU_F_VIRGL because 3D is the entire point.
  *
  * ACCESS_PLATFORM is absent and must stay absent. Offering it would put the
- * guest's vring behind the DMA API, and every descriptor would then carry a
- * DMA address rather than a guest physical one -- which would cost a
- * translation the host has no way to perform, and would throw away the
- * zero-copy property that makes this design worth building.
+ * guest's vring behind the DMA API, permitting every descriptor to carry a
+ * transformed DMA address rather than the pseudo address used to index KMAP.
+ * Keeping the transport in the pseudo domain preserves its direct lookup and
+ * zero-copy property.
  */
 #define CO_VGPU_F_VERSION_1	(1ULL << 32)	/* VIRTIO_F_VERSION_1 */
 #define CO_VGPU_F_VIRGL		(1ULL << 0)	/* VIRTIO_GPU_F_VIRGL */

@@ -39,18 +39,22 @@ extern void co_os_put_page(struct co_manager *manager, co_pfn_t pfn);
 extern void* co_os_alloc_exec_pages(unsigned int pages);
 extern void  co_os_free_exec_pages(void* ptr, unsigned int pages);
 
+/*
+ * Cached, non-pageable pages with one contiguous kernel virtual mapping.
+ *
+ * Unlike co_os_alloc_contiguous_pages(), these pages have no physical
+ * contiguity requirement.  The kload pseudo-physical layer records the
+ * machine frame behind each page separately; the virtual mapping is retained
+ * so host I/O and KMAP can still address a block without creating cache aliases.
+ */
+extern void* co_os_alloc_cached_pages(unsigned int pages);
+extern void  co_os_free_cached_pages(void* ptr, unsigned int pages);
+
 /* Which co_os_alloc_method() index co_os_alloc_exec_pages() uses. */
 extern int   co_os_exec_alloc_index(void);
 
 extern bool_t co_os_alloc_method(int index, const char** name);
-/*
- * Physically contiguous pages, from anywhere in physical memory.
- *
- * The guest's physical memory has to be host physical memory at its true
- * address: Linux reads its own page tables and calls __va() on the entries, so
- * a guest physical address has to be a host physical address. It comes in
- * several contiguous blocks rather than one. See colinux/kernel/kload.c.
- */
+/* Physically contiguous pages for legacy probes and callers that truly need it. */
 extern void*  co_os_alloc_contiguous_pages(unsigned int pages);
 extern void   co_os_free_contiguous_pages(void* ptr, unsigned int pages);
 

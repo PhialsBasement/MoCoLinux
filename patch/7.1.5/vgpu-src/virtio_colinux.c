@@ -14,8 +14,8 @@
  * here. Both kernels run on the bare processor, a store to any address is just
  * a store, and nobody is notified. So this transport is virtio_mmio with every
  * register access replaced by a plain memory write into a structure the host
- * can already see -- which it can, because guest physical memory IS host
- * physical memory in this design.
+ * can already see through persistent KMAP windows. Those windows are labelled
+ * with dense guest pseudo-physical addresses and backed through the host's p2m.
  *
  * That single property is what makes the whole thing cheap:
  *
@@ -25,10 +25,10 @@
  *
  *   - The vrings need no translation. A transport that does not offer
  *     VIRTIO_F_ACCESS_PLATFORM makes the vring code bypass the DMA API
- *     entirely, so every descriptor address is a guest physical address --
- *     and the host can dereference those directly through the persistent
- *     mappings R3 established. Vertex data and textures are never marshalled;
- *     only the command dwords cross anything.
+ *     entirely, so every descriptor address is a guest pseudo-physical
+ *     address. The host resolves it directly through the persistent mappings
+ *     R3 established. Vertex data and textures are never marshalled; only the
+ *     command dwords cross anything.
  *
  *   - Completions arrive the way every other asynchronous path in this port
  *     works: the host writes the used ring, and the guest calls
@@ -73,7 +73,7 @@
  * Every field is fixed-width for the same reason.
  */
 struct co_vgpu_vq {
-	__u64 desc_gpa;		/* guest physical == host physical */
+	__u64 desc_gpa;		/* dense guest pseudo-physical address */
 	__u64 avail_gpa;
 	__u64 used_gpa;
 	__u32 num;
@@ -299,7 +299,7 @@ static int co_vgpu_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
 		}
 
 		/*
-		 * Publish where the host can find it. These are guest physical
+		 * Publish where the host can find it. These are guest pseudo-physical
 		 * addresses precisely because ACCESS_PLATFORM was refused
 		 * above; with it, they would be DMA addresses and meaningless
 		 * to the daemon.

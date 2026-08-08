@@ -9,10 +9,9 @@
  * before switching back.
  *
  * That the host can write into the guest's buffer directly is the whole reason
- * this driver is short. Guest physical addresses are host physical addresses
- * here -- the guest's RAM is host allocations described at their true
- * addresses in the e820 -- so page_to_phys() of a bio's page is something the
- * host can resolve and address. There is no bounce buffer, no scatter list
+ * this driver is short. page_to_phys() yields a dense guest pseudo-physical
+ * address; the host resolves it through p2m to the scattered machine frame and
+ * addresses that frame directly. There is no bounce buffer, no scatter list
  * handed to hardware, and no DMA mapping.
  *
  * The transfer is synchronous: it is complete by the time the switch returns,

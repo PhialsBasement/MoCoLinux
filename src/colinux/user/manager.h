@@ -41,7 +41,8 @@ extern co_rc_t co_manager_save_state(co_manager_handle_t handle,
 				     co_manager_ioctl_save_state_t* out);
 
 extern co_rc_t co_manager_kload_begin(co_manager_handle_t handle,
-				      unsigned long long min_va, unsigned long long max_va);
+				      unsigned long long min_va, unsigned long long max_va,
+				      unsigned long long ram_bytes);
 extern co_rc_t co_manager_kload_chunk(co_manager_handle_t handle, unsigned long long va,
 				      const void* data, unsigned long size, int zero);
 extern co_rc_t co_manager_kload_verify(co_manager_handle_t handle,

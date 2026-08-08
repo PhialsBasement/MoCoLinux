@@ -103,10 +103,9 @@ co_rc_t co_manager_load(co_manager_t *manager)
 	 * It was an i386 inheritance and it was load-time fatal: the driver
 	 * would not start at all. Nothing in the x86-64 path needs it. Physical
 	 * addresses are already 64-bit (co_pa_t, and co_pfn_t in
-	 * arch/x86_64/mmu.h), guest RAM is allocated with no ceiling
-	 * (MmAllocateContiguousMemory against ~0ULL), guest physical equals
-	 * host physical, and the guest's tables are four-level -- so a block
-	 * above 4 GB needs no special handling anywhere.
+	 * arch/x86_64/mmu.h), guest RAM uses an explicit pseudo-to-machine
+	 * translation, and the guest's tables are four-level. Host frames above
+	 * 4 GB therefore need no special handling.
 	 *
 	 * What did need fixing before the check could go were the accounting
 	 * fields themselves, which were "unsigned long" and therefore 32-bit
@@ -196,16 +195,9 @@ void co_manager_unload(co_manager_t* manager)
 	 * Nothing else frees it here. The daemon calls KLOAD_END on its way
 	 * out, which covers a run that finishes -- but not one that is killed,
 	 * and reload-driver.sh kills the daemon by name every time it swaps the
-	 * driver. Windows does not reclaim MmAllocateContiguousMemory when a
-	 * driver unloads; that is the driver's job, and this driver was not
-	 * doing it. So every reload after a killed run stranded the guest's
-	 * whole memory -- 128 MB in four blocks -- until the machine rebooted.
-	 *
-	 * It does not announce itself as a leak, either. The symptom is that
-	 * contiguous allocation starts failing while the host still reports
-	 * gigabytes free, because what was lost is not the quantity, it is the
-	 * unbroken runs: each stranded block pins a region and the space
-	 * between them stops being large enough for the image.
+	 * driver. Pool allocations are not reclaimed on driver unload; releasing
+	 * them remains the driver's job. Every reload after a killed run used to
+	 * strand the guest's whole memory until the machine rebooted.
 	 *
 	 * First, because co_kload_free() destroys an address space through the
 	 * arch layer and reads page tables through the manager, both of which
@@ -492,14 +484,27 @@ static co_rc_t co_manager_kmap(co_manager_t*		 manager,
 	if (slice_bytes < CO_ARCH_PAGE_SIZE || slice_bytes > CO_KMAP_SLICE_BYTES)
 		slice_bytes = CO_KMAP_SLICE_BYTES;
 
-	blocks = co_kload_block_count();
-	if (blocks == 0)
+	/*
+	 * Reserve a finished, immutable block set before looking at it. KRAM
+	 * grows this list after KLOAD_BEGIN; mapping the early prefix is a
+	 * successful but permanently incomplete view of the running guest.
+	 * The reservation also keeps teardown from freeing a block mid-map.
+	 */
+	if (!co_kload_user_map_try_get())
 		return CO_RC(ERROR);
+
+	blocks = co_kload_block_count();
+	if (blocks == 0) {
+		co_kload_user_map_put(manager);
+		return CO_RC(ERROR);
+	}
 
 	opened->kmap_slice = co_os_malloc(sizeof(opened->kmap_slice[0]) *
 					  CO_KMAP_MAX_RANGES);
-	if (!opened->kmap_slice)
+	if (!opened->kmap_slice) {
+		co_kload_user_map_put(manager);
 		return CO_RC(OUT_OF_MEMORY);
+	}
 	co_memset(opened->kmap_slice, 0,
 		  sizeof(opened->kmap_slice[0]) * CO_KMAP_MAX_RANGES);
 
@@ -572,13 +577,6 @@ static co_rc_t co_manager_kmap(co_manager_t*		 manager,
 	if (n == 0)
 		goto fail;
 
-	/*
-	 * One reference per handle that holds windows, taken after the last
-	 * slice rather than per slice: what teardown has to wait for is a
-	 * process with a view, not a count of MDLs.
-	 */
-	co_kload_user_map_get();
-
 	params->count = n;
 	/*
 	 * max_slice is an input the caller no longer needs; it carries the
@@ -617,6 +615,7 @@ fail:
 	opened->kmap_slice  = NULL;
 	opened->kmap_slices = 0;
 	params->total_bytes = 0;
+	co_kload_user_map_put(manager);
 	return CO_RC(ERROR);
 }
 
@@ -870,7 +869,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			return CO_RC(OK);
 		}
 
-		params->rc = co_kload_begin(manager, params->min_va, params->max_va);
+		params->rc = co_kload_begin(manager, params->min_va, params->max_va,
+					    params->ram_bytes);
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}
@@ -1138,6 +1138,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->rc = co_kload_build_ram(manager, ram, text, end);
 		params->ram_pages    = co_kload_ram_pages();
 		params->phys_base    = co_kload_phys_base();
+		params->p2m_pages    = co_kload_p2m_pages();
+		params->m2p_mask     = co_kload_m2p_mask();
 		params->range_count  = co_kload_range_count();
 		if (params->range_count > CO_KRAM_MAX_RANGES)
 			params->range_count = CO_KRAM_MAX_RANGES;

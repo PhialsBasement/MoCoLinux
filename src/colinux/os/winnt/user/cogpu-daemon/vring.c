@@ -38,6 +38,39 @@ static const struct vring_desc *desc_at(const struct cogpu_vring *vr, uint16_t i
 	return &vr->desc[i];
 }
 
+/*
+ * Add one host-contiguous piece of a guest descriptor.
+ *
+ * KMAP is contiguous only inside one userspace window. A descriptor remains
+ * contiguous in the guest's pseudo-physical address space when it crosses
+ * such a boundary, but there is no single host pointer for the whole thing.
+ * Adjacent pieces are folded back together when Windows happened to place the
+ * two mappings beside each other, keeping ordinary chains as small as before.
+ */
+static int chain_add(struct cogpu_chain *chain, int write,
+		     void *addr, uint32_t len)
+{
+	struct cogpu_buf *buf = write ? chain->out : chain->in;
+	int *count = write ? &chain->out_count : &chain->in_count;
+
+	if (*count != 0) {
+		struct cogpu_buf *last = &buf[*count - 1];
+
+		if ((uintptr_t)last->addr + last->len == (uintptr_t)addr &&
+		    UINT32_MAX - last->len >= len) {
+			last->len += len;
+			return 1;
+		}
+	}
+
+	if (*count >= COGPU_MAX_CHAIN)
+		return 0;
+	buf[*count].addr = addr;
+	buf[*count].len = len;
+	(*count)++;
+	return 1;
+}
+
 int cogpu_vring_pop(struct cogpu_vring *vr, cogpu_resolve_fn resolve,
 		    void *ctx, struct cogpu_chain *chain)
 {
@@ -78,7 +111,6 @@ int cogpu_vring_pop(struct cogpu_vring *vr, cogpu_resolve_fn resolve,
 	i = head;
 	for (;;) {
 		const struct vring_desc *d = desc_at(vr, i);
-		void *p;
 
 		if (!d)
 			return 0;
@@ -92,25 +124,38 @@ int cogpu_vring_pop(struct cogpu_vring *vr, cogpu_resolve_fn resolve,
 			return 0;
 
 		if (d->len) {
-			p = resolve(ctx, d->addr, d->len);
-			if (!p)
-				return 0;	/* not inside guest RAM */
+			uint64_t addr = d->addr;
+			uint32_t left = d->len;
+			int write = (d->flags & VRING_DESC_F_WRITE) != 0;
+			void *p = resolve(ctx, addr, left);
 
-			if (d->flags & VRING_DESC_F_WRITE) {
-				if (chain->out_count >= COGPU_MAX_CHAIN)
+			if (p) {
+				if (!chain_add(chain, write, p, left))
 					return 0;
-				chain->out[chain->out_count].addr = p;
-				chain->out[chain->out_count].len  = d->len;
-				chain->out_count++;
-				chain->out_bytes += d->len;
 			} else {
-				if (chain->in_count >= COGPU_MAX_CHAIN)
-					return 0;
-				chain->in[chain->in_count].addr = p;
-				chain->in[chain->in_count].len	= d->len;
-				chain->in_count++;
-				chain->in_bytes += d->len;
+				/*
+				 * The address may be valid but span separate KMAP
+				 * windows. A page is the unit guaranteed contiguous
+				 * on both sides, so resolve page pieces and coalesce
+				 * whichever host mappings really are adjacent.
+				 */
+				while (left) {
+					uint32_t part = 4096u - (uint32_t)(addr & 4095u);
+
+					if (part > left)
+						part = left;
+					p = resolve(ctx, addr, part);
+					if (!p || !chain_add(chain, write, p, part))
+						return 0;
+					addr += part;
+					left -= part;
+				}
 			}
+
+			if (write)
+				chain->out_bytes += d->len;
+			else
+				chain->in_bytes += d->len;
 		}
 
 		if (!(d->flags & VRING_DESC_F_NEXT))
@@ -155,9 +200,11 @@ void cogpu_vring_push(struct cogpu_vring *vr, const struct cogpu_chain *chain,
  *
  * The cases are the ones ring code actually gets wrong: index wrap at 65535,
  * a ring that is completely full, an empty ring, a chain that loops back on
- * itself, and a descriptor pointing outside guest memory. The last two must be
- * REFUSED -- a self-test that only proves the happy path is the kind of
- * passing test this project has already been caught by.
+ * itself, a descriptor pointing outside guest memory, and one valid guest
+ * descriptor crossing two unrelated host mappings. The corrupt cases must be
+ * REFUSED and the split one must be accepted -- a self-test that only proves
+ * the happy path is the kind of passing test this project has already been
+ * caught by.
  */
 
 #define TEST_NUM 8
@@ -172,9 +219,32 @@ static void *test_resolve(void *ctx, uint64_t gpa, uint32_t len)
 	return base + (gpa - 0x100000);
 }
 
+struct test_split_ram {
+	unsigned char first[4096];
+	unsigned char gap[64];
+	unsigned char second[4096];
+};
+
+static void *test_split_resolve(void *ctx, uint64_t gpa, uint32_t len)
+{
+	struct test_split_ram *ram = ctx;
+	uint64_t off;
+
+	if (gpa < 0x200000 || gpa + len < gpa ||
+	    gpa + len > 0x200000 + 8192)
+		return NULL;
+	off = gpa - 0x200000;
+	if (off < 4096 && off + len <= 4096)
+		return ram->first + off;
+	if (off >= 4096 && off + len <= 8192)
+		return ram->second + (off - 4096);
+	return NULL;
+}
+
 int cogpu_vring_selftest(void)
 {
 	static unsigned char ram[0x10000];
+	static struct test_split_ram split_ram;
 	unsigned char	     descmem[sizeof(struct vring_desc) * TEST_NUM];
 	unsigned char	     availmem[sizeof(struct vring_avail) + 2 * TEST_NUM];
 	unsigned char	     usedmem[sizeof(struct vring_used) +
@@ -279,8 +349,31 @@ int cogpu_vring_selftest(void)
 		failures++;
 	}
 
+	/* 6. One guest descriptor may cross separate host KMAP windows. */
+	memset(descmem, 0, sizeof(descmem));
+	memset(availmem, 0, sizeof(availmem));
+	memset(usedmem, 0, sizeof(usedmem));
+	memset(&vr, 0, sizeof(vr));
+	vr.desc  = (struct vring_desc *)descmem;
+	vr.avail = (struct vring_avail *)availmem;
+	vr.used  = (struct vring_used *)usedmem;
+	vr.num   = TEST_NUM;
+	vr.desc[0].addr = 0x200000 + 4096 - 16;
+	vr.desc[0].len  = 32;
+	vr.avail->ring[0] = 0;
+	vr.avail->idx = 1;
+
+	if (!cogpu_vring_pop(&vr, test_split_resolve, &split_ram, &chain) ||
+	    chain.in_count != 2 || chain.in_bytes != 32 ||
+	    chain.in[0].len != 16 || chain.in[1].len != 16) {
+		printf("  vring selftest: split descriptor was not preserved"
+		       " (pieces %d, bytes %u)\n",
+		       chain.in_count, chain.in_bytes);
+		failures++;
+	}
+
 	if (failures == 0)
-		printf("  vring selftest: 5/5 (empty, chain, cycle, range, wrap)\n");
+		printf("  vring selftest: 6/6 (empty, chain, cycle, range, wrap, split)\n");
 
 	return failures;
 }

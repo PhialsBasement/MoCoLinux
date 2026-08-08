@@ -902,41 +902,13 @@ out:
 #define CO_KLOAD_CHUNK	0x8000
 
 /*
- * How much physical memory the guest is told it has, in megabytes, when --mem
- * does not say otherwise.
+ * How much usable pseudo-physical memory the guest is told it has when --mem
+ * does not say otherwise. The backing is nonpageable but not physically
+ * contiguous: each 4 KB machine frame is recorded independently in p2m.
  *
- * 1 GB, and the way the 2 GB attempt failed is the reason this is a flag now
- * rather than a constant.
- *
- * The host had 2.4 GB free and the box still became unresponsive the instant
- * the daemon started, before the guest executed an instruction -- because free
- * memory is not the resource being asked for. co_kload_build_ram wants unbroken
- * 32 MB physical runs from MmAllocateContiguousMemory, and after a session with
- * a browser and a package manager, free memory is holes. Windows then trims
- * working sets and repurposes standby pages trying to manufacture runs that do
- * not exist, with the memory manager's locks held, and the machine stops
- * answering while it tries. Task Manager shows memory available throughout,
- * which is what makes this so easy to misdiagnose -- and I misdiagnosed it as
- * a total-memory problem first.
- *
- * The allocation is also non-pageable, so whatever the guest gets is taken out
- * of the host's working set permanently for the life of the run, not shared
- * with it.
- *
- * 1 GB has booted this box repeatedly. Whether more works depends on how
- * fragmented that particular machine is at that particular moment, which is
- * exactly the sort of thing that should be tried from a command line rather
- * than discovered after a cross-compile. Falling short remains reported and
- * non-fatal: the e820 describes what was obtained, so a guest that gets less
- * boots with less and says so.
- *
- * The ceiling is the block count rather than this number. Block 0 is image plus
- * page tables and every later block is at most CO_KLOAD_CHUNK_BYTES, so it is
- * 44 + 32 * (CO_KLOAD_MAX_BLOCKS - 1) MB, near 4 GB. None of that helps if the
- * host cannot produce the runs.
- *
- * The real fix is not a better number: it is pseudo-physical memory, which
- * removes the contiguity requirement altogether. See TODO.
+ * Falling short remains reported and non-fatal. e820 describes what was
+ * obtained, so a guest that gets less boots with less and says so. Four
+ * gigabytes is the current p2m/ABI ceiling, not a contiguous-allocation limit.
  */
 #define CO_GUEST_RAM_DEFAULT_MB	1024
 
@@ -1304,6 +1276,9 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 	unsigned long size;
 	unsigned long alloc_sections = 0, nobits_sections = 0;
 	unsigned long long bytes = 0;
+	unsigned long long ram_bytes = enter == 3
+		? ((unsigned long long)(mem_mb ? mem_mb : CO_GUEST_RAM_DEFAULT_MB) << 20)
+		: 0;
 	char* buf;
 	co_rc_t rc;
 	bool_t installed = PFALSE;
@@ -1365,7 +1340,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		return CO_RC(ERROR_MONITOR_NOT_LOADED);
 	}
 
-	rc = co_manager_kload_begin(handle, lo, hi);
+	rc = co_manager_kload_begin(handle, lo, hi, ram_bytes);
 	if (!CO_OK(rc)) {
 		co_terminal_print("kload begin failed (rc %x)\n", (int)rc);
 		goto out;
@@ -1602,8 +1577,9 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		co_elf_symbol_t* s_cl;
 		co_elf_symbol_t* s_text;
 		co_elf_symbol_t* s_end;
-		unsigned long long ram = ((unsigned long long)
-			(mem_mb ? mem_mb : CO_GUEST_RAM_DEFAULT_MB)) << 20;
+		co_elf_symbol_t* s_p2m_pages;
+		co_elf_symbol_t* s_m2p_mask;
+		unsigned long long ram = ram_bytes;
 		static const char* want[] = { "co_arch_start_kernel", "initial_code",
 					      "start_kernel", "early_console",
 					      "early_colinux_console",
@@ -1668,8 +1644,32 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		}
 		co_terminal_print("    %lu pages mapped, %lu page-table pages total\n",
 				  m.ram_pages, m.tables);
-		co_terminal_print("    %d blocks, %llu MB usable of %llu MB asked\n",
+		co_terminal_print("    %d e820 ranges, %llu MB usable of %llu MB asked\n",
 				  m.range_count, m.total_usable >> 20, ram >> 20);
+
+		/*
+		 * The translations are mapped at fixed virtual addresses, but their
+		 * live bounds are run-specific.  Publish those before any guest page
+		 * table helper can use them.
+		 */
+		s_p2m_pages = co_get_symbol_by_name(pl, "co_colinux_p2m_pages");
+		s_m2p_mask  = co_get_symbol_by_name(pl, "co_colinux_m2p_mask");
+		if (!s_p2m_pages || !s_m2p_mask) {
+			co_terminal_print("\n  p2m symbols missing -- is the fragmented-RAM patch applied?\n");
+			goto out_end;
+		}
+
+		rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_p2m_pages),
+					    &m.p2m_pages, sizeof(m.p2m_pages), 0);
+		if (CO_OK(rc))
+			rc = co_manager_kload_chunk(handle, co_elf_get_symbol_value(s_m2p_mask),
+						    &m.m2p_mask, sizeof(m.m2p_mask), 0);
+		if (!CO_OK(rc)) {
+			co_terminal_print("  publishing p2m bounds failed (rc %x)\n", (int)rc);
+			goto out_end;
+		}
+		co_terminal_print("    p2m: %llu pages, reverse-map mask 0x%llx\n",
+				  m.p2m_pages, m.m2p_mask);
 
 		/*
 		 * The root device, attached before the guest runs so that the
@@ -1716,14 +1716,10 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		}
 
 		/*
-		 * The e820 describes where the memory really is.
-		 *
-		 * Guest physical addresses are host physical addresses, and the
-		 * memory comes in several contiguous blocks -- one usable entry
-		 * per block, at its true address. There is no low memory and no
-		 * hole to invent, because there is no emulated machine
-		 * underneath; a fragmented map is nothing unusual to Linux,
-		 * real machines have holes too.
+		 * e820 describes the dense pseudo-physical layout, not host PFNs.
+		 * Allocation-block boundaries are invisible to Linux. There is one
+		 * usable span below the reserved table hole and, when enough RAM was
+		 * obtained, one above it.
 		 *
 		 * The page-table region at the top of block 0 goes in as type
 		 * 3, E820_TYPE_ACPI, and the type is load bearing rather than
@@ -1744,7 +1740,6 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 * ACPI memory is spared by that test because it is exactly this
 		 * kind of region -- must stay mapped, must never be allocated
 		 * over -- and memblock still does not hand it out, since only
-		 * RAM becomes available memory. Which is the whole requirement.
 		 */
 		memset(bp, 0, sizeof(bp));
 		{
@@ -1755,25 +1750,16 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			 * single byte at 0x1e8, so writing past it would both
 			 * overrun this buffer and wrap the count -- a guest
 			 * told it has four ranges when it was given 260.
-			 * Refuse instead: the block cap is 40, so this cannot
-			 * fire today, which is precisely when a bound is worth
-			 * writing rather than after it has.
+			 * Refuse instead. The pseudo layout currently needs at
+			 * most three entries, but the bound belongs next to the
+			 * packed boot protocol field rather than in an allocator.
 			 */
 			const int max_entries = 128;
 
 			for (i = 0; i < m.range_count; i++) {
 				/*
-				 * What this range actually costs: one entry, and
-				 * a second only if it carries the reserved
-				 * page-table region, which is block 0 alone.
-				 *
-				 * Asking for two every time was wrong by exactly
-				 * one, and it rejected the case the block cap was
-				 * chosen to permit: CO_KLOAD_MAX_BLOCKS is 127
-				 * because 1 block at two entries plus 126 at one
-				 * is 128 on the nose. A 127-block guest -- which
-				 * is what a fragmented host hands back for a 1 GB
-				 * target -- refused to boot at all.
+				 * One entry for usable RAM and a second only when
+				 * this pseudo range carries the reserved table hole.
 				 */
 				int need = m.range[i].reserved ? 2 : 1;
 
@@ -1808,11 +1794,10 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 * Keep the guest's hands off the interrupt hardware.
 		 *
 		 * There is one physical machine here and Windows is using it.
-		 * The guest has already read the host's real firmware -- its
-		 * DMI strings, its MP-table, its ACPI tables -- because guest
-		 * physical is host physical and early_ioremap() of 0xf0000
-		 * finds the M92p's actual BIOS. Reading is survivable. What
-		 * comes next is not: apic_bsp_setup() calls setup_local_APIC()
+		 * Low guest pseudo addresses now resolve to guest RAM rather than
+		 * the host's firmware pages, but port I/O and any MMIO address
+		 * outside the pseudo range still name the real machine. What must
+		 * not happen is apic_bsp_setup() calling setup_local_APIC()
 		 * and setup_IO_APIC(), which write the enable bit, the task
 		 * priority, the logical destination and the whole IOAPIC
 		 * redirection table of the chips Windows takes its timer,
@@ -2049,12 +2034,10 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 *
 		 *     __pa(x) = x - __START_KERNEL_map + phys_base
 		 *
-		 * The driver chose where the image landed -- at the base of its
-		 * block, with the link address's 16 MB offset absorbed into
-		 * phys_base rather than allocated -- so phys_base is whatever
-		 * it reports, not something derived here. Left at zero the
-		 * kernel would compute physical addresses for its own text
-		 * that are nowhere near where it actually is.
+		 * The driver owns the pseudo layout, so phys_base is whatever it
+		 * reports rather than something derived here. In the fragmented
+		 * layout it is zero: the linked 16 MB text offset is represented
+		 * by real pseudo pages and p2m chooses their machine frames.
 		 */
 		{
 			co_elf_symbol_t* s_pb = co_get_symbol_by_name(pl, "phys_base");
@@ -2146,10 +2129,10 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		b.batch        = batch;
 
 		/*
-		 * The kernel's own page tables, init_top_pgt first. The host
-		 * relocates them to where the image really is and switches the
-		 * guest into them: the kernel walks and edits these directly,
-		 * and a space the host invented is not one it can work in.
+		 * The kernel's own page tables, init_top_pgt first. The host grafts
+		 * its 4 KB image/direct-map subtrees into that root, translates the
+		 * static fixmap parent, and switches the guest into it. The linked
+		 * 2 MB kernel leaves cannot describe scattered machine frames.
 		 */
 		{
 			static const char* const tnames[] = {

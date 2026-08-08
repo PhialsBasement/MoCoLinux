@@ -17,8 +17,8 @@
  * open and close a file per operation and take a co_monitor_t to translate
  * guest addresses through the pseudo-physical map. This is the other shape: a
  * handle held open for the life of the device, and a transfer straight into a
- * host virtual address, because guest physical is host physical here and the
- * caller has already resolved the guest's buffer to a mapping the driver owns.
+ * host virtual address after the caller resolves the guest pseudo frame through
+ * the loader's p2m-backed block index.
  *
  * A backing object is a file or a raw partition; \\??\\C:\\root.img and
  * \\??\\\\PhysicalDrive0\\Partition2 both open the same way, so which one is

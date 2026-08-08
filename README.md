@@ -74,9 +74,11 @@ address on both sides, holding the switch code, both saved CPU states, an IST
 stack, a TSS and the console ring — valid mid-crossing, when CR3 has changed
 but nothing else has.
 
-Guest RAM is host-contiguous memory described at its true physical addresses in
-a synthesized e820 (Linux calls `__va()` on its own page-table entries, so
-guest physical must equal host physical).
+Guest RAM is a dense pseudo-physical address space backed by ordinary scattered
+nonpaged-pool pages. A host-built p2m table converts each Linux PFN to the
+machine PFN placed in hardware page tables; a reverse m2p hash converts values
+back when Linux reads those tables. The synthesized e820 therefore describes
+RAM from pseudo address zero and does not expose host fragmentation.
 
 ### Networking
 
@@ -186,11 +188,11 @@ Not yet:
 - A repaired incremental patch series: `patch/7.1.5/current-tree-snapshot.diff`
   is the authoritative guest-side diff and is deliberately not in `series`
 
-Known issue: the first boot after a host reboot is reliable, ~~the second is
-not~~ more like the 15th if your on Windows 7 at least. Guest RAM is allocated per run from `MmAllocateContiguousMemory` in 32 MB
-runs, and a run's churn fragments host physical memory, so the next boot's
-allocations grind the machine. Allocate-once-per-driver-load is the
-workaround; pseudo-physical memory is the fix. Both are in `TODO`.
+The fragmented-RAM fix is now in tree: the boot path no longer calls
+`MmAllocateContiguousMemory` for guest RAM. It allocates virtually contiguous
+cached-pool chunks, records every machine frame independently, and maps the
+guest at 4 KB granularity. The host-side and Linux 7.1.5 builds pass; repeated
+boot/teardown soaking on the target Windows machines is still required.
 
 ## Layout
 
@@ -206,7 +208,8 @@ workaround; pseudo-physical memory is the fix. Both are in `TODO`.
 | `src/colinux/user/conet_ring.c` | the ring format and its decoder, shared by both readers |
 | `src/colinux/user/slirp/` | vendored slirp, with its Win64 repairs |
 | `src/colinux/user/elf_load.c` | the daemon: ELF loading, symbol resolution, boot |
-| `patch/7.1.5/` | the guest-side kernel changes, including `conet_colinux.c` and the trapless virtio transport `vgpu-src/virtio_colinux.c` |
+| `patch/7.1.5/current-tree-snapshot.diff` | the complete guest-side kernel patch, including conet, async COBD and the trapless virtio-GPU transport |
+| `patch/7.1.5/{async-cobd-src,vgpu-src}/` | standalone development copies of the guest device sources already folded into the cumulative patch |
 | `tools/mkmanjarorootfs.sh` | builds the Manjaro desktop image |
 | `tools/mkrootfs.sh` | builds the minimal BusyBox bring-up image |
 | `tools/coterm.py` | client for the guest's console port |
@@ -250,8 +253,9 @@ staged copies are present.
 To drive `comake` directly, or for the underlying recipe and every
 environment variable, see `doc/building-modern`. The guest kernel is separate:
 apply `patch/7.1.5/current-tree-snapshot.diff` to a 7.1.5 tree and build
-`vmlinux` normally. `CONFIG_KASAN` must be off — the host's allocation lands
-in PML4 slot 501, inside Linux's KASAN shadow region.
+`vmlinux` normally. The patch defaults `CONFIG_VIRTIO_COLINUX` on; verify that
+it is built in, not a module. `CONFIG_KASAN` must be off — the host's allocation
+lands in PML4 slot 501, inside Linux's KASAN shadow region.
 
 ## Running
 
@@ -275,9 +279,9 @@ cogpu-daemon.exe                           (a fourth: the guest's GPU)
 colinux-daemon.exe --run konsole           (start one app in a running guest)
 ```
 
-- `--mem MB` sets guest RAM (default 1024). It is a target: the e820 describes
-  what the host can actually produce in unbroken 32 MB runs, and falling short
-  is reported rather than fatal.
+- `--mem MB` sets usable pseudo RAM (default 1024). It is a target: e820
+  describes what the scattered nonpaged-pool backing actually supplied, and
+  falling short is reported rather than fatal.
 - The image ships `10-eth0.network` with slirp's fixed layout and
   `systemd-networkd` enabled, so the guest configures its own network at boot.
 - For a desktop, start an X server on the Windows side in multiwindow mode

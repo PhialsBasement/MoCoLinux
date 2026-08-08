@@ -63,10 +63,9 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("      --no-copic                   Do not interrupt a running guest. Ticks then\n");
 	co_terminal_print("                                   arrive only at idle and at exits to user mode,\n");
 	co_terminal_print("                                   so a userspace spin loop cannot be preempted.\n");
-	co_terminal_print("      --mem MB                     Guest RAM in megabytes (default 1024). Taken\n");
-	co_terminal_print("                                   as unbroken 32 MB physical runs, so a large\n");
-	co_terminal_print("                                   value on a fragmented host stalls it; short\n");
-	co_terminal_print("                                   is reported, not fatal.\n");
+	co_terminal_print("      --mem MB                     Usable pseudo RAM in megabytes (default 1024).\n");
+	co_terminal_print("                                   Backed page by page from nonpaged pool; short\n");
+	co_terminal_print("                                   allocation is reported, not fatal.\n");
 	co_terminal_print("      --cobd0 PATH                 Backing store for the guest's root device\n");
 	co_terminal_print("      --cobd1..3 PATH              Further disks, /dev/cobd1 and up. A blank\n");
 	co_terminal_print("                                   image here is how a running guest builds a\n");

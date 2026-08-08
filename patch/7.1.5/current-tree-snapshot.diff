@@ -1,10 +1,31 @@
-Authoritative cumulative snapshot of ref/linux-7.1.5: the conet ethernet
-device, runtime text pokes through the kernel's own poking mm, and the 32-bit
-syscall gate left alone.
+Authoritative cumulative snapshot of the cooperative Linux 7.1.5 guest: conet,
+runtime text pokes through the kernel's own poking mm, and dense
+pseudo-physical RAM backed by scattered machine frames.
 
-Generated against download/linux-7.1.5.tar.xz on 2026-08-03.
+Generated against download/linux-7.1.5.tar.xz on 2026-08-08.
 
 Over the previous snapshot:
+
+  * The guest GPU transport and asynchronous COBD implementation are now part
+    of this cumulative diff, including their Kconfig/Makefile wiring and shared
+    completion-drain hooks. The standalone source copies remain as development
+    references, but applying only this file now produces the complete guest.
+
+  * Guest RAM no longer has to be host-physically contiguous.
+
+    Linux keeps a dense pseudo-physical address space beginning at zero. A
+    fixed-address p2m array converts every present page-table constructor from a
+    pseudo PFN to the independently allocated machine PFN hardware needs; an
+    open-addressed m2p hash converts values back through the normal pgtable
+    accessors and CR3 helpers.
+
+    The direct map uses 4 KB leaves and the cooperative guest clears PSE, PSE36
+    and GBPAGES so Linux cannot later replace them with large hardware leaves
+    that would falsely imply consecutive machine frames. Swap encodings remain
+    untouched, while PROT_NONE entries retain translation because they still
+    carry a live PFN. Because x86-64 compiles PSE as an unconditional required
+    feature, vmemmap population also has an explicit cooperative 4 KB path; a
+    runtime capability clear alone cannot suppress its huge PMDs.
 
   * A clock, and the two-minute stall it exposed.
 
@@ -70,9 +91,138 @@ Over the previous snapshot:
 This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
 
-diff -urN a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/cooperative.h b/arch/x86/include/asm/cooperative.h
+--- a/arch/x86/include/asm/cooperative.h	1970-01-01 10:00:00.000000000 +1000
++++ b/arch/x86/include/asm/cooperative.h	2026-08-08 17:13:49.156282712 +1000
+@@ -0,0 +1,125 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_X86_COOPERATIVE_H
++#define _ASM_X86_COOPERATIVE_H
++
++#ifndef __ASSEMBLY__
++
++#include <linux/types.h>
++
++/* Set by the host before the first guest instruction. */
++extern int co_colinux_guest;
++extern unsigned long co_colinux_p2m_pages;
++extern unsigned long co_colinux_m2p_mask;
++
++#ifdef CONFIG_X86_64
++
++/* Keep these in lockstep with src/colinux/kernel/kload.h on the host. */
++#define CO_COLINUX_M2P_VA	0xffffe99fc0000000UL
++#define CO_COLINUX_P2M_VA	0xffffe99f80000000UL
++#define CO_COLINUX_PFN_MASK	0x000ffffffffff000ULL
++/* _PAGE_PRESENT, or _PAGE_PROTNONE when bit 0 is deliberately clear. */
++#define CO_COLINUX_MAPPED_BITS	0x101UL
++
++static __always_inline unsigned long
++co_colinux_pseudo_to_machine_pfn(unsigned long ppfn)
++{
++	volatile const u64 *p2m = (volatile const u64 *)CO_COLINUX_P2M_VA;
++
++	if (!co_colinux_guest || ppfn >= co_colinux_p2m_pages)
++		return ppfn;
++	return p2m[ppfn];
++}
++
++static __always_inline unsigned long
++co_colinux_machine_to_pseudo_pfn(unsigned long mfn)
++{
++	volatile const u64 *p2m = (volatile const u64 *)CO_COLINUX_P2M_VA;
++	volatile const u32 *m2p = (volatile const u32 *)CO_COLINUX_M2P_VA;
++	unsigned long mask = co_colinux_m2p_mask;
++	unsigned long slot, probes;
++
++	if (!co_colinux_guest || !mask)
++		return mfn;
++
++	slot = (unsigned long)((mfn * 11400714819323198485ULL) & mask);
++	for (probes = 0; probes <= mask; probes++) {
++		u32 stored = m2p[slot];
++		unsigned long ppfn;
++
++		if (!stored)
++			return mfn;
++		ppfn = (unsigned long)stored - 1;
++		if (ppfn < co_colinux_p2m_pages && p2m[ppfn] == mfn)
++			return ppfn;
++		slot = (slot + 1) & mask;
++	}
++
++	return mfn;
++}
++
++static __always_inline unsigned long
++co_colinux_pseudo_to_machine_addr(unsigned long value)
++{
++	unsigned long pfn = (value & CO_COLINUX_PFN_MASK) >> 12;
++
++	return (value & ~CO_COLINUX_PFN_MASK) |
++		(co_colinux_pseudo_to_machine_pfn(pfn) << 12);
++}
++
++static __always_inline unsigned long
++co_colinux_machine_to_pseudo_addr(unsigned long value)
++{
++	unsigned long pfn = (value & CO_COLINUX_PFN_MASK) >> 12;
++
++	return (value & ~CO_COLINUX_PFN_MASK) |
++		(co_colinux_machine_to_pseudo_pfn(pfn) << 12);
++}
++
++/* Swap and other truly non-present entries are software encodings. */
++static __always_inline unsigned long
++co_colinux_make_page_entry(unsigned long value)
++{
++	if (!co_colinux_guest || !(value & CO_COLINUX_MAPPED_BITS))
++		return value;
++	return co_colinux_pseudo_to_machine_addr(value);
++}
++
++static __always_inline unsigned long
++co_colinux_page_entry_value(unsigned long value)
++{
++	if (!co_colinux_guest || !(value & CO_COLINUX_MAPPED_BITS))
++		return value;
++	return co_colinux_machine_to_pseudo_addr(value);
++}
++
++#else
++
++static __always_inline unsigned long
++co_colinux_pseudo_to_machine_addr(unsigned long value)
++{
++	return value;
++}
++
++static __always_inline unsigned long
++co_colinux_machine_to_pseudo_addr(unsigned long value)
++{
++	return value;
++}
++
++static __always_inline unsigned long
++co_colinux_make_page_entry(unsigned long value)
++{
++	return value;
++}
++
++static __always_inline unsigned long
++co_colinux_page_entry_value(unsigned long value)
++{
++	return value;
++}
++
++#endif /* CONFIG_X86_64 */
++
++#endif /* !__ASSEMBLY__ */
++
++#endif /* _ASM_X86_COOPERATIVE_H */
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
 --- a/arch/x86/include/asm/desc.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/include/asm/desc.h	2026-08-01 10:49:13.251537400 +1000
++++ b/arch/x86/include/asm/desc.h	2026-08-08 16:41:54.014685744 +1000
 @@ -205,13 +205,49 @@
  	}
  }
@@ -140,9 +290,9 @@ diff -urN a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
  	native_store_gdt(&gdt);
  	fixmap_gdt = get_cpu_gdt_ro(cpu);
  
-diff -urN a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
 --- a/arch/x86/include/asm/idtentry.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/include/asm/idtentry.h	2026-08-02 21:20:21.233964400 +1000
++++ b/arch/x86/include/asm/idtentry.h	2026-08-08 16:41:54.014954306 +1000
 @@ -736,6 +736,20 @@
  # endif
  #endif
@@ -164,9 +314,9 @@ diff -urN a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
  #if IS_ENABLED(CONFIG_KVM)
  DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_VECTOR,		sysvec_kvm_posted_intr_ipi);
  DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_WAKEUP_VECTOR,	sysvec_kvm_posted_intr_wakeup_ipi);
-diff -urN a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
 --- a/arch/x86/include/asm/io.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/include/asm/io.h	2026-08-01 07:24:30.152830000 +1000
++++ b/arch/x86/include/asm/io.h	2026-08-08 16:41:54.015050635 +1000
 @@ -44,6 +44,52 @@
  #include <asm/shared/io.h>
  #include <asm/special_insns.h>
@@ -252,9 +402,37 @@ diff -urN a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
  	if (cc_platform_has(CC_ATTR_GUEST_UNROLL_STRING_IO)) {		\
  		type *value = (type *)addr;				\
  		while (count) {						\
-diff -urN a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/irq_vectors.h b/arch/x86/include/asm/irq_vectors.h
+--- a/arch/x86/include/asm/irq_vectors.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/irq_vectors.h	2026-08-08 16:41:54.015209482 +1000
+@@ -105,6 +105,24 @@
+  */
+ #define POSTED_MSI_NOTIFICATION_VECTOR	0xeb
+ 
++/*
++ * The cooperative timer: the host's way of interrupting a running guest.
++ *
++ * This guest has no timer hardware and takes no asynchronous entry of its own
++ * -- hardware interrupts vector through its IDT into the host's stubs and are
++ * replayed into Windows, so not one guest instruction runs for them. Without
++ * something like this there is no preemption at all: a task that stays runnable
++ * without entering the kernel owns the processor forever, and the idle task
++ * that would have advanced time is precisely what it prevents from running.
++ *
++ * No gate is ever installed for this vector. The host does not raise it; it
++ * synthesises the entry directly, by pointing the resume at asm_sysvec_co_timer
++ * with a hand-built frame. The number exists because DECLARE_IDTENTRY_SYSVEC
++ * wants one, and it is kept out of the allocatable range so nothing else can
++ * claim it.
++ */
++#define CO_TIMER_VECTOR			0xea
++
+ #define NR_VECTORS			 256
+ 
+ #ifdef CONFIG_X86_LOCAL_APIC
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
 --- a/arch/x86/include/asm/irqflags.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/include/asm/irqflags.h	2026-08-01 11:31:49.873661500 +1000
++++ b/arch/x86/include/asm/irqflags.h	2026-08-08 16:41:54.015147063 +1000
 @@ -12,6 +12,37 @@
   * Interrupt control:
   */
@@ -409,38 +587,66 @@ diff -urN a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
  	x86_idle_clear_cpu_buffers();
  	asm volatile("hlt": : :"memory");
  }
-diff -urN a/arch/x86/include/asm/irq_vectors.h b/arch/x86/include/asm/irq_vectors.h
---- a/arch/x86/include/asm/irq_vectors.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/include/asm/irq_vectors.h	2026-08-02 21:20:07.541203800 +1000
-@@ -105,6 +105,24 @@
-  */
- #define POSTED_MSI_NOTIFICATION_VECTOR	0xeb
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+--- a/arch/x86/include/asm/pgtable.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/pgtable.h	2026-08-08 16:59:22.804277823 +1000
+@@ -5,6 +5,7 @@
+ #include <linux/mem_encrypt.h>
+ #include <asm/page.h>
+ #include <asm/pgtable_types.h>
++#include <asm/cooperative.h>
  
-+/*
-+ * The cooperative timer: the host's way of interrupting a running guest.
-+ *
-+ * This guest has no timer hardware and takes no asynchronous entry of its own
-+ * -- hardware interrupts vector through its IDT into the host's stubs and are
-+ * replayed into Windows, so not one guest instruction runs for them. Without
-+ * something like this there is no preemption at all: a task that stays runnable
-+ * without entering the kernel owns the processor forever, and the idle task
-+ * that would have advanced time is precisely what it prevents from running.
-+ *
-+ * No gate is ever installed for this vector. The host does not raise it; it
-+ * synthesises the entry directly, by pointing the resume at asm_sysvec_co_timer
-+ * with a hand-built frame. The number exists because DECLARE_IDTENTRY_SYSVEC
-+ * wants one, and it is kept out of the allocatable range so nothing else can
-+ * claim it.
-+ */
-+#define CO_TIMER_VECTOR			0xea
-+
- #define NR_VECTORS			 256
+ /*
+  * Macro to mark a page protection value as UC-
+@@ -88,26 +89,26 @@
+ #define pte_clear(mm, addr, ptep)	native_pte_clear(mm, addr, ptep)
+ #define pmd_clear(pmd)			native_pmd_clear(pmd)
  
- #ifdef CONFIG_X86_LOCAL_APIC
-diff -urN a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
+-#define pgd_val(x)	native_pgd_val(x)
+-#define __pgd(x)	native_make_pgd(x)
++#define pgd_val(x)	co_colinux_page_entry_value(native_pgd_val(x))
++#define __pgd(x)	native_make_pgd(co_colinux_make_page_entry(x))
+ 
+ #ifndef __PAGETABLE_P4D_FOLDED
+-#define p4d_val(x)	native_p4d_val(x)
+-#define __p4d(x)	native_make_p4d(x)
++#define p4d_val(x)	co_colinux_page_entry_value(native_p4d_val(x))
++#define __p4d(x)	native_make_p4d(co_colinux_make_page_entry(x))
+ #endif
+ 
+ #ifndef __PAGETABLE_PUD_FOLDED
+-#define pud_val(x)	native_pud_val(x)
+-#define __pud(x)	native_make_pud(x)
++#define pud_val(x)	co_colinux_page_entry_value(native_pud_val(x))
++#define __pud(x)	native_make_pud(co_colinux_make_page_entry(x))
+ #endif
+ 
+ #ifndef __PAGETABLE_PMD_FOLDED
+-#define pmd_val(x)	native_pmd_val(x)
+-#define __pmd(x)	native_make_pmd(x)
++#define pmd_val(x)	co_colinux_page_entry_value(native_pmd_val(x))
++#define __pmd(x)	native_make_pmd(co_colinux_make_page_entry(x))
+ #endif
+ 
+-#define pte_val(x)	native_pte_val(x)
+-#define __pte(x)	native_make_pte(x)
++#define pte_val(x)	co_colinux_page_entry_value(native_pte_val(x))
++#define __pte(x)	native_make_pte(co_colinux_make_page_entry(x))
+ 
+ #define arch_end_context_switch(prev)	do {} while(0)
+ static inline void arch_flush_lazy_mmu_mode(void) {}
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
 --- a/arch/x86/include/asm/special_insns.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/include/asm/special_insns.h	2026-08-01 10:28:04.395788700 +1000
-@@ -38,6 +38,39 @@
++++ b/arch/x86/include/asm/special_insns.h	2026-08-08 16:59:22.877276556 +1000
+@@ -5,6 +5,7 @@
+ #ifdef __KERNEL__
+ #include <asm/nops.h>
+ #include <asm/processor-flags.h>
++#include <asm/cooperative.h>
+ 
+ #include <linux/errno.h>
+ #include <linux/irqflags.h>
+@@ -38,6 +39,39 @@
  	return val;
  }
  
@@ -480,9 +686,24 @@ diff -urN a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_
  static __always_inline void native_write_cr3(unsigned long val)
  {
  	asm volatile("mov %0,%%cr3": : "r" (val) : "memory");
-diff -urN a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+@@ -168,12 +202,12 @@
+  */
+ static inline unsigned long __read_cr3(void)
+ {
+-	return __native_read_cr3();
++	return co_colinux_machine_to_pseudo_addr(__native_read_cr3());
+ }
+ 
+ static inline void write_cr3(unsigned long x)
+ {
+-	native_write_cr3(x);
++	native_write_cr3(co_colinux_pseudo_to_machine_addr(x));
+ }
+ 
+ static inline void __write_cr4(unsigned long x)
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
 --- a/arch/x86/kernel/alternative.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/alternative.c	2026-08-01 20:20:29.391593000 +1000
++++ b/arch/x86/kernel/alternative.c	2026-08-08 16:41:54.015432738 +1000
 @@ -6,6 +6,7 @@
  #include <linux/vmalloc.h>
  #include <linux/memory.h>
@@ -518,9 +739,9 @@ diff -urN a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
  
  	/*
  	 * The patching is not fully atomic, so try to avoid local
-diff -urN a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
 --- a/arch/x86/kernel/cpu/common.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/cpu/common.c	2026-07-31 21:11:03.943771900 +1000
++++ b/arch/x86/kernel/cpu/common.c	2026-08-08 16:41:54.015647335 +1000
 @@ -6,6 +6,7 @@
  #include <linux/linkage.h>
  #include <linux/bitops.h>
@@ -566,9 +787,9 @@ diff -urN a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
  set_register:
  	asm volatile("mov %0,%%cr4": "+r" (val) : : "memory");
  
-diff -urN a/arch/x86/kernel/cpu/mtrr/mtrr.c b/arch/x86/kernel/cpu/mtrr/mtrr.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/cpu/mtrr/mtrr.c b/arch/x86/kernel/cpu/mtrr/mtrr.c
 --- a/arch/x86/kernel/cpu/mtrr/mtrr.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/cpu/mtrr/mtrr.c	2026-08-03 16:17:50.655995200 +1000
++++ b/arch/x86/kernel/cpu/mtrr/mtrr.c	2026-08-08 16:41:54.015798772 +1000
 @@ -42,6 +42,14 @@
  
  #include "mtrr.h"
@@ -646,10 +867,10 @@ diff -urN a/arch/x86/kernel/cpu/mtrr/mtrr.c b/arch/x86/kernel/cpu/mtrr/mtrr.c
  				changed_by_mtrr_cleanup = mtrr_cleanup();
  				mtrr_build_map();
  			} else {
-diff -urN a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
 --- a/arch/x86/kernel/early_printk.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/early_printk.c	2026-08-01 18:25:11.917353400 +1000
-@@ -370,6 +370,187 @@
++++ b/arch/x86/kernel/early_printk.c	2026-08-08 16:59:32.506109475 +1000
+@@ -370,6 +370,195 @@
  	.index =	-1,
  };
  
@@ -727,6 +948,12 @@ diff -urN a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
 +int co_colinux_guest;
 +EXPORT_SYMBOL(co_colinux_guest);
 +
++/* Bounds for the fixed-address pseudo-to-machine translation mappings. */
++unsigned long co_colinux_p2m_pages;
++EXPORT_SYMBOL(co_colinux_p2m_pages);
++unsigned long co_colinux_m2p_mask;
++EXPORT_SYMBOL(co_colinux_m2p_mask);
++
 +/*
 + * The guest's virtual interrupt flag -- see asm/irqflags.h. Real IF stays
 + * clear while the guest is current; sti/cli/save_fl edit this instead. Holds
@@ -751,6 +978,8 @@ diff -urN a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
 + */
 +SYM_PIC_ALIAS(co_colinux_guest);
 +SYM_PIC_ALIAS(co_colinux_own_idt);
++SYM_PIC_ALIAS(co_colinux_p2m_pages);
++SYM_PIC_ALIAS(co_colinux_m2p_mask);
 +
 +static void early_colinux_write(struct console *con, const char *s, unsigned n)
 +{
@@ -837,7 +1066,7 @@ diff -urN a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
  static void early_console_register(struct console *con, int keep_early)
  {
  	if (con->index != -1) {
-@@ -398,6 +579,10 @@
+@@ -398,6 +587,10 @@
  	keep = (strstr(buf, "keep") != NULL);
  
  	while (*buf != '\0') {
@@ -848,9 +1077,9 @@ diff -urN a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
  		if (!strncmp(buf, "mmio32", 6)) {
  			buf += 6;
  			early_mmio_serial_init(buf);
-diff -urN a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
 --- a/arch/x86/kernel/head64.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/head64.c	2026-07-31 18:22:36.332891600 +1000
++++ b/arch/x86/kernel/head64.c	2026-08-08 16:41:54.015999968 +1000
 @@ -19,6 +19,7 @@
  #include <linux/memblock.h>
  #include <linux/cc_platform.h>
@@ -886,9 +1115,9 @@ diff -urN a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
  	if (IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT)) {
  		setup_ghcb();
  		handler = vc_boot_ghcb;
-diff -urN a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
 --- a/arch/x86/kernel/head_64.S	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/head_64.S	2026-08-01 08:57:31.492334500 +1000
++++ b/arch/x86/kernel/head_64.S	2026-08-08 16:41:54.016074277 +1000
 @@ -195,6 +195,33 @@
  	 */
  	movq	%rax, %cr3
@@ -987,9 +1216,9 @@ diff -urN a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
  
  	/* Pass the boot_params pointer as first argument */
  	movq	%r15, %rdi
-diff -urN a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
 --- a/arch/x86/kernel/idt.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/idt.c	2026-08-02 15:22:50.297762000 +1000
++++ b/arch/x86/kernel/idt.c	2026-08-08 16:41:54.016175455 +1000
 @@ -3,6 +3,7 @@
   * Interrupt descriptor table related code
   */
@@ -1150,9 +1379,9 @@ diff -urN a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
  /**
   * idt_setup_early_handler - Initializes the idt table with early handlers
   */
-diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 --- a/arch/x86/kernel/process.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/process.c	2026-08-02 21:24:10.011964500 +1000
++++ b/arch/x86/kernel/process.c	2026-08-08 18:16:25.826200842 +1000
 @@ -50,10 +50,16 @@
  #include <asm/proto.h>
  #include <asm/frame.h>
@@ -1170,7 +1399,7 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
  
  #include "process.h"
  
-@@ -773,6 +779,342 @@
+@@ -773,6 +779,376 @@
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -1415,6 +1644,27 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 + * the sleepers, and still never take the processor away from the task that was
 + * running -- which is the thing that had to be fixed.
 + */
++/*
++ * The cooperative block device's completion reaper (drivers/block/cobd.c).
++ * Called on the same cooperative points that drain time, so a finished async
++ * transfer is completed within one tick. A no-op when async block I/O is off
++ * (the ring is empty), so it is always safe to call.
++ */
++void co_cobd_drain_completions(void);
++
++/*
++ * The GPU transport's completions, reaped at the same three points.
++ *
++ * Weak and empty by default so a kernel built without the transport still
++ * links; virtio_colinux.c provides the real one. The three call sites below
++ * are deliberately the same ones the block path uses -- a completion that only
++ * arrives on one of them can be delayed arbitrarily by a guest that happens
++ * not to take that path, which is how a fence turns into a hang.
++ */
++void __weak co_vgpu_drain(void)
++{
++}
++
 +DEFINE_IDTENTRY_SYSVEC(sysvec_co_timer)
 +{
 +	struct pt_regs *old = set_irq_regs(regs);
@@ -1422,6 +1672,9 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 +
 +	while (n--)
 +		co_colinux_clockevent.event_handler(&co_colinux_clockevent);
++
++	co_cobd_drain_completions();
++	co_vgpu_drain();
 +
 +	set_irq_regs(old);
 +}
@@ -1432,8 +1685,16 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 +	unsigned int n;
 +
 +	n = co_colinux_take_ticks();
-+	if (!n)
++	if (!n) {
++		/*
++		 * Reap block completions even when no tick is due: a task
++		 * sleeping on a read drove the guest to idle, and this is the
++		 * boundary where its I/O comes back and wakes it.
++		 */
++		co_cobd_drain_completions();
++		co_vgpu_drain();
 +		return;
++	}
 +
 +	/*
 +	 * A register frame for the tick to look at.
@@ -1460,6 +1721,8 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 +	old = set_irq_regs(&regs);
 +	while (n--)
 +		co_colinux_clockevent.event_handler(&co_colinux_clockevent);
++	co_cobd_drain_completions();
++	co_vgpu_drain();
 +	set_irq_regs(old);
 +	irq_exit();
 +}
@@ -1513,7 +1776,7 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +1278,18 @@
+@@ -936,6 +1312,18 @@
  
  void __init select_idle_routine(void)
  {
@@ -1532,9 +1795,9 @@ diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
  	if (boot_option_idle_override == IDLE_POLL) {
  		if (IS_ENABLED(CONFIG_SMP) && __max_threads_per_core > 1)
  			pr_warn_once("WARNING: polling idle and HT enabled, performance may degrade\n");
-diff -urN a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
 --- a/arch/x86/kernel/reboot.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/reboot.c	2026-08-01 15:30:12.318556600 +1000
++++ b/arch/x86/kernel/reboot.c	2026-08-08 16:41:54.016470830 +1000
 @@ -1,6 +1,7 @@
  // SPDX-License-Identifier: GPL-2.0
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -1616,9 +1879,9 @@ diff -urN a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
  	if (kernel_can_power_off()) {
  		if (!reboot_force)
  			machine_shutdown();
-diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
 --- a/arch/x86/kernel/setup.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/setup.c	2026-08-03 16:30:51.027939300 +1000
++++ b/arch/x86/kernel/setup.c	2026-08-08 16:59:23.025273988 +1000
 @@ -55,6 +55,7 @@
  #include <asm/proto.h>
  #include <asm/realmode.h>
@@ -1627,7 +1890,7 @@ diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
  #include <asm/unwind.h>
  #include <asm/vsyscall.h>
  
-@@ -933,6 +934,73 @@
+@@ -933,8 +934,85 @@
  	 */
  	olpc_ofw_detect();
  
@@ -1700,8 +1963,20 @@ diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
 +
  	idt_setup_early_traps();
  	early_cpu_init();
++	/*
++	 * A 2 MB or 1 GB hardware leaf requires consecutive machine frames.
++	 * Cooperative pseudo RAM promises only consecutive pseudo frames, so all
++	 * mappings -- including the direct map and hugetlb -- must stay at 4 KB.
++	 */
++	if (co_colinux_guest) {
++		setup_clear_cpu_cap(X86_FEATURE_PSE);
++		setup_clear_cpu_cap(X86_FEATURE_PSE36);
++		setup_clear_cpu_cap(X86_FEATURE_GBPAGES);
++	}
  	jump_label_init();
-@@ -1033,7 +1101,15 @@
+ 	static_call_init();
+ 	early_ioremap_init();
+@@ -1033,7 +1111,15 @@
  	 */
  	max_pfn = e820__end_of_ram_pfn();
  
@@ -1718,9 +1993,9 @@ diff -urN a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
  	cache_bp_init();
  	if (mtrr_trim_uncached_memory(max_pfn))
  		max_pfn = e820__end_of_ram_pfn();
-diff -urN a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
 --- a/arch/x86/kernel/traps.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/traps.c	2026-08-01 11:49:58.702868100 +1000
++++ b/arch/x86/kernel/traps.c	2026-08-08 16:41:54.016721576 +1000
 @@ -404,6 +404,21 @@
  	bool handled = false;
  	int ud_type, ud_len;
@@ -1767,9 +2042,40 @@ diff -urN a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
 +	if (co_colinux_guest)
 +		co_colinux_adopt_traps();
  }
-diff -urN a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+--- a/arch/x86/mm/init_64.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/mm/init_64.c	2026-08-08 17:49:25.968956033 +1000
+@@ -55,6 +55,7 @@
+ #include <asm/uv/uv.h>
+ #include <asm/setup.h>
+ #include <asm/ftrace.h>
++#include <asm/cooperative.h>
+ 
+ #include "mm_internal.h"
+ 
+@@ -1575,7 +1576,18 @@
+ 	VM_BUG_ON(!PAGE_ALIGNED(start));
+ 	VM_BUG_ON(!PAGE_ALIGNED(end));
+ 
+-	if (end - start < PAGES_PER_SECTION * sizeof(struct page))
++	/*
++	 * PSE is a required x86-64 feature, so boot_cpu_has(PSE) is folded to
++	 * true at build time even when setup_clear_cpu_cap() removes it from a
++	 * cooperative guest's advertised capabilities.  A huge vmemmap leaf is
++	 * invalid here: consecutive pseudo PFNs are backed by unrelated machine
++	 * frames, and the first translated frame need not be PMD-aligned either.
++	 * Populate the vmemmap with ordinary PTEs so every backing page crosses
++	 * the pseudo-to-machine boundary independently.
++	 */
++	if (co_colinux_guest)
++		err = vmemmap_populate_basepages(start, end, node, NULL);
++	else if (end - start < PAGES_PER_SECTION * sizeof(struct page))
+ 		err = vmemmap_populate_basepages(start, end, node, NULL);
+ 	else if (boot_cpu_has(X86_FEATURE_PSE))
+ 		err = vmemmap_populate_hugepages(start, end, node, altmap);
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
 --- a/arch/x86/mm/ioremap.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/mm/ioremap.c	2026-08-01 07:24:53.274427400 +1000
++++ b/arch/x86/mm/ioremap.c	2026-08-08 16:41:54.016857343 +1000
 @@ -31,6 +31,8 @@
  
  #include "physaddr.h"
@@ -1798,9 +2104,9 @@ diff -urN a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
  	/* Don't allow wraparound or zero size */
  	last_addr = phys_addr + size - 1;
  	if (!size || last_addr < phys_addr)
-diff -urN a/arch/x86/mm/pat/memtype.c b/arch/x86/mm/pat/memtype.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/mm/pat/memtype.c b/arch/x86/mm/pat/memtype.c
 --- a/arch/x86/mm/pat/memtype.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/mm/pat/memtype.c	2026-08-01 07:25:11.393111900 +1000
++++ b/arch/x86/mm/pat/memtype.c	2026-08-08 16:41:54.016957902 +1000
 @@ -225,6 +225,10 @@
  
  void pat_cpu_init(void)
@@ -1828,9 +2134,9 @@ diff -urN a/arch/x86/mm/pat/memtype.c b/arch/x86/mm/pat/memtype.c
  	if (!IS_ENABLED(CONFIG_X86_PAT))
  		pr_info_once("x86/PAT: PAT support disabled because CONFIG_X86_PAT is disabled in the kernel.\n");
  
-diff -urN a/arch/x86/pci/init.c b/arch/x86/pci/init.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/pci/init.c b/arch/x86/pci/init.c
 --- a/arch/x86/pci/init.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/pci/init.c	2026-08-01 07:25:22.983910100 +1000
++++ b/arch/x86/pci/init.c	2026-08-08 16:41:54.017044550 +1000
 @@ -5,12 +5,24 @@
  #include <asm/x86_init.h>
  #include <asm/irqdomain.h>
@@ -1856,9 +2162,9 @@ diff -urN a/arch/x86/pci/init.c b/arch/x86/pci/init.c
  	type = pci_direct_probe();
  
  	if (!(pci_probe & PCI_PROBE_NOEARLY))
-diff -urN a/arch/x86/pci/legacy.c b/arch/x86/pci/legacy.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/pci/legacy.c b/arch/x86/pci/legacy.c
 --- a/arch/x86/pci/legacy.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/pci/legacy.c	2026-08-01 07:25:23.057908800 +1000
++++ b/arch/x86/pci/legacy.c	2026-08-08 16:41:54.017094449 +1000
 @@ -8,6 +8,8 @@
  #include <asm/jailhouse_para.h>
  #include <asm/pci_x86.h>
@@ -1878,10 +2184,23 @@ diff -urN a/arch/x86/pci/legacy.c b/arch/x86/pci/legacy.c
  	/*
  	 * The init function returns an non zero value when
  	 * pci_legacy_init should be invoked.
-diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/block/Makefile b/drivers/block/Makefile
+--- a/drivers/block/Makefile	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/block/Makefile	2026-08-08 16:41:54.017270646 +1000
+@@ -20,6 +20,9 @@
+ obj-$(CONFIG_N64CART)		+= n64cart.o
+ obj-$(CONFIG_BLK_DEV_RAM)	+= brd.o
+ obj-$(CONFIG_BLK_DEV_LOOP)	+= loop.o
++# Cooperative Linux: built unconditionally and self-gated on co_colinux_guest,
++# so there is no Kconfig symbol to forget when the config is regenerated.
++obj-y				+= cobd.o
+ obj-$(CONFIG_SUNVDC)		+= sunvdc.o
+ 
+ obj-$(CONFIG_BLK_DEV_NBD)	+= nbd.o
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/block/cobd.c b/drivers/block/cobd.c
 --- a/drivers/block/cobd.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/block/cobd.c	2026-08-02 20:06:49.804809900 +1000
-@@ -0,0 +1,422 @@
++++ b/drivers/block/cobd.c	2026-08-08 18:21:42.360893018 +1000
+@@ -0,0 +1,581 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * cobd -- the cooperative block device.
@@ -1893,10 +2212,9 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 + * before switching back.
 + *
 + * That the host can write into the guest's buffer directly is the whole reason
-+ * this driver is short. Guest physical addresses are host physical addresses
-+ * here -- the guest's RAM is host allocations described at their true
-+ * addresses in the e820 -- so page_to_phys() of a bio's page is something the
-+ * host can resolve and address. There is no bounce buffer, no scatter list
++ * this driver is short. page_to_phys() yields a dense guest pseudo-physical
++ * address; the host resolves it through p2m to the scattered machine frame and
++ * addresses that frame directly. There is no bounce buffer, no scatter list
 + * handed to hardware, and no DMA mapping.
 + *
 + * The transfer is synchronous: it is complete by the time the switch returns,
@@ -1961,6 +2279,100 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +
 +static struct cobd_dev cobd_devs[COBD_MAX_UNITS];
 +static int cobd_major;
++
++/*
++ * Asynchronous block I/O -- defect 3 (doc/async-cobd-design).
++ *
++ * The synchronous path (cobd_io_sg) blocks the crossing until the host has
++ * finished the whole transfer; on a single-CPU cooperative guest that freezes
++ * everything -- the console, the timer, systemd's watchdogs -- for the duration
++ * of the disk I/O. Async instead submits the request and returns at once: the
++ * host queues it to a worker thread and posts the result into this completion
++ * ring, which the guest reaps on the cooperative tick.
++ *
++ * co_colinux_cobd_io is resolved by the host from the image by name, exactly as
++ * co_colinux_net_io is, and its layout is declared ABI -- kernel/cobd_async.c
++ * carries matching CO_CIO_* offsets. The host is the sole producer into comp[]
++ * and advances comp_head; the guest is the sole consumer and advances comp_tail.
++ * enabled is written once by the host at boot to switch this path on.
++ */
++#define CO_COBD_COMP_SLOTS	128		/* power of two, > 64 max outstanding */
++
++struct co_cobd_comp {
++	__u32 unit;
++	__u32 tag;
++	__u32 result;			/* 0 = OK, 1 = I/O error */
++	__u32 pad;
++};
++
++struct co_cobd_io {
++	volatile __u32 enabled;		/* host sets 1 at boot if async is on */
++	volatile __u32 comp_head;	/* host writes (producer) */
++	volatile __u32 comp_tail;	/* guest writes (consumer) */
++	volatile __u32 pad;
++	struct co_cobd_comp comp[CO_COBD_COMP_SLOTS];
++};
++
++struct co_cobd_io co_colinux_cobd_io;
++EXPORT_SYMBOL(co_colinux_cobd_io);
++
++void co_cobd_drain_completions(void);
++
++/*
++ * Reap finished requests. Called from the cooperative tick and the idle /
++ * exit-to-user drains (arch/x86/kernel/process.c), so completion latency is one
++ * tick (HZ=1000, <=1 ms) at worst and immediate whenever the guest returns to
++ * userspace. Harmless when async is off: the ring is zeroed .bss, head == tail,
++ * and the loop does not run.
++ *
++ * The tag is the blk-mq request tag, resolved with blk_mq_tag_to_rq -- a
++ * corrupted record can then only name a NULL or an unstarted request, both
++ * ignored, never an arbitrary kernel pointer. blk_mq_request_started guards a
++ * tag already ended and recycled, so a stray duplicate cannot double-complete.
++ */
++void co_cobd_drain_completions(void)
++{
++	struct co_cobd_io *io = &co_colinux_cobd_io;
++	__u32 head = io->comp_head;
++	__u32 tail = io->comp_tail;
++
++	if (head == tail)
++		return;
++
++	/*
++	 * A gap wider than the ring, or a nonsense unit, means the producer and
++	 * consumer have lost sync -- a bug, not weather. Resync rather than walk
++	 * garbage, matching conet's stance.
++	 */
++	if ((__u32)(head - tail) > CO_COBD_COMP_SLOTS) {
++		io->comp_tail = head;
++		return;
++	}
++
++	while (tail != head) {
++		struct co_cobd_comp *c;
++		struct cobd_dev *dev;
++		struct request *rq;
++
++		smp_rmb();		/* pairs with the host's store order */
++		c = &io->comp[tail & (CO_COBD_COMP_SLOTS - 1)];
++
++		if (c->unit < COBD_MAX_UNITS) {
++			dev = &cobd_devs[c->unit];
++			if (dev->disk && c->tag < dev->tag_set.queue_depth) {
++				rq = blk_mq_tag_to_rq(dev->tag_set.tags[0], c->tag);
++				if (rq && blk_mq_request_started(rq))
++					blk_mq_end_request(rq,
++						c->result ? BLK_STS_IOERR
++							  : BLK_STS_OK);
++			}
++		}
++		tail++;
++	}
++
++	io->comp_tail = tail;		/* x86 store order: after the reads above */
++}
++EXPORT_SYMBOL(co_cobd_drain_completions);
 +
 +/*
 + * The switch call itself.
@@ -2068,6 +2480,42 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +	return ret;
 +}
 +
++/*
++ * Async submit: hand the host the same request as cobd_io_sg, plus the blk-mq
++ * tag in params[57], and return whether it was accepted rather than the I/O
++ * result. The host queues it and returns immediately; params[56] now means
++ * accepted(0)/busy(1), and the actual result comes back later through the
++ * completion ring. Returns true if accepted.
++ *
++ * Same passage-page rule as cobd_io_sg: the param writes and the crossing are
++ * one operation under preempt_disable, because there is a single set of params
++ * and another task must not overwrite them mid-sequence.
++ */
++static bool cobd_submit_async(int unit, u64 offset, phys_addr_t sg_pa, u32 count,
++			      bool write, unsigned int tag)
++{
++	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
++	bool accepted;
++
++	preempt_disable();
++
++	*(volatile u64 *)(pp + CO_PP_PARAM(51)) = unit;
++	*(volatile u64 *)(pp + CO_PP_PARAM(52)) = offset;
++	*(volatile u64 *)(pp + CO_PP_PARAM(53)) = count;
++	*(volatile u64 *)(pp + CO_PP_PARAM(54)) = sg_pa;
++	*(volatile u64 *)(pp + CO_PP_PARAM(55)) = write ? 1 : 0;
++	*(volatile u64 *)(pp + CO_PP_PARAM(57)) = tag;
++	*(volatile u64 *)(pp + CO_PP_PARAM(56)) = ~0ULL;
++
++	cobd_switch(CO_OPERATION_BLOCK_IO);
++
++	accepted = (*(volatile u64 *)(pp + CO_PP_PARAM(56)) == 0);
++
++	preempt_enable();
++
++	return accepted;
++}
++
 +static u64 cobd_probe(int unit)
 +{
 +	unsigned char *pp = (unsigned char *)co_colinux_passage_page;
@@ -2154,8 +2602,29 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +			n++;
 +		}
 +
-+		if (status == BLK_STS_OK && n &&
-+		    cobd_io_sg(dev->unit, pos, virt_to_phys(cmd->sg), n,
++		if (status != BLK_STS_OK || n == 0)
++			break;
++
++		if (co_colinux_cobd_io.enabled) {
++			/*
++			 * Async (default): submit and leave the request
++			 * outstanding. The PDU (cmd->sg) stays valid until the
++			 * completion ends the request, which is exactly what
++			 * lets the host read the scatter list from a worker
++			 * thread later. A full host queue returns busy -> ask
++			 * blk-mq to requeue (backpressure, never a dropped or
++			 * failed request). Do NOT end the request here.
++			 */
++			if (cobd_submit_async(dev->unit, pos,
++					      virt_to_phys(cmd->sg), n,
++					      op_is_write(req_op(req)),
++					      req->tag))
++				return BLK_STS_OK;
++			return BLK_STS_DEV_RESOURCE;
++		}
++
++		/* Sync fallback (--sync-cobd): transfer inline, complete below. */
++		if (cobd_io_sg(dev->unit, pos, virt_to_phys(cmd->sg), n,
 +			       op_is_write(req_op(req))))
 +			status = BLK_STS_IOERR;
 +		break;
@@ -2263,6 +2732,15 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 +{
 +	int unit, found = 0;
 +
++	/*
++	 * The completion ring is declared ABI shared with the host's hand-written
++	 * CO_CIO_* offsets in kernel/cobd_async.c. Pin the layout so the two
++	 * cannot drift silently.
++	 */
++	BUILD_BUG_ON(sizeof(struct co_cobd_comp) != 16);
++	BUILD_BUG_ON(offsetof(struct co_cobd_io, comp) != 0x10);
++	BUILD_BUG_ON(CO_COBD_COMP_SLOTS & (CO_COBD_COMP_SLOTS - 1));
++
 +	if (!co_colinux_guest || !co_colinux_passage_page)
 +		return 0;
 +
@@ -2304,22 +2782,22 @@ diff -urN a/drivers/block/cobd.c b/drivers/block/cobd.c
 + * initialises later.
 + */
 +device_initcall(cobd_init);
-diff -urN a/drivers/block/Makefile b/drivers/block/Makefile
---- a/drivers/block/Makefile	2026-07-25 00:21:27.000000000 +1000
-+++ b/drivers/block/Makefile	2026-08-01 09:34:31.955400800 +1000
-@@ -20,6 +20,9 @@
- obj-$(CONFIG_N64CART)		+= n64cart.o
- obj-$(CONFIG_BLK_DEV_RAM)	+= brd.o
- obj-$(CONFIG_BLK_DEV_LOOP)	+= loop.o
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/net/Makefile b/drivers/net/Makefile
+--- a/drivers/net/Makefile	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/net/Makefile	2026-08-08 16:41:54.017415194 +1000
+@@ -21,6 +21,9 @@
+ obj-$(CONFIG_MII) += mii.o
+ obj-$(CONFIG_MDIO) += mdio.o
+ obj-$(CONFIG_NET) += loopback.o
 +# Cooperative Linux: built unconditionally and self-gated on co_colinux_guest,
 +# so there is no Kconfig symbol to forget when the config is regenerated.
-+obj-y				+= cobd.o
- obj-$(CONFIG_SUNVDC)		+= sunvdc.o
- 
- obj-$(CONFIG_BLK_DEV_NBD)	+= nbd.o
-diff -urN a/drivers/net/conet_colinux.c b/drivers/net/conet_colinux.c
++obj-y += conet_colinux.o
+ obj-$(CONFIG_NETDEV_LEGACY_INIT) += Space.o
+ obj-$(CONFIG_NETCONSOLE) += netconsole.o
+ obj-$(CONFIG_NETKIT) += netkit.o
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/net/conet_colinux.c b/drivers/net/conet_colinux.c
 --- a/drivers/net/conet_colinux.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/net/conet_colinux.c	2026-08-02 17:08:57.432206200 +1000
++++ b/drivers/net/conet_colinux.c	2026-08-08 16:41:54.017360275 +1000
 @@ -0,0 +1,289 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
@@ -2610,22 +3088,20 @@ diff -urN a/drivers/net/conet_colinux.c b/drivers/net/conet_colinux.c
 +	return 0;
 +}
 +device_initcall(co_net_init);
-diff -urN a/drivers/net/Makefile b/drivers/net/Makefile
---- a/drivers/net/Makefile	2026-07-25 00:21:27.000000000 +1000
-+++ b/drivers/net/Makefile	2026-08-01 19:11:02.915838100 +1000
-@@ -21,6 +21,9 @@
- obj-$(CONFIG_MII) += mii.o
- obj-$(CONFIG_MDIO) += mdio.o
- obj-$(CONFIG_NET) += loopback.o
-+# Cooperative Linux: built unconditionally and self-gated on co_colinux_guest,
-+# so there is no Kconfig symbol to forget when the config is regenerated.
-+obj-y += conet_colinux.o
- obj-$(CONFIG_NETDEV_LEGACY_INIT) += Space.o
- obj-$(CONFIG_NETCONSOLE) += netconsole.o
- obj-$(CONFIG_NETKIT) += netkit.o
-diff -urN a/drivers/tty/hvc/hvc_colinux.c b/drivers/tty/hvc/hvc_colinux.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/tty/hvc/Makefile b/drivers/tty/hvc/Makefile
+--- a/drivers/tty/hvc/Makefile	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/tty/hvc/Makefile	2026-08-08 16:41:54.017532362 +1000
+@@ -5,6 +5,7 @@
+ obj-$(CONFIG_HVC_RTAS)		+= hvc_rtas.o
+ obj-$(CONFIG_HVC_DCC)		+= hvc_dcc.o
+ obj-$(CONFIG_HVC_DRIVER)	+= hvc_console.o
++obj-$(CONFIG_HVC_DRIVER)	+= hvc_colinux.o
+ obj-$(CONFIG_HVC_IRQ)		+= hvc_irq.o
+ obj-$(CONFIG_HVC_XEN)		+= hvc_xen.o
+ obj-$(CONFIG_HVC_IUCV)		+= hvc_iucv.o
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/tty/hvc/hvc_colinux.c b/drivers/tty/hvc/hvc_colinux.c
 --- a/drivers/tty/hvc/hvc_colinux.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/tty/hvc/hvc_colinux.c	2026-08-01 11:55:42.897917800 +1000
++++ b/drivers/tty/hvc/hvc_colinux.c	2026-08-08 16:41:54.017489232 +1000
 @@ -0,0 +1,141 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
@@ -2768,21 +3244,606 @@ diff -urN a/drivers/tty/hvc/hvc_colinux.c b/drivers/tty/hvc/hvc_colinux.c
 +	return 0;
 +}
 +device_initcall(hvc_co_init);
-diff -urN a/drivers/tty/hvc/Makefile b/drivers/tty/hvc/Makefile
---- a/drivers/tty/hvc/Makefile	2026-07-25 00:21:27.000000000 +1000
-+++ b/drivers/tty/hvc/Makefile	2026-08-01 11:56:01.050604000 +1000
-@@ -5,6 +5,7 @@
- obj-$(CONFIG_HVC_RTAS)		+= hvc_rtas.o
- obj-$(CONFIG_HVC_DCC)		+= hvc_dcc.o
- obj-$(CONFIG_HVC_DRIVER)	+= hvc_console.o
-+obj-$(CONFIG_HVC_DRIVER)	+= hvc_colinux.o
- obj-$(CONFIG_HVC_IRQ)		+= hvc_irq.o
- obj-$(CONFIG_HVC_XEN)		+= hvc_xen.o
- obj-$(CONFIG_HVC_IUCV)		+= hvc_iucv.o
-diff -urN a/include/linux/console.h b/include/linux/console.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+--- a/drivers/virtio/Kconfig	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/virtio/Kconfig	2026-08-08 18:19:42.355026716 +1000
+@@ -150,6 +150,17 @@
+ 
+ 	 If unsure, say M.
+ 
++config VIRTIO_COLINUX
++	tristate "Cooperative Linux virtio transport"
++	depends on VIRTIO
++	default y
++	help
++	  A virtio transport for a guest running cooperatively alongside a
++	  host kernel on the same processor. Notifications are stores into a
++	  shared structure the host polls; there are no registers or hypercalls.
++
++	  If unsure, say N.
++
+ config VIRTIO_MMIO
+ 	tristate "Platform bus driver for memory mapped virtio devices"
+ 	depends on HAS_IOMEM && HAS_DMA
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/virtio/Makefile b/drivers/virtio/Makefile
+--- a/drivers/virtio/Makefile	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/virtio/Makefile	2026-08-08 18:16:26.045575823 +1000
+@@ -4,6 +4,7 @@
+ obj-$(CONFIG_VIRTIO_PCI_LIB) += virtio_pci_modern_dev.o
+ obj-$(CONFIG_VIRTIO_PCI_LIB_LEGACY) += virtio_pci_legacy_dev.o
+ obj-$(CONFIG_VIRTIO_MMIO) += virtio_mmio.o
++obj-$(CONFIG_VIRTIO_COLINUX) += virtio_colinux.o
+ obj-$(CONFIG_VIRTIO_PCI) += virtio_pci.o
+ virtio_pci-y := virtio_pci_modern.o virtio_pci_common.o
+ virtio_pci-$(CONFIG_VIRTIO_PCI_LEGACY) += virtio_pci_legacy.o
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/virtio/virtio_colinux.c b/drivers/virtio/virtio_colinux.c
+--- a/drivers/virtio/virtio_colinux.c	1970-01-01 10:00:00.000000000 +1000
++++ b/drivers/virtio/virtio_colinux.c	2026-08-08 18:21:42.223895442 +1000
+@@ -0,0 +1,560 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * virtio over a cooperative-Linux ring, with no registers and no traps.
++ *
++ * The guest already contains everything needed to drive a GPU: the virtio-gpu
++ * driver is compiled in, Mesa ships the virgl Gallium driver, and the vring
++ * code is stock. What has always been missing is a TRANSPORT -- something to
++ * hand virtio a device with ID 16 -- because this guest runs with pci=off and
++ * there is nowhere for a PCI device to come from.
++ *
++ * virtio_mmio is the obvious model and it does not work here either, for a
++ * reason worth stating plainly: MMIO transports work because a guest store to
++ * a fake register TRAPS, and the hypervisor sees it. There is no hypervisor
++ * here. Both kernels run on the bare processor, a store to any address is just
++ * a store, and nobody is notified. So this transport is virtio_mmio with every
++ * register access replaced by a plain memory write into a structure the host
++ * can already see through persistent KMAP windows. Those windows are labelled
++ * with dense guest pseudo-physical addresses and backed through the host's p2m.
++ *
++ * That single property is what makes the whole thing cheap:
++ *
++ *   - The "kick" is an increment of a counter in shared memory. The host
++ *     daemon spin-polls it on another core while the guest is still running.
++ *     No crossing, no exit, no notification path at all.
++ *
++ *   - The vrings need no translation. A transport that does not offer
++ *     VIRTIO_F_ACCESS_PLATFORM makes the vring code bypass the DMA API
++ *     entirely, so every descriptor address is a guest pseudo-physical
++ *     address. The host resolves it directly through the persistent mappings
++ *     R3 established. Vertex data and textures are never marshalled; only the
++ *     command dwords cross anything.
++ *
++ *   - Completions arrive the way every other asynchronous path in this port
++ *     works: the host writes the used ring, and the guest calls
++ *     vring_interrupt() from the existing cooperative drain points. The
++ *     waiting thread SLEEPS in stock dma_fence code and is woken there. It
++ *     must never spin: this guest has one processor, and a thread spinning on
++ *     a fence stops the entire machine, which is the mistake the block path
++ *     was built to avoid.
++ *
++ * num_scanouts is zero on purpose. This is a render-only device: presentation
++ * belongs to the X server on the Windows side, which already owns a real
++ * window per guest X window. The virtio-gpu driver has a KMS-disabled path for
++ * exactly this case and takes it when the config says there are no scanouts.
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/virtio.h>
++#include <linux/virtio_config.h>
++#include <linux/virtio_ring.h>
++#include <linux/virtio_ids.h>
++#include <linux/platform_device.h>
++#include <linux/delay.h>
++#include <linux/kthread.h>
++#include <linux/console.h>	/* co_vgpu_drain's prototype lives with the
++					 * other cooperative hooks */
++
++/*
++ * The shared structure, and the one rule about it: this layout is ABI.
++ *
++ * The host has its own copy of this declaration in
++ * src/colinux/kernel/vgpu.h. There is deliberately no shared header -- the two
++ * sides are built by different toolchains for different kernels -- so the
++ * contract is enforced by the BUILD_BUG_ON block at the bottom of this file
++ * and a matching set of compile-time assertions on the host. If you change a
++ * field here, both sets of assertions must be updated together or one side
++ * will fail to build, which is the intended outcome.
++ *
++ * Every field is fixed-width for the same reason.
++ */
++struct co_vgpu_vq {
++	__u64 desc_gpa;		/* dense guest pseudo-physical address */
++	__u64 avail_gpa;
++	__u64 used_gpa;
++	__u32 num;
++	__u32 kick;		/* guest increments; the daemon polls it */
++};
++
++struct co_vgpu_io {
++	__u32 magic;		/* 'VGPU'; the boot daemon writes it */
++	__u32 abi_version;
++	__u64 host_features;
++	__u64 guest_features;
++	__u32 status;		/* the virtio status byte, guest-owned */
++	__u32 enabled;		/* daemon presence; cleared on clean exit */
++	__u32 num_capsets;
++	__u32 num_scanouts;	/* zero: render-only, no KMS */
++	struct co_vgpu_vq vq[2];	/* controlq, cursorq */
++	__u32 used_pending;	/* host bumps when it publishes completions */
++	__u32 reaped;		/* guest bumps when it has consumed them */
++	__u32 guest_heartbeat;
++	__u32 host_heartbeat;
++};
++
++#define CO_VGPU_MAGIC		0x55504756	/* 'VGPU' little-endian */
++#define CO_VGPU_ABI_VERSION	1
++#define CO_VGPU_NUM_VQS		2
++
++/*
++ * In .bss, resolved by name from the host's ELF loader, exactly like
++ * co_colinux_console_ring and co_colinux_net_io before it. The host writes the
++ * magic and the feature bits into it between loading the image and starting
++ * the guest, so by the time this code runs the structure is either populated
++ * or plainly absent -- and absent means "no GPU today", not a failure.
++ */
++struct co_vgpu_io co_colinux_vgpu_io;
++EXPORT_SYMBOL(co_colinux_vgpu_io);
++
++struct co_vgpu_device {
++	struct virtio_device	vdev;
++	struct platform_device *pdev;
++	struct virtqueue       *vqs[CO_VGPU_NUM_VQS];
++	spinlock_t		lock;
++};
++
++static struct co_vgpu_device *co_vgpu;
++
++static struct co_vgpu_device *to_co_vgpu(struct virtio_device *vdev)
++{
++	return container_of(vdev, struct co_vgpu_device, vdev);
++}
++
++/* ------------------------------------------------------------ config space */
++
++/*
++ * The device's configuration space is four little-endian words, and all four
++ * are constants here: no events are ever raised, there are no scanouts, and
++ * the capset count is whatever the host told us it can render.
++ */
++static void co_vgpu_get(struct virtio_device *vdev, unsigned int offset,
++			void *buf, unsigned int len)
++{
++	struct virtio_gpu_config {
++		__le32 events_read;
++		__le32 events_clear;
++		__le32 num_scanouts;
++		__le32 num_capsets;
++	} cfg;
++
++	cfg.events_read  = cpu_to_le32(0);
++	cfg.events_clear = cpu_to_le32(0);
++	cfg.num_scanouts = cpu_to_le32(co_colinux_vgpu_io.num_scanouts);
++	cfg.num_capsets  = cpu_to_le32(co_colinux_vgpu_io.num_capsets);
++
++	if (offset >= sizeof(cfg))
++		return;
++	if (len > sizeof(cfg) - offset)
++		len = sizeof(cfg) - offset;
++
++	memcpy(buf, (char *)&cfg + offset, len);
++}
++
++static void co_vgpu_set(struct virtio_device *vdev, unsigned int offset,
++			const void *buf, unsigned int len)
++{
++	/* events_clear is the only writable field and there are no events. */
++}
++
++static u8 co_vgpu_get_status(struct virtio_device *vdev)
++{
++	return (u8)co_colinux_vgpu_io.status;
++}
++
++/*
++ * Publishing status is a store, and then we carry on.
++ *
++ * A register-based transport would write a register and the device would
++ * react synchronously. Here the daemon notices in its own time. Waiting for an
++ * acknowledgement would mean spinning on the guest's only processor during
++ * probe, so this deliberately does not: the ordering that matters (rings
++ * published before DRIVER_OK) is guaranteed by the store order below, not by a
++ * handshake.
++ */
++static void co_vgpu_set_status(struct virtio_device *vdev, u8 status)
++{
++	smp_wmb();
++	WRITE_ONCE(co_colinux_vgpu_io.status, status);
++}
++
++static void co_vgpu_reset(struct virtio_device *vdev)
++{
++	WRITE_ONCE(co_colinux_vgpu_io.status, 0);
++}
++
++static u64 co_vgpu_get_features(struct virtio_device *vdev)
++{
++	/*
++	 * Whatever the host offered, minus anything this transport cannot
++	 * honour. VIRTIO_F_ACCESS_PLATFORM is masked off unconditionally and
++	 * that is not an oversight: offering it would put the vring behind the
++	 * DMA API, descriptors would carry DMA addresses instead of guest
++	 * physical ones, and the host would have to translate every one. Its
++	 * absence is what makes resource memory readable in place.
++	 */
++	u64 f = co_colinux_vgpu_io.host_features;
++
++	f &= ~(1ULL << VIRTIO_F_ACCESS_PLATFORM);
++	return f;
++}
++
++static int co_vgpu_finalize_features(struct virtio_device *vdev)
++{
++	if (!__virtio_test_bit(vdev, VIRTIO_F_VERSION_1)) {
++		dev_err(&vdev->dev, "colinux vgpu: host must offer VERSION_1\n");
++		return -EINVAL;
++	}
++
++	if (__virtio_test_bit(vdev, VIRTIO_F_ACCESS_PLATFORM)) {
++		dev_err(&vdev->dev, "colinux vgpu: ACCESS_PLATFORM negotiated,"
++				    " which this transport cannot support\n");
++		return -EINVAL;
++	}
++
++	WRITE_ONCE(co_colinux_vgpu_io.guest_features, vdev->features);
++	return 0;
++}
++
++/* ---------------------------------------------------------------- the kick */
++
++/*
++ * The entire notification mechanism.
++ *
++ * A store. The daemon is spinning on this word on another physical core, sees
++ * the increment by cache coherency, and starts work -- while this guest thread
++ * carries straight on. There is no crossing here and no host entry: that is
++ * the difference between this and every hypervisor transport, and it is why
++ * submission costs nothing measurable.
++ */
++static bool co_vgpu_notify(struct virtqueue *vq)
++{
++	struct co_vgpu_vq *shared = &co_colinux_vgpu_io.vq[vq->index];
++
++	/* Descriptors and the avail index must be visible before the kick that
++	 * advertises them. */
++	smp_wmb();
++	WRITE_ONCE(shared->kick, READ_ONCE(shared->kick) + 1);
++	return true;
++}
++
++/* ------------------------------------------------------------- virtqueues */
++
++static void co_vgpu_del_vqs(struct virtio_device *vdev)
++{
++	struct co_vgpu_device *cd = to_co_vgpu(vdev);
++	struct virtqueue *vq, *n;
++	int i;
++
++	list_for_each_entry_safe(vq, n, &vdev->vqs, list)
++		vring_del_virtqueue(vq);
++
++	for (i = 0; i < CO_VGPU_NUM_VQS; i++) {
++		cd->vqs[i] = NULL;
++		memset(&co_colinux_vgpu_io.vq[i], 0,
++		       sizeof(co_colinux_vgpu_io.vq[i]));
++	}
++}
++
++static int co_vgpu_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
++			    struct virtqueue *vqs[],
++			    struct virtqueue_info vqs_info[],
++			    struct irq_affinity *desc)
++{
++	struct co_vgpu_device *cd = to_co_vgpu(vdev);
++	unsigned int i;
++
++	if (nvqs > CO_VGPU_NUM_VQS)
++		return -EINVAL;
++
++	for (i = 0; i < nvqs; i++) {
++		struct virtqueue_info *vqi = &vqs_info[i];
++		struct virtqueue *vq;
++
++		if (!vqi->name) {
++			vqs[i] = NULL;
++			continue;
++		}
++
++		/*
++		 * 256 descriptors, page-aligned. The ring is ordinary guest
++		 * memory; the host reads it in place, so its size is a
++		 * queue-depth decision and nothing else.
++		 */
++		vq = vring_create_virtqueue(i, 256, PAGE_SIZE, vdev,
++					    true,	/* weak barriers: same
++							 * machine, real
++							 * coherency */
++					    true,	/* may reduce num */
++					    vqi->ctx,
++					    co_vgpu_notify,
++					    vqi->callback,
++					    vqi->name);
++		if (!vq) {
++			co_vgpu_del_vqs(vdev);
++			return -ENOMEM;
++		}
++
++		/*
++		 * Publish where the host can find it. These are guest pseudo-physical
++		 * addresses precisely because ACCESS_PLATFORM was refused
++		 * above; with it, they would be DMA addresses and meaningless
++		 * to the daemon.
++		 */
++		co_colinux_vgpu_io.vq[i].desc_gpa  = virtqueue_get_desc_addr(vq);
++		co_colinux_vgpu_io.vq[i].avail_gpa = virtqueue_get_avail_addr(vq);
++		co_colinux_vgpu_io.vq[i].used_gpa  = virtqueue_get_used_addr(vq);
++		co_colinux_vgpu_io.vq[i].num	   = virtqueue_get_vring_size(vq);
++		co_colinux_vgpu_io.vq[i].kick	   = 0;
++
++		cd->vqs[i] = vq;
++		vqs[i]	   = vq;
++	}
++
++	/* The rings must be visible before anything can be told they exist. */
++	smp_wmb();
++	return 0;
++}
++
++static const char *co_vgpu_bus_name(struct virtio_device *vdev)
++{
++	return "colinux";
++}
++
++static const struct virtio_config_ops co_vgpu_config_ops = {
++	.get			= co_vgpu_get,
++	.set			= co_vgpu_set,
++	.get_status		= co_vgpu_get_status,
++	.set_status		= co_vgpu_set_status,
++	.reset			= co_vgpu_reset,
++	.find_vqs		= co_vgpu_find_vqs,
++	.del_vqs		= co_vgpu_del_vqs,
++	.get_features		= co_vgpu_get_features,
++	.finalize_features	= co_vgpu_finalize_features,
++	.bus_name		= co_vgpu_bus_name,
++};
++
++/* ------------------------------------------------------------ completions */
++
++/*
++ * Called from the cooperative drain points, not from an interrupt.
++ *
++ * The host has written the used ring and bumped used_pending. This runs the
++ * stock virtio completion path, which retires fences and wakes whatever was
++ * sleeping on them. It is deliberately reachable from the timer tick, the idle
++ * drain and the exit-to-user path -- the same three places the block driver's
++ * completions are reaped -- because a completion that only arrives on one of
++ * them is a completion that can be delayed arbitrarily by a guest that happens
++ * not to take that path.
++ */
++void co_vgpu_drain(void)
++{
++	u32 pending;
++	int i;
++
++	if (!co_vgpu)
++		return;
++
++	pending = READ_ONCE(co_colinux_vgpu_io.used_pending);
++	WRITE_ONCE(co_colinux_vgpu_io.guest_heartbeat,
++		   READ_ONCE(co_colinux_vgpu_io.guest_heartbeat) + 1);
++
++	if (pending == READ_ONCE(co_colinux_vgpu_io.reaped))
++		return;
++
++	WRITE_ONCE(co_colinux_vgpu_io.reaped, pending);
++	smp_rmb();
++
++	for (i = 0; i < CO_VGPU_NUM_VQS; i++) {
++		if (co_vgpu->vqs[i])
++			vring_interrupt(0, co_vgpu->vqs[i]);
++	}
++}
++EXPORT_SYMBOL(co_vgpu_drain);
++
++/* ------------------------------------------------------------------- probe */
++
++static void co_vgpu_release(struct device *dev)
++{
++	/* The virtio device is embedded in a static allocation. */
++}
++
++/*
++ * Poll for the daemon, then publish the device.
++ *
++ * Two minutes is generous on purpose: the daemon maps a gigabyte of guest RAM
++ * before it sets this flag, and on a fragmented host that is not instant. A
++ * guest that waits a little is strictly better than one that decides too early
++ * that it has no GPU.
++ */
++static int co_vgpu_wait_and_register(void *arg)
++{
++	struct co_vgpu_device *cd = arg;
++	int waited;
++
++	for (waited = 0; waited < 120000; waited += 100) {
++		if (kthread_should_stop())
++			return 0;
++		if (READ_ONCE(co_colinux_vgpu_io.enabled))
++			break;
++		msleep(100);
++	}
++
++	if (!READ_ONCE(co_colinux_vgpu_io.enabled)) {
++		pr_info("colinux vgpu: no host daemon appeared; no GPU this run\n");
++		return 0;
++	}
++
++	if (register_virtio_device(&cd->vdev)) {
++		pr_err("colinux vgpu: register_virtio_device failed\n");
++		return 0;
++	}
++
++	pr_info("colinux vgpu: host daemon is serving; device registered,"
++		" %u capsets\n", co_colinux_vgpu_io.num_capsets);
++	return 0;
++}
++
++static int __init co_vgpu_init(void)
++{
++	struct co_vgpu_device *cd;
++	int rc;
++
++	/*
++	 * No magic means the host did not set this up: either an older daemon,
++	 * or a run with no GPU daemon at all. That is a normal configuration,
++	 * so it is one quiet line rather than an error.
++	 */
++	if (READ_ONCE(co_colinux_vgpu_io.magic) != CO_VGPU_MAGIC) {
++		pr_info("colinux vgpu: no host device offered\n");
++		return 0;
++	}
++
++	if (co_colinux_vgpu_io.abi_version != CO_VGPU_ABI_VERSION) {
++		pr_err("colinux vgpu: ABI %u, expected %u -- refusing\n",
++		       co_colinux_vgpu_io.abi_version, CO_VGPU_ABI_VERSION);
++		return -ENODEV;
++	}
++
++	cd = kzalloc(sizeof(*cd), GFP_KERNEL);
++	if (!cd)
++		return -ENOMEM;
++
++	spin_lock_init(&cd->lock);
++
++	/*
++	 * A parent device, and it is not a formality.
++	 *
++	 * virtio_gpu_probe hands vdev->dev.parent straight to drm_dev_alloc,
++	 * and DRM refuses a NULL parent with -EINVAL -- which is exactly how
++	 * this failed the first time it ran: the transport registered, the
++	 * driver bound, and probe returned -22 before printing a single line
++	 * of its own, because the failure is upstream of everything that
++	 * reports. A real transport gets this for free (virtio_mmio has its
++	 * platform device, virtio_pci its PCI device); a transport invented
++	 * from nothing has to supply one.
++	 *
++	 * A bare platform device is the honest choice. It is not pretending to
++	 * be hardware -- dev_is_pci() on it is false, so virtio_gpu skips its
++	 * PCI quirk -- it exists to give DRM something to hang the device on.
++	 */
++	cd->pdev = platform_device_register_simple("colinux-vgpu", -1, NULL, 0);
++	if (IS_ERR(cd->pdev)) {
++		int rc2 = PTR_ERR(cd->pdev);
++
++		pr_err("colinux vgpu: no parent device (%d)\n", rc2);
++		kfree(cd);
++		return rc2;
++	}
++
++	cd->vdev.id.device = VIRTIO_ID_GPU;
++	cd->vdev.id.vendor = 0x434f4c58;	/* 'COLX' */
++	cd->vdev.config    = &co_vgpu_config_ops;
++	cd->vdev.dev.parent  = &cd->pdev->dev;
++	cd->vdev.dev.release = co_vgpu_release;
++
++	co_vgpu = cd;
++
++	/*
++	 * Wait for the host daemon before letting virtio-gpu see the device.
++	 *
++	 * The driver's probe asks for capset information and waits five
++	 * seconds for the answer. This transport's initcall runs about fifty
++	 * milliseconds into boot, while the daemon that answers is a Windows
++	 * process the launcher starts moments AFTER the guest -- so the query
++	 * went out before anyone was listening, timed out, and the driver came
++	 * up with no usable capset. Mesa then reported "No virgl contexts
++	 * available on host" and fell back to llvmpipe, which looks exactly
++	 * like a device that does not work.
++	 *
++	 * So registration is deferred to a thread that waits for the daemon to
++	 * announce itself. Boot is not held up: if no daemon ever appears the
++	 * thread gives up quietly and the guest simply has no GPU, which is
++	 * the correct outcome for a host that is not offering one.
++	 */
++	if (READ_ONCE(co_colinux_vgpu_io.enabled) == 0) {
++		struct task_struct *t;
++
++		t = kthread_run(co_vgpu_wait_and_register, cd, "covgpu-wait");
++		if (!IS_ERR(t)) {
++			pr_info("colinux vgpu: waiting for the host daemon\n");
++			return 0;
++		}
++		/* No thread: fall through and register now, so a host that is
++		 * already serving still works. */
++	}
++
++	rc = register_virtio_device(&cd->vdev);
++	if (rc) {
++		pr_err("colinux vgpu: register_virtio_device failed (%d)\n", rc);
++		co_vgpu = NULL;
++		platform_device_unregister(cd->pdev);
++		kfree(cd);
++		return rc;
++	}
++
++	pr_info("colinux vgpu: device registered, %u capsets, %u scanouts%s\n",
++		co_colinux_vgpu_io.num_capsets, co_colinux_vgpu_io.num_scanouts,
++		co_colinux_vgpu_io.num_scanouts ? "" : " (render-only, KMS off)");
++	return 0;
++}
++
++/*
++ * device_initcall, not a later one: virtio_gpu's own initcall has to find the
++ * bus populated, and DRM wants to come up before userspace does.
++ */
++device_initcall(co_vgpu_init);
++
++/*
++ * The ABI, asserted rather than documented.
++ *
++ * The host's copy of these structures lives in src/colinux/kernel/vgpu.h with
++ * an equivalent set of assertions. Two toolchains, two kernels, one layout --
++ * and the only thing keeping them honest is that both refuse to build when
++ * they disagree.
++ */
++static void __maybe_unused co_vgpu_abi_asserts(void)
++{
++	BUILD_BUG_ON(sizeof(struct co_vgpu_vq) != 32);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_vq, desc_gpa)  != 0);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_vq, avail_gpa) != 8);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_vq, used_gpa)  != 16);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_vq, num)	    != 24);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_vq, kick)	    != 28);
++
++	BUILD_BUG_ON(offsetof(struct co_vgpu_io, magic)		 != 0);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_io, abi_version)	 != 4);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_io, host_features)	 != 8);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_io, guest_features) != 16);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_io, status)	 != 24);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_io, enabled)	 != 28);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_io, num_capsets)	 != 32);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_io, num_scanouts)	 != 36);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_io, vq)		 != 40);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_io, used_pending)	 != 104);
++	BUILD_BUG_ON(offsetof(struct co_vgpu_io, reaped)	 != 108);
++	BUILD_BUG_ON(sizeof(struct co_vgpu_io)			 != 120);
++}
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/include/linux/console.h b/include/linux/console.h
 --- a/include/linux/console.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/include/linux/console.h	2026-08-01 15:25:13.615767600 +1000
-@@ -741,4 +741,24 @@
++++ b/include/linux/console.h	2026-08-08 18:17:17.113644258 +1000
+@@ -741,4 +741,28 @@
  void dummycon_register_output_notifier(struct notifier_block *nb);
  void dummycon_unregister_output_notifier(struct notifier_block *nb);
  
@@ -2794,6 +3855,8 @@ diff -urN a/include/linux/console.h b/include/linux/console.h
 +void co_colinux_yield(void);
 +void co_colinux_timer_init(void);
 +void co_colinux_drain_time(void);
++/* virtio-gpu completions; process.c supplies a weak no-op without transport. */
++void co_vgpu_drain(void);
 +void co_colinux_get_wallclock(struct timespec64 *now);
 +void co_colinux_terminate(unsigned long reason);
 +#else
@@ -2802,14 +3865,16 @@ diff -urN a/include/linux/console.h b/include/linux/console.h
 +void co_colinux_yield(void);
 +void co_colinux_timer_init(void);
 +void co_colinux_drain_time(void);
++/* virtio-gpu completions; process.c supplies a weak no-op without transport. */
++void co_vgpu_drain(void);
 +void co_colinux_get_wallclock(struct timespec64 *now);
 +void co_colinux_terminate(unsigned long reason);
 +#endif
 +
  #endif /* _LINUX_CONSOLE_H */
-diff -urN a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
 --- a/include/linux/irq-entry-common.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/include/linux/irq-entry-common.h	2026-08-02 21:02:20.641854400 +1000
++++ b/include/linux/irq-entry-common.h	2026-08-08 16:41:54.017710859 +1000
 @@ -194,10 +194,54 @@
  static __always_inline void __exit_to_user_mode_prepare(struct pt_regs *regs,
  							const unsigned long work_mask)
@@ -2921,9 +3986,9 @@ diff -urN a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
  } irqentry_state_t;
  #endif
  
-diff -urN a/kernel/entry/common.c b/kernel/entry/common.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/kernel/entry/common.c b/kernel/entry/common.c
 --- a/kernel/entry/common.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/kernel/entry/common.c	2026-08-01 11:39:09.340085700 +1000
++++ b/kernel/entry/common.c	2026-08-08 16:41:54.017823757 +1000
 @@ -103,18 +103,78 @@
  	}
  }
@@ -3039,9 +4104,9 @@ diff -urN a/kernel/entry/common.c b/kernel/entry/common.c
  }
  
  irqentry_state_t noinstr irqentry_nmi_enter(struct pt_regs *regs)
-diff -urN a/kernel/trace/trace.c b/kernel/trace/trace.c
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/kernel/trace/trace.c b/kernel/trace/trace.c
 --- a/kernel/trace/trace.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/kernel/trace/trace.c	2026-08-01 01:10:24.598058200 +1000
++++ b/kernel/trace/trace.c	2026-08-08 16:41:54.018200660 +1000
 @@ -15,6 +15,7 @@
  #include <linux/ring_buffer.h>
  #include <linux/utsname.h>

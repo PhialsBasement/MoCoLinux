@@ -47,10 +47,9 @@ typedef struct co_winnt_parameters {
 	bool_t batch;
 	char   batch_arg[0x20];
 	/*
-	 * Guest RAM in megabytes. A flag rather than a constant because whether
-	 * a given size can be found depends on how fragmented the host's
-	 * physical memory is at that moment, and finding out should not require
-	 * a cross-compile -- see the note on CO_GUEST_RAM_DEFAULT_MB.
+	 * Usable guest pseudo RAM in megabytes. The host backs it with scattered
+	 * nonpaged-pool pages; a flag keeps capacity a runtime choice rather than
+	 * requiring a cross-compile.
 	 */
 	bool_t mem;
 	char   mem_arg[0x20];

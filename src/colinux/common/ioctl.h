@@ -284,6 +284,7 @@ typedef struct {
 	co_rc_t		   rc;
 	unsigned long long min_va;
 	unsigned long long max_va;
+	unsigned long long ram_bytes;	/* p2m capacity needed by a boot */
 } co_manager_ioctl_kload_begin_t;
 
 typedef struct {
@@ -321,13 +322,12 @@ typedef struct {
  * interface for CO_MANAGER_IOCTL_KMAP / CO_MANAGER_IOCTL_KUNMAP: give a
  * user-mode process a direct, persistent view of the guest's RAM.
  *
- * This is the thing a virtual machine cannot do and this design gets for free.
- * Guest physical memory IS host physical memory here, so a host process does
- * not need to marshal anything across an address-space boundary -- it needs the
- * pages mapped once, and then a texture or a vertex buffer the guest wrote is
- * simply memory the daemon can read at memcpy speed. KREAD, by contrast, is an
- * ioctl and a page-table walk per call; it is right for a few kilobytes of
- * printk ring and hopeless for a gigabyte a second of GPU resources.
+ * The driver's virtually contiguous pool blocks are mapped once into the host
+ * process. Their reported bases are guest pseudo addresses, so a texture or
+ * vertex buffer can still be resolved and read at memcpy speed even though its
+ * machine frames are scattered. KREAD, by contrast, is an ioctl and a
+ * page-table walk per call; it is right for a few kilobytes of printk ring and
+ * hopeless for a gigabyte a second of GPU resources.
  *
  * SLICED, and not by preference. An MDL records its length in a CSHORT, so one
  * MDL can describe at most (32767 - sizeof(MDL)) / sizeof(PFN_NUMBER) pages --
@@ -347,7 +347,7 @@ typedef struct {
 #define CO_KMAP_MAX_RANGES	256
 
 typedef struct {
-	unsigned long long pa;		/* guest physical == host physical */
+	unsigned long long pa;		/* guest pseudo-physical base */
 	unsigned long long bytes;
 	unsigned long long user_va;	/* where the caller may read it */
 } co_kmap_range_t;
@@ -548,12 +548,6 @@ typedef struct {
 } co_manager_ioctl_kstop_t;
 
 /* interface for CO_MANAGER_IOCTL_KRAM: give the guest physical memory */
-/*
- * Must equal CO_KLOAD_MAX_BLOCKS. The driver fills one entry per block it
- * actually allocated and the daemon turns each into an e820 range, so a value
- * below the driver's block cap would describe a guest smaller than the one that
- * exists -- memory allocated, mapped, and never mentioned to the kernel.
- */
 #define CO_KRAM_MAX_RANGES 127
 typedef struct {
 	co_rc_t		   rc;
@@ -563,21 +557,19 @@ typedef struct {
 	unsigned long	   ram_pages;	/* out: pages allocated for RAM */
 	unsigned long	   tables;	/* out */
 	/*
-	 * Where the guest's memory actually is.
+	 * The guest sees one pseudo-physical address space beginning at zero.
 	 *
-	 * Guest physical addresses are host physical addresses, because Linux
-	 * calls __va() on what it reads out of its own page tables and those
-	 * entries hold host physical addresses. The memory comes in several
-	 * contiguous blocks, each one a usable e820 range at its true address;
-	 * range 0 additionally carries the reserved page-table region at its
-	 * top. The daemon builds the e820 and phys_base from these rather than
-	 * inventing a layout.
+	 * The reserved range contains the host-built page tables.  Every pseudo
+	 * page is independently backed and translated to the machine PFN stored
+	 * in hardware entries; allocation-block boundaries never appear in e820.
 	 */
 	unsigned long long phys_base;	/* out: what the guest's __pa() adds */
 	unsigned long long total_usable;/* out: usable bytes across all ranges */
+	unsigned long long p2m_pages;	/* out: dense p2m entries in use */
+	unsigned long long m2p_mask;	/* out: reverse-hash slot mask */
 	int		   range_count;	/* out */
 	struct {
-		unsigned long long pa;		/* host physical base */
+		unsigned long long pa;		/* guest pseudo-physical base */
 		unsigned long long usable;	/* usable RAM bytes */
 		unsigned long long reserved;	/* reserved bytes above usable */
 	} range[CO_KRAM_MAX_RANGES];

@@ -103,13 +103,10 @@
      span encloses our window, DEBUG_ENTRY off because it ud2's on the real IF
      this design keeps set, and now SECURITY_LANDLOCK on -- is a decision made
      once and recorded nowhere a rebuild would find it.
-   * "x86/mm: Checked W+X mappings: FAILED, 125045 W+X pages found" on every
-     boot, from the kernel's own page-table auditor. The host builds the direct
-     map with _PAGE_RW and no NX, so every page of it is writable and
-     executable. It is harmless for a guest that runs at ring 0 anyway -- it has
-     no privilege boundary to protect -- but nothing in the tree says so, and it
-     reads like a security finding to whoever sees it next. Either mark the map
-     NX where the guest never executes, or write down why it is not worth doing.
+   * DONE with fragmented RAM: the host's 4 KB direct-map leaves now carry NX,
+     as do the fixed p2m/m2p data mappings. Recheck the page-table auditor on
+     the first target boot; any remaining W+X report is no longer the entire
+     direct map and should be investigated on its own.
 
  * SOLVED 2026-08-04, kept so none of it is re-opened or re-derived. One
    session, six real bugs, and the order they were found in is misleading --
@@ -217,11 +214,11 @@
      running daemon holds its own image, so the desktop shortcuts keep using
      whatever binary was there when the guest started. Harmless, but it means a
      driver/daemon swap needs the guest stopped first, and nothing says so.
-   * The guest-side async cobd changes are not in the snapshot diff yet. They
-     live in patch/7.1.5/async-cobd-src/ as whole files (cobd.c, process.c),
-     deliberately, until the design has had more than one successful run behind
-     it. patch/7.1.5/current-tree-snapshot.diff must be regenerated from the
-     pristine tarball before anyone else can build this kernel.
+   * DONE: the async COBD and virtio-GPU whole-file overlays are folded into
+     patch/7.1.5/current-tree-snapshot.diff, including Kconfig/Makefile wiring
+     and their shared completion drains. A dry apply followed by a tree diff
+     against the build source is clean; applying that one patch now produces
+     the complete guest instead of silently building without either device.
    * Async cobd is one worker per unit, which is the right shape but not the
      limit: a single unit still serializes on its FILE_SYNCHRONOUS_IO_NONALERT
      handle. Parallelising one disk needs the handle reopened without that flag
@@ -335,7 +332,18 @@
      already has a single-instance mutex, so asking whether that is held is
      both cheaper and exact.
 
- * Guest RAM is freed and re-allocated every run, and that fragments the host:
+ * IMPLEMENTED 2026-08-08; target-host soak still pending. Guest RAM used to be
+   freed and re-allocated as physically contiguous runs every boot:
+   * The loader now uses cached NonPagedPool allocations with no physical
+     contiguity requirement. Linux sees dense pseudo RAM from zero; a p2m array
+     supplies machine PFNs to hardware entries and an m2p hash translates them
+     back when Linux reads its page tables. The direct map is built from 4 KB
+     leaves and PSE/GB pages are disabled for the cooperative guest.
+   * The host driver and the patched 7.1.5 vmlinux both build. What remains is
+     repeated boot/teardown testing on fragmented XP x64 and Windows 7 hosts,
+     including KMAP/GPU and asynchronous cobd traffic.
+   * The bullets below are the diagnosis that led to the change, kept because
+     they distinguish host PFN fragmentation from leaks and teardown bugs.
    * QUANTIFIED 2026-08-04 while soaking R3, and the number is better than the
      entry below implies: on Windows 7, four consecutive boot/teardown cycles
      each got the full 1024 MB back. What fails first is not the gigabyte, it
@@ -366,7 +374,7 @@
      searches have to hunt for runs that no longer exist in one piece. So the
      state that is not reset between runs is not ours -- it is Windows'
      physical memory, and we are the ones fragmenting it.
-   * The targeted fix is to stop giving it back. Allocate the guest's RAM once
+   * A considered workaround was to stop giving it back. Allocate the guest's RAM once
      per driver load and reuse it across runs: nothing else can use those blocks
      while the driver is loaded, one guest runs at a time by construction, and
      the second and tenth boots then cost zero contiguous searches. co_kload_free
@@ -384,14 +392,14 @@
      MmUnmapIoSpace in co_space_free_table) in a single evening; it deserves its
      own change and its own five-point audit rather than a rider on something
      else.
-   * The real fix underneath is pseudo-physical memory. The contiguity
+   * The implemented fix is pseudo-physical memory. The contiguity
      requirement exists only because guest physical must equal host physical,
      which is forced by Linux calling __va() on entries it reads out of its own
      page tables. A p2m/machine-frame layer -- which coLinux-i386 and Xen both
-     have -- removes it entirely, and with it the whole class of problem: RAM
-     becomes ordinary scattered pages, there is no e820 entry limit to work
-     around, and CO_KLOAD_MAX_BLOCKS stops existing. That is a milestone, not a
-     fix.
+     have -- removes it entirely, and with it the whole class of physical-run
+     searches: RAM becomes ordinary scattered pages and allocation boundaries
+     disappear from e820. CO_KLOAD_MAX_BLOCKS remains only virtual-allocation
+     and KMAP bookkeeping, not a physical-contiguity requirement.
 
  * One-click bring-up:
    * Most of the prerequisites landed while chasing other things, so what is
@@ -471,9 +479,9 @@
    * The other half is real and not fixable this way: load 6 on one processor.
      Four Steam processes plus the kernel's own work, six-times oversubscribed.
      That is the SMP entry, not this one.
-   * Worth trying --mem 1536 alongside. 2048 failed on contiguous allocation, but
-     that was on a host that had already run a guest; on a fresh boot it may be
-     available.
+   * Worth trying --mem 1536 and 2048 alongside. The old 2048 failure was a
+     contiguous-run failure and no longer predicts success; this now tests
+     nonpaged-pool capacity, p2m sizing and guest reclaim instead.
 
  * co_debug_read has a use-after-free:
    * bugcheck 0xD5 DRIVER_PAGE_FAULT_IN_FREED_SPECIAL_POOL, p3 resolving to
@@ -566,13 +574,12 @@
 
        Worth being explicit about why this is more tractable here than the
        equivalent in a virtual machine, because it is the argument for
-       attempting it at all: guest physical IS host physical. There is no
-       second address space to marshal resources into. A vertex buffer or a
-       texture the guest application writes sits in memory the host can already
-       address by arithmetic (co_kload_frame_va on the page), so the replay
-       reads those buffers in place, where the application put them. Zero copy
-       is not an optimisation to add later, it is what happens if nothing is
-       done to prevent it -- and eliminating that copy is most of what virtio
+       attempting it at all: persistent KMAP windows expose every pseudo page
+       directly in the daemon even though the machine frames are scattered. A
+       vertex buffer or texture the guest writes can be resolved by pseudo
+       address and read in place, where the application put it. Zero copy is
+       not an optimisation to add later, it is what happens if nothing is done
+       to prevent it -- and eliminating that copy is most of what virtio
        designs spend their complexity on.
 
        Presentation lands the same way. An X client here already owns a real

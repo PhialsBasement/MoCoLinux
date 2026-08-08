@@ -4,9 +4,9 @@
  * Small on purpose, and it will stay small. Almost everything about this
  * device happens in userspace -- the daemon that embeds virglrenderer polls
  * the kick counter from another core, walks the vrings through the persistent
- * mappings R3 established, and writes completions back. None of that needs the
- * driver, because guest physical memory is host physical memory and a mapped
- * page is just a page.
+ * mappings R3 established, and writes completions back. KMAP labels those
+ * windows with guest pseudo addresses, so the daemon resolves a descriptor
+ * without caring which machine frame backs it.
  *
  * What the driver owns is exactly two things the daemon cannot do for itself:
  *

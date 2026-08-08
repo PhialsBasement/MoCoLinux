@@ -25,7 +25,7 @@
 #define VRING_DESC_F_INDIRECT	4
 
 struct vring_desc {
-	uint64_t addr;		/* guest physical == host physical */
+	uint64_t addr;		/* guest pseudo-physical */
 	uint32_t len;
 	uint16_t flags;
 	uint16_t next;
@@ -70,7 +70,7 @@ struct cogpu_vring {
  * it may write -- because that split is what says which parts of the chain are
  * the request and which are the reply.
  */
-#define COGPU_MAX_CHAIN 128
+#define COGPU_MAX_CHAIN 256
 
 struct cogpu_buf {
 	void	*addr;

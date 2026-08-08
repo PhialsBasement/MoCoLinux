@@ -347,8 +347,8 @@ static co_rc_t co_winnt_main(int argc, char *args[])
 		/*
 		 * One guest at a time, refused here rather than discovered
 		 * later. Two monitor loops on one machine means two passage
-		 * pages, two guests and two lots of contiguous RAM, and it has
-		 * taken this box down every time it has happened. run-boot.sh
+		 * pages, two guests and two independently mutable RAM pools, and
+		 * it has taken this box down every time it has happened. run-boot.sh
 		 * has carried a guard for exactly this since the early
 		 * milestones; run-arch.bat never did, and going around it cost
 		 * a box.
