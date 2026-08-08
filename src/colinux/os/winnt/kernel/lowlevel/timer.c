@@ -95,40 +95,243 @@ void co_os_msleep(unsigned int msecs)
  * the monitor is still inside the crossing is not lost -- it is consumed by
  * the next wait, immediately -- and repeated wakes do not accumulate into a
  * burst of re-entries later.
+ *
+ * One per vCPU: the event releases a single waiter, so vCPUs must not share
+ * one. See colinux/os/timer.h.
  */
-static KEVENT co_idle_wake_event;
+static KEVENT co_idle_wake_event[CO_MAX_VCPUS];
+static KDPC   co_vcpu_kick_dpc[CO_MAX_VCPUS];
+static KSPIN_LOCK co_vcpu_kick_lock[CO_MAX_VCPUS];
+static int    co_vcpu_kick_bound[CO_MAX_VCPUS];
+static KTIMER co_vcpu_preempt_timer[CO_MAX_VCPUS];
+static KDPC   co_vcpu_preempt_dpc[CO_MAX_VCPUS];
 static int    co_idle_wake_ready;
+
+static VOID DDKAPI co_os_vcpu_kick_dpc_routine(
+	IN PKDPC Dpc,
+	IN PVOID DeferredContext,
+	IN PVOID SystemArgument1,
+	IN PVOID SystemArgument2)
+{
+	(void)Dpc;
+	(void)DeferredContext;
+	(void)SystemArgument1;
+	(void)SystemArgument2;
+}
+
+/*
+ * Xen's VIRQ_TIMER equivalent.
+ *
+ * The body is empty for the same reason as the posted-IPI DPC above.  Expiring
+ * a high-priority DPC on the processor carrying a running vCPU sends that
+ * processor a Windows interrupt.  The interrupt enters the guest's hybrid IDT,
+ * crosses to the monitor, and is replayed into Windows.  At that point the
+ * monitor owns a complete stopped userspace frame and can deliver the guarded
+ * cooperative timer upcall before resuming it.
+ *
+ * Without this targeted source, periodic injection was merely *checked* after
+ * unrelated host interrupts.  A quiet processor can go tens of seconds
+ * without one, which made a two-second guest sleep take fifty-two seconds.
+ */
+static VOID DDKAPI co_os_vcpu_preempt_dpc_routine(
+	IN PKDPC Dpc,
+	IN PVOID DeferredContext,
+	IN PVOID SystemArgument1,
+	IN PVOID SystemArgument2)
+{
+	(void)Dpc;
+	(void)DeferredContext;
+	(void)SystemArgument1;
+	(void)SystemArgument2;
+}
 
 void co_os_idle_wake_init(void)
 {
-	KeInitializeEvent(&co_idle_wake_event, SynchronizationEvent, FALSE);
+	unsigned long i;
+
+	for (i = 0; i < CO_MAX_VCPUS; i++) {
+		KeInitializeEvent(&co_idle_wake_event[i], SynchronizationEvent, FALSE);
+		KeInitializeDpc(&co_vcpu_kick_dpc[i],
+				&co_os_vcpu_kick_dpc_routine, NULL);
+		KeSetImportanceDpc(&co_vcpu_kick_dpc[i], HighImportance);
+		KeInitializeSpinLock(&co_vcpu_kick_lock[i]);
+		co_vcpu_kick_bound[i] = 0;
+		KeInitializeTimerEx(&co_vcpu_preempt_timer[i], NotificationTimer);
+		KeInitializeDpc(&co_vcpu_preempt_dpc[i],
+				&co_os_vcpu_preempt_dpc_routine, NULL);
+		KeSetImportanceDpc(&co_vcpu_preempt_dpc[i], HighImportance);
+	}
 	co_idle_wake_ready = 1;
 }
 
-void co_os_idle_wake(void)
+void co_os_idle_wake_shutdown(void)
 {
+	unsigned long i;
+
 	if (!co_idle_wake_ready)
+		return;
+
+	co_idle_wake_ready = 0;
+	for (i = 0; i < CO_MAX_VCPUS; i++) {
+		KIRQL old_irql;
+
+		KeAcquireSpinLock(&co_vcpu_kick_lock[i], &old_irql);
+		co_vcpu_kick_bound[i] = 0;
+		KeCancelTimer(&co_vcpu_preempt_timer[i]);
+		KeRemoveQueueDpc(&co_vcpu_kick_dpc[i]);
+		KeRemoveQueueDpc(&co_vcpu_preempt_dpc[i]);
+		KeReleaseSpinLock(&co_vcpu_kick_lock[i], old_irql);
+	}
+
+	/* A DPC already taken off its queue may still be executing our code. */
+	KeFlushQueuedDpcs();
+}
+
+void co_os_idle_wake(unsigned long vcpu)
+{
+	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS)
 		return;
 	/*
 	 * The increment of 1 boosts the waiting monitor thread so it runs now
 	 * rather than at the end of the scheduler's queue -- this call exists
 	 * to shave latency, and a wake that waits its turn is half a fix.
 	 */
-	KeSetEvent(&co_idle_wake_event, 1, FALSE);
+	KeSetEvent(&co_idle_wake_event[vcpu], 1, FALSE);
 }
 
-bool_t co_os_idle_wait(unsigned int msecs)
+void co_os_idle_wake_all(void)
+{
+	unsigned long i;
+
+	for (i = 0; i < CO_MAX_VCPUS; i++)
+		co_os_idle_wake(i);
+}
+
+/*
+ * Ring a running vCPU, not only one parked in co_os_idle_wait().
+ *
+ * KeSetTargetProcessorDpc selects the Windows processor carrying the target
+ * vCPU, and HighImportance makes KeInsertQueueDpc begin processing that
+ * processor's queue immediately. If the target is executing guest code, the
+ * resulting host IPI first enters the guest's hybrid IDT and crosses to its
+ * monitor loop. The loop replays the IPI into Windows, then uses that stopped
+ * guest frame to deliver the posted cooperative IPI before resuming it.
+ *
+ * The DPC body is intentionally empty. Its interrupt is the doorbell; the
+ * message itself is already in co_colinux_ipi_pending[].
+ */
+bool_t co_os_vcpu_kick_bind(unsigned long vcpu, unsigned long host_cpu)
+{
+	KIRQL old_irql;
+
+	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS ||
+	    host_cpu >= sizeof(KAFFINITY) * 8)
+		return PFALSE;
+
+	KeAcquireSpinLock(&co_vcpu_kick_lock[vcpu], &old_irql);
+	/* A proper release drains this first; remove defensively for a slot
+	 * recovered after an interrupted bring-up. */
+	KeRemoveQueueDpc(&co_vcpu_kick_dpc[vcpu]);
+	KeSetTargetProcessorDpc(&co_vcpu_kick_dpc[vcpu], (CCHAR)host_cpu);
+	co_vcpu_kick_bound[vcpu] = 1;
+	KeReleaseSpinLock(&co_vcpu_kick_lock[vcpu], old_irql);
+
+	return PTRUE;
+}
+
+void co_os_vcpu_kick_unbind(unsigned long vcpu)
+{
+	KIRQL old_irql;
+
+	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS)
+		return;
+
+	/* Closing the gate under the same lock as queueing means a sender that
+	 * observed the old vCPU cannot enqueue after the drain. */
+	KeAcquireSpinLock(&co_vcpu_kick_lock[vcpu], &old_irql);
+	co_vcpu_kick_bound[vcpu] = 0;
+	KeRemoveQueueDpc(&co_vcpu_kick_dpc[vcpu]);
+	KeReleaseSpinLock(&co_vcpu_kick_lock[vcpu], old_irql);
+
+	/* The routine is empty, but it still lives in this driver image.  Make
+	 * slot reuse and eventual unload wait for an already-running instance. */
+	KeFlushQueuedDpcs();
+}
+
+void co_os_vcpu_kick(unsigned long vcpu)
+{
+	KIRQL old_irql;
+
+	co_os_idle_wake(vcpu);
+
+	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS)
+		return;
+
+	KeAcquireSpinLock(&co_vcpu_kick_lock[vcpu], &old_irql);
+	if (co_vcpu_kick_bound[vcpu])
+		KeInsertQueueDpc(&co_vcpu_kick_dpc[vcpu], NULL, NULL);
+	KeReleaseSpinLock(&co_vcpu_kick_lock[vcpu], old_irql);
+}
+
+void co_os_vcpu_preempt_start(unsigned long vcpu, unsigned long host_cpu,
+			      unsigned int period_msec)
+{
+	LARGE_INTEGER due;
+
+	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS ||
+	    host_cpu >= sizeof(KAFFINITY) * 8 || period_msec == 0)
+		return;
+
+	/* Re-arming a lane first retires any timer left by an earlier run. */
+	KeCancelTimer(&co_vcpu_preempt_timer[vcpu]);
+	KeRemoveQueueDpc(&co_vcpu_preempt_dpc[vcpu]);
+	KeSetTargetProcessorDpc(&co_vcpu_preempt_dpc[vcpu], (CCHAR)host_cpu);
+
+	due.QuadPart = -((long long)period_msec * 10000LL);
+	KeSetTimerEx(&co_vcpu_preempt_timer[vcpu], due, (LONG)period_msec,
+		     &co_vcpu_preempt_dpc[vcpu]);
+}
+
+void co_os_vcpu_preempt_stop(unsigned long vcpu)
+{
+	if (vcpu >= CO_MAX_VCPUS)
+		return;
+
+	KeCancelTimer(&co_vcpu_preempt_timer[vcpu]);
+	KeRemoveQueueDpc(&co_vcpu_preempt_dpc[vcpu]);
+}
+
+bool_t co_os_idle_wait(unsigned long vcpu, unsigned int msecs)
 {
 	LARGE_INTEGER DueTime;
 	NTSTATUS      status;
 
-	if (!co_idle_wake_ready) {
-		co_os_msleep(msecs);
+	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS) {
+		co_os_msleep(msecs ? msecs : 1);
 		return PFALSE;
 	}
 
+	/*
+	 * Zero means no timeout at all. No caller passes it today -- see the
+	 * contract in os/timer.h.
+	 *
+	 * The temptation is obvious: every producer rings the doorbell now, so a
+	 * timeout looks like a pure poll, and a poll here is a full world switch
+	 * -- CR3, GDT, IDT, TR, fourteen MSRs, FXSAVE -- taken to find an empty
+	 * operation slot. But the monitor's timeout is also the guest's clock:
+	 * ticks are synthesised from elapsed host time only when a vCPU wakes and
+	 * re-enters, so removing it stops time on that processor. This path
+	 * exists for the day the guest publishes its next expiry instead of
+	 * asking for a periodic tick.
+	 */
+	if (msecs == 0) {
+		status = KeWaitForSingleObject(&co_idle_wake_event[vcpu],
+					       Executive, KernelMode, FALSE, NULL);
+		return status == STATUS_SUCCESS ? PTRUE : PFALSE;
+	}
+
 	DueTime.QuadPart = (long long)msecs * 10000 * (-1);
-	status = KeWaitForSingleObject(&co_idle_wake_event, Executive,
+	status = KeWaitForSingleObject(&co_idle_wake_event[vcpu], Executive,
 				       KernelMode, FALSE, &DueTime);
 	return status == STATUS_SUCCESS ? PTRUE : PFALSE;
 }

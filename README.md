@@ -1,9 +1,9 @@
 # MoCoLinux
 
-Cooperative Linux for x86-64 (Now with 128GB Fragged RAM support): a modern Linux kernel running as a guest inside
+Cooperative Linux for x86-64, with fragmented-RAM backing and guest memory
+configurations up to 128 GB: a modern Linux kernel running as a guest inside
 Windows XP x64, Windows 7 x64, Windows 8.1 x64 and Windows 10 x64 on real
-hardware, without a
-hypervisor, emulation, or virtualization extensions. It is a port of
+hardware, without a hypervisor, emulation, or virtualization extensions. It is a port of
 [coLinux](http://colinux.org/) (i386, unmaintained since ~2011) to x86-64,
 against a 2026 kernel.
 
@@ -74,11 +74,35 @@ address on both sides, holding the switch code, both saved CPU states, an IST
 stack, a TSS and the console ring — valid mid-crossing, when CR3 has changed
 but nothing else has.
 
-Guest RAM is a dense pseudo-physical address space backed by ordinary scattered
-nonpaged-pool pages. A host-built p2m table converts each Linux PFN to the
-machine PFN placed in hardware page tables; a reverse m2p hash converts values
-back when Linux reads those tables. The synthesized e820 therefore describes
-RAM from pseudo address zero and does not expose host fragmentation.
+### FragRAM
+
+FragRAM is shorthand here for backing the guest with whatever physical pages
+Windows can provide instead of requiring guest RAM in unbroken physical runs.
+The earlier x86-64 port treated a Linux guest page number as the corresponding
+host machine page number. That was simple, but it meant a host could have
+enough free RAM in total and still fail to boot the guest because the free
+pages were scattered after normal use or repeated guest runs.
+
+The driver now allocates cached nonpaged-pool chunks which are contiguous in
+its kernel virtual address but may be scattered across physical RAM. It records
+the machine frame behind every 4 KB page. Linux still sees ordinary dense RAM
+starting at pseudo-physical address zero: a p2m table translates a guest page
+number before it is placed in a hardware page table, and an m2p hash translates
+it back when Linux reads that entry. The guest direct map uses 4 KB leaves
+because a huge page would incorrectly imply that the host frames are adjacent.
+
+Supporting configurations up to 128 GB also required 64-bit memory sizes and
+block accounting, allocation and p2m/m2p metadata sized for 131072 MiB, and a
+change to how the GPU daemon sees guest memory. It no longer maps the configured
+RAM size in advance; it asks the driver for 12 MB windows around guest
+addresses as it needs them. A large `--mem` value therefore does not create
+thousands of unused user mappings before the GPU has touched a page.
+
+This is not RAM overcommit or ballooning. Memory advertised to Linux still
+needs real nonpaged host backing. `--mem 131072` is therefore a supported
+ceiling, not a promise that every supported Windows machine can spare 128 GB;
+if the host supplies less than the requested target, that is reported and the
+guest e820 map describes the amount actually backed.
 
 ### Networking
 
@@ -149,6 +173,10 @@ ask for:
   server
 - Preemption: the host interrupts a busy-looping task; time advances at real
   speed
+- Cooperative SMP: the installed launcher requests `--cpus 2`; two Linux
+  processors run concurrently on distinct host logical processors with
+  per-vCPU switch state, passage pages, timers and posted-IPI delivery. Linux
+  receives their real physical-core/SMT relationship
 - Networking: guest ethernet device, host NAT, static address via
   `systemd-networkd`; pacman installs a 791-package desktop over HTTPS at
   16 MB/s
@@ -170,12 +198,15 @@ ask for:
 - Self-installing: `mocolinux-setup.exe` lays down driver, daemons, kernel,
   the GPU daemon with virglrenderer, X server and launchers, then boots Linux
   and builds a Manjaro system on a fresh image over the network
-  - A repaired incremental patch series: `patch/7.1.5/current-tree-snapshot.diff`
-  is the authoritative guest-side diff and is [here](https://github.com/PhialsBasement/MoCoLinux/blob/mocolinux/patch/7.1.5/current-tree-snapshot.diff)
+- The authoritative complete guest-side Linux 7.1.5 diff is
+  [`patch/7.1.5/current-tree-snapshot.diff`](patch/7.1.5/current-tree-snapshot.diff).
+  It is regenerated against the released tarball and checked by applying and
+  reverse-applying it with zero fuzz and an exact tree comparison
 
 Not yet:
 
-- SMP
+- SMP beyond two vCPUs, long-duration desktop/Steam soaking, and evaluation of
+  one-shot/NO_HZ clock events. The two-vCPU path is functional and benchmarked
 - The coLinux message layer (`co_monitor_t`, queues, reactor), so upstream's
   `cocon`/`conet` consoles and devices — including `colinux-console-nt` —
   cannot attach
@@ -188,12 +219,60 @@ Not yet:
   RAM, the same zero-copy R3 windows the GPU command stream already rides
   (parked on the `r6-window-presentation` branch)
 
+### Cooperative SMP milestone
 
-The fragmented-RAM fix is now in tree: the boot path no longer calls
-`MmAllocateContiguousMemory` for guest RAM. It allocates virtually contiguous
-cached-pool chunks, records every machine frame independently, and maps the
-guest at 4 KB granularity. The host-side and Linux 7.1.5 builds pass; repeated
-boot/teardown soaking on the target Windows machines is still required.
+To the project's knowledge, MoCoLinux is the first coLinux-style cooperative
+kernel to run a working SMP Linux guest on Windows 10. This is guest SMP, not
+merely a uniprocessor guest running on an SMP host: Linux reports CPUs 0 and 1
+online and schedules useful work on both simultaneously. Upstream coLinux
+[documented that its guest could use only one CPU](https://colinux.fandom.com/wiki/FAQ#Q39._Does_coLinux_take_advantage_of_dual_core_processors?)
+and its changelog records that the daemon was
+[pinned to the first processor while SMP remained unresolved](https://colinux.sourceforge.net/?section=changelog).
+
+The first validated two-vCPU run was recorded on 2026-08-09 on the ThinkCentre
+M92p (Core i5-3470, four physical cores, no SMT), Windows 10 IoT Enterprise
+LTSC 21H2 build 19044, and Linux 7.1.5. Each result compares the same running
+guest with one worker against two; higher is better:
+
+| Workload | 1 vCPU | 2 vCPUs | Gain |
+| --- | ---: | ---: | ---: |
+| `sysbench cpu --cpu-max-prime=20000`, 10 s | 345.23 events/s | 682.96 events/s | **1.978x** |
+| `openssl speed -evp sha256`, 8192-byte blocks | 320,064.72 kB/s | 634,843.21 kB/s | **1.983x** |
+| `sysbench memory` sequential write, 1 MiB blocks | 17,631.70 MiB/s | 35,828.47 MiB/s | **2.032x** |
+| `sysbench memory` sequential read, 1 MiB blocks | 21,729.63 MiB/s | 42,494.90 MiB/s | **1.956x** |
+
+The memory figures are a hot-buffer/cache-path scaling test, not a claim about
+the M92p's raw DRAM bandwidth. Stability and scheduling checks completed too:
+
+- A 20-second two-worker `stress-ng` matrix run accumulated 39.65 CPU-seconds
+  and passed both workers, showing that both vCPUs stayed busy for the full run.
+- Four oversubscribed context-switch workers completed 3,275,146 operations in
+  10.02 seconds (327,349/s), with no failed or untrustworthy metrics.
+- A lock/yield-heavy two-thread sysbench run completed 35,432 events in exactly
+  10 seconds, with 0.56 ms average latency and balanced workers.
+- Firefox, the workload that previously drove both processors into a hard
+  deadlock, loaded pages normally after the posted-IPI polling fix. The guest
+  remained reachable over SSH after every test, and a post-stress two-second
+  sleep measured 2.023 seconds.
+
+The mechanism follows the useful parts of Xen PV's shape without pretending an
+APIC exists. A posted per-vCPU bitmap is the message; a targeted Windows DPC is
+the doorbell that interrupts a running target core. A separate targeted 100 Hz
+deadline guarantees that a userspace-bound vCPU crosses to the monitor, where a
+guarded cooperative interrupt entry batches the guest's 1 ms clock events.
+Kernel spin waits poll posted vectors without allowing re-entry from NMI,
+hardirq or virtual-interrupt-off regions. CPU scaling is therefore solved for
+two vCPUs; presentation frame rate remains limited by the separate GPU-to-X
+transport described above.
+
+Guest APIC routing IDs remain synthetic because no APIC hardware is addressed.
+Package, core and SMT topology instead comes from CPUID on each pinned host
+logical processor, so Linux's sibling masks describe the placement Windows
+actually supplied.
+
+The same tested build uses the [FragRAM](#fragram) path described above. A real
+2048 MiB guest boot has been verified; 128 GB is the supported configuration
+ceiling, not a claim that a 128 GB host has already been tested.
 
 ## Layout
 
@@ -209,7 +288,7 @@ boot/teardown soaking on the target Windows machines is still required.
 | `src/colinux/user/conet_ring.c` | the ring format and its decoder, shared by both readers |
 | `src/colinux/user/slirp/` | vendored slirp, with its Win64 repairs |
 | `src/colinux/user/elf_load.c` | the daemon: ELF loading, symbol resolution, boot |
-| `patch/7.1.5/current-tree-snapshot.diff` | the complete guest-side kernel patch, including conet, async COBD and the trapless virtio-GPU transport |
+| `patch/7.1.5/current-tree-snapshot.diff` | the complete guest-side kernel patch, including cooperative SMP/IPIs, conet, async COBD and the trapless virtio-GPU transport |
 | `patch/7.1.5/{async-cobd-src,vgpu-src}/` | standalone development copies of the guest device sources already folded into the cumulative patch |
 | `tools/mkmanjarorootfs.sh` | builds the Manjaro desktop image |
 | `tools/mkrootfs.sh` | builds the minimal BusyBox bring-up image |
@@ -228,6 +307,12 @@ the driver signature, and two kernel trees: the Windows side builds against
 2.6.33 headers (the passage-page ABI is a header inside the guest kernel
 tree), while the guest kernel is 7.1.5. The 2.6.33 tree is used for headers
 only — nothing in it is built or run.
+
+The host and guest halves are one matched interface and should be built from
+the same commit. `linux.sys` and the host daemons come from `src/colinux/`; the
+matching `vmlinux` comes from applying
+`patch/7.1.5/current-tree-snapshot.diff` to pristine Linux 7.1.5. Keeping both
+source halves is what makes a tested driver/kernel pair reproducible.
 
 The Windows side, driver through release, is one script:
 
@@ -273,6 +358,7 @@ developing:
 
 ```
 colinux-daemon.exe --boot-kernel vmlinux --max-switches none \
+                   --cpus 2 \
                    --cobd0 \??\C:\path\to\root.img
 colinux-daemon.exe --console 2323          (a second process: a terminal)
 colinux-slirp-net-daemon.exe -R            (a third: NAT for the guest)
@@ -280,9 +366,14 @@ cogpu-daemon.exe                           (a fourth: the guest's GPU)
 colinux-daemon.exe --run konsole           (start one app in a running guest)
 ```
 
-- `--mem MB` sets usable pseudo RAM (default 1024). It is a target: e820
-  describes what the scattered nonpaged-pool backing actually supplied, and
-  falling short is reported rather than fatal.
+- `--mem MB` sets usable pseudo RAM (default 1024, maximum 131072). It is a
+  target: e820 describes what the scattered nonpaged-pool backing actually
+  supplied, and falling short is reported rather than fatal. See
+  [FragRAM](#fragram) for how that backing is translated.
+- `--cpus N` sets the guest's processor count (the daemon default is one; the
+  installed launcher requests two). Every vCPU needs a distinct host logical
+  processor, and the driver reserves capacity for Windows and the GPU daemon
+  instead of placing two guest processors on the same one.
 - The image ships `10-eth0.network` with slirp's fixed layout and
   `systemd-networkd` enabled, so the guest configures its own network at boot.
 - For a desktop, start an X server on the Windows side in multiwindow mode
@@ -347,8 +438,8 @@ been run on hardware.
 ## Windows 10
 
 Supported and verified on hardware (Windows 10 IoT Enterprise LTSC 21H2,
-build 19044) with GPU acceleration. Everything the earlier hosts do, plus two
-world-switch fixes that only this version needs:
+build 19044) with GPU acceleration and a two-vCPU SMP guest. Everything the
+earlier hosts do, plus two world-switch fixes that only this version needs:
 
 - **CR4 before CR3 at the crossing.** Windows 10 with KVA Shadow sets
   `CR4.PCIDE`, which makes bits 11:0 of CR3 a PCID and bit 63 the NOFLUSH

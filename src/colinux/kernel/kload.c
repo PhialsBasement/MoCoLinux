@@ -186,6 +186,29 @@ static co_pa_t kload_pseudo_to_machine_pa(co_pa_t pseudo)
 		| (pseudo & ~CO_ARCH_PAGE_MASK);
 }
 
+/*
+ * Translate a Linux-visible pseudo-physical address for host consumers.
+ *
+ * Most of the p2m boundary is page-table construction, where the translation
+ * stays private to this file.  A START_VCPU request is the exception: Linux
+ * names init_mm.pgd with __pa(), so the CR3 in the request is pseudo-physical,
+ * while the switch must load and compare the machine CR3.  Keeping this small
+ * checked interface avoids exposing the p2m array itself to the SMP path.
+ */
+co_rc_t co_kload_pseudo_to_machine(co_pa_t pseudo, co_pa_t* machine)
+{
+	co_pfn_t mfn;
+
+	if (machine == NULL ||
+	    !kload_pseudo_to_machine_pfn(
+		(co_pfn_t)(pseudo >> CO_ARCH_PAGE_SHIFT), &mfn))
+		return CO_RC(NOT_FOUND);
+
+	*machine = (((co_pa_t)mfn) << CO_ARCH_PAGE_SHIFT)
+		| (pseudo & ~CO_ARCH_PAGE_MASK);
+	return CO_RC(OK);
+}
+
 /* Resolve a pseudo address through the virtually contiguous block index. */
 void* co_kload_pseudo_frame_va(co_pfn_t pfn)
 {

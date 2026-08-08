@@ -73,6 +73,8 @@ int main(int argc, char** argv)
 	co_manager_handle_t handle;
 	co_manager_ioctl_kmap_t* map;
 	unsigned long slice = 0;
+	unsigned long long peek_va = 0;
+	unsigned long peek_bytes = 128;
 	int i, checked = 0, mismatches = 0;
 	double t0, t1;
 	unsigned long long total = 0;
@@ -89,9 +91,13 @@ int main(int argc, char** argv)
 			mode = MODE_STARVE;
 		else if (!strcmp(argv[i], "--slice") && i + 1 < argc)
 			slice = strtoul(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--peek-va") && i + 1 < argc)
+			peek_va = _strtoui64(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--bytes") && i + 1 < argc)
+			peek_bytes = strtoul(argv[++i], NULL, 0);
 		else {
 			printf("usage: kmap-test [--clean|--exit|--crash|--starve]"
-			       " [--slice BYTES]\n");
+			       " [--slice BYTES] [--peek-va ADDRESS] [--bytes COUNT]\n");
 			return 2;
 		}
 	}
@@ -106,6 +112,61 @@ int main(int argc, char** argv)
 	if (!handle) {
 		printf("cannot open the driver -- is it started?\n");
 		return 1;
+	}
+
+	/*
+	 * Read a live guest virtual address without involving either vCPU.
+	 *
+	 * This is intentionally part of the existing KMAP diagnostic rather
+	 * than a new driver interface: Kvirt-to-phys walks the guest's current
+	 * page tables in the host, KMAP_RANGE maps only the containing physical
+	 * slice into this process, and neither operation asks the wedged guest
+	 * to run. It is therefore useful precisely when both vCPUs are spinning
+	 * and the console cannot report their interrupt state.
+	 */
+	if (peek_va) {
+		co_kmap_range_t range;
+		int reused = 0;
+		unsigned long long pa = 0, off;
+		const unsigned char* p;
+
+		if (!CO_OK(co_manager_kvirt_to_phys(handle, peek_va, &pa))) {
+			printf("cannot translate guest va 0x%llx\n", peek_va);
+			co_os_manager_close(handle);
+			return 1;
+		}
+		if (!CO_OK(co_manager_kmap_range(handle, pa, &range, &reused))) {
+			printf("cannot map guest pa 0x%llx\n", pa);
+			co_os_manager_close(handle);
+			return 1;
+		}
+
+		off = pa - range.pa;
+		if (off >= range.bytes) {
+			printf("driver returned a range that does not contain pa 0x%llx\n",
+			       pa);
+			co_manager_kunmap(handle, NULL);
+			co_os_manager_close(handle);
+			return 1;
+		}
+		if ((unsigned long long)peek_bytes > range.bytes - off)
+			peek_bytes = (unsigned long)(range.bytes - off);
+
+		p = (const unsigned char*)(size_t)(range.user_va + off);
+		printf("guest va 0x%llx -> pa 0x%llx, %lu byte(s)%s\n",
+		       peek_va, pa, peek_bytes, reused ? " (mapping reused)" : "");
+		for (i = 0; i < (int)peek_bytes; i += 16) {
+			int j;
+
+			printf("  %016llx:", peek_va + (unsigned long long)i);
+			for (j = 0; j < 16 && i + j < (int)peek_bytes; j++)
+				printf(" %02x", p[i + j]);
+			printf("\n");
+		}
+
+		co_manager_kunmap(handle, NULL);
+		co_os_manager_close(handle);
+		return 0;
 	}
 
 	printf("kmap-test: mode %s, slice %lu\n",

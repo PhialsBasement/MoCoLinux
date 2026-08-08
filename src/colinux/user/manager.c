@@ -554,6 +554,32 @@ co_rc_t co_manager_test_space(co_manager_handle_t handle,
 				   out, sizeof(*out), out, sizeof(*out), &returned);
 }
 
+co_rc_t co_manager_kvcpu_run(co_manager_handle_t handle,
+			     co_manager_ioctl_kvcpu_run_t* out)
+{
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KVCPU_RUN,
+				 out, sizeof(*out), out, sizeof(*out), &returned);
+	if (CO_OK(rc) && returned != sizeof(*out))
+		return CO_RC(ERROR);
+	return rc;
+}
+
+co_rc_t co_manager_test_smp(co_manager_handle_t handle,
+			    co_manager_ioctl_test_smp_t* out)
+{
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_TEST_SMP,
+				 out, sizeof(*out), out, sizeof(*out), &returned);
+	if (CO_OK(rc) && returned != sizeof(*out))
+		return CO_RC(ERROR);
+	return rc;
+}
+
 co_rc_t co_manager_test_switch(co_manager_handle_t handle,
 			       co_manager_ioctl_test_switch_t* out,
 			       int mode)

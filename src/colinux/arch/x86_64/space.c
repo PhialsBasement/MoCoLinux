@@ -424,7 +424,42 @@ co_rc_t co_arch_guest_lookup_root(co_manager_t* manager,
 			return CO_RC(OK);
 		}
 
-		/* A large page terminates the walk and maps the range directly. */
+		/*
+		 * A large page terminates the walk and maps the range directly.
+		 *
+		 * DELIBERATELY INCOMPLETE. DO NOT "FIX" THIS IN PASSING.
+		 *
+		 * This returns the BASE of the 2 MB or 1 GB region and drops va's
+		 * offset within it, so a caller that adds va & 0xfff lands on the
+		 * first page of the region instead of the right one. That is a real
+		 * bug and it is measured: co_colinux_passage_page at
+		 * 0xffffffff83881e48 resolves to .call_sites at 0xffffffff83800e48
+		 * through the guest's own root. Everything at and above
+		 * __end_rodata_hpage_align (0xffffffff82e00000 -- .data, .bss, and
+		 * init_thread_union, the init task's boot stack) is still covered by
+		 * level2_kernel_pgt's original 2 MB PSE entries, because
+		 * mark_rodata_ro only splits text and rodata.
+		 *
+		 * Correcting it was tried and reverted. The arithmetic was not the
+		 * problem; the problem is that consumers of this walk have never
+		 * executed and were being held off by the truncation:
+		 *
+		 *   - co_arch_inject_tick's virtual-IF gate read .call_sites at
+		 *     0xffffffff83800ee0 rather than co_colinux_virtual_if. Bit 9 of
+		 *     those bytes is clear, so it declined on every call and the
+		 *     cooperative timer had never once fired. Turning it on reset the
+		 *     machine instantly, with no bugcheck.
+		 *   - the monitor loop's per-crossing frame read and write-back
+		 *     (pp->params[28]) address the init task's boot stack for the
+		 *     whole of early boot, so correcting this changes what every WARN
+		 *     step-over and every exception-table fixup reads, and what they
+		 *     write back into a live guest, on the hottest path in the driver.
+		 *
+		 * Each is a rung of its own. Until they are brought up and verified,
+		 * nothing needing a correct answer here may depend on it: publish
+		 * through kload_space instead, where the image is mapped with 4 KB
+		 * PTEs and this branch is never reached.
+		 */
 		if (entry & _PAGE_PSE) {
 			*pa_out    = (co_pa_t)(entry & CO_ARCH_PAGE_MASK & ~CO_ARCH_PAGE_NX);
 			*level_out = level;

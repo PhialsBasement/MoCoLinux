@@ -37,6 +37,7 @@
 #include <colinux/os/kernel/mutex.h>
 #include <colinux/os/kernel/wait.h>
 #include <colinux/os/kernel/misc.h>
+#include <colinux/os/timer.h>
 
 /*
  * Completion ring layout, mirroring struct co_cobd_io in the guest's
@@ -55,6 +56,23 @@
 #define CO_CIO_COMP_TAIL	0x08
 #define CO_CIO_COMP		0x10
 #define CO_CIO_COMP_STRIDE	0x10
+/*
+ * Twice the maximum outstanding, and that headroom is load-bearing rather than
+ * generous.
+ *
+ * The guest claims a slot by advancing comp_tail BEFORE it reads the record
+ * (drivers/block/cobd.c), which is what lets two processors reap at once. The
+ * cost is that comp_tail no longer means "the guest has finished with
+ * everything below this" -- it means "everything below this is claimed" -- so
+ * the fullness test in co_cobd_complete() is the only thing keeping a producer
+ * from writing into a slot a consumer is still holding. With outstanding
+ * bounded at CO_COBD_MAX_UNITS * queue_depth = 4 * 16 = 64 and 128 slots,
+ * head - tail never exceeds 64 and the producer is never within a lap of a
+ * claimed slot.
+ *
+ * Raise the queue depth or the unit count without raising this and the ring
+ * silently starts handing one record to two readers.
+ */
 #define CO_COBD_COMP_SLOTS	128		/* power of two, > 64 max outstanding */
 
 /*
@@ -224,6 +242,27 @@ static void co_cobd_complete(int unit, unsigned int tag, unsigned int result)
 		       (const unsigned char*)&head, sizeof(head));
 
 	co_os_mutex_release(comp_lock);
+
+	/*
+	 * The completion is in the ring; now tell somebody it is there.
+	 *
+	 * This is the doorbell the block path never had. A task that issued a
+	 * read and then had nothing else to do drove its processor to a
+	 * cooperative IDLE, and the only thing that ever brought it back was the
+	 * monitor's poll timeout -- which is why that timeout kept being
+	 * shortened, and why shortening it made an idle guest expensive. A
+	 * transfer finishing is an event; it should ring, not be discovered.
+	 *
+	 * Every vCPU, because a worker thread has no idea which one is waiting
+	 * on this tag: the ring is claimed slot by slot by whichever processor
+	 * reaches a drain point first (drivers/block/cobd.c). Waking one that is
+	 * not interested costs it a crossing that finds nothing; waking none
+	 * costs the whole timeout this doorbell exists to remove.
+	 *
+	 * Outside comp_lock deliberately -- KeSetEvent boosts the woken thread,
+	 * and there is no reason to hold a mutex a peer worker wants across it.
+	 */
+	co_os_idle_wake_all();
 }
 
 static struct co_cobd_work* fifo_pop(int unit)
@@ -269,8 +308,21 @@ static void co_cobd_worker(void* arg)
 		rc = co_cobd_request_sg(async_manager, node->unit, node->offset,
 					node->sg_pa, node->count, node->write);
 		result = CO_OK(rc) ? 0 : 1;
-		if (result)
-			async_errors++;		/* one worker today; see header */
+		if (result) {
+			/*
+			 * Under the lock, because there is more than one worker.
+			 *
+			 * "one worker today" stopped being true when this became
+			 * one worker PER UNIT: four threads doing a non-atomic
+			 * read-modify-write on the same word lose counts. Only
+			 * the report suffers, but a run that says it had two I/O
+			 * errors when it had four is a run whose evidence has to
+			 * be re-gathered.
+			 */
+			co_os_mutex_acquire(sub_lock);
+			async_errors++;
+			co_os_mutex_release(sub_lock);
+		}
 
 		co_cobd_complete(node->unit, node->tag, result);
 		node_free(node);

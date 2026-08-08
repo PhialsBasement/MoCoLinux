@@ -58,6 +58,8 @@ extern co_rc_t		  co_kload_table_frame(co_manager_t* manager, co_pfn_t* pfn_out)
 extern void*		  co_kload_frame_va(co_pfn_t pfn);
 /* Pseudo PFN, as used by Linux, e820 and cooperative device requests. */
 extern void*		  co_kload_pseudo_frame_va(co_pfn_t pfn);
+extern co_rc_t		  co_kload_pseudo_to_machine(co_pa_t pseudo,
+					     co_pa_t* machine);
 extern unsigned long	  co_kload_p2m_pages(void);
 extern unsigned long long co_kload_m2p_mask(void);
 /*

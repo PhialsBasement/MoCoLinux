@@ -122,6 +122,17 @@ unsigned long long co_vgpu_address(void)
  * counter has moved since the last time this function saw it. A false positive
  * costs one extra pass through the monitor loop; a false negative would cost a
  * stalled submission, so the bias is towards saying yes.
+ *
+ * NOT CALLED BY ANYTHING. The monitor loop's idle gate does not consult it and
+ * never has; the header's claim that it sits "beside co_net_rx_pending" is
+ * aspirational. Said here because the alternative is a reader concluding that
+ * a stalled GPU submission has already been accounted for.
+ *
+ * Its static last_seen[] would also be wrong if it were called: it is a
+ * read-modify-write shared by every vCPU's idle path, so one processor would
+ * swallow the edge another needed, which is a missed kick and exactly the
+ * stalled submission the bias above is trying to avoid. Fix that before wiring
+ * it up rather than after.
  */
 bool_t co_vgpu_kick_pending(co_manager_t* manager)
 {

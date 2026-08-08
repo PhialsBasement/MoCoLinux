@@ -1260,12 +1260,119 @@ static void co_report_bug_at(co_elf_data_t* pl, unsigned long long rip)
 	co_terminal_print("      (no __bug_table entry for this address)\n");
 }
 
+/*
+ * A secondary processor's thread.
+ *
+ * It blocks in KVCPU_RUN for the whole run: the driver pins it to a host core
+ * no other vCPU holds and parks it until the guest issues START_VCPU, then it
+ * becomes that processor's crossing loop. Nothing to drive from here -- the
+ * guest decides when, and the host decides where.
+ */
+struct co_ap_ctx {
+	co_manager_handle_t		handle;
+	co_manager_ioctl_kvcpu_run_t	r;
+	volatile int			stop;
+};
+
+static void co_ap_thread(void* arg)
+{
+	struct co_ap_ctx* ctx = arg;
+	co_rc_t ioctl_rc;
+	int tries;
+
+	if (!ctx->handle)
+		return;
+
+	/*
+	 * Ask, sleep, ask again -- here, not inside the driver.
+	 *
+	 * The first version blocked in the ioctl until the guest asked for
+	 * this processor, which meant a thread sat in kernel context holding a
+	 * claimed vCPU slot and a pinned core for the whole of the guest's
+	 * boot. The boot processor did not survive it, every time, without
+	 * this thread ever running a single guest instruction -- and S0 had
+	 * already shown that two threads which enter and immediately start
+	 * crossing are perfectly happy together. The difference was the
+	 * waiting, so the waiting belongs out here.
+	 *
+	 * Each call is short: it either finds the request and becomes that
+	 * processor for the rest of the run, or returns at once having done
+	 * nothing. Sixty seconds of patience at 200 ms a turn, which is far
+	 * quicker than a guest gets to smp_init() and costs the boot
+	 * processor nothing in between.
+	 */
+	for (tries = 0; tries < 300; tries++) {
+		if (ctx->stop)
+			return;
+		/*
+		 * KVCPU_RUN's reply contains the number of crossings it performed.
+		 * That is output, not the next request.  A failed AP attempt used to
+		 * feed LLONG_MAX back here on the retry, silently changing the call
+		 * from "wait for START_VCPU" (zero) into the synthetic SMP lane.
+		 */
+		ctx->r.iterations = 0;
+		ioctl_rc = co_manager_kvcpu_run(ctx->handle, &ctx->r);
+
+		/*
+		 * Keep AP-start failures in the ordinary boot log.
+		 *
+		 * The driver's fine-grained trace is deliberately a crash tool;
+		 * a processor that merely refuses to start must explain itself in
+		 * the same colinux-daemon.exe log as the kernel line it stopped
+		 * after.  Report only failures, not the expected "not requested
+		 * yet" polls, so a normal boot remains quiet.
+		 */
+		if (!CO_OK(ioctl_rc)) {
+			co_terminal_print("  vcpu %d: polling ioctl failed (rc %x)\n",
+					  ctx->r.vcpu, (int)ioctl_rc);
+			ctx->r.never_started = 1;
+			return;
+		}
+		if (ctx->r.validated_only) {
+			co_terminal_print("  vcpu %d: stepped AP probe stopped safely "
+					  "after %lld crossings at rip 0x%llx "
+					  "(vector %llu, faulted %d)\n",
+					  ctx->r.vcpu, ctx->r.completed,
+					  ctx->r.fault_rip, ctx->r.vector,
+					  ctx->r.faulted);
+			return;
+		}
+		else if (ctx->r.preflight_failed)
+			co_terminal_print("  vcpu %d: AP preflight refused 0x%llx "
+					  "at page-table level %d (driver rc %x)\n",
+					  ctx->r.vcpu, ctx->r.preflight_va,
+					  ctx->r.preflight_level, (int)ctx->r.rc);
+		else if (ctx->r.never_started && ctx->r.no_free_core && tries == 0)
+			co_terminal_print("  vcpu %d: driver found no safe host core "
+					  "(rc %x)\n", ctx->r.vcpu, (int)ctx->r.rc);
+		else if (ctx->r.never_started && !ctx->r.no_free_core &&
+			 !CO_OK(ctx->r.rc))
+			co_terminal_print("  vcpu %d: START_VCPU attempt was refused "
+					  "(driver rc %x, host processor %lu, waited %d)\n",
+					  ctx->r.vcpu, (int)ctx->r.rc,
+					  ctx->r.host_cpu, ctx->r.waited_for_start);
+
+		if (!ctx->r.never_started)
+			return;			/* ran, or failed for a real reason */
+
+		/* Preserve the result for the main thread's post-run report. */
+		if (tries == 299)
+			break;
+		ctx->r.never_started = 0;
+		co_os_user_msleep(200);
+	}
+}
+
 co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 			       unsigned long max_switches, unsigned long batch,
 			       const char* const* cobd, const char* init_path,
-			       unsigned long mem_mb, int no_copic, int async_cobd)
+			       unsigned long mem_mb, int no_copic, int async_cobd,
+			       int cpus)
 {
 	const char* cobd0 = cobd ? cobd[0] : NULL;
+	int in_cpus = (cpus >= 1) ? cpus : 1;
+	struct co_ap_ctx ap_ctx[CO_MAX_VCPUS];
+	void* ap_thread[CO_MAX_VCPUS];
 	co_elf_data_t* pl;
 	co_manager_handle_t handle;
 	co_manager_ioctl_kload_verify_t v = {0, };
@@ -1603,8 +1710,9 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 					       * in arch/x86_64/switch.c.
 					       */
 					      "asm_sysvec_co_timer",
-					      "co_colinux_virtual_if", NULL };
-		unsigned long long addr[9];
+					      "co_colinux_virtual_if",
+					      "co_colinux_ipi_pending", NULL };
+		unsigned long long addr[10];
 		int i;
 
 		for (i = 0; want[i]; i++) {
@@ -1997,6 +2105,32 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 				" initcall_blacklist=intel_uncore_init");
 
 		/*
+		 * How many processors the guest has, which is the host's answer
+		 * and not the machine's.
+		 *
+		 * Without this the guest counts the host firmware's MP table and
+		 * concludes it has as many processors as the M92p does -- three,
+		 * on a box where the host is going to run one vCPU. That is the
+		 * host's chip inventory describing the host's CPUs, and the guest
+		 * has no claim on any of them: a vCPU exists only where the host
+		 * has a pinned thread to run it, so the count is the host's to
+		 * state. Left to the MP table the kernel sizes its per-CPU areas,
+		 * cpumasks and RCU geometry for processors that will never come
+		 * online, and then tries to start them.
+		 *
+		 * possible_cpus= is the kernel's own parameter for exactly this
+		 * and needs no patch: topology_apply_cmdline_limits_early() takes
+		 * the minimum of it and whatever was enumerated.
+		 */
+		{
+			char cpus_arg[32];
+
+			co_snprintf(cpus_arg, sizeof(cpus_arg), " possible_cpus=%d",
+				    in_cpus);
+			strcat(cmdline, cpus_arg);
+		}
+
+		/*
 		 * A root filesystem, if the host attached one. Without it the
 		 * kernel reaches prepare_namespace with nothing to mount and
 		 * panics -- which is the correct end for a kernel with no
@@ -2095,6 +2229,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 */
 		b.tick_entry_va      = no_copic ? 0 : addr[7];
 		b.virtual_if_va      = addr[8];
+		b.ipi_pending_va     = addr[9];
 		if (no_copic)
 			co_terminal_print("    cooperative timer disabled (--no-copic):"
 					  " a running guest will not be interrupted\n");
@@ -2391,7 +2526,72 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		if (klog_ctx.handle)
 			klog_thread = co_os_thread_start(co_klog_stream, &klog_ctx);
 
+		/*
+		 * The secondary processors, in this process and around this
+		 * call, for the same reason the log stream is: they have to
+		 * exist before the guest asks for them, and they must be gone
+		 * before KLOAD_END frees what they are running in.
+		 *
+		 * Threads here rather than a second invocation of this binary.
+		 * The guest reaches smp_init() within milliseconds of booting,
+		 * so anything started by hand afterwards is always too late --
+		 * and a run whose output lands in two places cannot be read.
+		 */
+		/*
+		 * Cleared first. These are stack arrays, and the join below
+		 * tests ap_thread[i] before waiting on it -- an entry left
+		 * uninitialised because its handle could not be opened is
+		 * whatever was on the stack, which is not NULL and is not a
+		 * thread either.
+		 */
+		memset(ap_ctx, 0, sizeof(ap_ctx));
+		memset(ap_thread, 0, sizeof(ap_thread));
+
+		/*
+		 * Say so before doing it. Every line here reaches the run's own
+		 * log file as it is written, so the last one present is where
+		 * the machine stopped -- which is the only evidence there is
+		 * when a run resets the box instead of returning.
+		 */
+		co_terminal_print("  cpus: %d, starting %d secondary thread(s)\n",
+				  in_cpus, in_cpus - 1);
+
+		for (i = 1; i < in_cpus && i < CO_MAX_VCPUS; i++) {
+			ap_ctx[i].handle     = co_os_manager_open_quite();
+			ap_ctx[i].r.vcpu     = i;
+			ap_ctx[i].r.iterations = 0;	/* wait to be started */
+			if (ap_ctx[i].handle) {
+				ap_thread[i] = co_os_thread_start(co_ap_thread, &ap_ctx[i]);
+				co_terminal_print("  vcpu %d: a thread is waiting for the "
+						  "guest to start it\n", i);
+			}
+		}
+
 		rc = co_manager_kboot(handle, &b);
+
+		/* A failed/finished KBOOT leaves no guest for a polling AP. */
+		for (i = 1; i < in_cpus && i < CO_MAX_VCPUS; i++)
+			ap_ctx[i].stop = 1;
+
+		for (i = 1; i < in_cpus && i < CO_MAX_VCPUS; i++) {
+			if (ap_thread[i]) {
+				co_os_thread_join(ap_thread[i]);
+				ap_thread[i] = NULL;
+			}
+			if (ap_ctx[i].handle) {
+				co_os_manager_close(ap_ctx[i].handle);
+				ap_ctx[i].handle = NULL;
+			}
+			if (ap_ctx[i].r.never_started)
+				co_terminal_print("  vcpu %d: the guest never started it\n", i);
+			else if (ap_ctx[i].r.faulted)
+				co_terminal_print("  vcpu %d: FAULTED, vector %llu at "
+						  "0x%016llx\n", i, ap_ctx[i].r.vector,
+						  ap_ctx[i].r.fault_rip);
+			else if (ap_ctx[i].r.completed)
+				co_terminal_print("  vcpu %d: ran, %lld crossings\n",
+						  i, ap_ctx[i].r.completed);
+		}
 
 		/* Stop and join before anything else, in particular before the
 		 * KLOAD_END that out_end reaches. */

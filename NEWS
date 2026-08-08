@@ -1,3 +1,14 @@
+* MoCoLinux cooperative SMP (unreleased, 2026-08-09)
+  Kernel and driver:
+  * Start a second Linux processor on its own host core with a per-vCPU passage
+    page, switch state, timer, virtual interrupt flag and posted-IPI bitmap.
+  * Deliver running-vCPU IPIs through targeted Windows DPC doorbells and poll
+    posted vectors from guarded Linux spin waits, closing the Firefox hardlock.
+  * Give each vCPU a targeted 100 Hz preemption deadline while batching the
+    guest's 1 ms clock events, restoring exact time without a crossing storm.
+  * Verified on Windows 10 build 19044: 1.978x sysbench CPU and 1.983x OpenSSL
+    SHA-256 scaling, plus sustained CPU, lock and context-switch stress.
+
 * Version 0.7.9
   Bugfixes:
   * Bug #1780633: Skip negative timestamp glitches from QueryPerformanceCounter.
