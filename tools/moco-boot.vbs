@@ -209,9 +209,19 @@ guest_up = Running("colinux-daemon.exe")
 ' and the attach fails with "cannot attach cobd0 to '\root.img'". It only bites
 ' when a match exists, which is why F: paths worked for days and the first C:
 ' one did not.
+' Two processors. Each one is a daemon thread of its own, pinned to a host core
+' the driver picks -- never the boot processor's -- and crossing into the guest
+' through a passage page of its own. The guest starts the second itself, by
+' crossing with START_VCPU from smp_init(); there is no INIT-SIPI here and no
+' local APIC for one to go through.
+'
+' This is the default because a second processor is the point of the SMP work,
+' not an option to opt into. Drop it back to 1 if a guest ever has to be
+' compared against the uniprocessor build.
 If Not guest_up Then
 	shell.Run """" & moco & "\colinux-daemon.exe"" --boot-kernel vmlinux" & _
 		" --max-switches none" & _
+		" --cpus 2" & _
 		" --cobd0 \DosDevices\" & linux & "\root.img" & _
 		" --cobd1 \DosDevices\" & linux & "\root-arch.img" & _
 		" --init /sbin/init", SHOWN, NOWAIT

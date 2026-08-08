@@ -1076,8 +1076,14 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		 * The daemon has just published completions into guest RAM.
 		 * Cut the monitor's idle sleep short so the guest reaps them
 		 * now instead of at the end of a backoff tick.
+		 *
+		 * Every vCPU, because the daemon has no idea which one is
+		 * waiting on the fence -- and the ones that are not simply
+		 * wake, find nothing and sleep again. Waking the wrong one
+		 * costs a re-entry; waking none costs the whole tick this
+		 * doorbell exists to avoid.
 		 */
-		co_os_idle_wake();
+		co_os_idle_wake_all();
 
 		params->rc = CO_RC(OK);
 		*return_size = sizeof(*params);
@@ -1285,6 +1291,22 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 					     params->in, offered, &params->in_taken,
 					     params->out, wanted,
 					     &params->out_len);
+
+		/*
+		 * Keystrokes are in the ring; ring the doorbell.
+		 *
+		 * A shell at a prompt IS idle by definition, so without this the
+		 * first character of every command waited out whatever the
+		 * monitor's backoff happened to be -- and with the wait now
+		 * indefinite it would wait forever. Only when something was
+		 * actually taken: the console server probes with a zero-length
+		 * call every 200 ms whenever no client is attached, and waking
+		 * every vCPU for that would be a poll wearing a doorbell's
+		 * clothes.
+		 */
+		if (CO_OK(params->rc) && params->in_taken)
+			co_os_idle_wake_all();
+
 		return CO_RC(OK);
 	}
 
@@ -1472,6 +1494,23 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 
 		params->rc = co_net_put(manager, params->data, params->size,
 					params->frames, &params->taken);
+
+		/*
+		 * Frames are in the RX ring; wake whoever is parked.
+		 *
+		 * The guest's conet-rx kthread runs on whichever processor the
+		 * scheduler put it on, so every doorbell rather than a guess.
+		 *
+		 * This is what the rx_spins re-entry in the monitor loop was
+		 * standing in for: it noticed pending frames only when a vCPU
+		 * happened to reach an idle yield, only on the vCPU that got
+		 * there, and at the cost of a mutex and two guest page-table
+		 * walks on every yield. A doorbell is the mechanism; the spin
+		 * was the symptom of not having one.
+		 */
+		if (CO_OK(params->rc) && params->taken)
+			co_os_idle_wake_all();
+
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}
@@ -1679,6 +1718,297 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->fault_rip  = result.fault_rip;
 		params->faulted    = result.faulted;
 		params->code_size  = result.code_size;
+
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_TEST_SMP: {
+		co_manager_ioctl_test_smp_t* params;
+		co_arch_smp_test_t result;
+		co_rc_t trc;
+		int req_lane;
+		long long req_iterations;
+
+		params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		/* input fields are not output fields: read before the clear */
+		req_lane       = params->lane;
+		req_iterations = params->iterations;
+
+		co_memset(params, 0, sizeof(*params));
+		params->lane = req_lane;
+
+		if (manager->state < CO_MANAGER_STATE_INITIALIZED) {
+			params->rc   = CO_RC(ERROR);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		if (req_lane < 0 ||
+		    (unsigned long)req_lane >= co_os_cpu_count()) {
+			co_debug_error("TEST_SMP: lane %d does not name an "
+				       "active processor (%lu active)",
+				       req_lane, co_os_cpu_count());
+			params->rc   = CO_RC(INVALID_PARAMETER);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		/*
+		 * Pinned to the *named* processor, not the current one --
+		 * distinctness of the lanes is the whole experiment. The
+		 * refusal above means a failure here is a race with hot
+		 * remove, which the host does not do; report it anyway.
+		 */
+		if (!co_os_pin_cpu_to((unsigned long)req_lane)) {
+			params->rc   = CO_RC(ERROR);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		/*
+		 * A private address space: --test-smp is meant to run with no
+		 * guest loaded, so there is nothing to join.
+		 */
+		trc = co_arch_test_smp_lane(manager, &result, req_lane,
+					    req_iterations, 0);
+
+		co_os_unpin_cpu();
+
+		params->rc               = trc;
+		params->supported        = result.supported;
+		params->succeeded        = result.succeeded;
+		params->host_cpu         = result.host_cpu;
+		params->iterations       = result.iterations;
+		params->completed        = result.completed;
+		params->interrupts       = result.interrupts;
+		params->counter          = result.counter;
+		params->reg_accum        = result.reg_accum;
+		params->faulted          = result.faulted;
+		params->vector           = result.vector;
+		params->error_code       = result.error_code;
+		params->fault_rip        = result.fault_rip;
+		params->unforwardable    = result.unforwardable;
+		params->aborted          = result.aborted;
+		params->migrated         = result.migrated;
+		params->msr_ok           = result.msr_ok;
+		params->msr_bad          = result.msr_bad;
+		params->msr_want         = result.msr_want;
+		params->msr_got          = result.msr_got;
+		params->preflight_failed = result.preflight_failed;
+		params->preflight_level  = result.preflight_level;
+		params->preflight_va     = result.preflight_va;
+
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KVCPU_RUN: {
+		co_manager_ioctl_kvcpu_run_t* params;
+		co_arch_smp_test_t result;
+		co_rc_t trc;
+		int req_vcpu;
+		long long req_iterations;
+		unsigned long cores, cpu, chosen;
+
+		params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		req_vcpu       = params->vcpu;
+		req_iterations = params->iterations;
+
+		co_memset(params, 0, sizeof(*params));
+		params->vcpu = req_vcpu;
+
+		/*
+		 * "Not started" until something starts it.
+		 *
+		 * The caller polls, and decides whether to ask again from this
+		 * one flag. The struct is cleared just above, so every path
+		 * that returns without entering the guest reports, by default,
+		 * that the processor RAN -- and the daemon retires the thread
+		 * for the rest of the run. That is why the secondary stopped
+		 * asking after two turns, long before the guest requested it:
+		 * the state check and the "no boot processor yet" path both
+		 * meant "too early, try again", and both read as success.
+		 *
+		 * Set it here, once, and clear it only on the path that
+		 * actually enters.
+		 */
+		params->never_started = PTRUE;
+
+		if (manager->state < CO_MANAGER_STATE_INITIALIZED) {
+			params->rc   = CO_RC(ERROR);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		/*
+		 * vCPU 0 is the boot processor and belongs to the boot loop.
+		 * A secondary is 1 and up.
+		 */
+		if (req_vcpu < 1 || req_vcpu >= CO_MAX_VCPUS) {
+			params->rc   = CO_RC(INVALID_PARAMETER);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		/*
+		 * Wait for the boot processor to claim its core before picking
+		 * one, and this ordering is the whole of it.
+		 *
+		 * The picker below avoids cores held by ACTIVE vCPUs. A
+		 * secondary's thread is started before the guest boots -- it
+		 * has to be, because the guest reaches smp_init() within
+		 * milliseconds -- so if it picks immediately, nothing is active
+		 * yet, it takes core 0, and then KBOOT pins the boot processor
+		 * to whichever core the daemon's main thread was on, which can
+		 * be core 0 too.
+		 *
+		 * Two vCPUs on one core is not slow, it is stuck: each crossing
+		 * loop holds its processor for as long as its guest runs, so
+		 * neither ever yields to the other. A core that stops answering
+		 * the clock is CLOCK_WATCHDOG_TIMEOUT, and that is exactly what
+		 * this cost -- bugcheck 0x101 naming processor 1, then two more
+		 * resets that died before Windows could write the dump.
+		 */
+		{
+			int spins;
+
+			for (spins = 0; spins < 3000 && !co_arch_boot_running(); spins++)
+				co_os_msleep(10);
+
+			if (!co_arch_boot_running()) {
+				co_debug_error("KVCPU_RUN: no boot processor appeared, so "
+					       "there is no core map to avoid -- refusing "
+					       "to start vcpu %d", req_vcpu);
+				params->no_free_core = PTRUE;
+				params->rc           = CO_RC(ERROR);
+				*return_size         = sizeof(*params);
+				return CO_RC(OK);
+			}
+		}
+
+		/*
+		 * A core nobody else is holding. Not "the one I am on" and not
+		 * "the one whose number matches", because the boot processor
+		 * took whichever core the scheduler had it on and the answer
+		 * has to work while that run is in progress.
+		 */
+		/*
+		 * From the top down, and never processor 0.
+		 *
+		 * Scanning upwards from 0 handed the first secondary host
+		 * processor 0 -- the one the boot processor is on and the one
+		 * Windows schedules its own work on by preference. Two crossing
+		 * loops there is not slow, it is stuck: each holds its
+		 * processor for as long as its guest runs, so neither yields,
+		 * and a core that stops answering the clock is
+		 * CLOCK_WATCHDOG_TIMEOUT. That is what took the machine down,
+		 * before any secondary had even been started.
+		 *
+		 * co_arch_vcpu_core_taken() is still consulted, but it cannot
+		 * be the only guard: it depends on the boot processor having
+		 * recorded its core before this thread looks, and this thread
+		 * starts before the guest boots. Refusing processor 0 outright
+		 * does not depend on that ordering at all, and costs nothing --
+		 * the core budget already reserves a processor for the host.
+		 */
+		/*
+		 * A preference, not a rule, and never a refusal.
+		 *
+		 * The old scan started at the top and stopped BEFORE processor
+		 * 0, on the theory that two vCPUs on one core is a deadlock.
+		 * That theory belongs to the era when the guest ran with real
+		 * interrupts off. Today it free-runs with them on: every host
+		 * clock tick vectors through this vCPU's own IDT stub and
+		 * crosses back, and the loop restores the host's flags on every
+		 * iteration -- so a vCPU thread is preemptible sub-millisecond
+		 * and two of them on one core time-share rather than wedge.
+		 *
+		 * The failure that was blamed on this is recorded a few lines
+		 * below: the guest died after 11 switches instead of 1641 when
+		 * the AP thread was left unpinned. That thread was WAITING
+		 * inside the driver at the time, which is the failure that was
+		 * fixed by moving the wait out to the daemon -- not by where the
+		 * thread sat.
+		 *
+		 * So take a core nobody else is carrying if there is one, take
+		 * processor 0 otherwise, and never turn placement into an error.
+		 * Processor 0 is last choice because Windows schedules its own
+		 * work and most device ISRs there, which is a performance
+		 * argument and is treated as one.
+		 */
+		cores  = co_os_cpu_count();
+		chosen = 0;
+		for (cpu = cores; cpu-- > 1; ) {
+			if (!co_arch_vcpu_core_taken(cpu)) {
+				chosen = cpu;
+				break;
+			}
+		}
+
+		/*
+		 * Placed immediately, and placement failing is not fatal.
+		 *
+		 * Placing it early is still right: deferring the affinity until
+		 * the guest asks for the processor looked tidier and made it far
+		 * worse, because an unplaced thread lands on processor 0
+		 * alongside the boot processor while it waits.
+		 *
+		 * But a thread that cannot be placed is slower, not broken.
+		 * Every register the crossing needs is saved and restored per
+		 * crossing, from the live processor, so a vCPU that ends up
+		 * sharing a core -- or moving between cores -- is correct and
+		 * merely contended. Refusing to start it left the guest a
+		 * processor short for a scheduling reason.
+		 */
+		if (chosen >= cores || !co_os_pin_cpu_to(chosen))
+			co_debug("KVCPU_RUN: vcpu %d could not be placed on host "
+				 "processor %lu of %lu -- running unplaced, which "
+				 "is slower and not wrong", req_vcpu, chosen, cores);
+		else
+			co_debug("KVCPU_RUN: vcpu %d on host processor %lu of %lu",
+				 req_vcpu, chosen, cores);
+
+		/*
+		 * Into the running guest's own address space. That is the
+		 * point of this ioctl as against a --test-smp lane: one CR3,
+		 * two processors.
+		 */
+		trc = co_arch_test_smp_lane(manager, &result, req_vcpu,
+					    req_iterations, 1);
+
+		co_os_unpin_cpu();
+
+		params->rc            = trc;
+		params->supported     = result.supported;
+		params->succeeded     = result.succeeded;
+		params->host_cpu      = result.host_cpu;
+		params->iterations    = result.iterations;
+		params->completed     = result.completed;
+		params->interrupts    = result.interrupts;
+		params->counter       = result.counter;
+		params->reg_accum     = result.reg_accum;
+		params->faulted       = result.faulted;
+		params->vector        = result.vector;
+		params->error_code    = result.error_code;
+		params->fault_rip     = result.fault_rip;
+		params->unforwardable = result.unforwardable;
+		params->aborted       = result.aborted;
+		params->migrated      = result.migrated;
+		params->msr_ok        = result.msr_ok;
+		params->msr_bad       = result.msr_bad;
+		params->msr_want      = result.msr_want;
+		params->msr_got       = result.msr_got;
+		params->waited_for_start = result.waited_for_start;
+		params->never_started    = result.never_started;
 
 		*return_size = sizeof(*params);
 		return CO_RC(OK);

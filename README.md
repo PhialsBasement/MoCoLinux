@@ -186,7 +186,10 @@ Not yet:
   RAM, the same zero-copy R3 windows the GPU command stream already rides
   (parked on the `r6-window-presentation` branch)
 - A repaired incremental patch series: `patch/7.1.5/current-tree-snapshot.diff`
-  is the authoritative guest-side diff and is deliberately not in `series`
+  is the authoritative guest-side diff and is deliberately not in `series`.
+  It is regenerated against the released tarball and checked by
+  reverse-applying it to `ref/linux-7.1.5`, so "the snapshot is behind the
+  tree" is a thing that gets caught rather than discovered later
 
 The fragmented-RAM fix is now in tree: the boot path no longer calls
 `MmAllocateContiguousMemory` for guest RAM. It allocates virtually contiguous

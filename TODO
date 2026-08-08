@@ -97,12 +97,16 @@
      way of checking (cat /sys/kernel/security/lsm) reports nothing and looks
      like failure; securityfs is simply not mounted. The dmesg line is the
      check.
-   * The guest .config is not in the tree and nothing reproduces it. Every
-     option this port depends on -- KASAN off because the host's allocation
-     lands in Linux's shadow region, RANDOMIZE_MEMORY off because the KASLR
-     span encloses our window, DEBUG_ENTRY off because it ud2's on the real IF
-     this design keeps set, and now SECURITY_LANDLOCK on -- is a decision made
-     once and recorded nowhere a rebuild would find it.
+   * DONE 2026-08-07: the guest .config is in the tree, as
+     conf/linux-7.1.5-config (the shipped uniprocessor build) and
+     conf/linux-7.1.5-smp-config (SMP rung S2). Every option this port depends
+     on -- KASAN off because the host's allocation lands in Linux's shadow
+     region, RANDOMIZE_MEMORY off because the KASLR span encloses our window,
+     DEBUG_ENTRY off because it ud2's on the real IF this design keeps set,
+     SECURITY_LANDLOCK on -- was a decision made once and recorded nowhere a
+     rebuild would find it. The two configs differ in 81 options, all of them
+     SMP infrastructure; diffing them is how you see what SMP=y actually
+     brings in.
    * DONE with fragmented RAM: the host's 4 KB direct-map leaves now carry NX,
      as do the fixed p2m/m2p data mappings. Recheck the page-table auditor on
      the first target boot; any remaining W+X report is no longer the entire
@@ -497,22 +501,28 @@
    * Likely the same family as the disabled resize_section (see the 0x4E entry):
      a section freed while a reader still holds a pointer into it.
 
- * An unexplained #GP in trap_init, seen once:
-   * A Manjaro boot stopped with vector 13 at co_colinux_adopt_traps+0x150,
-     error code 0x40. The error code is a selector, not an address: index 8 in
-     the GDT, which on x86-64 is GDT_ENTRY_TSS, so the processor refused the ltr
-     that loads the guest's task register. The kernel log ends at the
-     inode-cache line, which is vfs_caches_init_early() -- the call immediately
-     before trap_init() -- so the stopping point and the faulting address agree.
-   * It has not recurred, on the same vmlinux, across many boots since. That is
-     not the same as fixed, and it is recorded here rather than forgotten
-     because an intermittent fault in the one function that installs the guest's
-     descriptor tables is the kind of thing that comes back during a
-     demonstration. Candidates worth reading when it does: whether the TSS
-     descriptor's busy bit can be set on entry (the switch clears it before
-     every ltr in both directions, but adopt_traps does its own lgdt/ltr/lidt
-     outside that), and whether the descriptor's base can be built from a
-     per-CPU TSS address before the guest has settled which CPU it is on.
+ * CLOSED 2026-08-07: the "unexplained #GP in trap_init" was the ltr race,
+   already solved above on 2026-08-04. Two entries for one bug, because the
+   sighting was written down two days before the cause was found and nobody
+   went back to join them up.
+   * The sighting: a Manjaro boot stopped with vector 13 at
+     co_colinux_adopt_traps+0x150, error code 0x40 -- a selector, index 8,
+     GDT_ENTRY_TSS. The processor refused the ltr loading the guest's task
+     register. That is the same instruction, the same selector and the same
+     error code as the race documented above, and co_colinux_adopt_traps() IS
+     the "guest ... about to ltr" in that description: it does its own
+     load_direct_gdt / native_load_tr_desc / load_idt. An interrupt landing
+     between the lgdt and the ltr re-enters through the switch, whose own ltr
+     marks the descriptor busy, and the guest's ltr is then refused.
+   * Recorded 2026-08-02 (413586be); fixed 2026-08-04 (af3b2f67) by clearing
+     the busy bit again after ltr, and only when the side being entered is the
+     guest. "Has not recurred across many boots since" is explained by that
+     fix landing in between, not by luck.
+   * The entry's second candidate does survive, as an SMP question rather than
+     a bug: native_load_tr_desc() reads raw_smp_processor_id() and
+     get_cpu_gdt_ro(cpu). Under CONFIG_SMP=n that is the constant 0. Under
+     SMP=y it is a GS-relative per-CPU read, so GS has to be valid by
+     trap_init() -- checked as part of rung S2.
 
  * The release artifacts are not built by anything:
    * Mostly answered, and by a different route than this entry assumed. The
@@ -709,6 +719,134 @@
      Anything that treats that success as "the driver is loaded" then fails
      with "manager open: The system cannot find the file specified" on every
      subsequent run. It should start the service, or say that it did not.
+
+ * SMP -- the milestone the swap and OpenGL entries defer to. Staged plan
+   agreed 2026-08-07; rungs are S0..S6, each hardware-verified and committed
+   before the next starts.
+   * S0 DONE 2026-08-07 (commit 26638a3d), verified on the M92p under Windows
+     10: --test-smp runs two threads pinned to two processors, each crossing
+     into a guest of its own, concurrently. 10M crossings per lane in 54 s
+     (~2.7 us each), counters and rbx exact both lanes, 5671 host interrupts
+     replayed from inside the guests on both cores at once, lane-distinct MSR
+     sentinels (FS_BASE/GS_BASE/KERNEL_GS_BASE/LSTAR) intact throughout, zero
+     host-verify escalations, zero migrations. KSTOP mid-run ends both lanes
+     cleanly; the boot regression after it is clean. The central claim --
+     per-crossing state is fully per-passage-page and two cores can switch
+     worlds independently -- is now measured, not argued.
+   * The design in one paragraph: each vCPU is a daemon thread in a blocking
+     per-vCPU ioctl, pinned to its own core, with a passage block of its own
+     (incl. GDT/TSS/IDT/stubs/FXSAVE). Guest-side machine globals
+     (co_colinux_virtual_if, co_colinux_passage_page) become fixed arrays
+     indexed by a raw GS read of cpu_number -- host-visible, so never percpu.
+     APIC cannot be config'd out on x86-64: an inert struct apic (Xen PV's
+     xen_pv_apic shape), fake topology, and an smp_prepare_cpus override
+     replace nolapic. AP bringup is the BSP's kick_ap crossing handing the
+     host an explicit initial-state block (the KBOOT shape, once per AP).
+     IPIs are shared-memory pending bitmaps + an idle doorbell + opportunistic
+     ring-3 frame surgery; reschedule is arrival-only. TLB shootdown needs no
+     IPI at all: every crossing already clears CR4.PGE around the CR3 write
+     (full flush, globals included, nopcid), so a sequence counter + in-host
+     flag per vCPU answers "has it flushed" -- kick and wait for the counter.
+   * S1 DONE 2026-08-07 (commits d268bbaf host, 0dd6c60c guest), verified on
+     the M92p under Windows 10. Host: the monitor loop's statics became
+     co_vcpu_t fields (passage page, replayed-vector table, run flag); the
+     abort flag became a broadcast and co_arch_boot_running() now means "any
+     vCPU still inside"; the idle doorbell went from one auto-reset event
+     (which releases exactly ONE waiter -- a lost wake with two vCPUs, a
+     correctness bug not a fairness one) to one per vCPU plus a wake-all for
+     device doorbells. A --test-smp lane is now a vCPU in the slot of its own
+     number, so KSTOP and unload have one mechanism instead of two. Loop
+     locals deliberately stayed locals: a second vCPU is a second thread with
+     its own stack. Guest: co_colinux_virtual_if and co_colinux_passage_page
+     became arrays indexed by co_colinux_vcpu_id(), which is 0 under SMP=n
+     and a deliberate #error under SMP=y.
+     **Parity was measured, not assumed**: the rebuilt vmlinux disassembles
+     to 7,756,149 instructions identical to the previous build, differing
+     only in the version string and one renumbered constant-pool label. Plus
+     5M concurrent crossings per lane, bounded boot regression matching the
+     baseline (vgpu timeout 128.62s vs 128.43s), and the full Manjaro guest
+     booting on the new driver and kernel -- coterm reports #74, load 0.01.
+     The guest-side snapshot was regenerated against the released tarball and
+     reverse-apply checked; it now covers 34 files, including the two the
+     README recorded as missing.
+   * S2 DONE 2026-08-07 (54603af5 and 9806e2fe), verified on the M92p under
+     Windows 10. An SMP=y guest boots to /sbin/init with three possible CPUs
+     and the local APIC never touched.
+     - co_colinux_vcpu_id() is raw_cpu_read(cpu_number). GS is valid before
+       any C runs: the guest enters at co_arch_start_kernel, falls into
+       common_startup_64, and writes MSR_GS_BASE from __per_cpu_offset[0];
+       the boot CPU reads cpu_number out of the init image (0) until
+       setup_per_cpu_areas() and its own area (0) after. Booting is what
+       proves it -- every cli/sti/save_fl in the kernel is now a GS-relative
+       per-CPU read.
+     - **nolapic STAYS**, which reverses the plan and is the safer direction.
+       The kernel ties "APIC disabled" to "one CPU" in
+       topology_apply_cmdline_limits_early() and restrict_to_up(); that is a
+       true fact about hardware (no APIC, no INIT-SIPI) and false here, where
+       the host starts processors. Both sites now exempt a cooperative guest,
+       next to the exemption XEN PV already has for the same reason. So the
+       inference changes and the fact does not: the APIC is still the host's
+       chip and the guest still never touches it.
+     - smp_ops: co_colinux_smp_prepare_cpus() replaces the native one, which
+       reads apic_intr_mode and answers disable_smp(). co_colinux_kick_ap()
+       refuses, and is a safety belt rather than a stub -- native kick_ap
+       reaches do_boot_cpu() and sends INIT-SIPI-SIPI to a real processor of
+       the host machine. It fired on the first boot: three possible CPUs
+       meant the kernel tried to start two of them.
+     - The gate is closed too: the "unexplained #GP in trap_init" was the ltr
+       race, fixed 2026-08-04, recorded 2026-08-02, never joined up. See the
+       CLOSED entry below. adopt_traps() also runs clean under SMP=y.
+   * S3a DONE 2026-08-07 (9458af3c): --cpus N, capped at host cores minus two
+     (Windows and the GPU daemon's spin-poller need one each), passed to the
+     guest as the kernel's own possible_cpus= -- no patch needed. Before it
+     the guest counted the host firmware's MP table and sized its per-CPU
+     areas, cpumasks and RCU geometry for the HOST's processors, then tried
+     to start them. Verified: --cpus 2 gives "Limiting to 2 possible CPUs",
+     nr_cpu_ids 2, one refused AP attempt instead of two, boots to
+     /sbin/init. The daemon prints the core map, which the entry below asked
+     for.
+   * S3b-1 DONE 2026-08-07 (b43fb96c): KVCPU_RUN, the ioctl an AP thread
+     blocks in, issued WHILE the boot loop runs -- the first time the real
+     monitor loop and a second guest processor exist at once. The driver
+     picks the core rather than taking the caller's, because two vCPUs on one
+     core is a deadlock and not a slowdown; co_arch_vcpu_core_taken() scans
+     the host_cpu that S1 already records, so the boot processor's core is
+     excluded by construction instead of by the caller guessing which one it
+     landed on. Payload is still the trivial crossing loop. Verified: guest
+     booting on vCPU 0, then 3,000,000 crossings on vCPU 1 on another core,
+     counters exact, 8886 host interrupts replayed from inside it, no MSR
+     bleed, while vCPU 0 reached /sbin/init and kept running.
+   * TWO vCPUs IN ONE ADDRESS SPACE, 2026-08-07 (bac33be7). The property
+     --test-smp could not show: its lanes each had a space of their own, so
+     it proved two crossings can run at once, not that two processors can
+     share a guest. KVCPU_RUN now enters the running guest's CR3 -- each vCPU
+     keeps its own passage page (state, params, FPU area, IST stack, TSS,
+     GDT) and they share the page tables. Reachability is free: the boot
+     path already grafts kload_space's top-level entries into the kernel's
+     table, so a passage page mapped into kload_space under a grafted slot is
+     visible from the kernel's CR3. The preflight therefore walks the GUEST's
+     space, not the passage page's own tables -- the wrong walk answers the
+     wrong question. vCPU 0 publishes the adopted kernel root, not its live
+     CR3, which follows whatever process Linux last scheduled and can be
+     freed underneath a secondary. Verified both ways: 3,000,000 crossings on
+     vCPU 1 with the guest at /sbin/init, and a refusal when no guest is
+     running -- which is what makes the positive mean something.
+   * S3b-2, STILL OPEN and where the remaining risk is: START_VCPU (the BSP
+     hands the host an AP initial-state block -- rip, rsp, CR3, GS_BASE,
+     per-vCPU GDT/IDT/TSS, virtual-IF slot starting blocked; structurally
+     co_arch_boot_result_t again, which the host already builds once for the
+     boot CPU), KICK_VCPU doorbell, and guest-side co_kick_ap +
+     co_cpu_bringup per Xen smp_pv.c. Do it the S0 way: point START_VCPU at a
+     trivial spin-loop context FIRST and only then at the real bringup -- a
+     wrong initial state is a triple fault on core 1 with nothing to read.
+     co_colinux_kick_ap() is the thing to replace, and until it is replaced
+     it is what stops an INIT-SIPI reaching a host processor.
+   * Remaining rungs: S3 second vCPU
+     to idle (KVCPU_RUN + START_VCPU/KICK_VCPU ops, cpu_bringup per Xen
+     smp_pv.c); S4 IPIs + per-CPU timer + shootdown under TLB-torture and
+     make -j2; S5 device-ring locking + desktop/Steam soak; S6 --cpus 3 and
+     oneshot/NO_HZ evaluation. Host core budget: 4 cores = Windows + cogpu
+     spin-poll + 2 vCPUs, zero slack -- the daemon should print the core map.
 
  * Cleanups:
    * Merge console into console-base.

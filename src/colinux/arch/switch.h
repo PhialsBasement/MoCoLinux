@@ -382,4 +382,74 @@ extern co_rc_t co_arch_enter_loaded(co_manager_t* manager,
 extern co_rc_t co_arch_test_resume(co_manager_t* manager, co_arch_switch_test_t* out,
 				   int iterations);
 
+/*
+ * The SMP spike: one lane of a concurrent crossing test.
+ *
+ * Two of these run at once, on two different processors, each crossing into
+ * its own guest context in its own passage page. Everything a real second
+ * vCPU would stress is stressed here first, at the cost of a test ioctl
+ * rather than a kernel: concurrent world switches on two cores, ltr against
+ * a per-lane GDT/TSS while the other core does the same, per-lane MSR
+ * save/restore with nothing shared, and host interrupt replay happening on
+ * both cores at once.
+ *
+ * The MSR sentinels are the point, not a detail. Each lane plants distinct
+ * values in its guest state's FS_BASE/GS_BASE/KERNEL_GS_BASE/LSTAR; the
+ * switch loads them entering the guest and saves them back leaving it. If
+ * any lane ever observes the other lane's values -- in its guest state
+ * afterwards, or live in the host MSRs between crossings -- the design's
+ * central claim (per-crossing state is fully per-passage-page) is false, and
+ * that must be learned here, not from a booted SMP kernel dying strangely.
+ */
+typedef struct {
+	int		   supported;
+	int		   succeeded;
+	int		   lane;
+	unsigned long	   host_cpu;	/* where the lane actually ran */
+	long long	   iterations;	/* requested */
+	long long	   completed;	/* voluntary guest loop crossings */
+	long long	   interrupts;	/* host vectors replayed from this lane */
+	unsigned long long counter;	/* guest memory counter */
+	unsigned long long reg_accum;	/* guest rbx accumulator */
+	int		   faulted;	/* a guest exception (vector < 32) stopped the lane */
+	unsigned long long vector;
+	unsigned long long error_code;
+	unsigned long long fault_rip;
+	int		   unforwardable;
+	int		   aborted;	/* KSTOP ended the lane early */
+	int		   migrated;	/* the host processor changed mid-run: fatal */
+	int		   msr_ok;	/* sentinels and host MSRs intact throughout */
+	unsigned long	   msr_bad;	/* first MSR that went wrong (CO_MSR_*) */
+	unsigned long long msr_want;
+	unsigned long long msr_got;
+	int		   preflight_failed;
+	int		   preflight_level;
+	unsigned long long preflight_va;
+	int		   waited_for_start;	/* real secondary, not the test loop */
+	int		   never_started;	/* the guest never issued START_VCPU */
+	unsigned long	   stopped_op;		/* guest operation this loop cannot serve */
+} co_arch_smp_test_t;
+
+/*
+ * A lane is a vCPU and takes the vCPU slot of its own number, so a running
+ * lane answers co_arch_boot_running() and is ended by co_arch_boot_abort() --
+ * KSTOP and driver unload need no separate mechanism for it.
+ *
+ * join_guest: enter the RUNNING guest's address space instead of the private
+ * one built for this passage page. Each vCPU keeps its own passage page --
+ * its own state, params, FPU area, IST stack, TSS and GDT -- but shares the
+ * page tables, which is what makes them processors of one machine rather than
+ * two guests. Requires vCPU 0 to be running.
+ */
+extern co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
+				     int lane, long long iterations,
+				     int join_guest);
+
+/*
+ * Whether a host processor already carries a vCPU. Two vCPUs on one core
+ * deadlock -- each crossing loop holds its processor for as long as its
+ * guest runs -- so a vCPU about to start has to pick a core nobody holds.
+ */
+extern int co_arch_vcpu_core_taken(unsigned long cpu);
+
 #endif

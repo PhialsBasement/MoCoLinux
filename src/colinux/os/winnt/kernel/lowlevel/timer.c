@@ -95,40 +95,73 @@ void co_os_msleep(unsigned int msecs)
  * the monitor is still inside the crossing is not lost -- it is consumed by
  * the next wait, immediately -- and repeated wakes do not accumulate into a
  * burst of re-entries later.
+ *
+ * One per vCPU: the event releases a single waiter, so vCPUs must not share
+ * one. See colinux/os/timer.h.
  */
-static KEVENT co_idle_wake_event;
+static KEVENT co_idle_wake_event[CO_MAX_VCPUS];
 static int    co_idle_wake_ready;
 
 void co_os_idle_wake_init(void)
 {
-	KeInitializeEvent(&co_idle_wake_event, SynchronizationEvent, FALSE);
+	unsigned long i;
+
+	for (i = 0; i < CO_MAX_VCPUS; i++)
+		KeInitializeEvent(&co_idle_wake_event[i], SynchronizationEvent, FALSE);
 	co_idle_wake_ready = 1;
 }
 
-void co_os_idle_wake(void)
+void co_os_idle_wake(unsigned long vcpu)
 {
-	if (!co_idle_wake_ready)
+	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS)
 		return;
 	/*
 	 * The increment of 1 boosts the waiting monitor thread so it runs now
 	 * rather than at the end of the scheduler's queue -- this call exists
 	 * to shave latency, and a wake that waits its turn is half a fix.
 	 */
-	KeSetEvent(&co_idle_wake_event, 1, FALSE);
+	KeSetEvent(&co_idle_wake_event[vcpu], 1, FALSE);
 }
 
-bool_t co_os_idle_wait(unsigned int msecs)
+void co_os_idle_wake_all(void)
+{
+	unsigned long i;
+
+	for (i = 0; i < CO_MAX_VCPUS; i++)
+		co_os_idle_wake(i);
+}
+
+bool_t co_os_idle_wait(unsigned long vcpu, unsigned int msecs)
 {
 	LARGE_INTEGER DueTime;
 	NTSTATUS      status;
 
-	if (!co_idle_wake_ready) {
-		co_os_msleep(msecs);
+	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS) {
+		co_os_msleep(msecs ? msecs : 1);
 		return PFALSE;
 	}
 
+	/*
+	 * Zero means no timeout at all. No caller passes it today -- see the
+	 * contract in os/timer.h.
+	 *
+	 * The temptation is obvious: every producer rings the doorbell now, so a
+	 * timeout looks like a pure poll, and a poll here is a full world switch
+	 * -- CR3, GDT, IDT, TR, fourteen MSRs, FXSAVE -- taken to find an empty
+	 * operation slot. But the monitor's timeout is also the guest's clock:
+	 * ticks are synthesised from elapsed host time only when a vCPU wakes and
+	 * re-enters, so removing it stops time on that processor. This path
+	 * exists for the day the guest publishes its next expiry instead of
+	 * asking for a periodic tick.
+	 */
+	if (msecs == 0) {
+		status = KeWaitForSingleObject(&co_idle_wake_event[vcpu],
+					       Executive, KernelMode, FALSE, NULL);
+		return status == STATUS_SUCCESS ? PTRUE : PFALSE;
+	}
+
 	DueTime.QuadPart = (long long)msecs * 10000 * (-1);
-	status = KeWaitForSingleObject(&co_idle_wake_event, Executive,
+	status = KeWaitForSingleObject(&co_idle_wake_event[vcpu], Executive,
 				       KernelMode, FALSE, &DueTime);
 	return status == STATUS_SUCCESS ? PTRUE : PFALSE;
 }
