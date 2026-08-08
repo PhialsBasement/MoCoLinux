@@ -90,7 +90,8 @@ int main(int argc, char** argv)
 		else if (!strcmp(argv[i], "--slice") && i + 1 < argc)
 			slice = strtoul(argv[++i], NULL, 0);
 		else {
-			printf("usage: kmap-test [--clean|--exit|--crash] [--slice BYTES]\n");
+			printf("usage: kmap-test [--clean|--exit|--crash|--starve]"
+			       " [--slice BYTES]\n");
 			return 2;
 		}
 	}
@@ -114,16 +115,13 @@ int main(int argc, char** argv)
 	/*
 	 * The failure path, exercised rather than assumed.
 	 *
-	 * The driver probes for free user address space before every map,
-	 * because MmMapLockedPagesSpecifyCache RAISES on failure and cannot be
-	 * caught in this toolchain -- so the probe is the only thing standing
-	 * between an exhausted address space and a bugcheck. Untested code is
-	 * the thing this project keeps being bitten by, so this mode reserves
-	 * essentially the whole user address space first and then asks for a
-	 * gigabyte of windows.
+	 * MmMapLockedPagesSpecifyCache raises on a failed UserMode map. The driver
+	 * now calls it through a dedicated x64 SEH frame which converts that raise
+	 * to a normal KMAP refusal. This mode exhausts user VA first so the catch
+	 * path is the thing being tested, not the success path.
 	 *
 	 * The pass condition is a clean refusal and a live host. A bugcheck
-	 * here means the probe does not work; a SUCCESS here means the
+	 * here means the handler does not work; a SUCCESS here means the
 	 * starvation did not take, and the test proved nothing.
 	 */
 	if (mode == MODE_STARVE) {
@@ -143,16 +141,16 @@ int main(int argc, char** argv)
 		printf("reserved %llu GB; largest remaining hole is now small\n",
 		       held >> 30);
 
-		/* Squeeze the rest out in smaller pieces, so nothing 8 MB wide
-		 * is left -- an 8 MB slice is what the driver will ask for. */
+		/* Squeeze the rest out in smaller pieces, so nothing 12 MB wide
+		 * is left -- a 12 MB slice is what the driver will ask for. */
 		for (;;) {
-			p = VirtualAlloc(NULL, 8ULL << 20, MEM_RESERVE,
+			p = VirtualAlloc(NULL, CO_KMAP_SLICE_BYTES, MEM_RESERVE,
 					 PAGE_READWRITE);
 			if (!p)
 				break;
-			held += 8ULL << 20;
+			held += CO_KMAP_SLICE_BYTES;
 		}
-		printf("no 8 MB hole remains. asking the driver to map anyway.\n");
+		printf("no 12 MB hole remains. asking the driver to map anyway.\n");
 
 		if (CO_OK(co_manager_kmap(handle, slice, map))) {
 			printf("\nFAIL: KMAP SUCCEEDED with no address space left"
@@ -164,8 +162,8 @@ int main(int argc, char** argv)
 		}
 
 		printf("\nPASS: KMAP refused cleanly and the host is alive.\n"
-		       "      That is the probe working; without it this is a"
-		       " bugcheck 0x1E/0x7E.\n");
+		       "      The driver's SEH wrapper converted the mapping"
+		       " exception into an error.\n");
 		co_os_manager_close(handle);
 		return 0;
 	}
@@ -206,7 +204,7 @@ int main(int argc, char** argv)
 	t0 = now_s();
 	for (i = 0; i < (int)map->count; i++) {
 		const unsigned long long* q =
-			(const unsigned long long*)(unsigned long)map->range[i].user_va;
+			(const unsigned long long*)(size_t)map->range[i].user_va;
 		unsigned long long n = map->range[i].bytes / sizeof(*q);
 		unsigned long long acc = 0, j;
 
@@ -287,7 +285,7 @@ int main(int argc, char** argv)
 
 		for (i = 0; i < (int)map->count && checked < 8; i++) {
 			const unsigned char* p =
-				(const unsigned char*)(unsigned long)map->range[i].user_va;
+				(const unsigned char*)(size_t)map->range[i].user_va;
 			unsigned long long va = PAGE_OFFSET + map->range[i].pa;
 
 			if (!CO_OK(co_manager_kread(handle, va, via_kread,
@@ -347,6 +345,10 @@ int main(int argc, char** argv)
 		 */
 		SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
 		*(volatile int*)0 = 1;
+		break;
+
+	case MODE_STARVE:
+		/* Handled, including cleanup, before KMAP above. */
 		break;
 	}
 

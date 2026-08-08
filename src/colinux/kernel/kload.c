@@ -130,8 +130,6 @@ static bool_t		      kload_pending_free;
 /* KMAP may take a snapshot only after KRAM has finished growing the blocks. */
 static bool_t		      kload_ram_ready;
 
-/* Four gigabytes was already the old block layout's practical ceiling. */
-#define CO_KLOAD_MAX_RAM_BYTES	(4ULL << 30)
 #define CO_KLOAD_MIN_TABLE_BYTES (4ULL << 20)
 
 static unsigned long kload_m2p_hash(co_pfn_t mfn)
@@ -637,6 +635,50 @@ co_rc_t co_kload_block(int i, void** va_out, unsigned long long* pa_out,
 }
 
 /*
+ * Find the allocation block containing a pseudo-physical address.
+ *
+ * KMAP_RANGE uses the block base to choose a deterministic 12 MB slice. Doing
+ * that in the driver, rather than independently in every userspace caller,
+ * means two requests for the same page always name the same mapping and never
+ * consume duplicate VADs. The blocks are appended in pseudo-address order, so
+ * a binary search stays cheap even at the 128 GB block-table ceiling.
+ */
+co_rc_t co_kload_block_for_pa(unsigned long long query_pa, void** va_out,
+			      unsigned long long* pa_out,
+			      unsigned long long* bytes_out)
+{
+	co_rc_t rc = CO_RC(ERROR);
+	int lo, hi;
+
+	if (!va_out || !pa_out || !bytes_out)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(kload_lock);
+	lo = 0;
+	hi = kload_block_count - 1;
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+		co_kload_block_t* block = &kload_block[mid];
+
+		if (query_pa < block->pseudo_base) {
+			hi = mid - 1;
+		} else if (query_pa >= block->pseudo_base + block->bytes) {
+			lo = mid + 1;
+		} else if (block->va != NULL) {
+			*va_out = block->va;
+			*pa_out = block->pseudo_base;
+			*bytes_out = block->bytes;
+			rc = CO_RC(OK);
+			break;
+		} else {
+			break;
+		}
+	}
+	co_os_mutex_release(kload_lock);
+	return rc;
+}
+
+/*
  * Whether a new run may start yet.
  *
  * Waits outside the lock, in short sleeps, for a deferred teardown to finish.
@@ -682,23 +724,54 @@ static co_rc_t kload_translation_alloc(unsigned long capacity_pages)
 {
 	unsigned long long p2m_bytes;
 	unsigned long long m2p_bytes;
-	unsigned long wanted_slots;
+	unsigned long long wanted_slots;
+	unsigned long long alloc_pages;
 
 	if (capacity_pages == 0)
 		return CO_RC(INVALID_PARAMETER);
 
-	wanted_slots = capacity_pages << 1;
+	/*
+	 * A power-of-two table at least 1.5x the population stays below a 2/3
+	 * load factor. The former 2x request needlessly crossed the next power of
+	 * two at 128 GB because the reserved page-table pages put capacity just
+	 * above 2^25: that made m2p 512 MB instead of 256 MB for no useful gain.
+	 */
+	wanted_slots = (unsigned long long)capacity_pages +
+			 ((unsigned long long)capacity_pages + 1) / 2;
+	if (wanted_slots > (unsigned long long)~0UL)
+		return CO_RC(INVALID_PARAMETER);
+
 	kload_m2p_slots = 1;
-	while (kload_m2p_slots < wanted_slots)
+	while ((unsigned long long)kload_m2p_slots < wanted_slots) {
+		if (kload_m2p_slots > (~0UL >> 1))
+			return CO_RC(INVALID_PARAMETER);
 		kload_m2p_slots <<= 1;
+	}
 	kload_m2p_mask_value = kload_m2p_slots - 1;
 
 	p2m_bytes = (unsigned long long)capacity_pages * sizeof(kload_p2m[0]);
 	m2p_bytes = (unsigned long long)kload_m2p_slots * sizeof(kload_m2p[0]);
-	kload_p2m_alloc_pages = (unsigned int)((p2m_bytes + CO_ARCH_PAGE_SIZE - 1)
-						 >> CO_ARCH_PAGE_SHIFT);
-	kload_m2p_alloc_pages = (unsigned int)((m2p_bytes + CO_ARCH_PAGE_SIZE - 1)
-						 >> CO_ARCH_PAGE_SHIFT);
+
+	/* The guest reserves adjacent 1 GB virtual windows for these mappings. */
+	if (p2m_bytes > CO_KLOAD_TRANSLATION_WINDOW_BYTES ||
+	    m2p_bytes > CO_KLOAD_TRANSLATION_WINDOW_BYTES) {
+		kload_m2p_slots = 0;
+		kload_m2p_mask_value = 0;
+		return CO_RC(INVALID_PARAMETER);
+	}
+
+	alloc_pages = (p2m_bytes + CO_ARCH_PAGE_SIZE - 1) >> CO_ARCH_PAGE_SHIFT;
+	if (alloc_pages > (unsigned long long)~0U)
+		return CO_RC(INVALID_PARAMETER);
+	kload_p2m_alloc_pages = (unsigned int)alloc_pages;
+	alloc_pages = (m2p_bytes + CO_ARCH_PAGE_SIZE - 1) >> CO_ARCH_PAGE_SHIFT;
+	if (alloc_pages > (unsigned long long)~0U)
+		return CO_RC(INVALID_PARAMETER);
+	kload_m2p_alloc_pages = (unsigned int)alloc_pages;
+
+	co_debug("kload: translation metadata p2m %llu MB, m2p %llu MB"
+		 " (%lu slots)", p2m_bytes >> 20, m2p_bytes >> 20,
+		 kload_m2p_slots);
 
 	kload_p2m = (co_pfn_t*)co_os_alloc_cached_pages(kload_p2m_alloc_pages);
 	if (kload_p2m == NULL) {
@@ -778,8 +851,9 @@ co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 		return CO_RC(INVALID_PARAMETER);
 
 	if (ram_bytes > CO_KLOAD_MAX_RAM_BYTES) {
-		co_debug_error("kload: %lld MB exceeds the 4 GB pseudo-RAM limit",
-			       ram_bytes >> 20);
+		co_debug_error("kload: %lld MB exceeds the %lld MB pseudo-RAM limit",
+			       ram_bytes >> 20,
+			       (unsigned long long)CO_KLOAD_MAX_RAM_MB);
 		return CO_RC(INVALID_PARAMETER);
 	}
 

@@ -247,6 +247,18 @@ void co_os_free(void *ptr)
 unsigned long co_last_map_state;
 unsigned long co_last_map_protect;
 
+/*
+ * Defined in build/safe-map.c and linked directly into linux.sys.
+ *
+ * It cannot live in this compilation unit: this tree combines driver objects
+ * with two `ld -r` passes, and GNU ld corrupts x64 .pdata addends while doing
+ * that. Ordinary functions survive because they rarely raise; an SEH wrapper
+ * without its runtime-function entry is exactly the unhandled exception it is
+ * meant to prevent. Keeping the wrapper out of both aggregate objects lets the
+ * final PE link consume its .pdata/.xdata once, without an intermediate link.
+ */
+extern PVOID co_os_map_locked_pages_user_safe(PMDL mdl);
+
 co_rc_t co_os_userspace_map(void *address, unsigned int pages, void **user_address_out, void **handle_out)
 {
 	void *user_address = NULL;
@@ -287,70 +299,11 @@ co_rc_t co_os_userspace_map(void *address, unsigned int pages, void **user_addre
 	 */
 	MmBuildMdlForNonPagedPool(mdl);
 
-	/*
-	 * Probe before mapping, because the map cannot be caught if it fails.
-	 *
-	 * MmMapLockedPagesSpecifyCache with AccessMode == UserMode RAISES an
-	 * exception when it cannot map; it does not return NULL, and the
-	 * BugCheckOnFailure argument is documented as ignored for UserMode. The
-	 * NULL test below therefore never runs on the path that actually
-	 * fails, and an unhandled exception in a driver is a bugcheck
-	 * (0x1E / 0x7E), not an error return.
-	 *
-	 * It cannot be guarded with this toolchain: GCC's C frontend has no
-	 * __try/__except -- that is MSVC syntax -- and mingw's x64 substitute
-	 * (__try1/__except1 in excpt.h) is inline assembly emitting
-	 * .seh_handler scope tables by hand. Getting that subtly wrong corrupts
-	 * the stack on precisely the path meant to save the machine.
-	 *
-	 * So instead of catching the failure, make it not happen: ask the
-	 * caller's address space for a reservation of exactly this size first.
-	 * If there is no contiguous hole that big, the reservation fails
-	 * cleanly with a status code and this returns an error, which is what
-	 * the caller wanted all along. If there is, it is released again
-	 * immediately and the map takes it.
-	 *
-	 * The window between the release and the map is real, and it is
-	 * accepted knowingly: the only caller that maps at this scale is the
-	 * daemon's single-threaded startup, nothing else in the process is
-	 * reserving address space at that moment, and the alternative is
-	 * hand-written SEH. It converts "certain bugcheck when VA runs out"
-	 * into "clean refusal, with a vanishingly small chance of the old
-	 * behaviour". R3 maps ~1 GB in 130 slices on every daemon start, which
-	 * is what makes this path reachable at all.
-	 *
-	 * MEM_RESERVE only -- no pages are committed, so this costs address
-	 * space for the length of the call and nothing else.
-	 */
-	{
-		PVOID	 probe = NULL;
-		SIZE_T	 probe_size = memory_size;
-		NTSTATUS status;
-
-		status = ZwAllocateVirtualMemory(ZwCurrentProcess(), &probe, 0,
-						 &probe_size, MEM_RESERVE,
-						 PAGE_READWRITE);
-		if (!NT_SUCCESS(status)) {
-			co_debug("userspace_map: no %lu KB of free user VA (status %x)",
-				 (unsigned long)(memory_size >> 10),
-				 (unsigned int)status);
-			IoFreeMdl(mdl);
-			return CO_RC(ERROR);
-		}
-
-		probe_size = 0;	/* MEM_RELEASE requires zero, with the base */
-		ZwFreeVirtualMemory(ZwCurrentProcess(), &probe, &probe_size,
-				    MEM_RELEASE);
-	}
-
-	/*
-	 * The NULL check stays regardless: a Windows that returns NULL rather
-	 * than raising must not be treated as success.
-	 */
-	user_address = MmMapLockedPagesSpecifyCache(mdl, UserMode, MmCached,
-						    NULL, FALSE, HighPagePriority);
+	user_address = co_os_map_locked_pages_user_safe(mdl);
 
 	if (!user_address) {
+		co_debug("userspace_map: Windows refused %lu KB; mapping not installed",
+			 (unsigned long)(memory_size >> 10));
 		IoFreeMdl(mdl);
 		return CO_RC(ERROR);
 	}

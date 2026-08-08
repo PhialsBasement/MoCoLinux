@@ -17,15 +17,19 @@
  * machine PFN of every 4 KB guest page, so physical fragmentation is invisible
  * to Linux and never drives an MmAllocateContiguousMemory search.
  *
- * 32 MB keeps the block/KMAP bookkeeping small.  Allocation falls back as far
- * as one page if the nonpaged-pool virtual address space itself is fragmented.
+ * 32 MB keeps allocation latency and bookkeeping bounded. The pages inside a
+ * block are physically scattered; only its kernel virtual address is linear.
+ * Allocation falls back as far as one page if nonpaged-pool virtual space is
+ * itself fragmented. 16384 entries let a 128 GB guest average 8 MB per block,
+ * four times the metadata headroom of an unfragmented 32 MB layout.
  */
 #define CO_KLOAD_CHUNK_BYTES	(32ULL << 20)
-#define CO_KLOAD_MAX_BLOCKS	256
+#define CO_KLOAD_MAX_BLOCKS	16384
 
 /* Keep these in lockstep with arch/x86/include/asm/cooperative.h in the guest. */
 #define CO_KLOAD_M2P_VA		0xffffe99fc0000000ULL
 #define CO_KLOAD_P2M_VA		0xffffe99f80000000ULL
+#define CO_KLOAD_TRANSLATION_WINDOW_BYTES (1ULL << 30)
 #define CO_KLOAD_PFN_MASK	0x000ffffffffff000ULL
 
 /*
@@ -36,6 +40,10 @@
 extern int	 co_kload_block_count(void);
 extern co_rc_t	 co_kload_block(int i, void** va, unsigned long long* pa,
 				unsigned long long* bytes);
+/* The complete allocation block containing one pseudo-physical byte. */
+extern co_rc_t	 co_kload_block_for_pa(unsigned long long query_pa, void** va,
+				       unsigned long long* block_pa,
+				       unsigned long long* block_bytes);
 /* Reserve the finished RAM image for a KMAP caller. */
 extern bool_t	 co_kload_user_map_try_get(void);
 extern void	 co_kload_user_map_put(co_manager_t* manager);

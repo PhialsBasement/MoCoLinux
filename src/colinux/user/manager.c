@@ -331,6 +331,29 @@ co_rc_t co_manager_kmap(co_manager_handle_t handle, unsigned long max_slice,
 	return rc;
 }
 
+/* Map only the fixed-size slice containing one guest-physical address. */
+co_rc_t co_manager_kmap_range(co_manager_handle_t handle,
+			      unsigned long long pa,
+			      co_kmap_range_t* range_out,
+			      int* reused_out)
+{
+	co_manager_ioctl_kmap_range_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	params.pa = pa;
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KMAP_RANGE,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (CO_OK(rc) && range_out)
+		*range_out = params.range;
+	if (CO_OK(rc) && reused_out)
+		*reused_out = params.reused ? 1 : 0;
+	return rc;
+}
+
 co_rc_t co_manager_kunmap(co_manager_handle_t handle, unsigned long* released_out)
 {
 	co_manager_ioctl_kunmap_t params = {0, };

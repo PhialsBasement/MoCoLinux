@@ -1,13 +1,13 @@
 /*
  * The host half of the X wire.
  *
- * A channel arrives on the control port as a list of guest-physical pages. The
- * daemon already maps the whole of guest RAM through R3's windows, so those
- * pages become pointers of its own and the rings are read and written in
- * place -- the bytes of an XPutImage are never copied out of the guest, they
- * are handed straight to a socket that ends at VcXsrv on the same machine.
+ * A channel arrives on the control port as a list of guest-physical pages.
+ * resolve_gpa maps each containing working-set slice on first touch, so those
+ * pages become persistent pointers and the rings are read and written in place
+ * -- the bytes of an XPutImage are never copied out of the guest, they are
+ * handed straight to a socket that ends at VcXsrv on the same machine.
  *
- * Why per page rather than per run: the windows are 8 MB slices, adjacent in
+ * Why per page rather than per run: the windows are 12 MB slices, adjacent in
  * guest-physical but not in host-virtual, and the guest's region is ordinary
  * scattered anonymous memory besides. A page is the largest unit guaranteed
  * contiguous on both sides, so the ring walk is page-granular and any run that
@@ -84,7 +84,7 @@ struct xchan {
  * measurement's ceiling, not the design's: every send() carried 4096 bytes, so
  * a 3 MB frame cost 768 syscalls and 1024x768 topped out at 28 fps. The pages
  * are scattered in guest-physical space, but scattered is not the same as
- * unlucky -- an 8 MB anonymous mapping under MAP_POPULATE comes back in long
+ * unlucky -- a multi-megabyte anonymous mapping under MAP_POPULATE comes back in long
  * physically contiguous runs, and transparent huge pages make many of them
  * 2 MB. Where two pages happen to be adjacent on both sides they can be sent
  * as one.

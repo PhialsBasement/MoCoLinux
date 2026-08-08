@@ -436,6 +436,15 @@ targets['driver.o'] = Target(
     tool = Linker(),
 )
 
+# Keep this object out of driver.o and every other `ld -r` aggregate. Its x64
+# .pdata/.xdata are the safety mechanism for a documented raising kernel API;
+# intermediate GNU PE links corrupt their section-relative addends. Linking it
+# directly into linux.sys leaves the final linker one intact record to consume.
+targets['safe-map.o'] = Target(
+    inputs = [Input('safe-map.c')],
+    tool = Compiler(),
+)
+
 def script_cmdline(scripter, tool_run_inf):
     from comake.settings import settings
 
@@ -463,13 +472,14 @@ def script_cmdline(scripter, tool_run_inf):
     (scripter.get_cross_build_tool('gcc', tool_run_inf),
      entry,
      tool_run_inf.target.pathname,
-     inputs[0].pathname))
+     ' '.join([item.pathname for item in inputs])))
     return command_line
 
 targets['linux.sys'] = Target(
     tool = Script(script_cmdline),
     inputs = [
        Input('driver.o'),
+       Input('safe-map.o'),
     ],
     options = Options(
         appenders = dict(

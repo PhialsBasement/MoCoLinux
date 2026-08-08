@@ -59,6 +59,8 @@ typedef enum {
 	CO_MANAGER_IOCTL_KUNMAP,
 	CO_MANAGER_IOCTL_VGPU,
 	CO_MANAGER_IOCTL_VGPU_WAKE,
+	/* Appended so older ioctl numbers keep their meaning across an upgrade. */
+	CO_MANAGER_IOCTL_KMAP_RANGE,
 } co_manager_ioctl_t;
 
 /*
@@ -280,6 +282,9 @@ typedef struct {
 } co_manager_ioctl_test_switch_t;
 
 /* interface for the CO_MANAGER_IOCTL_KLOAD_* family */
+#define CO_KLOAD_MAX_RAM_BYTES	(128ULL << 30)
+#define CO_KLOAD_MAX_RAM_MB	(CO_KLOAD_MAX_RAM_BYTES >> 20)
+
 typedef struct {
 	co_rc_t		   rc;
 	unsigned long long min_va;
@@ -319,31 +324,23 @@ typedef struct {
 } co_manager_ioctl_kread_t;
 
 /*
- * interface for CO_MANAGER_IOCTL_KMAP / CO_MANAGER_IOCTL_KUNMAP: give a
- * user-mode process a direct, persistent view of the guest's RAM.
+ * Direct, persistent user-mode views of guest RAM.
  *
- * The driver's virtually contiguous pool blocks are mapped once into the host
- * process. Their reported bases are guest pseudo addresses, so a texture or
- * vertex buffer can still be resolved and read at memcpy speed even though its
- * machine frames are scattered. KREAD, by contrast, is an ioctl and a
- * page-table walk per call; it is right for a few kilobytes of printk ring and
- * hopeless for a gigabyte a second of GPU resources.
+ * An MDL records its own size in a CSHORT. On x86-64 one MDL can therefore
+ * describe at most (32767 - 48) / 8 = 4089 pages, just under 16 MB. Twelve MB
+ * leaves a full 4 MB of margin and divides a 32 MB kload block into three
+ * slices (12 + 12 + 8), instead of the four mappings the old 8 MB size needed.
  *
- * SLICED, and not by preference. An MDL records its length in a CSHORT, so one
- * MDL can describe at most (32767 - sizeof(MDL)) / sizeof(PFN_NUMBER) pages --
- * on x86-64 that is (32767 - 48) / 8 = 4089 pages, a little under 16 MB. A
- * kload block is CO_KLOAD_CHUNK_BYTES (32 MB, 8192 pages), so one MDL per block
- * fails on every full-size block, deterministically, every time. 8 MB slices
- * are used instead: comfortably under the ceiling with room for a differently
- * sized MDL header, and a round number of them per block.
- *
- * (The design note this came from said 16 MB and 4089-versus-8185 pages. 8185
- * is the 32-bit figure, where PFN_NUMBER is four bytes; a 4096-page slice would
- * have overshot the real x86-64 ceiling by seven pages and failed on the first
- * call. The arithmetic is spelled out above so the next person can check it
- * rather than inherit it.)
+ * CO_MANAGER_IOCTL_KMAP is the original map-everything diagnostic interface.
+ * Its fixed response cannot scale to a 128 GB guest: even 12 MB slices would
+ * require more than ten thousand MDLs and VADs before the GPU touched a byte.
+ * CO_MANAGER_IOCTL_KMAP_RANGE is the scalable interface. It maps only the
+ * deterministic slice containing one requested guest-physical address and
+ * may be called repeatedly on the same handle. The driver keeps every returned
+ * address alive until KUNMAP/handle cleanup, so callers can cache pointers and
+ * the amount passed to --mem never determines their mapping footprint.
  */
-#define CO_KMAP_SLICE_BYTES	(8ULL << 20)
+#define CO_KMAP_SLICE_BYTES	(12ULL << 20)
 #define CO_KMAP_MAX_RANGES	256
 
 typedef struct {
@@ -359,6 +356,13 @@ typedef struct {
 	unsigned long long total_bytes;	/* out */
 	co_kmap_range_t	   range[CO_KMAP_MAX_RANGES];
 } co_manager_ioctl_kmap_t;
+
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long	   reused;	/* out: this handle already had the slice */
+	unsigned long long pa;		/* in: any guest pseudo-physical byte */
+	co_kmap_range_t	   range;	/* out: the complete containing slice */
+} co_manager_ioctl_kmap_range_t;
 
 typedef struct {
 	co_rc_t		   rc;

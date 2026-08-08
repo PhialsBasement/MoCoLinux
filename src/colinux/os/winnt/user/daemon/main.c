@@ -103,8 +103,14 @@ static bool_t co_parse_count(const char* s, unsigned long* out)
 {
 	unsigned long v = 0;
 
-	while (*s >= '0' && *s <= '9')
-		v = v * 10 + (unsigned long)(*s++ - '0');
+	while (*s >= '0' && *s <= '9') {
+		unsigned long digit = (unsigned long)(*s++ - '0');
+
+		/* Windows is LLP64: unsigned long is still 32 bits on x64. */
+		if (v > (~0UL - digit) / 10)
+			return PFALSE;
+		v = v * 10 + digit;
+	}
 
 	if (*s || !v)
 		return PFALSE;

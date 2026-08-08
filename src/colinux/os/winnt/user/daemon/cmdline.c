@@ -63,7 +63,7 @@ void co_winnt_daemon_syntax(void)
 	co_terminal_print("      --no-copic                   Do not interrupt a running guest. Ticks then\n");
 	co_terminal_print("                                   arrive only at idle and at exits to user mode,\n");
 	co_terminal_print("                                   so a userspace spin loop cannot be preempted.\n");
-	co_terminal_print("      --mem MB                     Usable pseudo RAM in megabytes (default 1024).\n");
+	co_terminal_print("      --mem MB                     Usable pseudo RAM in MB (default 1024, max 131072).\n");
 	co_terminal_print("                                   Backed page by page from nonpaged pool; short\n");
 	co_terminal_print("                                   allocation is reported, not fatal.\n");
 	co_terminal_print("      --cobd0 PATH                 Backing store for the guest's root device\n");

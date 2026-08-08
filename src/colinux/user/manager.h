@@ -72,6 +72,10 @@ extern co_rc_t co_manager_kread(co_manager_handle_t handle, unsigned long long v
 				void* data, unsigned long size);
 extern co_rc_t co_manager_kmap(co_manager_handle_t handle, unsigned long max_slice,
 			       co_manager_ioctl_kmap_t* out);
+extern co_rc_t co_manager_kmap_range(co_manager_handle_t handle,
+				     unsigned long long pa,
+				     co_kmap_range_t* range_out,
+				     int* reused_out);
 extern co_rc_t co_manager_kunmap(co_manager_handle_t handle,
 				 unsigned long* released_out);
 extern co_rc_t co_manager_vgpu_address(co_manager_handle_t handle,

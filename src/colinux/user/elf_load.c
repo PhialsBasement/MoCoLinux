@@ -907,8 +907,8 @@ out:
  * contiguous: each 4 KB machine frame is recorded independently in p2m.
  *
  * Falling short remains reported and non-fatal. e820 describes what was
- * obtained, so a guest that gets less boots with less and says so. Four
- * gigabytes is the current p2m/ABI ceiling, not a contiguous-allocation limit.
+ * obtained, so a guest that gets less boots with less and says so. The shared
+ * p2m/ABI ceiling is 128 GB; it is independent of host physical contiguity.
  */
 #define CO_GUEST_RAM_DEFAULT_MB	1024
 
@@ -1282,6 +1282,13 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 	char* buf;
 	co_rc_t rc;
 	bool_t installed = PFALSE;
+
+	if (ram_bytes > CO_KLOAD_MAX_RAM_BYTES) {
+		co_terminal_print("--mem supports at most %llu MB (%llu GB)\n",
+				  (unsigned long long)CO_KLOAD_MAX_RAM_MB,
+				  (unsigned long long)(CO_KLOAD_MAX_RAM_BYTES >> 30));
+		return CO_RC(INVALID_PARAMETER);
+	}
 
 	rc = co_os_file_load((char*)filename, &buf, &size, 0);
 	if (!CO_OK(rc)) {

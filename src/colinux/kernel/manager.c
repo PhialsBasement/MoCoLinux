@@ -451,147 +451,142 @@ co_rc_t co_manager_close(co_manager_t *manager, co_manager_open_desc_t opened)
 	return CO_RC(OK);
 }
 
+static co_manager_kmap_slice_t* co_manager_kmap_find(
+	co_manager_open_desc_t opened, unsigned long long pa)
+{
+	co_manager_kmap_slice_t* slice;
+
+	for (slice = opened->kmap_slice; slice; slice = slice->next)
+		if (pa >= slice->pa && pa - slice->pa < slice->bytes)
+			return slice;
+	return NULL;
+}
+
+static unsigned long co_manager_kmap_unmap_list(co_manager_kmap_slice_t* slice)
+{
+	unsigned long count = 0;
+
+	while (slice) {
+		co_manager_kmap_slice_t* next = slice->next;
+
+		if (slice->handle)
+			co_os_userspace_unmap(slice->user_va, slice->handle,
+					      slice->pages);
+		co_os_free(slice);
+		slice = next;
+		count++;
+	}
+	return count;
+}
+
+/* opened->lock is held and the completed kload block set is reserved. */
+static co_rc_t co_manager_kmap_add_locked(co_manager_open_desc_t opened,
+					  void* kernel_va,
+					  unsigned long long pa,
+					  unsigned long long bytes,
+					  co_manager_kmap_slice_t** out)
+{
+	co_manager_kmap_slice_t* slice;
+	void* user_va = NULL;
+	void* handle = NULL;
+	unsigned long pages = (unsigned long)(bytes >> CO_ARCH_PAGE_SHIFT);
+	co_rc_t rc;
+
+	if (pages == 0 || (bytes & ~CO_ARCH_PAGE_MASK) != 0)
+		return CO_RC(INVALID_PARAMETER);
+
+	slice = co_os_malloc(sizeof(*slice));
+	if (!slice)
+		return CO_RC(OUT_OF_MEMORY);
+	co_memset(slice, 0, sizeof(*slice));
+
+	rc = co_os_userspace_map(kernel_va, pages, &user_va, &handle);
+	if (!CO_OK(rc)) {
+		co_os_free(slice);
+		return rc;
+	}
+
+	slice->handle = handle;
+	slice->user_va = user_va;
+	slice->pages = pages;
+	slice->pa = pa;
+	slice->bytes = bytes;
+	slice->next = opened->kmap_slice;
+	opened->kmap_slice = slice;
+	opened->kmap_slices++;
+	*out = slice;
+	return CO_RC(OK);
+}
+
 /*
- * Map the guest's RAM into the calling process, in slices.
- *
- * Called from the ioctl path, so it runs in the requesting process's context
- * -- which is required: MmMapLockedPagesSpecifyCache with UserMode maps into
- * whatever process is current.
- *
- * All or nothing. A half-mapped guest is a caller that thinks it has a
- * complete view and silently reads zeroes off the end of the part that
- * worked, which is the kind of failure that gets diagnosed as a GPU bug three
- * rungs later.
+ * Original map-everything interface, retained for kmap-test and diagnostics.
+ * GPU/X users use KMAP_RANGE below; this fixed response is deliberately not
+ * made hundreds of kilobytes wide merely because --mem can now be 128 GB.
  */
-static co_rc_t co_manager_kmap(co_manager_t*		 manager,
-			       co_manager_open_desc_t	 opened,
-			       co_manager_ioctl_kmap_t*	 params)
+static co_rc_t co_manager_kmap(co_manager_t* manager,
+			       co_manager_open_desc_t opened,
+			       co_manager_ioctl_kmap_t* params)
 {
 	unsigned long long slice_bytes = params->max_slice ? params->max_slice
 							  : CO_KMAP_SLICE_BYTES;
+	co_manager_kmap_slice_t* failed = NULL;
+	bool_t put_reservation = PFALSE;
 	int blocks, i, n = 0;
 
-	params->count	    = 0;
+	params->count = 0;
 	params->total_bytes = 0;
-
 	if (!opened)
 		return CO_RC(INVALID_PARAMETER);
-
-	/* One window per handle. A second request would leak the first. */
-	if (opened->kmap_slices != 0)
-		return CO_RC(ERROR);
-
 	if (slice_bytes < CO_ARCH_PAGE_SIZE || slice_bytes > CO_KMAP_SLICE_BYTES)
 		slice_bytes = CO_KMAP_SLICE_BYTES;
+	slice_bytes &= CO_ARCH_PAGE_MASK;
 
-	/*
-	 * Reserve a finished, immutable block set before looking at it. KRAM
-	 * grows this list after KLOAD_BEGIN; mapping the early prefix is a
-	 * successful but permanently incomplete view of the running guest.
-	 * The reservation also keeps teardown from freeing a block mid-map.
-	 */
-	if (!co_kload_user_map_try_get())
+	co_os_mutex_acquire(opened->lock);
+	if (opened->kmap_reserved || opened->kmap_slices != 0) {
+		co_os_mutex_release(opened->lock);
 		return CO_RC(ERROR);
+	}
+	if (!co_kload_user_map_try_get())
+		goto fail_locked;
+	opened->kmap_reserved = PTRUE;
 
 	blocks = co_kload_block_count();
-	if (blocks == 0) {
-		co_kload_user_map_put(manager);
-		return CO_RC(ERROR);
-	}
-
-	opened->kmap_slice = co_os_malloc(sizeof(opened->kmap_slice[0]) *
-					  CO_KMAP_MAX_RANGES);
-	if (!opened->kmap_slice) {
-		co_kload_user_map_put(manager);
-		return CO_RC(OUT_OF_MEMORY);
-	}
-	co_memset(opened->kmap_slice, 0,
-		  sizeof(opened->kmap_slice[0]) * CO_KMAP_MAX_RANGES);
-
 	for (i = 0; i < blocks; i++) {
-		void*		   va;
+		void* va;
 		unsigned long long pa, bytes, off;
 
 		if (!CO_OK(co_kload_block(i, &va, &pa, &bytes)))
 			continue;
-
 		for (off = 0; off < bytes; off += slice_bytes) {
+			co_manager_kmap_slice_t* slice = NULL;
 			unsigned long long this = bytes - off;
-			unsigned long	   pages;
-			void*		   uva	  = NULL;
-			void*		   handle = NULL;
 
 			if (this > slice_bytes)
 				this = slice_bytes;
-			pages = (unsigned long)(this >> CO_ARCH_PAGE_SHIFT);
-			if (pages == 0)
-				continue;
-
 			if (n >= CO_KMAP_MAX_RANGES) {
-				co_debug("kmap: more than %d slices needed",
+				co_debug("kmap-all: more than %d slices needed; use KMAP_RANGE",
 					 CO_KMAP_MAX_RANGES);
-				goto fail;
+				goto fail_locked;
+			}
+			if (!CO_OK(co_manager_kmap_add_locked(opened,
+							 (char*)va + off,
+							 pa + off, this, &slice))) {
+				co_debug("kmap-all: slice %d refused", n);
+				goto fail_locked;
 			}
 
-			if (!CO_OK(co_os_userspace_map((char*)va + off, pages,
-						       &uva, &handle))) {
-				co_debug("kmap: slice %d (%lu pages) refused", n, pages);
-				goto fail;
-			}
-
-			opened->kmap_slice[n].handle  = handle;
-			opened->kmap_slice[n].user_va = uva;
-			opened->kmap_slice[n].pages   = pages;
-
-			params->range[n].pa	 = pa + off;
-			params->range[n].bytes	 = this;
-			/*
-			 * (size_t), never (unsigned long).
-			 *
-			 * Windows is LLP64: unsigned long is 32 bits here, so
-			 * this cast threw away the top half of every user
-			 * address above 4 GB. The daemon then computed
-			 * user_va + (gpa - pa) from half a pointer and read it,
-			 * which is an access violation on the first touch --
-			 * seen as cogpu-daemon.exe dying at +0x75ba on the
-			 * 'VGPU' magic, and before that as "the transport page
-			 * is not backed".
-			 *
-			 * It hid for three releases because XP and 7 placed
-			 * these MDL mappings below 4 GB, where the truncation
-			 * changes nothing. Windows 8.1 places them higher, and
-			 * the reported user_va came back as 0xbdc70000 -- a
-			 * plausible-looking address that was simply the bottom
-			 * 32 bits of the real one.
-			 *
-			 * The same mistake, with the same cause, is recorded
-			 * against this tree's snprintf %p.
-			 */
-			params->range[n].user_va = (unsigned long long)(size_t)uva;
-			params->total_bytes	+= this;
+			params->range[n].pa = slice->pa;
+			params->range[n].bytes = slice->bytes;
+			params->range[n].user_va =
+				(unsigned long long)(size_t)slice->user_va;
+			params->total_bytes += slice->bytes;
 			n++;
-			opened->kmap_slices = n;
 		}
 	}
 
 	if (n == 0)
-		goto fail;
-
+		goto fail_locked;
 	params->count = n;
-	/*
-	 * max_slice is an input the caller no longer needs; it carries the
-	 * driver's own view of the last mapping back out, so the daemon can
-	 * print what the kernel saw beside what it sees itself.
-	 *
-	 * The 0xD0 tag is here because the first attempt at this came back as a
-	 * clean zero while params->count, written on the line above, arrived
-	 * intact -- which is not a result, it is two indistinguishable failures
-	 * wearing the same value. A constant the driver cannot have computed by
-	 * accident separates them: if the daemon sees the tag, the write-back
-	 * works and co_os_userspace_map is not reaching its own report; if it
-	 * sees zero, the field never made the trip and nothing measured through
-	 * it has meant anything.
-	 */
 	{
 		extern unsigned long co_last_map_state;
 		extern unsigned long co_last_map_protect;
@@ -600,51 +595,130 @@ static co_rc_t co_manager_kmap(co_manager_t*		 manager,
 				    ((co_last_map_state & 0xff) << 16) |
 				    (co_last_map_protect & 0xffff);
 	}
-	co_debug("kmap: %d slices, %llu MB mapped into the caller",
+	co_os_mutex_release(opened->lock);
+	co_debug("kmap-all: %d slices, %llu MB mapped into the caller",
 		 n, params->total_bytes >> 20);
 	return CO_RC(OK);
 
-fail:
-	/* Unwind whatever did map; see the all-or-nothing note above. */
-	while (n-- > 0) {
-		co_os_userspace_unmap(opened->kmap_slice[n].user_va,
-				      opened->kmap_slice[n].handle,
-				      opened->kmap_slice[n].pages);
-	}
-	co_os_free(opened->kmap_slice);
-	opened->kmap_slice  = NULL;
+fail_locked:
+	failed = opened->kmap_slice;
+	opened->kmap_slice = NULL;
 	opened->kmap_slices = 0;
+	put_reservation = opened->kmap_reserved;
+	opened->kmap_reserved = PFALSE;
+	co_os_mutex_release(opened->lock);
+	co_manager_kmap_unmap_list(failed);
+	if (put_reservation)
+		co_kload_user_map_put(manager);
 	params->total_bytes = 0;
-	co_kload_user_map_put(manager);
 	return CO_RC(ERROR);
+}
+
+/*
+ * Map the deterministic slice containing one pseudo-physical address.
+ *
+ * A handle may add as many working-set slices as it needs. Repeating an
+ * address returns the existing pointer, so concurrent GPU/X consumers do not
+ * multiply mappings. The list is protected by opened->lock; the mappings
+ * themselves belong to the requesting process and stay immutable afterwards.
+ */
+static co_rc_t co_manager_kmap_range(co_manager_t* manager,
+				     co_manager_open_desc_t opened,
+				     co_manager_ioctl_kmap_range_t* params)
+{
+	co_manager_kmap_slice_t* slice = NULL;
+	unsigned long long block_pa = 0, block_bytes = 0;
+	unsigned long long block_off, slice_off, bytes;
+	void* block_va = NULL;
+	bool_t took_reservation = PFALSE;
+	co_rc_t rc = CO_RC(ERROR);
+
+	params->reused = 0;
+	co_memset(&params->range, 0, sizeof(params->range));
+	if (!opened)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(opened->lock);
+	if (!opened->kmap_reserved) {
+		if (!co_kload_user_map_try_get())
+			goto out;
+		opened->kmap_reserved = PTRUE;
+		took_reservation = PTRUE;
+	}
+
+	slice = co_manager_kmap_find(opened, params->pa);
+	if (slice) {
+		params->reused = 1;
+		rc = CO_RC(OK);
+		goto found;
+	}
+
+	rc = co_kload_block_for_pa(params->pa, &block_va, &block_pa,
+					   &block_bytes);
+	if (!CO_OK(rc))
+		goto out;
+
+	block_off = params->pa - block_pa;
+	slice_off = (block_off / CO_KMAP_SLICE_BYTES) * CO_KMAP_SLICE_BYTES;
+	bytes = block_bytes - slice_off;
+	if (bytes > CO_KMAP_SLICE_BYTES)
+		bytes = CO_KMAP_SLICE_BYTES;
+
+	rc = co_manager_kmap_add_locked(opened, (char*)block_va + slice_off,
+					block_pa + slice_off, bytes, &slice);
+	if (!CO_OK(rc)) {
+		co_debug("kmap-range: pa 0x%llx (%llu KB) refused",
+			 block_pa + slice_off, bytes >> 10);
+		goto out;
+	}
+
+found:
+	params->range.pa = slice->pa;
+	params->range.bytes = slice->bytes;
+	params->range.user_va = (unsigned long long)(size_t)slice->user_va;
+	co_debug("kmap-range: pa 0x%llx, %llu KB at %p%s",
+		 slice->pa, slice->bytes >> 10, slice->user_va,
+		 params->reused ? " (reused)" : "");
+
+out:
+	/* A failed first request must not pin the guest forever with no mapping. */
+	if (!CO_OK(rc) && took_reservation && opened->kmap_slices == 0) {
+		opened->kmap_reserved = PFALSE;
+		took_reservation = PFALSE;
+		co_os_mutex_release(opened->lock);
+		co_kload_user_map_put(manager);
+		return rc;
+	}
+	co_os_mutex_release(opened->lock);
+	return rc;
 }
 
 void co_manager_kmap_release(co_manager_t* manager, co_manager_open_desc_t opened)
 {
-	int i;
+	co_manager_kmap_slice_t* list;
+	unsigned long expected, released;
+	bool_t put_reservation;
 
-	if (!opened || opened->kmap_slices == 0)
+	if (!opened)
 		return;
 
-	for (i = 0; i < opened->kmap_slices; i++) {
-		if (opened->kmap_slice[i].handle == NULL)
-			continue;
-		co_os_userspace_unmap(opened->kmap_slice[i].user_va,
-				      opened->kmap_slice[i].handle,
-				      opened->kmap_slice[i].pages);
-	}
-
-	co_debug("kmap: released %d slices", opened->kmap_slices);
-
-	co_os_free(opened->kmap_slice);
-	opened->kmap_slice  = NULL;
+	co_os_mutex_acquire(opened->lock);
+	list = opened->kmap_slice;
+	expected = opened->kmap_slices;
+	put_reservation = opened->kmap_reserved;
+	opened->kmap_slice = NULL;
 	opened->kmap_slices = 0;
+	opened->kmap_reserved = PFALSE;
+	co_os_mutex_release(opened->lock);
 
-	/*
-	 * After the unmaps, never before: this is what may complete a deferred
-	 * teardown and free the very pages just unmapped.
-	 */
-	co_kload_user_map_put(manager);
+	released = co_manager_kmap_unmap_list(list);
+	if (released || expected)
+		co_debug("kmap: released %lu slices (recorded %lu)",
+			 released, expected);
+
+	/* The last unmap may complete deferred guest-RAM teardown. */
+	if (put_reservation)
+		co_kload_user_map_put(manager);
 }
 
 co_rc_t co_manager_open_desc_deactive_and_close(co_manager_t*	       manager,
@@ -934,6 +1008,17 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			return CO_RC(INVALID_PARAMETER);
 
 		params->rc = co_manager_kmap(manager, opened, params);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KMAP_RANGE: {
+		co_manager_ioctl_kmap_range_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_manager_kmap_range(manager, opened, params);
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}

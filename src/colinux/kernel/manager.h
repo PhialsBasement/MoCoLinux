@@ -31,6 +31,15 @@ struct co_manager_open_desc_os;
 
 typedef struct co_manager_open_desc_os *co_manager_open_desc_os_t;
 
+typedef struct co_manager_kmap_slice {
+	struct co_manager_kmap_slice *next;
+	void		 *handle;	/* the MDL */
+	void		 *user_va;
+	unsigned long	  pages;
+	unsigned long long pa;		/* guest pseudo-physical range */
+	unsigned long long bytes;
+} co_manager_kmap_slice_t;
+
 /*
  * Stamped at open, cleared immediately before the descriptor is freed.
  *
@@ -62,7 +71,7 @@ typedef struct co_manager_open_desc {
 	co_debug_section_t *debug_section;
 
 	/*
-	 * R3: this handle's user-mode windows onto guest RAM, if any.
+	 * This handle's user-mode windows onto guest RAM, if any.
 	 *
 	 * Recorded here rather than in the mapper because the mapping belongs
 	 * to the handle, not to the request: a process that maps and then dies
@@ -72,15 +81,14 @@ typedef struct co_manager_open_desc {
 	 * requires for a UserMode mapping. IRP_MJ_CLOSE can run in an arbitrary
 	 * process and must not be the one to do it.
 	 *
-	 * The MDL is stored as void* because this header is OS-independent;
-	 * co_os_userspace_map already hands it back that way.
+	 * A linked list, not a fixed array: KMAP_RANGE adds working-set slices on
+	 * demand and a 128 GB guest must not allocate a response-sized block in
+	 * nonpaged pool just because one texture was touched. Nodes are immutable
+	 * after publication and are all retired by KUNMAP/cleanup.
 	 */
-	struct {
-		void	     *handle;	/* the MDL */
-		void	     *user_va;
-		unsigned long pages;
-	} *kmap_slice;
-	int kmap_slices;
+	co_manager_kmap_slice_t *kmap_slice;
+	unsigned long		  kmap_slices;
+	bool_t			  kmap_reserved;
 } *co_manager_open_desc_t;
 
 /*
