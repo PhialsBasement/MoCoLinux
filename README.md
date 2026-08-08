@@ -1,10 +1,9 @@
 # MoCoLinux
 
-Cooperative Linux for x86-64 (Now with 128GB Fragged RAM support): a modern
-Linux kernel running as a guest inside Windows XP x64, Windows 7 x64, Windows
-8.1 x64 and Windows 10 x64 on real
-hardware, without a
-hypervisor, emulation, or virtualization extensions. It is a port of
+Cooperative Linux for x86-64, with fragmented-RAM backing and guest memory
+configurations up to 128 GB: a modern Linux kernel running as a guest inside
+Windows XP x64, Windows 7 x64, Windows 8.1 x64 and Windows 10 x64 on real
+hardware, without a hypervisor, emulation, or virtualization extensions. It is a port of
 [coLinux](http://colinux.org/) (i386, unmaintained since ~2011) to x86-64,
 against a 2026 kernel.
 
@@ -75,11 +74,35 @@ address on both sides, holding the switch code, both saved CPU states, an IST
 stack, a TSS and the console ring — valid mid-crossing, when CR3 has changed
 but nothing else has.
 
-Guest RAM is a dense pseudo-physical address space backed by ordinary scattered
-nonpaged-pool pages. A host-built p2m table converts each Linux PFN to the
-machine PFN placed in hardware page tables; a reverse m2p hash converts values
-back when Linux reads those tables. The synthesized e820 therefore describes
-RAM from pseudo address zero and does not expose host fragmentation.
+### FragRAM
+
+FragRAM is shorthand here for backing the guest with whatever physical pages
+Windows can provide instead of requiring guest RAM in unbroken physical runs.
+The earlier x86-64 port treated a Linux guest page number as the corresponding
+host machine page number. That was simple, but it meant a host could have
+enough free RAM in total and still fail to boot the guest because the free
+pages were scattered after normal use or repeated guest runs.
+
+The driver now allocates cached nonpaged-pool chunks which are contiguous in
+its kernel virtual address but may be scattered across physical RAM. It records
+the machine frame behind every 4 KB page. Linux still sees ordinary dense RAM
+starting at pseudo-physical address zero: a p2m table translates a guest page
+number before it is placed in a hardware page table, and an m2p hash translates
+it back when Linux reads that entry. The guest direct map uses 4 KB leaves
+because a huge page would incorrectly imply that the host frames are adjacent.
+
+Supporting configurations up to 128 GB also required 64-bit memory sizes and
+block accounting, allocation and p2m/m2p metadata sized for 131072 MiB, and a
+change to how the GPU daemon sees guest memory. It no longer maps the configured
+RAM size in advance; it asks the driver for 12 MB windows around guest
+addresses as it needs them. A large `--mem` value therefore does not create
+thousands of unused user mappings before the GPU has touched a page.
+
+This is not RAM overcommit or ballooning. Memory advertised to Linux still
+needs real nonpaged host backing. `--mem 131072` is therefore a supported
+ceiling, not a promise that every supported Windows machine can spare 128 GB;
+if the host supplies less than the requested target, that is reported and the
+guest e820 map describes the amount actually backed.
 
 ### Networking
 
@@ -151,8 +174,9 @@ ask for:
 - Preemption: the host interrupts a busy-looping task; time advances at real
   speed
 - Cooperative SMP: the installed launcher requests `--cpus 2`; two Linux
-  processors run concurrently on distinct host cores with per-vCPU switch
-  state, passage pages, timers and posted-IPI delivery
+  processors run concurrently on distinct host logical processors with
+  per-vCPU switch state, passage pages, timers and posted-IPI delivery. Linux
+  receives their real physical-core/SMT relationship
 - Networking: guest ethernet device, host NAT, static address via
   `systemd-networkd`; pacman installs a 791-package desktop over HTTPS at
   16 MB/s
@@ -175,7 +199,7 @@ ask for:
   the GPU daemon with virglrenderer, X server and launchers, then boots Linux
   and builds a Manjaro system on a fresh image over the network
 - The authoritative complete guest-side Linux 7.1.5 diff is
-  [`patch/7.1.5/current-tree-snapshot.diff`](https://github.com/PhialsBasement/MoCoLinux/blob/mocolinux/patch/7.1.5/current-tree-snapshot.diff).
+  [`patch/7.1.5/current-tree-snapshot.diff`](patch/7.1.5/current-tree-snapshot.diff).
   It is regenerated against the released tarball and checked by applying and
   reverse-applying it with zero fuzz and an exact tree comparison
 
@@ -241,11 +265,14 @@ hardirq or virtual-interrupt-off regions. CPU scaling is therefore solved for
 two vCPUs; presentation frame rate remains limited by the separate GPU-to-X
 transport described above.
 
-The fragmented-RAM fix is now in tree: the boot path no longer calls
-`MmAllocateContiguousMemory` for guest RAM. It allocates virtually contiguous
-cached-pool chunks, records every machine frame independently, and maps the
-guest at 4 KB granularity. The host-side and Linux 7.1.5 builds pass; repeated
-boot/teardown soaking on the target Windows machines is still required.
+Guest APIC routing IDs remain synthetic because no APIC hardware is addressed.
+Package, core and SMT topology instead comes from CPUID on each pinned host
+logical processor, so Linux's sibling masks describe the placement Windows
+actually supplied.
+
+The same tested build uses the [FragRAM](#fragram) path described above. A real
+2048 MiB guest boot has been verified; 128 GB is the supported configuration
+ceiling, not a claim that a 128 GB host has already been tested.
 
 ## Layout
 
@@ -280,6 +307,12 @@ the driver signature, and two kernel trees: the Windows side builds against
 2.6.33 headers (the passage-page ABI is a header inside the guest kernel
 tree), while the guest kernel is 7.1.5. The 2.6.33 tree is used for headers
 only — nothing in it is built or run.
+
+The host and guest halves are one matched interface and should be built from
+the same commit. `linux.sys` and the host daemons come from `src/colinux/`; the
+matching `vmlinux` comes from applying
+`patch/7.1.5/current-tree-snapshot.diff` to pristine Linux 7.1.5. Keeping both
+source halves is what makes a tested driver/kernel pair reproducible.
 
 The Windows side, driver through release, is one script:
 
@@ -333,13 +366,14 @@ cogpu-daemon.exe                           (a fourth: the guest's GPU)
 colinux-daemon.exe --run konsole           (start one app in a running guest)
 ```
 
-- `--mem MB` sets usable pseudo RAM (default 1024). It is a target: e820
-  describes what the scattered nonpaged-pool backing actually supplied, and
-  falling short is reported rather than fatal.
+- `--mem MB` sets usable pseudo RAM (default 1024, maximum 131072). It is a
+  target: e820 describes what the scattered nonpaged-pool backing actually
+  supplied, and falling short is reported rather than fatal. See
+  [FragRAM](#fragram) for how that backing is translated.
 - `--cpus N` sets the guest's processor count (the daemon default is one; the
-  installed launcher requests two). Every vCPU needs a distinct host core, and
-  the driver reserves capacity for Windows and the GPU daemon instead of
-  oversubscribing a core carrying another guest processor.
+  installed launcher requests two). Every vCPU needs a distinct host logical
+  processor, and the driver reserves capacity for Windows and the GPU daemon
+  instead of placing two guest processors on the same one.
 - The image ships `10-eth0.network` with slirp's fixed layout and
   `systemd-networkd` enabled, so the guest configures its own network at boot.
 - For a desktop, start an X server on the Windows side in multiwindow mode

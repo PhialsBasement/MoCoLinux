@@ -93,6 +93,12 @@ Over the previous snapshot:
     accounting and posted vectors are per-vCPU; the AP is entered through the
     normal x86 startup path and each processor receives its own clock event.
 
+    Guest APIC ids remain the synthetic 0..n-1 routing namespace required by
+    the cooperative CPU maps and shared-memory IPIs. Physical package, core and
+    SMT relationships instead come from CPUID on each pinned host processor,
+    so Linux advertises whether its selected vCPUs are separate physical cores
+    or sibling hardware threads without attempting to address the host APIC.
+
     The two-vCPU runtime is now complete rather than boot-only. Posted vectors
     have a shared-memory pending bitmap and a host-targeted doorbell; structured
     spin waits and the final cpu_relax() fallback poll them with per-vCPU
@@ -1165,56 +1171,37 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/cpu/topology_common.c b/arch/x86/kernel/cpu/topology_common.c
 --- a/arch/x86/kernel/cpu/topology_common.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/cpu/topology_common.c	2026-08-08 23:30:46.905687100 +1000
++++ b/arch/x86/kernel/cpu/topology_common.c	2026-08-09 02:31:39.514453300 +1000
 @@ -1,4 +1,5 @@
  // SPDX-License-Identifier: GPL-2.0
 +#include <linux/console.h>	/* co_colinux_guest */
  #include <linux/cpu.h>
  
  #include <xen/xen.h>
-@@ -144,10 +145,49 @@
+@@ -144,10 +145,30 @@
  	 * the APIC is mapped or X2APIC enabled. For establishing the
  	 * topology, that's not required. Use the initial APIC ID.
  	 */
 -	if (early)
 +	/*
-+	 * A cooperative guest's APIC ids are its CPU numbers, on both passes.
++	 * A cooperative processor has two different, equally real ids.
 +	 *
-+	 * Two things go wrong otherwise, and they are the same thing. CPUID
-+	 * leaf 1 is not virtualised, so ebx.apicid above is the id of whatever
-+	 * HOST core the monitor thread happens to be pinned to -- 6 on this
-+	 * machine. And read_apic_id() is apic->read(APIC_ID), which with
-+	 * nolapic still lands on the native MMIO read and faults on an APIC
-+	 * fixmap that was never mapped.
++	 * apicid is the guest routing id. It has to match the synthetic APIC
++	 * list co_colinux_smp_config() registered as 0..n-1; otherwise the
++	 * generic BSP check mistakes the guest for a crash kernel and refuses
++	 * every secondary. No hardware is addressed with this id -- IPIs are
++	 * shared-memory doorbells -- but the generic CPU maps still require it.
 +	 *
-+	 * So neither source describes this guest. Its processor list is
-+	 * fabricated by co_colinux_smp_config() as 0..n-1, and the ids have to
-+	 * agree with that list or nothing lines up: the boot CPU claims id 6
-+	 * while the enumeration says 0, check_for_real_bsp() sees a boot APIC
-+	 * that is not the first enumerated one, concludes it is a crash kernel
-+	 * and refuses every secondary. "Allowing 1 present CPUs", with the
-+	 * real reason three lines earlier as an APIC ID mismatch.
-+	 *
-+	 * Using the CPU number makes the fabricated id true by construction.
-+	 * Nothing addresses these ids as hardware -- there is no interrupt
-+	 * controller here and IPIs do not go through one -- they exist to
-+	 * index the topology maps.
-+	 */
-+	/*
-+	 * The CPU number, both passes, because CPUID leaf 1 is not virtualised
-+	 * here: ebx.apicid above is the id of whatever HOST core the monitor
-+	 * thread is pinned to, which has nothing to do with this guest. The
-+	 * fabricated ids from co_colinux_smp_config() are 0..n-1 and the two
-+	 * have to agree, or check_for_real_bsp() sees a boot APIC that is not
-+	 * the first enumerated one and refuses every secondary.
-+	 *
-+	 * read_apic_id() itself is safe now -- the inert driver installed in
-+	 * co_colinux_smp_init() returns the id without touching an APIC -- so
-+	 * this is about CPUID being wrong, not about the fixmap.
++	 * initial_apicid is deliberately left as the value CPUID returned.
++	 * CPUID is not virtualised, and that is useful here: every monitor
++	 * thread is pinned for its lifetime, so this is the topology id of the
++	 * exact host logical processor carrying this vCPU. Keeping it lets
++	 * topo_set_ids() distinguish two physical cores from two SMT siblings
++	 * instead of interpreting adjacent synthetic ids through the host's
++	 * APIC bit layout.
 +	 */
 +	if (co_colinux_guest) {
-+		c->topo.initial_apicid = early ? 0 : smp_processor_id();
-+		c->topo.apicid = c->topo.initial_apicid;
++		c->topo.apicid = early ? 0 : smp_processor_id();
 +	} else if (early) {
  		c->topo.apicid = c->topo.initial_apicid;
 -	else
@@ -1224,6 +1211,56 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  
  	/* The above is sufficient for UP */
  	if (!IS_ENABLED(CONFIG_SMP))
+@@ -177,9 +198,17 @@
+ {
+ 	struct cpuinfo_x86 *c = tscan->c;
+ 	u32 apicid = c->topo.apicid;
++	u32 topology_apicid = co_colinux_guest ? c->topo.initial_apicid : apicid;
+ 
+-	c->topo.pkg_id = topo_shift_apicid(apicid, TOPO_PKG_DOMAIN);
+-	c->topo.die_id = topo_shift_apicid(apicid, TOPO_DIE_DOMAIN);
++	/*
++	 * Keep logical ids in the fabricated guest APIC namespace: those are
++	 * the ids topology_register_apic() registered. Physical package/core
++	 * relationships, however, come from the host processor that really
++	 * carries this pinned vCPU. This makes sibling masks describe the CPUs
++	 * the guest actually received.
++	 */
++	c->topo.pkg_id = topo_shift_apicid(topology_apicid, TOPO_PKG_DOMAIN);
++	c->topo.die_id = topo_shift_apicid(topology_apicid, TOPO_DIE_DOMAIN);
+ 
+ 	if (!early) {
+ 		c->topo.logical_pkg_id = topology_get_logical_id(apicid, TOPO_PKG_DOMAIN);
+@@ -188,7 +217,7 @@
+ 	}
+ 
+ 	/* Package relative core ID */
+-	c->topo.core_id = (apicid & topo_domain_mask(TOPO_PKG_DOMAIN)) >>
++	c->topo.core_id = (topology_apicid & topo_domain_mask(TOPO_PKG_DOMAIN)) >>
+ 		x86_topo_system.dom_shifts[TOPO_SMT_DOMAIN];
+ 
+ 	c->topo.amd_node_id = tscan->amd_node_id;
+@@ -205,7 +234,7 @@
+ 	parse_topology(&tscan, false);
+ 
+ 	if (IS_ENABLED(CONFIG_X86_LOCAL_APIC)) {
+-		if (c->topo.initial_apicid != c->topo.apicid) {
++		if (!co_colinux_guest && c->topo.initial_apicid != c->topo.apicid) {
+ 			pr_err(FW_BUG "CPU%4u: APIC ID mismatch. CPUID: 0x%04x APIC: 0x%04x\n",
+ 			       cpu, c->topo.initial_apicid, c->topo.apicid);
+ 		}
+@@ -224,6 +253,11 @@
+ 	}
+ 
+ 	topo_set_ids(&tscan, false);
++
++	if (co_colinux_guest)
++		pr_info("colinux: CPU %u uses host APIC 0x%x (package %u, core %u)\n",
++			cpu, c->topo.initial_apicid, c->topo.pkg_id,
++			c->topo.core_id);
+ }
+ 
+ void __init cpu_init_topology(struct cpuinfo_x86 *c)
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
 --- a/arch/x86/kernel/early_printk.c	2026-07-25 00:21:27.000000000 +1000
 +++ b/arch/x86/kernel/early_printk.c	2026-08-08 23:30:46.905687100 +1000
@@ -3222,7 +3259,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  		max_pfn = e820__end_of_ram_pfn();
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
 --- a/arch/x86/kernel/smpboot.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/smpboot.c	2026-08-08 23:30:46.907687000 +1000
++++ b/arch/x86/kernel/smpboot.c	2026-08-09 02:31:48.646279200 +1000
 @@ -40,6 +40,8 @@
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
  
@@ -3232,7 +3269,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  #include <linux/smp.h>
  #include <linux/export.h>
  #include <linux/sched.h>
-@@ -1152,6 +1154,860 @@
+@@ -1152,6 +1154,862 @@
  	cpumask_set_cpu(0, topology_die_cpumask(0));
  }
  
@@ -3834,9 +3871,10 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 + *
 + * So: register that many, with APIC ids that are simply their CPU numbers.
 + * Nothing reads those ids as hardware -- there is no APIC to address and IPIs
-+ * do not go through one -- they exist so the topology bitmaps are populated
-+ * and the generic code can be used unmodified. Xen PV fabricates its list the
-+ * same way and for the same reason.
++ * do not go through one. They are routing/map ids only; scheduler topology is
++ * derived separately from each pinned host processor's unvirtualised CPUID id
++ * in topology_common.c. Xen PV similarly separates its fabricated APIC list
++ * from the topology presented to the guest.
 + */
 +/* Defined below, installed here -- see the comment on the struct. */
 +static struct apic co_colinux_apic;
@@ -3923,8 +3961,9 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +static u32 co_apic_get_id(u32 x)
 +{
 +	/*
-+	 * Ids are CPU numbers here, fabricated by co_colinux_smp_config().
-+	 * Nothing addresses them as hardware.
++	 * Routing ids are CPU numbers, fabricated by co_colinux_smp_config().
++	 * The scheduler's package/core ids come from the pinned host processor
++	 * instead; nothing addresses either id through APIC hardware.
 +	 */
 +	return x;
 +}
