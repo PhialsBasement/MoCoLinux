@@ -100,15 +100,82 @@ void co_os_msleep(unsigned int msecs)
  * one. See colinux/os/timer.h.
  */
 static KEVENT co_idle_wake_event[CO_MAX_VCPUS];
+static KDPC   co_vcpu_kick_dpc[CO_MAX_VCPUS];
+static KTIMER co_vcpu_preempt_timer[CO_MAX_VCPUS];
+static KDPC   co_vcpu_preempt_dpc[CO_MAX_VCPUS];
 static int    co_idle_wake_ready;
+
+static VOID DDKAPI co_os_vcpu_kick_dpc_routine(
+	IN PKDPC Dpc,
+	IN PVOID DeferredContext,
+	IN PVOID SystemArgument1,
+	IN PVOID SystemArgument2)
+{
+	(void)Dpc;
+	(void)DeferredContext;
+	(void)SystemArgument1;
+	(void)SystemArgument2;
+}
+
+/*
+ * Xen's VIRQ_TIMER equivalent.
+ *
+ * The body is empty for the same reason as the posted-IPI DPC above.  Expiring
+ * a high-priority DPC on the processor carrying a running vCPU sends that
+ * processor a Windows interrupt.  The interrupt enters the guest's hybrid IDT,
+ * crosses to the monitor, and is replayed into Windows.  At that point the
+ * monitor owns a complete stopped userspace frame and can deliver the guarded
+ * cooperative timer upcall before resuming it.
+ *
+ * Without this targeted source, periodic injection was merely *checked* after
+ * unrelated host interrupts.  A quiet processor can go tens of seconds
+ * without one, which made a two-second guest sleep take fifty-two seconds.
+ */
+static VOID DDKAPI co_os_vcpu_preempt_dpc_routine(
+	IN PKDPC Dpc,
+	IN PVOID DeferredContext,
+	IN PVOID SystemArgument1,
+	IN PVOID SystemArgument2)
+{
+	(void)Dpc;
+	(void)DeferredContext;
+	(void)SystemArgument1;
+	(void)SystemArgument2;
+}
 
 void co_os_idle_wake_init(void)
 {
 	unsigned long i;
 
-	for (i = 0; i < CO_MAX_VCPUS; i++)
+	for (i = 0; i < CO_MAX_VCPUS; i++) {
 		KeInitializeEvent(&co_idle_wake_event[i], SynchronizationEvent, FALSE);
+		KeInitializeDpc(&co_vcpu_kick_dpc[i],
+				&co_os_vcpu_kick_dpc_routine, NULL);
+		KeSetImportanceDpc(&co_vcpu_kick_dpc[i], HighImportance);
+		KeInitializeTimerEx(&co_vcpu_preempt_timer[i], NotificationTimer);
+		KeInitializeDpc(&co_vcpu_preempt_dpc[i],
+				&co_os_vcpu_preempt_dpc_routine, NULL);
+		KeSetImportanceDpc(&co_vcpu_preempt_dpc[i], HighImportance);
+	}
 	co_idle_wake_ready = 1;
+}
+
+void co_os_idle_wake_shutdown(void)
+{
+	unsigned long i;
+
+	if (!co_idle_wake_ready)
+		return;
+
+	co_idle_wake_ready = 0;
+	for (i = 0; i < CO_MAX_VCPUS; i++) {
+		KeCancelTimer(&co_vcpu_preempt_timer[i]);
+		KeRemoveQueueDpc(&co_vcpu_kick_dpc[i]);
+		KeRemoveQueueDpc(&co_vcpu_preempt_dpc[i]);
+	}
+
+	/* A DPC already taken off its queue may still be executing our code. */
+	KeFlushQueuedDpcs();
 }
 
 void co_os_idle_wake(unsigned long vcpu)
@@ -129,6 +196,59 @@ void co_os_idle_wake_all(void)
 
 	for (i = 0; i < CO_MAX_VCPUS; i++)
 		co_os_idle_wake(i);
+}
+
+/*
+ * Ring a running vCPU, not only one parked in co_os_idle_wait().
+ *
+ * KeSetTargetProcessorDpc selects the Windows processor carrying the target
+ * vCPU, and HighImportance makes KeInsertQueueDpc begin processing that
+ * processor's queue immediately. If the target is executing guest code, the
+ * resulting host IPI first enters the guest's hybrid IDT and crosses to its
+ * monitor loop. The loop replays the IPI into Windows, then uses that stopped
+ * guest frame to deliver the posted cooperative IPI before resuming it.
+ *
+ * The DPC body is intentionally empty. Its interrupt is the doorbell; the
+ * message itself is already in co_colinux_ipi_pending[].
+ */
+void co_os_vcpu_kick(unsigned long vcpu, unsigned long host_cpu)
+{
+	co_os_idle_wake(vcpu);
+
+	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS ||
+	    host_cpu >= sizeof(KAFFINITY) * 8)
+		return;
+
+	KeSetTargetProcessorDpc(&co_vcpu_kick_dpc[vcpu], (CCHAR)host_cpu);
+	KeInsertQueueDpc(&co_vcpu_kick_dpc[vcpu], NULL, NULL);
+}
+
+void co_os_vcpu_preempt_start(unsigned long vcpu, unsigned long host_cpu,
+			      unsigned int period_msec)
+{
+	LARGE_INTEGER due;
+
+	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS ||
+	    host_cpu >= sizeof(KAFFINITY) * 8 || period_msec == 0)
+		return;
+
+	/* Re-arming a lane first retires any timer left by an earlier run. */
+	KeCancelTimer(&co_vcpu_preempt_timer[vcpu]);
+	KeRemoveQueueDpc(&co_vcpu_preempt_dpc[vcpu]);
+	KeSetTargetProcessorDpc(&co_vcpu_preempt_dpc[vcpu], (CCHAR)host_cpu);
+
+	due.QuadPart = -((long long)period_msec * 10000LL);
+	KeSetTimerEx(&co_vcpu_preempt_timer[vcpu], due, (LONG)period_msec,
+		     &co_vcpu_preempt_dpc[vcpu]);
+}
+
+void co_os_vcpu_preempt_stop(unsigned long vcpu)
+{
+	if (vcpu >= CO_MAX_VCPUS)
+		return;
+
+	KeCancelTimer(&co_vcpu_preempt_timer[vcpu]);
+	KeRemoveQueueDpc(&co_vcpu_preempt_dpc[vcpu]);
 }
 
 bool_t co_os_idle_wait(unsigned long vcpu, unsigned int msecs)

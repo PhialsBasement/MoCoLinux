@@ -2,7 +2,7 @@ Authoritative cumulative snapshot of the cooperative Linux 7.1.5 guest: conet,
 runtime text pokes through the kernel's own poking mm, two-vCPU cooperative
 SMP, and dense pseudo-physical RAM backed by scattered machine frames.
 
-Generated against download/linux-7.1.5.tar.xz on 2026-08-08.
+Generated against download/linux-7.1.5.tar.xz on 2026-08-09.
 
 Over the previous snapshot:
 
@@ -93,6 +93,15 @@ Over the previous snapshot:
     accounting and posted vectors are per-vCPU; the AP is entered through the
     normal x86 startup path and each processor receives its own clock event.
 
+    The two-vCPU runtime is now complete rather than boot-only. Posted vectors
+    have a shared-memory pending bitmap and a host-targeted doorbell; structured
+    spin waits and the final cpu_relax() fallback poll them with per-vCPU
+    throttling and recursion/interrupt-context guards. This closes waits which
+    otherwise deadlocked when a processor needed an IPI to leave the loop it
+    was spinning in. A targeted 100 Hz host deadline guarantees that a busy
+    userspace processor crosses often enough for the cooperative timer entry,
+    which batches all elapsed 1 ms Linux clock events.
+
     Shared completion paths are SMP-safe too. COBD consumers claim completion
     slots atomically so a request cannot be completed twice, while either CPU
     may schedule virtio-gpu completion work without publishing a drain before
@@ -102,7 +111,7 @@ This file is intentionally not listed in series: it preserves the exact live
 guest source while the incremental patch set is still being repaired.
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/cooperative.h b/arch/x86/include/asm/cooperative.h
 --- a/arch/x86/include/asm/cooperative.h	1970-01-01 10:00:00.000000000 +1000
-+++ b/arch/x86/include/asm/cooperative.h	2026-08-08 22:10:08.577214678 +1000
++++ b/arch/x86/include/asm/cooperative.h	2026-08-08 23:30:46.902687100 +1000
 @@ -0,0 +1,125 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _ASM_X86_COOPERATIVE_H
@@ -230,8 +239,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +
 +#endif /* _ASM_X86_COOPERATIVE_H */
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
---- a/arch/x86/include/asm/desc.h	2026-08-08 22:10:08.560934883 +1000
-+++ b/arch/x86/include/asm/desc.h	2026-08-08 22:10:08.577855397 +1000
+--- a/arch/x86/include/asm/desc.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/desc.h	2026-08-08 23:30:46.902687100 +1000
 @@ -205,13 +205,50 @@
  	}
  }
@@ -301,8 +310,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  	fixmap_gdt = get_cpu_gdt_ro(cpu);
  
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
---- a/arch/x86/include/asm/idtentry.h	2026-08-08 22:10:08.562213301 +1000
-+++ b/arch/x86/include/asm/idtentry.h	2026-08-08 22:10:08.578721372 +1000
+--- a/arch/x86/include/asm/idtentry.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/idtentry.h	2026-08-08 23:30:46.902687100 +1000
 @@ -736,6 +736,20 @@
  # endif
  #endif
@@ -325,8 +334,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_VECTOR,		sysvec_kvm_posted_intr_ipi);
  DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_WAKEUP_VECTOR,	sysvec_kvm_posted_intr_wakeup_ipi);
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
---- a/arch/x86/include/asm/io.h	2026-08-08 22:10:08.562427878 +1000
-+++ b/arch/x86/include/asm/io.h	2026-08-08 22:10:08.578721372 +1000
+--- a/arch/x86/include/asm/io.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/io.h	2026-08-08 23:30:46.903687100 +1000
 @@ -44,6 +44,52 @@
  #include <asm/shared/io.h>
  #include <asm/special_insns.h>
@@ -413,8 +422,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  		type *value = (type *)addr;				\
  		while (count) {						\
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/irq_vectors.h b/arch/x86/include/asm/irq_vectors.h
---- a/arch/x86/include/asm/irq_vectors.h	2026-08-08 22:10:08.562427878 +1000
-+++ b/arch/x86/include/asm/irq_vectors.h	2026-08-08 22:10:08.578868464 +1000
+--- a/arch/x86/include/asm/irq_vectors.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/irq_vectors.h	2026-08-08 23:30:46.903687100 +1000
 @@ -105,6 +105,24 @@
   */
  #define POSTED_MSI_NOTIFICATION_VECTOR	0xeb
@@ -441,8 +450,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  
  #ifdef CONFIG_X86_LOCAL_APIC
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
---- a/arch/x86/include/asm/irqflags.h	2026-08-08 22:10:08.562427878 +1000
-+++ b/arch/x86/include/asm/irqflags.h	2026-08-08 22:10:08.578868464 +1000
+--- a/arch/x86/include/asm/irqflags.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/irqflags.h	2026-08-08 23:30:46.903687100 +1000
 @@ -7,11 +7,127 @@
  #ifndef __ASSEMBLER__
  
@@ -689,8 +698,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  	asm volatile("hlt": : :"memory");
  }
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
---- a/arch/x86/include/asm/pgtable.h	2026-08-08 22:10:08.564839577 +1000
-+++ b/arch/x86/include/asm/pgtable.h	2026-08-08 22:10:08.581359858 +1000
+--- a/arch/x86/include/asm/pgtable.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/pgtable.h	2026-08-08 23:30:46.903687100 +1000
 @@ -5,6 +5,7 @@
  #include <linux/mem_encrypt.h>
  #include <asm/page.h>
@@ -737,8 +746,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  #define arch_end_context_switch(prev)	do {} while(0)
  static inline void arch_flush_lazy_mmu_mode(void) {}
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
---- a/arch/x86/include/asm/special_insns.h	2026-08-08 22:10:08.566290392 +1000
-+++ b/arch/x86/include/asm/special_insns.h	2026-08-08 22:10:08.583335404 +1000
+--- a/arch/x86/include/asm/special_insns.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/special_insns.h	2026-08-08 23:30:46.903687100 +1000
 @@ -5,6 +5,7 @@
  #ifdef __KERNEL__
  #include <asm/nops.h>
@@ -802,9 +811,37 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  }
  
  static inline void __write_cr4(unsigned long x)
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/vdso/processor.h b/arch/x86/include/asm/vdso/processor.h
+--- a/arch/x86/include/asm/vdso/processor.h	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/include/asm/vdso/processor.h	2026-08-09 00:45:41.003975500 +1000
+@@ -13,9 +13,24 @@
+ 	asm volatile("pause" ::: "memory");
+ }
+ 
++/*
++ * vDSO and decompressor objects cannot call back into the kernel. Every one of
++ * those builds defines __DISABLE_EXPORTS; the normal kernel build does not.
++ */
++#if defined(__KERNEL__) && !defined(__DISABLE_EXPORTS)
++extern int co_colinux_guest;
++extern unsigned long co_colinux_ipi_any;
++void co_colinux_ipi_relax(void);
++#endif
++
+ static __always_inline void cpu_relax(void)
+ {
+ 	native_pause();
++#if defined(__KERNEL__) && !defined(__DISABLE_EXPORTS)
++	/* The asm memory clobber above makes both shared words reload each spin. */
++	if (co_colinux_guest && co_colinux_ipi_any)
++		co_colinux_ipi_relax();
++#endif
+ }
+ 
+ notrace long __vdso_getcpu(unsigned *cpu, unsigned *node, void *unused);
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
---- a/arch/x86/kernel/alternative.c	2026-08-08 22:10:08.570222766 +1000
-+++ b/arch/x86/kernel/alternative.c	2026-08-08 22:10:08.587223888 +1000
+--- a/arch/x86/kernel/alternative.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/alternative.c	2026-08-08 23:30:46.904687100 +1000
 @@ -6,6 +6,7 @@
  #include <linux/vmalloc.h>
  #include <linux/memory.h>
@@ -841,8 +878,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  	/*
  	 * The patching is not fully atomic, so try to avoid local
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
---- a/arch/x86/kernel/cpu/common.c	2026-08-08 22:10:08.572214482 +1000
-+++ b/arch/x86/kernel/cpu/common.c	2026-08-08 22:10:08.589075337 +1000
+--- a/arch/x86/kernel/cpu/common.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/cpu/common.c	2026-08-08 23:30:46.904687100 +1000
 @@ -6,6 +6,7 @@
  #include <linux/linkage.h>
  #include <linux/bitops.h>
@@ -985,8 +1022,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  	}
  }
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/cpu/mtrr/mtrr.c b/arch/x86/kernel/cpu/mtrr/mtrr.c
---- a/arch/x86/kernel/cpu/mtrr/mtrr.c	2026-08-08 22:10:08.573903124 +1000
-+++ b/arch/x86/kernel/cpu/mtrr/mtrr.c	2026-08-08 22:10:08.591138872 +1000
+--- a/arch/x86/kernel/cpu/mtrr/mtrr.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/cpu/mtrr/mtrr.c	2026-08-08 23:30:46.905687100 +1000
 @@ -42,6 +42,14 @@
  
  #include "mtrr.h"
@@ -1065,8 +1102,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  				mtrr_build_map();
  			} else {
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/cpu/topology.c b/arch/x86/kernel/cpu/topology.c
---- a/arch/x86/kernel/cpu/topology.c	2026-08-08 22:10:08.574663971 +1000
-+++ b/arch/x86/kernel/cpu/topology.c	2026-08-08 22:10:08.592038447 +1000
+--- a/arch/x86/kernel/cpu/topology.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/cpu/topology.c	2026-08-08 23:30:46.905687100 +1000
 @@ -125,7 +125,21 @@
  
  static __init bool check_for_real_bsp(u32 apic_id)
@@ -1127,8 +1164,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  }
  
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/cpu/topology_common.c b/arch/x86/kernel/cpu/topology_common.c
---- a/arch/x86/kernel/cpu/topology_common.c	2026-08-08 22:10:08.574663971 +1000
-+++ b/arch/x86/kernel/cpu/topology_common.c	2026-08-08 22:10:08.592376771 +1000
+--- a/arch/x86/kernel/cpu/topology_common.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/cpu/topology_common.c	2026-08-08 23:30:46.905687100 +1000
 @@ -1,4 +1,5 @@
  // SPDX-License-Identifier: GPL-2.0
 +#include <linux/console.h>	/* co_colinux_guest */
@@ -1188,8 +1225,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  	/* The above is sufficient for UP */
  	if (!IS_ENABLED(CONFIG_SMP))
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
---- a/arch/x86/kernel/early_printk.c	2026-08-08 22:10:08.574663971 +1000
-+++ b/arch/x86/kernel/early_printk.c	2026-08-08 22:10:08.592794414 +1000
+--- a/arch/x86/kernel/early_printk.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/early_printk.c	2026-08-08 23:30:46.905687100 +1000
 @@ -370,6 +370,199 @@
  	.index =	-1,
  };
@@ -1402,8 +1439,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  			buf += 6;
  			early_mmio_serial_init(buf);
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
---- a/arch/x86/kernel/head64.c	2026-08-08 22:10:08.576152286 +1000
-+++ b/arch/x86/kernel/head64.c	2026-08-08 22:10:08.593599081 +1000
+--- a/arch/x86/kernel/head64.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/head64.c	2026-08-08 23:30:46.905687100 +1000
 @@ -19,6 +19,7 @@
  #include <linux/memblock.h>
  #include <linux/cc_platform.h>
@@ -1440,8 +1477,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  		setup_ghcb();
  		handler = vc_boot_ghcb;
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
---- a/arch/x86/kernel/head_64.S	2026-08-08 22:10:08.576152286 +1000
-+++ b/arch/x86/kernel/head_64.S	2026-08-08 22:10:08.593770078 +1000
+--- a/arch/x86/kernel/head_64.S	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/head_64.S	2026-08-08 23:30:46.905687100 +1000
 @@ -195,6 +195,33 @@
  	 */
  	movq	%rax, %cr3
@@ -1541,8 +1578,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  	/* Pass the boot_params pointer as first argument */
  	movq	%r15, %rdi
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
---- a/arch/x86/kernel/idt.c	2026-08-08 22:10:08.576635677 +1000
-+++ b/arch/x86/kernel/idt.c	2026-08-08 22:10:08.593825567 +1000
+--- a/arch/x86/kernel/idt.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/idt.c	2026-08-08 23:30:46.906687000 +1000
 @@ -3,6 +3,7 @@
   * Interrupt descriptor table related code
   */
@@ -1799,9 +1836,9 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
   * idt_setup_early_handler - Initializes the idt table with early handlers
   */
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
---- a/arch/x86/kernel/process.c	2026-08-08 22:10:08.577855397 +1000
-+++ b/arch/x86/kernel/process.c	2026-08-08 22:10:08.595326802 +1000
-@@ -50,10 +50,16 @@
+--- a/arch/x86/kernel/process.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/process.c	2026-08-09 00:45:41.108973700 +1000
+@@ -50,10 +50,17 @@
  #include <asm/proto.h>
  #include <asm/frame.h>
  #include <asm/unwind.h>
@@ -1812,13 +1849,14 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  #include <asm/msr.h>
  #include <asm/shstk.h>
 +#include <linux/console.h>	/* co_colinux_guest */
++#include <linux/irq_work.h>	/* irq_work_run, for the posted IRQ_WORK_VECTOR */
 +#include <linux/clockchips.h>	/* the cooperative tick device */
 +#include <linux/hardirq.h>	/* irq_enter/irq_exit around delivered ticks */
 +#include <asm/irq_regs.h>	/* the register frame the tick handler reads */
  
  #include "process.h"
  
-@@ -773,6 +779,906 @@
+@@ -773,6 +780,1104 @@
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -2048,6 +2086,28 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +	case CALL_FUNCTION_SINGLE_VECTOR:
 +		generic_smp_call_function_single_interrupt();
 +		break;
++	case IRQ_WORK_VECTOR:
++		/*
++		 * Deferred work, and dropping it breaks the console.
++		 *
++		 * This vector is not an SMP thing and it arrives even with one
++		 * processor: arch_irq_work_raise() posts it with
++		 * apic->send_IPI_self(), which the inert apic installed in
++		 * co_colinux_smp_init() routes straight into this processor's
++		 * own pending set. Before that driver existed the core asked
++		 * arch_irq_work_has_interrupt(), got no for a guest with no
++		 * local APIC, and ran irq_work off the tick instead -- so this
++		 * path simply did not exist.
++		 *
++		 * With no case here it fell to the default, which warns once,
++		 * clears the bit and throws the work away. printk uses irq_work
++		 * to flush deferred output, so the visible symptom is a guest
++		 * that runs and says nothing: an installer talking to it over
++		 * the console sees silence and gives up, on a boot with
++		 * cpus: 1, where none of the SMP work is even in the path.
++		 */
++		irq_work_run();
++		break;
 +	case REBOOT_VECTOR:
 +		/*
 +		 * The stop message. Does not return: this processor takes
@@ -2074,6 +2134,69 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +EXPORT_SYMBOL(co_colinux_ipi_pending);
 +
 +/*
++ * Non-zero while this processor is already inside co_colinux_ipi_poll().
++ *
++ * The poll is now reached from every structured busy-wait in the kernel
++ * (smp_cond_load_relaxed, asm-generic/barrier.h), and the handlers it runs spin
++ * on locks of their own -- generic_smp_call_function_single_interrupt() walks a
++ * llist and takes rq->lock by way of sched_ttwu_pending(). Without this the
++ * first such spin re-enters the poll, which dispatches the same queue again.
++ *
++ * A plain array rather than a percpu variable, for the same reason the pending
++ * sets are: this is indexed by co_colinux_vcpu_id() from headers that cannot
++ * reach the percpu machinery, and it is only ever written by the processor it
++ * belongs to, under a virtual local_irq_save.
++ */
++static int co_colinux_ipi_polling[CO_COLINUX_NR_VCPUS];
++
++/*
++ * "Somebody, somewhere, has a vector posted."
++ *
++ * The one word every spinning processor reads (asm-generic/barrier.h), so it
++ * gets a cache line to itself: co_colinux_ipi_pending[] is four rows of 32
++ * bytes and therefore shares lines between vCPUs, which means a post to one
++ * processor invalidates the line another is reading in its spin loop. That
++ * ping-pong is what made the unthrottled hook crawl.
++ *
++ * Set after the bit, cleared only by a drain that has checked every set. Never
++ * zero while a bit is set; may be one when nothing is, which costs a poll that
++ * finds nothing.
++ */
++unsigned long co_colinux_ipi_any ____cacheline_aligned;
++EXPORT_SYMBOL(co_colinux_ipi_any);
++
++/*
++ * The last-resort poll behind cpu_relax().
++ *
++ * Structured waits already poll once per 64 turns. A bare cpu_relax() in an
++ * otherwise private subsystem does not, and one such wait is enough to strand
++ * a CALL_FUNCTION vector forever. Keep the universal hook cheap: cpu_relax()
++ * calls here only while some vector is posted, and this function performs the
++ * real poll only once per 64 calls on this vCPU. Each row owns a cache line so
++ * two spinning processors do not turn the throttle itself into contention.
++ */
++static unsigned int co_colinux_ipi_relax_spins[CO_COLINUX_NR_VCPUS][16]
++	____cacheline_aligned;
++
++void co_colinux_ipi_relax(void)
++{
++	unsigned int cpu;
++
++	if (!co_colinux_guest || !READ_ONCE(co_colinux_ipi_any) ||
++	    in_nmi() || in_hardirq() || irqs_disabled())
++		return;
++
++	cpu = co_colinux_vcpu_id();
++	if (cpu >= CO_COLINUX_NR_VCPUS || READ_ONCE(co_colinux_ipi_polling[cpu]))
++		return;
++
++	if (co_colinux_ipi_relax_spins[cpu][0]++ & 63)
++		return;
++
++	co_colinux_ipi_poll();
++}
++
++/*
 + * Post a vector to another processor and ring its doorbell.
 + *
 + * Two halves, and both are needed. The bit is the message: it survives
@@ -2095,6 +2218,11 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +
 +	set_bit(vector, co_colinux_ipi_pending[cpu]);
 +	smp_mb__after_atomic();
++	/*
++	 * After the bit, so a spinner that sees this is guaranteed to find the
++	 * bit. See co_colinux_spin_poll() in asm-generic/barrier.h.
++	 */
++	WRITE_ONCE(co_colinux_ipi_any, 1);
 +
 +	preempt_disable();
 +	pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
@@ -2121,8 +2249,31 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +
 +	for (;;) {
 +		vector = find_first_bit(set, 256);
-+		if (vector >= 256)
++		if (vector >= 256) {
++			/*
++			 * This processor is empty; retire the machine-wide
++			 * summary only if every other one is too.
++			 *
++			 * Cleared before the re-scan, so a post that lands
++			 * during the scan either sets it again afterwards or is
++			 * seen by the scan. Getting it wrong in this direction
++			 * -- leaving it one -- costs a poll that finds nothing;
++			 * getting it wrong the other way would lose a
++			 * cross-call, so the clear is never done blind.
++			 */
++			int v;
++
++			WRITE_ONCE(co_colinux_ipi_any, 0);
++			smp_mb();
++
++			for (v = 0; v < CO_COLINUX_NR_VCPUS; v++)
++				if (find_first_bit(co_colinux_ipi_pending[v],
++						   256) < 256) {
++					WRITE_ONCE(co_colinux_ipi_any, 1);
++					break;
++				}
 +			return;
++		}
 +		clear_bit(vector, set);
 +		co_colinux_ipi_dispatch(vector);
 +	}
@@ -2155,8 +2306,76 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +{
 +	unsigned long flags;
 +
++	/*
++	 * NOT gated on irqs_disabled(), and that is the whole point of this
++	 * function.
++	 *
++	 * irqs_disabled() here is the VIRTUAL flag: native_save_fl()
++	 * substitutes co_colinux_virtual_if[co_colinux_vcpu_id()] for
++	 * X86_EFLAGS_IF (asm/irqflags.h), so every processor inside a
++	 * spin_lock_irqsave() section reads as disabled. Returning early for
++	 * those is what deadlocks two processors:
++	 *
++	 *   CPU A calls on_each_cpu() -- flush_tlb_kernel_range, text_poke,
++	 *   any of them -- and spins in csd_lock_wait() waiting for B.
++	 *   CPU B is inside spin_lock_irqsave(), so its virtual IF is clear,
++	 *   so its poll returned here without dispatching A's request. B is
++	 *   waiting on something A must finish. Neither yields, and neither
++	 *   receives a tick, because ticks arrive only at cooperative
++	 *   boundaries and a spinner reaches none -- which is also why no
++	 *   hung-task warning and no RCU stall ever fires to name it. Both
++	 *   host threads burn 100% for ever.
++	 *
++	 * Hardware does not behave this way, and smp_call_function is built on
++	 * that: cli DELAYS an IPI, it does not cancel it, so a processor with
++	 * interrupts off still takes the cross-call. Declining to poll turns a
++	 * delay into a cancellation, and this port's "interrupt" is this poll.
++	 *
++	 * Running the handlers with the virtual IF clear is exactly what
++	 * hardware would have done at the same instruction, and the vectors
++	 * involved are the ones a hardware IPI runs there anyway --
++	 * flush_tlb_func on the TLB path. What must not follow is irq_exit()'s
++	 * softirq pass, and it does not: the bracket below is deliberately raw.
++	 *
++	 * local_irq_save() below still makes the drain atomic against a real
++	 * interrupt arriving on this processor mid-dispatch.
++	 */
 +	if (!co_colinux_guest || irqs_disabled())
 +		return;
++
++	/*
++	 * The virtual-IF gate is BACK, and removing it was the wrong half of
++	 * the fix.
++	 *
++	 * The reasoning that removed it was that a spinner with the virtual IF
++	 * clear can never service a peer, so gating on it deadlocks. That is
++	 * true and it is not the whole picture: dispatching with the flag clear
++	 * runs the handlers in regions where hardware STRUCTURALLY cannot run
++	 * them, and some of those regions hold the very locks the handlers take.
++	 *
++	 * sched_ttwu_pending() -- reached from
++	 * generic_smp_call_function_single_interrupt() through the call-function
++	 * queue -- does rq_lock_irqsave() (kernel/sched/core.c:3802). So every
++	 * holder of rq->lock holds it with interrupts disabled, which on real
++	 * hardware is exactly why the CALL_FUNCTION gate cannot fire inside that
++	 * region: an interrupt gate never fires while IF is clear. Dispatch
++	 * there anyway and a processor that holds rq->lock and then spins takes
++	 * rq->lock again from inside its own spin. That is a self-deadlock on a
++	 * non-recursive spinlock: one processor pinned at 100%, and the peer
++	 * pinned behind the rq->lock it will never release.
++	 *
++	 * It is also why widening the poll made things worse rather than better
++	 * -- more spin sites meant more chances to dispatch inside an
++	 * interrupts-disabled critical section, and the freeze went from minutes
++	 * to instant.
++	 *
++	 * What the widening DID fix stays fixed: the poll now runs at every
++	 * structured busy-wait (asm-generic/barrier.h) rather than only in
++	 * csd_lock_wait(), so a processor spinning with interrupts ENABLED --
++	 * which is precisely where hardware would have delivered the IPI -- now
++	 * services its peer wherever it spins. That was the real gap. The gate
++	 * only declines the case hardware declines too.
++	 */
 +
 +	/*
 +	 * Posted vectors ONLY. Not time, and not the device rings.
@@ -2177,7 +2396,21 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +	 * and takes ticks at its own idle boundary.
 +	 */
 +	local_irq_save(flags);
-+	if (find_first_bit(co_colinux_ipi_pending[co_colinux_vcpu_id()], 256) < 256) {
++	if (!co_colinux_ipi_polling[co_colinux_vcpu_id()] &&
++	    find_first_bit(co_colinux_ipi_pending[co_colinux_vcpu_id()], 256) < 256) {
++		/*
++		 * Claim this processor before dispatching, because the handlers
++		 * spin and every spin is now a poll.
++		 *
++		 * generic_smp_call_function_single_interrupt() walks a llist and
++		 * reaches rq->lock through sched_ttwu_pending(); the moment that
++		 * contends, queued_spin_lock_slowpath() spins, the spin calls
++		 * back into here, and the same queue is dispatched a second time
++		 * underneath the first. Set before, cleared after, read under the
++		 * same virtual local_irq_save -- one processor, one writer, no
++		 * atomic needed.
++		 */
++		co_colinux_ipi_polling[co_colinux_vcpu_id()] = 1;
 +		/*
 +		 * The raw hardirq bracket, NOT irq_enter()/irq_exit().
 +		 *
@@ -2228,6 +2461,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +		preempt_count_sub(HARDIRQ_OFFSET);
 +		ct_irq_exit();
 +		lockdep_hardirq_exit();
++
++		co_colinux_ipi_polling[co_colinux_vcpu_id()] = 0;
 +	}
 +	local_irq_restore(flags);
 +}
@@ -2462,6 +2697,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +{
 +	return false;
 +}
++
 +DEFINE_IDTENTRY_SYSVEC(sysvec_co_timer)
 +{
 +	struct pt_regs *old = set_irq_regs(regs);
@@ -2725,7 +2961,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +1842,18 @@
+@@ -936,6 +2041,18 @@
  
  void __init select_idle_routine(void)
  {
@@ -2745,8 +2981,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  		if (IS_ENABLED(CONFIG_SMP) && __max_threads_per_core > 1)
  			pr_warn_once("WARNING: polling idle and HT enabled, performance may degrade\n");
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
---- a/arch/x86/kernel/reboot.c	2026-08-08 22:10:08.578238980 +1000
-+++ b/arch/x86/kernel/reboot.c	2026-08-08 22:10:08.595856343 +1000
+--- a/arch/x86/kernel/reboot.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/reboot.c	2026-08-08 23:30:46.907687000 +1000
 @@ -1,6 +1,7 @@
  // SPDX-License-Identifier: GPL-2.0
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -2829,8 +3065,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  		if (!reboot_force)
  			machine_shutdown();
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
---- a/arch/x86/kernel/setup.c	2026-08-08 22:10:08.578238980 +1000
-+++ b/arch/x86/kernel/setup.c	2026-08-08 22:10:08.596108058 +1000
+--- a/arch/x86/kernel/setup.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/setup.c	2026-08-08 23:30:46.907687000 +1000
 @@ -55,6 +55,7 @@
  #include <asm/proto.h>
  #include <asm/realmode.h>
@@ -2985,8 +3221,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  	if (mtrr_trim_uncached_memory(max_pfn))
  		max_pfn = e820__end_of_ram_pfn();
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
---- a/arch/x86/kernel/smpboot.c	2026-08-08 22:10:08.578721372 +1000
-+++ b/arch/x86/kernel/smpboot.c	2026-08-08 22:10:08.596452313 +1000
+--- a/arch/x86/kernel/smpboot.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/smpboot.c	2026-08-08 23:30:46.907687000 +1000
 @@ -40,6 +40,8 @@
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
  
@@ -3858,8 +4094,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  {
  	unsigned int cpu, node;
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
---- a/arch/x86/kernel/traps.c	2026-08-08 22:10:08.578721372 +1000
-+++ b/arch/x86/kernel/traps.c	2026-08-08 22:10:08.596452313 +1000
+--- a/arch/x86/kernel/traps.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/kernel/traps.c	2026-08-08 23:30:46.907687000 +1000
 @@ -404,6 +404,21 @@
  	bool handled = false;
  	int ud_type, ud_len;
@@ -3908,8 +4144,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
 +		co_colinux_adopt_traps();
  }
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
---- a/arch/x86/mm/init_64.c	2026-08-08 22:10:08.589075337 +1000
-+++ b/arch/x86/mm/init_64.c	2026-08-08 22:10:08.605867992 +1000
+--- a/arch/x86/mm/init_64.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/mm/init_64.c	2026-08-08 23:30:46.908687000 +1000
 @@ -55,6 +55,7 @@
  #include <asm/uv/uv.h>
  #include <asm/setup.h>
@@ -3939,8 +4175,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  	else if (boot_cpu_has(X86_FEATURE_PSE))
  		err = vmemmap_populate_hugepages(start, end, node, altmap);
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
---- a/arch/x86/mm/ioremap.c	2026-08-08 22:10:08.589075337 +1000
-+++ b/arch/x86/mm/ioremap.c	2026-08-08 22:10:08.605867992 +1000
+--- a/arch/x86/mm/ioremap.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/mm/ioremap.c	2026-08-08 23:30:46.908687000 +1000
 @@ -31,6 +31,8 @@
  
  #include "physaddr.h"
@@ -3970,8 +4206,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  	last_addr = phys_addr + size - 1;
  	if (!size || last_addr < phys_addr)
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/mm/pat/memtype.c b/arch/x86/mm/pat/memtype.c
---- a/arch/x86/mm/pat/memtype.c	2026-08-08 22:10:08.590016951 +1000
-+++ b/arch/x86/mm/pat/memtype.c	2026-08-08 22:10:08.607837000 +1000
+--- a/arch/x86/mm/pat/memtype.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/mm/pat/memtype.c	2026-08-08 23:30:46.908687000 +1000
 @@ -225,6 +225,10 @@
  
  void pat_cpu_init(void)
@@ -4000,8 +4236,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  		pr_info_once("x86/PAT: PAT support disabled because CONFIG_X86_PAT is disabled in the kernel.\n");
  
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/pci/init.c b/arch/x86/pci/init.c
---- a/arch/x86/pci/init.c	2026-08-08 22:10:08.591138872 +1000
-+++ b/arch/x86/pci/init.c	2026-08-08 22:10:08.609081189 +1000
+--- a/arch/x86/pci/init.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/pci/init.c	2026-08-08 23:30:46.908687000 +1000
 @@ -5,12 +5,24 @@
  #include <asm/x86_init.h>
  #include <asm/irqdomain.h>
@@ -4028,8 +4264,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  
  	if (!(pci_probe & PCI_PROBE_NOEARLY))
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/pci/legacy.c b/arch/x86/pci/legacy.c
---- a/arch/x86/pci/legacy.c	2026-08-08 22:10:08.591575825 +1000
-+++ b/arch/x86/pci/legacy.c	2026-08-08 22:10:08.609081189 +1000
+--- a/arch/x86/pci/legacy.c	2026-07-25 00:21:27.000000000 +1000
++++ b/arch/x86/pci/legacy.c	2026-08-08 23:30:46.909687000 +1000
 @@ -8,6 +8,8 @@
  #include <asm/jailhouse_para.h>
  #include <asm/pci_x86.h>
@@ -4050,8 +4286,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ar
  	 * The init function returns an non zero value when
  	 * pci_legacy_init should be invoked.
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/block/Makefile b/drivers/block/Makefile
---- a/drivers/block/Makefile	2026-08-08 22:10:08.668846589 +1000
-+++ b/drivers/block/Makefile	2026-08-08 22:10:08.687054571 +1000
+--- a/drivers/block/Makefile	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/block/Makefile	2026-08-08 23:30:46.909687000 +1000
 @@ -20,6 +20,9 @@
  obj-$(CONFIG_N64CART)		+= n64cart.o
  obj-$(CONFIG_BLK_DEV_RAM)	+= brd.o
@@ -4064,7 +4300,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
  obj-$(CONFIG_BLK_DEV_NBD)	+= nbd.o
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/block/cobd.c b/drivers/block/cobd.c
 --- a/drivers/block/cobd.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/block/cobd.c	2026-08-08 22:10:08.687220569 +1000
++++ b/drivers/block/cobd.c	2026-08-08 23:30:46.909687000 +1000
 @@ -0,0 +1,656 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
@@ -4723,8 +4959,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 + */
 +device_initcall(cobd_init);
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/net/Makefile b/drivers/net/Makefile
---- a/drivers/net/Makefile	2026-08-08 22:10:09.801803353 +1000
-+++ b/drivers/net/Makefile	2026-08-08 22:10:09.844444092 +1000
+--- a/drivers/net/Makefile	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/net/Makefile	2026-08-08 23:30:46.909687000 +1000
 @@ -21,6 +21,9 @@
  obj-$(CONFIG_MII) += mii.o
  obj-$(CONFIG_MDIO) += mdio.o
@@ -4737,7 +4973,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
  obj-$(CONFIG_NETKIT) += netkit.o
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/net/conet_colinux.c b/drivers/net/conet_colinux.c
 --- a/drivers/net/conet_colinux.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/net/conet_colinux.c	2026-08-08 22:10:09.852925659 +1000
++++ b/drivers/net/conet_colinux.c	2026-08-08 23:30:46.910687000 +1000
 @@ -0,0 +1,289 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
@@ -5029,8 +5265,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +}
 +device_initcall(co_net_init);
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/tty/hvc/Makefile b/drivers/tty/hvc/Makefile
---- a/drivers/tty/hvc/Makefile	2026-08-08 22:10:10.403149920 +1000
-+++ b/drivers/tty/hvc/Makefile	2026-08-08 22:10:10.454865106 +1000
+--- a/drivers/tty/hvc/Makefile	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/tty/hvc/Makefile	2026-08-08 23:30:46.910687000 +1000
 @@ -5,6 +5,7 @@
  obj-$(CONFIG_HVC_RTAS)		+= hvc_rtas.o
  obj-$(CONFIG_HVC_DCC)		+= hvc_dcc.o
@@ -5041,7 +5277,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
  obj-$(CONFIG_HVC_IUCV)		+= hvc_iucv.o
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/tty/hvc/hvc_colinux.c b/drivers/tty/hvc/hvc_colinux.c
 --- a/drivers/tty/hvc/hvc_colinux.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/tty/hvc/hvc_colinux.c	2026-08-08 22:10:10.454865106 +1000
++++ b/drivers/tty/hvc/hvc_colinux.c	2026-08-08 23:30:46.910687000 +1000
 @@ -0,0 +1,176 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
@@ -5220,8 +5456,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +}
 +device_initcall(hvc_co_init);
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
---- a/drivers/virtio/Kconfig	2026-08-08 22:10:10.486714598 +1000
-+++ b/drivers/virtio/Kconfig	2026-08-08 22:10:10.540845713 +1000
+--- a/drivers/virtio/Kconfig	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/virtio/Kconfig	2026-08-08 23:30:46.910687000 +1000
 @@ -150,6 +150,17 @@
  
  	 If unsure, say M.
@@ -5241,8 +5477,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
  	tristate "Platform bus driver for memory mapped virtio devices"
  	depends on HAS_IOMEM && HAS_DMA
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/virtio/Makefile b/drivers/virtio/Makefile
---- a/drivers/virtio/Makefile	2026-08-08 22:10:10.487067132 +1000
-+++ b/drivers/virtio/Makefile	2026-08-08 22:10:10.541120388 +1000
+--- a/drivers/virtio/Makefile	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/virtio/Makefile	2026-08-08 23:30:46.910687000 +1000
 @@ -4,6 +4,7 @@
  obj-$(CONFIG_VIRTIO_PCI_LIB) += virtio_pci_modern_dev.o
  obj-$(CONFIG_VIRTIO_PCI_LIB_LEGACY) += virtio_pci_legacy_dev.o
@@ -5253,7 +5489,7 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
  virtio_pci-$(CONFIG_VIRTIO_PCI_LEGACY) += virtio_pci_legacy.o
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/virtio/virtio_colinux.c b/drivers/virtio/virtio_colinux.c
 --- a/drivers/virtio/virtio_colinux.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/virtio/virtio_colinux.c	2026-08-08 22:10:10.541120388 +1000
++++ b/drivers/virtio/virtio_colinux.c	2026-08-08 23:30:46.910687000 +1000
 @@ -0,0 +1,581 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
@@ -5836,9 +6072,100 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/dr
 +	BUILD_BUG_ON(offsetof(struct co_vgpu_io, reaped)	 != 108);
 +	BUILD_BUG_ON(sizeof(struct co_vgpu_io)			 != 120);
 +}
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/include/asm-generic/barrier.h b/include/asm-generic/barrier.h
+--- a/include/asm-generic/barrier.h	2026-07-25 00:21:27.000000000 +1000
++++ b/include/asm-generic/barrier.h	2026-08-08 23:35:26.659842000 +1000
+@@ -242,15 +242,87 @@
+  * Due to C lacking lambda expressions we load the value of *ptr into a
+  * pre-named variable @VAL to be used in @cond.
+  */
++/*
++ * A cooperative guest has no interrupts, so every busy-wait must poll.
++ *
++ * On real hardware a processor spinning here is preempted by the incoming
++ * CALL_FUNCTION IPI and runs the peer's request. This guest takes no
++ * asynchronous entry at all: its "interrupts" are polls at hand-placed call
++ * sites, and a spin that has no such site never services anything. That is a
++ * complete deadlock cycle and it is not hypothetical --
++ *
++ *   A holds lock L, calls on_each_cpu() (a TLB shootdown, a text_poke) and
++ *   waits in csd_lock_wait(), which does poll.
++ *   B waits for L in queued_spin_lock_slowpath(), which did not.
++ *   A waits for B's acknowledgement; B waits for A's lock. Neither reaches a
++ *   cooperative boundary, so neither receives a tick either, and no watchdog
++ *   fires because every watchdog is timer-driven.
++ *
++ * cpu_relax() is the marker Linux uses for "I am spinning", and would be the
++ * obvious hook, but it cannot be one: cpu_relax() lives in
++ * asm/vdso/processor.h and vdso_read_begin() (include/vdso/helpers.h) spins on
++ * it in the vDSO, which is userspace and cannot reference a kernel symbol.
++ *
++ * So the hook goes one level down, here. This macro is kernel-only and it is
++ * where the structured busy-waits actually spin: atomic_cond_read_relaxed,
++ * atomic_cond_read_acquire and smp_cond_load_acquire are all built on it, which
++ * covers four of the five spins in queued_spin_lock_slowpath() (the fifth is a
++ * bare cpu_relax() and is hooked at its own site) as well as csd_lock_wait()'s
++ * native form and every other smp_cond_load_*() wait in the tree.
++ *
++ * The guard is one load of a variable that is false on any non-cooperative
++ * build, so the fast path is a predictable not-taken branch; the pending-set
++ * test lives inside co_colinux_ipi_poll(), which does nothing and returns when
++ * this processor has no posted vectors.
++ */
++#ifndef __ASSEMBLY__
++extern int co_colinux_guest;
++extern unsigned long co_colinux_ipi_any;
++void co_colinux_ipi_poll(void);
++
++/*
++ * TWO plain loads of words that are almost always unchanged, and only once
++ * every 64 spins.
++ *
++ * The first version of this hook called co_colinux_ipi_poll() on every
++ * iteration and the machine crawled. The cost was not the call: the first thing
++ * the poll did was local_irq_save(), which in this guest is a WRITE to
++ * co_colinux_virtual_if[], followed by find_first_bit() over four words of
++ * co_colinux_ipi_pending[] -- a line the PEER writes when it posts. A write and
++ * a shared-line read in the innermost loop of every contended spinlock is a
++ * cacheline ping-pong for the whole duration of every lock wait.
++ *
++ * So nothing is touched until co_colinux_ipi_any says there is something to
++ * find. It is one word on a line of its own, written only when a vector is
++ * posted and when a drain empties every set -- both rare -- so a spinning
++ * processor reads it from L1 with the line unmodified.
++ *
++ * Machine-wide rather than per-vCPU on purpose: it keeps the fast path free of
++ * co_colinux_vcpu_id(), which is a GS-relative read and a header dependency
++ * this file cannot take. The imprecision costs a processor an occasional slow
++ * path for a vector posted to a DIFFERENT processor, which finds nothing of its
++ * own and returns. It is never falsely zero while a bit is set, and that is the
++ * only direction that matters.
++ */
++#define co_colinux_spin_poll()						\
++	do {								\
++		if (co_colinux_guest && READ_ONCE(co_colinux_ipi_any))	\
++			co_colinux_ipi_poll();				\
++	} while (0)
++#endif
++
+ #ifndef smp_cond_load_relaxed
+ #define smp_cond_load_relaxed(ptr, cond_expr) ({		\
+ 	typeof(ptr) __PTR = (ptr);				\
+ 	__unqual_scalar_typeof(*ptr) VAL;			\
++	unsigned int __co_spins = 0;				\
+ 	for (;;) {						\
+ 		VAL = READ_ONCE(*__PTR);			\
+ 		if (cond_expr)					\
+ 			break;					\
+ 		cpu_relax();					\
++		if (!(++__co_spins & 63))			\
++			co_colinux_spin_poll();			\
+ 	}							\
+ 	(typeof(*ptr))VAL;					\
+ })
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/include/linux/console.h b/include/linux/console.h
---- a/include/linux/console.h	2026-08-08 22:10:10.665003675 +1000
-+++ b/include/linux/console.h	2026-08-08 22:10:10.717363770 +1000
+--- a/include/linux/console.h	2026-07-25 00:21:27.000000000 +1000
++++ b/include/linux/console.h	2026-08-08 23:30:46.911687000 +1000
 @@ -741,4 +741,50 @@
  void dummycon_register_output_notifier(struct notifier_block *nb);
  void dummycon_unregister_output_notifier(struct notifier_block *nb);
@@ -5891,8 +6218,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/in
 +
  #endif /* _LINUX_CONSOLE_H */
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
---- a/include/linux/irq-entry-common.h	2026-08-08 22:10:10.681946829 +1000
-+++ b/include/linux/irq-entry-common.h	2026-08-08 22:10:10.734417582 +1000
+--- a/include/linux/irq-entry-common.h	2026-07-25 00:21:27.000000000 +1000
++++ b/include/linux/irq-entry-common.h	2026-08-08 23:30:46.911687000 +1000
 @@ -194,10 +194,64 @@
  static __always_inline void __exit_to_user_mode_prepare(struct pt_regs *regs,
  							const unsigned long work_mask)
@@ -6016,8 +6343,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/in
  #endif
  
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/kernel/entry/common.c b/kernel/entry/common.c
---- a/kernel/entry/common.c	2026-08-08 22:10:10.816679532 +1000
-+++ b/kernel/entry/common.c	2026-08-08 22:10:10.871083922 +1000
+--- a/kernel/entry/common.c	2026-07-25 00:21:27.000000000 +1000
++++ b/kernel/entry/common.c	2026-08-08 23:30:46.911687000 +1000
 @@ -103,18 +103,79 @@
  	}
  }
@@ -6134,9 +6461,36 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ke
  }
  
  irqentry_state_t noinstr irqentry_nmi_enter(struct pt_regs *regs)
+diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/kernel/locking/qspinlock.c b/kernel/locking/qspinlock.c
+--- a/kernel/locking/qspinlock.c	2026-07-25 00:21:27.000000000 +1000
++++ b/kernel/locking/qspinlock.c	2026-08-08 23:35:26.810839400 +1000
+@@ -228,9 +228,22 @@
+ 	 * simple enough.
+ 	 */
+ 	if (unlikely(idx >= _Q_MAX_NODES)) {
++		unsigned int __co_spins = 0;
++
+ 		lockevent_inc(lock_no_node);
+-		while (!queued_spin_trylock(lock))
++		while (!queued_spin_trylock(lock)) {
+ 			cpu_relax();
++			/*
++			 * The one spin in this function that is not built on
++			 * smp_cond_load_relaxed(), so it needs the cooperative
++			 * poll spelled out. A guest processor spinning here
++			 * with no way to service a peer's cross-call is half of
++			 * a deadlock -- see the comment on smp_cond_load_relaxed
++			 * in asm-generic/barrier.h.
++			 */
++			if (!(++__co_spins & 63))
++				co_colinux_spin_poll();
++		}
+ 		goto release;
+ 	}
+ 
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/kernel/smp.c b/kernel/smp.c
---- a/kernel/smp.c	2026-08-08 22:10:10.833446868 +1000
-+++ b/kernel/smp.c	2026-08-08 22:10:10.886828103 +1000
+--- a/kernel/smp.c	2026-07-25 00:21:27.000000000 +1000
++++ b/kernel/smp.c	2026-08-08 23:30:46.911687000 +1000
 @@ -348,6 +348,29 @@
  
  static __always_inline void csd_lock_wait(call_single_data_t *csd)
@@ -6168,8 +6522,8 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ke
  }
  #endif
 diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/kernel/trace/trace.c b/kernel/trace/trace.c
---- a/kernel/trace/trace.c	2026-08-08 22:10:10.840170475 +1000
-+++ b/kernel/trace/trace.c	2026-08-08 22:10:10.894248641 +1000
+--- a/kernel/trace/trace.c	2026-07-25 00:21:27.000000000 +1000
++++ b/kernel/trace/trace.c	2026-08-08 23:30:46.912686900 +1000
 @@ -15,6 +15,7 @@
  #include <linux/ring_buffer.h>
  #include <linux/utsname.h>
@@ -6202,366 +6556,3 @@ diff -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/ke
  	len = __stop_ftrace_eval_maps - __start_ftrace_eval_maps;
  	trace_event_update_with_eval_map(NULL, __start_ftrace_eval_maps, len);
  }
-diff -urN a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
---- a/arch/x86/kernel/process.c
-+++ b/arch/x86/kernel/process.c
-@@ -57,6 +57,7 @@
- #include <asm/msr.h>
- #include <asm/shstk.h>
- #include <linux/console.h>	/* co_colinux_guest */
-+#include <linux/irq_work.h>	/* irq_work_run, for the posted IRQ_WORK_VECTOR */
- #include <linux/clockchips.h>	/* the cooperative tick device */
- #include <linux/hardirq.h>	/* irq_enter/irq_exit around delivered ticks */
- #include <asm/irq_regs.h>	/* the register frame the tick handler reads */
-@@ -1005,6 +1006,28 @@
- 	case CALL_FUNCTION_SINGLE_VECTOR:
- 		generic_smp_call_function_single_interrupt();
- 		break;
-+	case IRQ_WORK_VECTOR:
-+		/*
-+		 * Deferred work, and dropping it breaks the console.
-+		 *
-+		 * This vector is not an SMP thing and it arrives even with one
-+		 * processor: arch_irq_work_raise() posts it with
-+		 * apic->send_IPI_self(), which the inert apic installed in
-+		 * co_colinux_smp_init() routes straight into this processor's
-+		 * own pending set. Before that driver existed the core asked
-+		 * arch_irq_work_has_interrupt(), got no for a guest with no
-+		 * local APIC, and ran irq_work off the tick instead -- so this
-+		 * path simply did not exist.
-+		 *
-+		 * With no case here it fell to the default, which warns once,
-+		 * clears the bit and throws the work away. printk uses irq_work
-+		 * to flush deferred output, so the visible symptom is a guest
-+		 * that runs and says nothing: an installer talking to it over
-+		 * the console sees silence and gives up, on a boot with
-+		 * cpus: 1, where none of the SMP work is even in the path.
-+		 */
-+		irq_work_run();
-+		break;
- 	case REBOOT_VECTOR:
- 		/*
- 		 * The stop message. Does not return: this processor takes
-@@ -1031,6 +1054,38 @@
- EXPORT_SYMBOL(co_colinux_ipi_pending);
- 
- /*
-+ * Non-zero while this processor is already inside co_colinux_ipi_poll().
-+ *
-+ * The poll is now reached from every structured busy-wait in the kernel
-+ * (smp_cond_load_relaxed, asm-generic/barrier.h), and the handlers it runs spin
-+ * on locks of their own -- generic_smp_call_function_single_interrupt() walks a
-+ * llist and takes rq->lock by way of sched_ttwu_pending(). Without this the
-+ * first such spin re-enters the poll, which dispatches the same queue again.
-+ *
-+ * A plain array rather than a percpu variable, for the same reason the pending
-+ * sets are: this is indexed by co_colinux_vcpu_id() from headers that cannot
-+ * reach the percpu machinery, and it is only ever written by the processor it
-+ * belongs to, under a virtual local_irq_save.
-+ */
-+static int co_colinux_ipi_polling[CO_COLINUX_NR_VCPUS];
-+
-+/*
-+ * "Somebody, somewhere, has a vector posted."
-+ *
-+ * The one word every spinning processor reads (asm-generic/barrier.h), so it
-+ * gets a cache line to itself: co_colinux_ipi_pending[] is four rows of 32
-+ * bytes and therefore shares lines between vCPUs, which means a post to one
-+ * processor invalidates the line another is reading in its spin loop. That
-+ * ping-pong is what made the unthrottled hook crawl.
-+ *
-+ * Set after the bit, cleared only by a drain that has checked every set. Never
-+ * zero while a bit is set; may be one when nothing is, which costs a poll that
-+ * finds nothing.
-+ */
-+unsigned long co_colinux_ipi_any ____cacheline_aligned;
-+EXPORT_SYMBOL(co_colinux_ipi_any);
-+
-+/*
-  * Post a vector to another processor and ring its doorbell.
-  *
-  * Two halves, and both are needed. The bit is the message: it survives
-@@ -1052,6 +1107,11 @@
- 
- 	set_bit(vector, co_colinux_ipi_pending[cpu]);
- 	smp_mb__after_atomic();
-+	/*
-+	 * After the bit, so a spinner that sees this is guaranteed to find the
-+	 * bit. See co_colinux_spin_poll() in asm-generic/barrier.h.
-+	 */
-+	WRITE_ONCE(co_colinux_ipi_any, 1);
- 
- 	preempt_disable();
- 	pp = (unsigned char *)co_colinux_passage_page[co_colinux_vcpu_id()];
-@@ -1078,8 +1138,31 @@
- 
- 	for (;;) {
- 		vector = find_first_bit(set, 256);
--		if (vector >= 256)
-+		if (vector >= 256) {
-+			/*
-+			 * This processor is empty; retire the machine-wide
-+			 * summary only if every other one is too.
-+			 *
-+			 * Cleared before the re-scan, so a post that lands
-+			 * during the scan either sets it again afterwards or is
-+			 * seen by the scan. Getting it wrong in this direction
-+			 * -- leaving it one -- costs a poll that finds nothing;
-+			 * getting it wrong the other way would lose a
-+			 * cross-call, so the clear is never done blind.
-+			 */
-+			int v;
-+
-+			WRITE_ONCE(co_colinux_ipi_any, 0);
-+			smp_mb();
-+
-+			for (v = 0; v < CO_COLINUX_NR_VCPUS; v++)
-+				if (find_first_bit(co_colinux_ipi_pending[v],
-+						   256) < 256) {
-+					WRITE_ONCE(co_colinux_ipi_any, 1);
-+					break;
-+				}
- 			return;
-+		}
- 		clear_bit(vector, set);
- 		co_colinux_ipi_dispatch(vector);
- 	}
-@@ -1112,10 +1195,78 @@
- {
- 	unsigned long flags;
- 
-+	/*
-+	 * NOT gated on irqs_disabled(), and that is the whole point of this
-+	 * function.
-+	 *
-+	 * irqs_disabled() here is the VIRTUAL flag: native_save_fl()
-+	 * substitutes co_colinux_virtual_if[co_colinux_vcpu_id()] for
-+	 * X86_EFLAGS_IF (asm/irqflags.h), so every processor inside a
-+	 * spin_lock_irqsave() section reads as disabled. Returning early for
-+	 * those is what deadlocks two processors:
-+	 *
-+	 *   CPU A calls on_each_cpu() -- flush_tlb_kernel_range, text_poke,
-+	 *   any of them -- and spins in csd_lock_wait() waiting for B.
-+	 *   CPU B is inside spin_lock_irqsave(), so its virtual IF is clear,
-+	 *   so its poll returned here without dispatching A's request. B is
-+	 *   waiting on something A must finish. Neither yields, and neither
-+	 *   receives a tick, because ticks arrive only at cooperative
-+	 *   boundaries and a spinner reaches none -- which is also why no
-+	 *   hung-task warning and no RCU stall ever fires to name it. Both
-+	 *   host threads burn 100% for ever.
-+	 *
-+	 * Hardware does not behave this way, and smp_call_function is built on
-+	 * that: cli DELAYS an IPI, it does not cancel it, so a processor with
-+	 * interrupts off still takes the cross-call. Declining to poll turns a
-+	 * delay into a cancellation, and this port's "interrupt" is this poll.
-+	 *
-+	 * Running the handlers with the virtual IF clear is exactly what
-+	 * hardware would have done at the same instruction, and the vectors
-+	 * involved are the ones a hardware IPI runs there anyway --
-+	 * flush_tlb_func on the TLB path. What must not follow is irq_exit()'s
-+	 * softirq pass, and it does not: the bracket below is deliberately raw.
-+	 *
-+	 * local_irq_save() below still makes the drain atomic against a real
-+	 * interrupt arriving on this processor mid-dispatch.
-+	 */
- 	if (!co_colinux_guest || irqs_disabled())
- 		return;
- 
- 	/*
-+	 * The virtual-IF gate is BACK, and removing it was the wrong half of
-+	 * the fix.
-+	 *
-+	 * The reasoning that removed it was that a spinner with the virtual IF
-+	 * clear can never service a peer, so gating on it deadlocks. That is
-+	 * true and it is not the whole picture: dispatching with the flag clear
-+	 * runs the handlers in regions where hardware STRUCTURALLY cannot run
-+	 * them, and some of those regions hold the very locks the handlers take.
-+	 *
-+	 * sched_ttwu_pending() -- reached from
-+	 * generic_smp_call_function_single_interrupt() through the call-function
-+	 * queue -- does rq_lock_irqsave() (kernel/sched/core.c:3802). So every
-+	 * holder of rq->lock holds it with interrupts disabled, which on real
-+	 * hardware is exactly why the CALL_FUNCTION gate cannot fire inside that
-+	 * region: an interrupt gate never fires while IF is clear. Dispatch
-+	 * there anyway and a processor that holds rq->lock and then spins takes
-+	 * rq->lock again from inside its own spin. That is a self-deadlock on a
-+	 * non-recursive spinlock: one processor pinned at 100%, and the peer
-+	 * pinned behind the rq->lock it will never release.
-+	 *
-+	 * It is also why widening the poll made things worse rather than better
-+	 * -- more spin sites meant more chances to dispatch inside an
-+	 * interrupts-disabled critical section, and the freeze went from minutes
-+	 * to instant.
-+	 *
-+	 * What the widening DID fix stays fixed: the poll now runs at every
-+	 * structured busy-wait (asm-generic/barrier.h) rather than only in
-+	 * csd_lock_wait(), so a processor spinning with interrupts ENABLED --
-+	 * which is precisely where hardware would have delivered the IPI -- now
-+	 * services its peer wherever it spins. That was the real gap. The gate
-+	 * only declines the case hardware declines too.
-+	 */
-+
-+	/*
- 	 * Posted vectors ONLY. Not time, and not the device rings.
- 	 *
- 	 * This runs from inside an arbitrary busy wait -- csd_lock_wait, which
-@@ -1134,7 +1285,21 @@
- 	 * and takes ticks at its own idle boundary.
- 	 */
- 	local_irq_save(flags);
--	if (find_first_bit(co_colinux_ipi_pending[co_colinux_vcpu_id()], 256) < 256) {
-+	if (!co_colinux_ipi_polling[co_colinux_vcpu_id()] &&
-+	    find_first_bit(co_colinux_ipi_pending[co_colinux_vcpu_id()], 256) < 256) {
-+		/*
-+		 * Claim this processor before dispatching, because the handlers
-+		 * spin and every spin is now a poll.
-+		 *
-+		 * generic_smp_call_function_single_interrupt() walks a llist and
-+		 * reaches rq->lock through sched_ttwu_pending(); the moment that
-+		 * contends, queued_spin_lock_slowpath() spins, the spin calls
-+		 * back into here, and the same queue is dispatched a second time
-+		 * underneath the first. Set before, cleared after, read under the
-+		 * same virtual local_irq_save -- one processor, one writer, no
-+		 * atomic needed.
-+		 */
-+		co_colinux_ipi_polling[co_colinux_vcpu_id()] = 1;
- 		/*
- 		 * The raw hardirq bracket, NOT irq_enter()/irq_exit().
- 		 *
-@@ -1185,6 +1350,8 @@
- 		preempt_count_sub(HARDIRQ_OFFSET);
- 		ct_irq_exit();
- 		lockdep_hardirq_exit();
-+
-+		co_colinux_ipi_polling[co_colinux_vcpu_id()] = 0;
- 	}
- 	local_irq_restore(flags);
- }
-@@ -1419,6 +1586,7 @@
- {
- 	return false;
- }
-+
- DEFINE_IDTENTRY_SYSVEC(sysvec_co_timer)
- {
- 	struct pt_regs *old = set_irq_regs(regs);
-
-diff -urN a/include/asm-generic/barrier.h b/include/asm-generic/barrier.h
---- a/include/asm-generic/barrier.h
-+++ b/include/asm-generic/barrier.h
-@@ -242,15 +242,87 @@
-  * Due to C lacking lambda expressions we load the value of *ptr into a
-  * pre-named variable @VAL to be used in @cond.
-  */
-+/*
-+ * A cooperative guest has no interrupts, so every busy-wait must poll.
-+ *
-+ * On real hardware a processor spinning here is preempted by the incoming
-+ * CALL_FUNCTION IPI and runs the peer's request. This guest takes no
-+ * asynchronous entry at all: its "interrupts" are polls at hand-placed call
-+ * sites, and a spin that has no such site never services anything. That is a
-+ * complete deadlock cycle and it is not hypothetical --
-+ *
-+ *   A holds lock L, calls on_each_cpu() (a TLB shootdown, a text_poke) and
-+ *   waits in csd_lock_wait(), which does poll.
-+ *   B waits for L in queued_spin_lock_slowpath(), which did not.
-+ *   A waits for B's acknowledgement; B waits for A's lock. Neither reaches a
-+ *   cooperative boundary, so neither receives a tick either, and no watchdog
-+ *   fires because every watchdog is timer-driven.
-+ *
-+ * cpu_relax() is the marker Linux uses for "I am spinning", and would be the
-+ * obvious hook, but it cannot be one: cpu_relax() lives in
-+ * asm/vdso/processor.h and vdso_read_begin() (include/vdso/helpers.h) spins on
-+ * it in the vDSO, which is userspace and cannot reference a kernel symbol.
-+ *
-+ * So the hook goes one level down, here. This macro is kernel-only and it is
-+ * where the structured busy-waits actually spin: atomic_cond_read_relaxed,
-+ * atomic_cond_read_acquire and smp_cond_load_acquire are all built on it, which
-+ * covers four of the five spins in queued_spin_lock_slowpath() (the fifth is a
-+ * bare cpu_relax() and is hooked at its own site) as well as csd_lock_wait()'s
-+ * native form and every other smp_cond_load_*() wait in the tree.
-+ *
-+ * The guard is one load of a variable that is false on any non-cooperative
-+ * build, so the fast path is a predictable not-taken branch; the pending-set
-+ * test lives inside co_colinux_ipi_poll(), which does nothing and returns when
-+ * this processor has no posted vectors.
-+ */
-+#ifndef __ASSEMBLY__
-+extern int co_colinux_guest;
-+extern unsigned long co_colinux_ipi_any;
-+void co_colinux_ipi_poll(void);
-+
-+/*
-+ * TWO plain loads of words that are almost always unchanged, and only once
-+ * every 64 spins.
-+ *
-+ * The first version of this hook called co_colinux_ipi_poll() on every
-+ * iteration and the machine crawled. The cost was not the call: the first thing
-+ * the poll did was local_irq_save(), which in this guest is a WRITE to
-+ * co_colinux_virtual_if[], followed by find_first_bit() over four words of
-+ * co_colinux_ipi_pending[] -- a line the PEER writes when it posts. A write and
-+ * a shared-line read in the innermost loop of every contended spinlock is a
-+ * cacheline ping-pong for the whole duration of every lock wait.
-+ *
-+ * So nothing is touched until co_colinux_ipi_any says there is something to
-+ * find. It is one word on a line of its own, written only when a vector is
-+ * posted and when a drain empties every set -- both rare -- so a spinning
-+ * processor reads it from L1 with the line unmodified.
-+ *
-+ * Machine-wide rather than per-vCPU on purpose: it keeps the fast path free of
-+ * co_colinux_vcpu_id(), which is a GS-relative read and a header dependency
-+ * this file cannot take. The imprecision costs a processor an occasional slow
-+ * path for a vector posted to a DIFFERENT processor, which finds nothing of its
-+ * own and returns. It is never falsely zero while a bit is set, and that is the
-+ * only direction that matters.
-+ */
-+#define co_colinux_spin_poll()						\
-+	do {								\
-+		if (co_colinux_guest && READ_ONCE(co_colinux_ipi_any))	\
-+			co_colinux_ipi_poll();				\
-+	} while (0)
-+#endif
-+
- #ifndef smp_cond_load_relaxed
- #define smp_cond_load_relaxed(ptr, cond_expr) ({		\
- 	typeof(ptr) __PTR = (ptr);				\
- 	__unqual_scalar_typeof(*ptr) VAL;			\
-+	unsigned int __co_spins = 0;				\
- 	for (;;) {						\
- 		VAL = READ_ONCE(*__PTR);			\
- 		if (cond_expr)					\
- 			break;					\
- 		cpu_relax();					\
-+		if (!(++__co_spins & 63))			\
-+			co_colinux_spin_poll();			\
- 	}							\
- 	(typeof(*ptr))VAL;					\
- })
-
-diff -urN a/kernel/locking/qspinlock.c b/kernel/locking/qspinlock.c
---- a/kernel/locking/qspinlock.c
-+++ b/kernel/locking/qspinlock.c
-@@ -228,9 +228,22 @@
- 	 * simple enough.
- 	 */
- 	if (unlikely(idx >= _Q_MAX_NODES)) {
-+		unsigned int __co_spins = 0;
-+
- 		lockevent_inc(lock_no_node);
--		while (!queued_spin_trylock(lock))
-+		while (!queued_spin_trylock(lock)) {
- 			cpu_relax();
-+			/*
-+			 * The one spin in this function that is not built on
-+			 * smp_cond_load_relaxed(), so it needs the cooperative
-+			 * poll spelled out. A guest processor spinning here
-+			 * with no way to service a peer's cross-call is half of
-+			 * a deadlock -- see the comment on smp_cond_load_relaxed
-+			 * in asm-generic/barrier.h.
-+			 */
-+			if (!(++__co_spins & 63))
-+				co_colinux_spin_poll();
-+		}
- 		goto release;
- 	}
- 

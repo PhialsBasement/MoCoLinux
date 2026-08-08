@@ -149,8 +149,9 @@ ask for:
   server
 - Preemption: the host interrupts a busy-looping task; time advances at real
   speed
-- Experimental cooperative SMP: `--cpus 2` starts a second guest processor on
-  its own host core, with per-vCPU switch state, timers and passage pages
+- Cooperative SMP: the installed launcher requests `--cpus 2`; two Linux
+  processors run concurrently on distinct host cores with per-vCPU switch
+  state, passage pages, timers and posted-IPI delivery
 - Networking: guest ethernet device, host NAT, static address via
   `systemd-networkd`; pacman installs a 791-package desktop over HTTPS at
   16 MB/s
@@ -175,8 +176,8 @@ ask for:
 
 Not yet:
 
-- SMP release readiness. The two-vCPU path is restored for target testing but
-  still needs desktop/KMS, load and performance validation before release
+- SMP beyond two vCPUs, long-duration desktop/Steam soaking, and evaluation of
+  one-shot/NO_HZ clock events. The two-vCPU path is functional and benchmarked
 - The coLinux message layer (`co_monitor_t`, queues, reactor), so upstream's
   `cocon`/`conet` consoles and devices — including `colinux-console-nt` —
   cannot attach
@@ -193,6 +194,52 @@ Not yet:
   It is regenerated against the released tarball and checked by
   reverse-applying it to `ref/linux-7.1.5`, so "the snapshot is behind the
   tree" is a thing that gets caught rather than discovered later
+
+### Cooperative SMP milestone
+
+To the project's knowledge, MoCoLinux is the first coLinux-style cooperative
+kernel to run a working SMP Linux guest on Windows 10. This is guest SMP, not
+merely a uniprocessor guest running on an SMP host: Linux reports CPUs 0 and 1
+online and schedules useful work on both simultaneously. Upstream coLinux
+[documented that its guest could use only one CPU](https://colinux.fandom.com/wiki/FAQ#Q39._Does_coLinux_take_advantage_of_dual_core_processors?)
+and its changelog records that the daemon was
+[pinned to the first processor while SMP remained unresolved](https://colinux.sourceforge.net/?section=changelog).
+
+The first validated two-vCPU run was recorded on 2026-08-09 on the ThinkCentre
+M92p (Core i5-3470, four physical cores, no SMT), Windows 10 IoT Enterprise
+LTSC 21H2 build 19044, and Linux 7.1.5. Each result compares the same running
+guest with one worker against two; higher is better:
+
+| Workload | 1 vCPU | 2 vCPUs | Gain |
+| --- | ---: | ---: | ---: |
+| `sysbench cpu --cpu-max-prime=20000`, 10 s | 345.23 events/s | 682.96 events/s | **1.978x** |
+| `openssl speed -evp sha256`, 8192-byte blocks | 320,064.72 kB/s | 634,843.21 kB/s | **1.983x** |
+| `sysbench memory` sequential write, 1 MiB blocks | 17,631.70 MiB/s | 35,828.47 MiB/s | **2.032x** |
+| `sysbench memory` sequential read, 1 MiB blocks | 21,729.63 MiB/s | 42,494.90 MiB/s | **1.956x** |
+
+The memory figures are a hot-buffer/cache-path scaling test, not a claim about
+the M92p's raw DRAM bandwidth. Stability and scheduling checks completed too:
+
+- A 20-second two-worker `stress-ng` matrix run accumulated 39.65 CPU-seconds
+  and passed both workers, showing that both vCPUs stayed busy for the full run.
+- Four oversubscribed context-switch workers completed 3,275,146 operations in
+  10.02 seconds (327,349/s), with no failed or untrustworthy metrics.
+- A lock/yield-heavy two-thread sysbench run completed 35,432 events in exactly
+  10 seconds, with 0.56 ms average latency and balanced workers.
+- Firefox, the workload that previously drove both processors into a hard
+  deadlock, loaded pages normally after the posted-IPI polling fix. The guest
+  remained reachable over SSH after every test, and a post-stress two-second
+  sleep measured 2.023 seconds.
+
+The mechanism follows the useful parts of Xen PV's shape without pretending an
+APIC exists. A posted per-vCPU bitmap is the message; a targeted Windows DPC is
+the doorbell that interrupts a running target core. A separate targeted 100 Hz
+deadline guarantees that a userspace-bound vCPU crosses to the monitor, where a
+guarded cooperative interrupt entry batches the guest's 1 ms clock events.
+Kernel spin waits poll posted vectors without allowing re-entry from NMI,
+hardirq or virtual-interrupt-off regions. CPU scaling is therefore solved for
+two vCPUs; presentation frame rate remains limited by the separate GPU-to-X
+transport described above.
 
 The fragmented-RAM fix is now in tree: the boot path no longer calls
 `MmAllocateContiguousMemory` for guest RAM. It allocates virtually contiguous
@@ -214,7 +261,7 @@ boot/teardown soaking on the target Windows machines is still required.
 | `src/colinux/user/conet_ring.c` | the ring format and its decoder, shared by both readers |
 | `src/colinux/user/slirp/` | vendored slirp, with its Win64 repairs |
 | `src/colinux/user/elf_load.c` | the daemon: ELF loading, symbol resolution, boot |
-| `patch/7.1.5/current-tree-snapshot.diff` | the complete guest-side kernel patch, including conet, async COBD and the trapless virtio-GPU transport |
+| `patch/7.1.5/current-tree-snapshot.diff` | the complete guest-side kernel patch, including cooperative SMP/IPIs, conet, async COBD and the trapless virtio-GPU transport |
 | `patch/7.1.5/{async-cobd-src,vgpu-src}/` | standalone development copies of the guest device sources already folded into the cumulative patch |
 | `tools/mkmanjarorootfs.sh` | builds the Manjaro desktop image |
 | `tools/mkrootfs.sh` | builds the minimal BusyBox bring-up image |
@@ -278,6 +325,7 @@ developing:
 
 ```
 colinux-daemon.exe --boot-kernel vmlinux --max-switches none \
+                   --cpus 2 \
                    --cobd0 \??\C:\path\to\root.img
 colinux-daemon.exe --console 2323          (a second process: a terminal)
 colinux-slirp-net-daemon.exe -R            (a third: NAT for the guest)
@@ -288,6 +336,10 @@ colinux-daemon.exe --run konsole           (start one app in a running guest)
 - `--mem MB` sets usable pseudo RAM (default 1024). It is a target: e820
   describes what the scattered nonpaged-pool backing actually supplied, and
   falling short is reported rather than fatal.
+- `--cpus N` sets the guest's processor count (the daemon default is one; the
+  installed launcher requests two). Every vCPU needs a distinct host core, and
+  the driver reserves capacity for Windows and the GPU daemon instead of
+  oversubscribing a core carrying another guest processor.
 - The image ships `10-eth0.network` with slirp's fixed layout and
   `systemd-networkd` enabled, so the guest configures its own network at boot.
 - For a desktop, start an X server on the Windows side in multiwindow mode
@@ -352,8 +404,8 @@ been run on hardware.
 ## Windows 10
 
 Supported and verified on hardware (Windows 10 IoT Enterprise LTSC 21H2,
-build 19044) with GPU acceleration. Everything the earlier hosts do, plus two
-world-switch fixes that only this version needs:
+build 19044) with GPU acceleration and a two-vCPU SMP guest. Everything the
+earlier hosts do, plus two world-switch fixes that only this version needs:
 
 - **CR4 before CR3 at the crossing.** Windows 10 with KVA Shadow sets
   `CR4.PCIDE`, which makes bits 11:0 of CR3 a PCID and bit 63 the NOFLUSH

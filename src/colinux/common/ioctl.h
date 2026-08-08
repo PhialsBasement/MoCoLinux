@@ -682,11 +682,13 @@ typedef struct {
 	 * The cooperative timer. tick_entry_va is asm_sysvec_co_timer, the
 	 * stock idtentry the host vectors a running guest to; virtual_if_va is
 	 * the guest's virtual interrupt flag, which says whether it may be
-	 * vectored there at all. Without these the guest has no asynchronous
-	 * entry and nothing can ever preempt a task that stays runnable.
+	 * vectored there at all; ipi_pending_va is the base of the fixed posted-
+	 * IPI bitmap. Without these the guest has no asynchronous entry and
+	 * nothing can ever preempt a task that stays runnable.
 	 */
 	unsigned long long tick_entry_va;
 	unsigned long long virtual_if_va;
+	unsigned long long ipi_pending_va;
 	int		   max_switches;
 	int		   step;
 	int		   batch;

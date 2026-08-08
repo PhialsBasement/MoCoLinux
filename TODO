@@ -60,7 +60,9 @@
  * Miscellaneous enhancements and fixes:
    * Lack of entropy - empty /dev/random
    * Make coLinux work on Windows NT 4 SP*.
-   * Address all reported SMP issues.
+   * SMP follow-ups: validate three or more guest processors, one-shot/NO_HZ
+     clock events, and long-duration desktop/Steam soaking. The two-vCPU path
+     is working and benchmarked; see the SMP milestone below and README.md.
    * The first search path for files specified in the XML, such as in 
      <image path="vmlinux" /> or block devices, should be in the directory 
      that contains the XML file.
@@ -720,9 +722,8 @@
      with "manager open: The system cannot find the file specified" on every
      subsequent run. It should start the service, or say that it did not.
 
- * SMP -- the milestone the swap and OpenGL entries defer to. Staged plan
-   agreed 2026-08-07; rungs are S0..S6, each hardware-verified and committed
-   before the next starts.
+ * SMP -- working two-vCPU feature. Staged plan agreed 2026-08-07; rungs are
+   S0..S6, each hardware-verified before the next starts.
    * S0 DONE 2026-08-07 (commit 26638a3d), verified on the M92p under Windows
      10: --test-smp runs two threads pinned to two processors, each crossing
      into a guest of its own, concurrently. 10M crossings per lane in 54 s
@@ -831,22 +832,48 @@
      freed underneath a secondary. Verified both ways: 3,000,000 crossings on
      vCPU 1 with the guest at /sbin/init, and a refusal when no guest is
      running -- which is what makes the positive mean something.
-   * S3b-2, STILL OPEN and where the remaining risk is: START_VCPU (the BSP
-     hands the host an AP initial-state block -- rip, rsp, CR3, GS_BASE,
-     per-vCPU GDT/IDT/TSS, virtual-IF slot starting blocked; structurally
-     co_arch_boot_result_t again, which the host already builds once for the
-     boot CPU), KICK_VCPU doorbell, and guest-side co_kick_ap +
-     co_cpu_bringup per Xen smp_pv.c. Do it the S0 way: point START_VCPU at a
-     trivial spin-loop context FIRST and only then at the real bringup -- a
-     wrong initial state is a triple fault on core 1 with nothing to read.
-     co_colinux_kick_ap() is the thing to replace, and until it is replaced
-     it is what stops an INIT-SIPI reaching a host processor.
-   * Remaining rungs: S3 second vCPU
-     to idle (KVCPU_RUN + START_VCPU/KICK_VCPU ops, cpu_bringup per Xen
-     smp_pv.c); S4 IPIs + per-CPU timer + shootdown under TLB-torture and
-     make -j2; S5 device-ring locking + desktop/Steam soak; S6 --cpus 3 and
-     oneshot/NO_HZ evaluation. Host core budget: 4 cores = Windows + cogpu
-     spin-poll + 2 vCPUs, zero slack -- the daemon should print the core map.
+   * S3b-2 DONE 2026-08-09. START_VCPU now carries the BSP-built AP state into
+     a dedicated KVCPU_RUN thread and the AP follows Linux's normal x86 bringup
+     far enough to report CPUs 0 and 1 online and reach userspace. The host
+     claims a distinct physical processor for each lane; no INIT-SIPI reaches
+     the host APIC. The installed launcher requests --cpus 2 by default.
+   * S4 DONE for the two-vCPU path 2026-08-09. The failures after AP bringup
+     were interrupt-delivery failures, not bad AP state:
+     - A posted vector is stored in co_colinux_ipi_pending[vcpu]. An idle event
+       wakes a parked target; a high-priority Windows DPC targeted at the
+       target's actual host processor interrupts a running one. Its body is
+       empty because the host interrupt is the doorbell and the bitmap is the
+       durable message.
+     - The monitor inspects that bitmap before resuming a stopped ring-3 frame
+       and uses the guarded cooperative interrupt entry immediately for an IPI.
+       The entry is refused while virtual IF or saved IF is clear, before the
+       guest has idled, or outside ring 3; violating the SYSCALL/swapgs window
+       here produced the otherwise logless triple faults during bringup.
+     - Linux structured spin waits poll posted IPIs once per 64 turns. A
+       throttled cpu_relax() fallback catches private subsystem loops that do
+       not use those helpers, but only while a vector is globally pending and
+       never from NMI, hardirq, virtual-IRQ-off, or a recursive poll. This is
+       the fix that turned Firefox from an instant two-core hardlock into a
+       normal workload.
+     - Each vCPU has a targeted 100 Hz host deadline, the equivalent of Xen's
+       VIRQ_TIMER doorbell. A quiet host core therefore crosses within 10 ms;
+       sysvec_co_timer drains all elapsed 1 ms Linux clock events in one entry.
+       Before this, a two-second guest sleep took about 52 seconds because
+       periodic injection was checked only after unrelated host interrupts.
+       Afterwards it took 2.033 seconds, and 2.023 seconds after the stress run.
+   * VALIDATED 2026-08-09 on the M92p under Windows 10 IoT Enterprise LTSC
+     build 19044. sysbench CPU rose from 345.23 to 682.96 events/s (1.978x),
+     OpenSSL SHA-256 from 320,064.72 to 634,843.21 kB/s (1.983x), cached
+     sysbench writes from 17,631.70 to 35,828.47 MiB/s (2.032x), and reads from
+     21,729.63 to 42,494.90 MiB/s (1.956x). A 20-second two-worker stress-ng
+     matrix run accumulated 39.65 CPU-seconds; four oversubscribed switch
+     workers completed 3,275,146 context-switch operations; the guest stayed
+     reachable over SSH and produced no new kernel warning.
+   * Remaining rungs: formal TLB/lock torture and long desktop/Steam soaking;
+     S6 --cpus 3 and higher; one-shot/NO_HZ clockevent evaluation. Presentation
+     frame rate is a separate GPU transport problem, not evidence that the
+     second CPU is idle. Host core budget on the M92p remains four cores =
+     Windows + cogpu spin-poll + 2 vCPUs, with no slack.
 
  * Cleanups:
    * Merge console into console-base.

@@ -1710,8 +1710,9 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 					       * in arch/x86_64/switch.c.
 					       */
 					      "asm_sysvec_co_timer",
-					      "co_colinux_virtual_if", NULL };
-		unsigned long long addr[9];
+					      "co_colinux_virtual_if",
+					      "co_colinux_ipi_pending", NULL };
+		unsigned long long addr[10];
 		int i;
 
 		for (i = 0; want[i]; i++) {
@@ -2228,6 +2229,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		 */
 		b.tick_entry_va      = no_copic ? 0 : addr[7];
 		b.virtual_if_va      = addr[8];
+		b.ipi_pending_va     = addr[9];
 		if (no_copic)
 			co_terminal_print("    cooperative timer disabled (--no-copic):"
 					  " a running guest will not be interrupted\n");

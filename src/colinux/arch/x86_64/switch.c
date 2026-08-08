@@ -137,9 +137,10 @@ typedef struct {
 	int		   step;
 	int		   batch;
 	unsigned long	   deadline_secs;	/* 0: no deadline */
-	/* asm_sysvec_co_timer, and the BASE of co_colinux_virtual_if[] */
+	/* Cooperative entry, virtual-IF base, and posted-IPI bitmap base. */
 	unsigned long long tick_entry_va;
 	unsigned long long virtual_if_va;
+	unsigned long long ipi_pending_va;
 	int		   async_cobd;
 	unsigned long long cobd_io_va;
 	/*
@@ -3386,32 +3387,66 @@ extern char co_host_interrupt_replay_stubs;
  * would have consumed several times as much.
  */
 /*
- * Injection is held off by name, and this restores the status quo rather than
- * deciding anything new.
+ * Periodic preemption is intentionally slower than the guest's 1 kHz tick.
  *
- * The virtual-IF gate below reads co_colinux_virtual_if, a kernel .bss address
- * -- 0xffffffff83889ee0. mark_rodata_ro() splits text and rodata to 4 KB and
- * stops at __end_rodata_hpage_align, 0xffffffff82e00000, so .bss is still
- * covered by level2_kernel_pgt's original 2 MB PSE entries. Until
- * co_arch_guest_lookup_root learned to add the offset within a large page, that
- * read did not return the flag at all: it returned the eight bytes of
- * .call_sites at 0xffffffff83800ee0, which are 0xfea2920cfea29147, and bit 9 of
- * that is clear. The gate therefore answered "the guest has interrupts off" on
- * every single call, and this function has never once injected a tick.
+ * sysvec_co_timer drains every 1 ms tick which elapsed since its last entry, so
+ * entering it at 100 Hz still keeps Linux time exact: one host entry normally
+ * runs ten clockevent callbacks.  What changes is only the preemption quantum.
+ * The old 1 kHz policy paid for a synthetic interrupt and two world switches
+ * on every millisecond of every busy vCPU, which erased the benefit of SMP and
+ * starved the GPU transport.  Ten milliseconds bounds a userspace spin without
+ * recreating that crossing storm.
  *
- * Correcting the walk turned it on for the first time, in the middle of an
- * unrelated bring-up, and the machine reset instantly with no bugcheck after
- * 8682 switches -- which is what synthesising an interrupt frame onto a live
- * guest stack looks like when the code doing it has never executed. The comment
- * on the function records the same sequence happening once already, one layer
- * down: "the readiness gate was an accident of a bug".
+ * Posted IPIs do not wait for this period.  A processor can sit in userspace
+ * forever while another waits synchronously for CALL_FUNCTION; the exported
+ * pending bitmap remains an immediate doorbell for that case.
  *
- * So injection gets a rung of its own, with its own hardware verification,
- * instead of arriving as a side effect of a page-table fix. Every gate above
- * stays live, so out->ticks_injected now measures how many ticks WOULD be
- * delivered per run without touching a byte of guest memory.
+ * The entry path is no longer speculative: the pending-IPI path delivered 1075
+ * synthetic entries during the Firefox run before periodic delivery was
+ * enabled.  Every entry passed the idle, virtual-IF, saved-IF and ring-3 gates
+ * below and returned successfully.
+ *
+ *              .--------.
+ *              | []  [] |  --->  ___/\____/\____/\____
+ *              |   GD   |
+ *              '--------'
+ *
+ *                         DEADLOCKED BY F777
+ *              https://www.youtube.com/watch?v=OPBECnDBiRQ
+ *
+ * If you found this while debugging a synthetic interrupt between SYSCALL,
+ * swapgs and virtual IF, congratulations: you are playing the demon level.
  */
-static const bool_t co_tick_injection_enabled = PFALSE;
+#define CO_GUEST_PREEMPT_HZ	100
+#define CO_GUEST_PREEMPT_MS	(1000u / CO_GUEST_PREEMPT_HZ)
+#define CO_GUEST_PREEMPT_100NS	(10000000ULL / CO_GUEST_PREEMPT_HZ)
+static const bool_t co_periodic_tick_injection_enabled = PTRUE;
+
+#define CO_GUEST_IPI_WORDS 4
+
+static bool_t co_arch_guest_ipi_pending(co_manager_t* manager,
+					unsigned long long cr3,
+					unsigned long long base,
+					int vcpu_index)
+{
+	unsigned long long pending[CO_GUEST_IPI_WORDS];
+	int i;
+
+	if (!base)
+		return PFALSE;
+
+	if (!CO_OK(co_kload_read_cr3(manager, cr3,
+				     base + (unsigned long long)vcpu_index *
+					    sizeof(pending),
+				     (unsigned char*)pending, sizeof(pending))))
+		return PFALSE;
+
+	for (i = 0; i < CO_GUEST_IPI_WORDS; i++)
+		if (pending[i])
+			return PTRUE;
+
+	return PFALSE;
+}
 
 static void co_arch_inject_tick(co_manager_t* manager,
 				co_arch_passage_page_t* pp,
@@ -3420,10 +3455,11 @@ static void co_arch_inject_tick(co_manager_t* manager,
 				unsigned long long* last,
 				co_arch_boot_result_t* out)
 {
-	const unsigned long long period = CO_GUEST_TICK_100NS;
+	const unsigned long long period = CO_GUEST_PREEMPT_100NS;
 	unsigned long long frame_va, now, vif = 0;
 	unsigned long long f[5], newsp;
 	unsigned long long cr3 = pp->linuxvm_state.cr3;
+	bool_t ipi_pending;
 
 	if (!ctl->tick_entry_va || !ctl->virtual_if_va)
 		return;
@@ -3457,13 +3493,20 @@ static void co_arch_inject_tick(co_manager_t* manager,
 	if (!frame_va)
 		return;
 
+	ipi_pending = co_arch_guest_ipi_pending(manager, cr3,
+						ctl->ipi_pending_va, vcpu_index);
+
 	now = co_os_monotonic_100ns();
-	if (*last == 0) {
-		*last = now;
+	if (!ipi_pending && !co_periodic_tick_injection_enabled)
 		return;
+	if (!ipi_pending) {
+		if (*last == 0) {
+			*last = now;
+			return;
+		}
+		if (now - *last < period)
+			return;
 	}
-	if (now - *last < period)
-		return;
 
 	/*
 	 * Would hardware have delivered here? The guest's cli/sti are virtual,
@@ -3554,13 +3597,6 @@ static void co_arch_inject_tick(co_manager_t* manager,
 	if ((f[1] & 3) != 3)			/* saved CS: not ring 3 */
 		return;
 
-	/* Counted, not delivered. See co_tick_injection_enabled above. */
-	if (!co_tick_injection_enabled) {
-		*last = now;
-		out->ticks_injected++;
-		return;
-	}
-
 	newsp = (frame_va - 0x40) & ~0xfULL;
 
 	if (!CO_OK(co_kload_write_cr3(manager, cr3, newsp,
@@ -3591,6 +3627,9 @@ static void co_arch_inject_tick(co_manager_t* manager,
 				      (const unsigned char*)f, sizeof(f))))
 		return;
 
+	if (ipi_pending && out->ticks_injected == 0)
+		co_debug("boot: vcpu %d injected its first pending IPI through "
+			 "the cooperative interrupt entry", vcpu_index);
 	*last = now;
 	out->ticks_injected++;
 }
@@ -5232,6 +5271,15 @@ static co_rc_t co_arch_vcpu_run(co_manager_t* manager, co_vcpu_t* vcpu,
 {
 	co_arch_passage_page_t* pp = vcpu->pp;
 	co_switch_full_fn fn = (co_switch_full_fn)(void*)pp->code;
+
+	/*
+	 * A per-vCPU host deadline, like Xen's VIRQ_TIMER.  The DPC does not run
+	 * guest code; it guarantees the target processor crosses to this monitor
+	 * often enough for co_arch_inject_tick() below to deliver its guarded
+	 * upcall.  The idle/startup gates in that function remain authoritative.
+	 */
+	co_os_vcpu_preempt_start(vcpu->index, vcpu->host_cpu,
+				 CO_GUEST_PREEMPT_MS);
 	{
 		unsigned long long resume_rip = (unsigned long long)(size_t)pp->code
 			+ (unsigned long)(&co_guest_resume - &co_switch_full);
@@ -6056,14 +6104,17 @@ static co_rc_t co_arch_vcpu_run(co_manager_t* manager, co_vcpu_t* vcpu,
 					int target = (int)pp->params[CO_PP_AP_VCPU];
 
 					/*
-					 * Only a wake. The message itself is
-					 * already in the target's pending set
-					 * in guest memory; this exists because
-					 * a processor sitting in the host's
-					 * idle wait has nothing to re-enter it.
+					 * Wake an idle target and interrupt a running
+					 * one. The posted bitmap is the message; the
+					 * targeted host DPC is its hardware doorbell.
 					 */
-					if (target >= 0 && target < CO_MAX_VCPUS)
-						co_os_idle_wake(target);
+					if (target >= 0 && target < CO_MAX_VCPUS) {
+						if (co_vcpu[target].active)
+							co_os_vcpu_kick(target,
+								co_vcpu[target].host_cpu);
+						else
+							co_os_idle_wake(target);
+					}
 					continue;
 				}
 
@@ -6609,6 +6660,8 @@ static co_rc_t co_arch_vcpu_run(co_manager_t* manager, co_vcpu_t* vcpu,
 		out->guest_switches = guest_crossings;
 	}
 
+	co_os_vcpu_preempt_stop(vcpu->index);
+
 	return CO_RC(OK);
 }
 
@@ -6689,6 +6742,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	vcpu_ctl.batch         = in->batch;
 	vcpu_ctl.tick_entry_va = in->tick_entry_va;
 	vcpu_ctl.virtual_if_va = in->virtual_if_va;
+	vcpu_ctl.ipi_pending_va = in->ipi_pending_va;
 	vcpu_ctl.async_cobd    = in->async_cobd;
 	vcpu_ctl.cobd_io_va    = in->cobd_io_va;
 	/*

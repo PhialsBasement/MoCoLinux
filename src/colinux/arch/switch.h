@@ -166,9 +166,10 @@ typedef struct {
 	unsigned long long colinux_console_va;
 	unsigned long long ring_symbol_va;
 	unsigned long long guest_flag_va;
-	/* asm_sysvec_co_timer, and the guest's virtual interrupt flag. */
+	/* The cooperative interrupt entry, its virtual IF, and posted IPIs. */
 	unsigned long long tick_entry_va;
 	unsigned long long virtual_if_va;
+	unsigned long long ipi_pending_va;
 	int		   max_switches;
 	int		   step;
 	/*

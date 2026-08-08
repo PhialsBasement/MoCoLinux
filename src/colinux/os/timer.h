@@ -56,8 +56,14 @@ extern void co_os_msleep(unsigned int msecs);
  * rings co_os_idle_wake_all().
  */
 extern void   co_os_idle_wake_init(void);
+extern void   co_os_idle_wake_shutdown(void);
 extern void   co_os_idle_wake(unsigned long vcpu);
 extern void   co_os_idle_wake_all(void);
+extern void   co_os_vcpu_kick(unsigned long vcpu, unsigned long host_cpu);
+extern void   co_os_vcpu_preempt_start(unsigned long vcpu,
+				       unsigned long host_cpu,
+				       unsigned int period_msec);
+extern void   co_os_vcpu_preempt_stop(unsigned long vcpu);
 extern bool_t co_os_idle_wait(unsigned long vcpu, unsigned int msecs);
 
 typedef struct {
@@ -75,4 +81,3 @@ extern void co_os_get_timestamp_freq(co_timestamp_t *dts, co_timestamp_t *freq);
 extern unsigned long co_os_get_cpu_khz(void);
 
 #endif
-

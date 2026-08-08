@@ -235,6 +235,9 @@ void co_manager_unload(co_manager_t* manager)
 			co_debug("unload: the monitor loop stopped");
 	}
 
+	/* Nothing may still return into a DPC routine after the image unloads. */
+	co_os_idle_wake_shutdown();
+
 	/*
 	 * The console next, and before co_kload_free: it reaches guest memory
 	 * by walking the guest's page tables, and a console client is a
@@ -1327,6 +1330,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.guest_flag_va      = params->guest_flag_va;
 		in.tick_entry_va      = params->tick_entry_va;
 		in.virtual_if_va      = params->virtual_if_va;
+		in.ipi_pending_va     = params->ipi_pending_va;
 		in.step               = params->step;
 		in.batch              = params->batch;
 		in.kernel_table_count = params->kernel_table_count;
