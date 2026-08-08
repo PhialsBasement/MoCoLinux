@@ -170,6 +170,8 @@ ask for:
 - Self-installing: `mocolinux-setup.exe` lays down driver, daemons, kernel,
   the GPU daemon with virglrenderer, X server and launchers, then boots Linux
   and builds a Manjaro system on a fresh image over the network
+  - A repaired incremental patch series: `patch/7.1.5/current-tree-snapshot.diff`
+  is the authoritative guest-side diff and is [here](https://github.com/PhialsBasement/MoCoLinux/blob/mocolinux/patch/7.1.5/current-tree-snapshot.diff)
 
 Not yet:
 
@@ -185,8 +187,7 @@ Not yet:
   presentation off TCP entirely and hand frames to the host through guest
   RAM, the same zero-copy R3 windows the GPU command stream already rides
   (parked on the `r6-window-presentation` branch)
-- A repaired incremental patch series: `patch/7.1.5/current-tree-snapshot.diff`
-  is the authoritative guest-side diff and is deliberately not in `series`
+
 
 The fragmented-RAM fix is now in tree: the boot path no longer calls
 `MmAllocateContiguousMemory` for guest RAM. It allocates virtually contiguous
