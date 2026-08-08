@@ -1293,20 +1293,19 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 					     &params->out_len);
 
 		/*
-		 * Keystrokes are in the ring; ring the doorbell.
+		 * No doorbell here either, and for the same reason as conet RX
+		 * above: hvc's input ring is drained by the khvcd kthread on a
+		 * timer, so the guest cannot consume a keystroke at its idle
+		 * boundary and an early re-entry only shortens the interval the
+		 * next tick is derived from.
 		 *
-		 * A shell at a prompt IS idle by definition, so without this the
-		 * first character of every command waited out whatever the
-		 * monitor's backoff happened to be -- and with the wait now
-		 * indefinite it would wait forever. Only when something was
-		 * actually taken: the console server probes with a zero-length
-		 * call every 200 ms whenever no client is attached, and waking
-		 * every vCPU for that would be a poll wearing a doorbell's
-		 * clothes.
+		 * It could not storm the way conet does -- a person types a few
+		 * characters a second, not tens of thousands of batches -- so
+		 * this is a correctness tidy rather than a fix. The latency it
+		 * was supposed to save was never real: the first character of a
+		 * command waits one tick, which is what khvcd's own poll period
+		 * costs anyway.
 		 */
-		if (CO_OK(params->rc) && params->in_taken)
-			co_os_idle_wake_all();
-
 		return CO_RC(OK);
 	}
 
@@ -1496,21 +1495,53 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 					params->frames, &params->taken);
 
 		/*
-		 * Frames are in the RX ring; wake whoever is parked.
+		 * NO DOORBELL HERE, and the reasoning that put one here was
+		 * wrong in a way worth writing down.
 		 *
-		 * The guest's conet-rx kthread runs on whichever processor the
-		 * scheduler put it on, so every doorbell rather than a guess.
+		 * A doorbell is only useful for work the guest can consume at
+		 * its idle boundary. co_colinux_drain_devices() reaps exactly
+		 * two things -- cobd completions and the vgpu used ring -- and
+		 * conet RX is not one of them. The RX ring is drained by the
+		 * guest's conet-rx kthread, which sleeps in schedule_timeout(1)
+		 * and wakes only when a TICK is delivered.
 		 *
-		 * This is what the rx_spins re-entry in the monitor loop was
-		 * standing in for: it noticed pending frames only when a vCPU
-		 * happened to reach an idle yield, only on the vCPU that got
-		 * there, and at the cost of a mutex and two guest page-table
-		 * walks on every yield. A doorbell is the mechanism; the spin
-		 * was the symptom of not having one.
+		 * And a tick IS elapsed time: co_colinux_take_ticks() divides
+		 * (now - last) by the tick period, where `now` was stamped into
+		 * the passage page on entry. So waking the host early does not
+		 * get one frame drained -- it removes the very interval the
+		 * tick is computed from. The idle wait returns with almost no
+		 * time elapsed, n comes out zero, no tick is delivered, the
+		 * kthread stays asleep, and the host re-enters again. Narrowing
+		 * the ring to active vCPUs does not change this: on a
+		 * uniprocessor guest vCPU 0 is the active one, and it is the
+		 * one being robbed of its tick.
+		 *
+		 * Under sustained RX that is a ping-pong at crossing speed with
+		 * the guest making no progress, and the crossing runs under
+		 * cli. It is the exact hazard the bounded rx_spins gate existed
+		 * to prevent -- "the second one spinning without a sleep is how
+		 * the host loses its clock" -- and that gate was deleted on the
+		 * strength of this doorbell replacing it. It does not replace
+		 * it; there was nothing here to replace it with.
+		 *
+		 * Measured: a pacstrap of ~857 packages died every time on a
+		 * large package after several hundred MB. The guest stopped
+		 * draining, co_net_put started short-writing, ring_flush() set
+		 * ring_rx_full (user/slirp/co_main.c) which stops the TX walk,
+		 * slirp stopped reading from its sockets, and the server tore
+		 * the transfer down -- "HTTP/2 stream reset by server (CANCEL)"
+		 * and "SSL_read: unexpected eof while reading" -- while the
+		 * fallback mirror could not complete a connection at all and
+		 * timed out at 10 s. Nothing appeared in the guest log because
+		 * nothing in the guest was wrong.
+		 *
+		 * RX latency without a doorbell is one tick, which is also the
+		 * period of the kthread's own poll, so there is nothing here to
+		 * win. If RX is ever to have a doorbell it needs a reaper in
+		 * co_colinux_drain_devices() first -- something that can move
+		 * frames without the kthread -- and then the wake would have
+		 * work it can actually do.
 		 */
-		if (CO_OK(params->rc) && params->taken)
-			co_os_idle_wake_all();
-
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}
@@ -1945,8 +1976,27 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		 * work and most device ISRs there, which is a performance
 		 * argument and is treated as one.
 		 */
+		/*
+		 * A core of its own, and never processor 0. Measured, not
+		 * theorised.
+		 *
+		 * The reasoning that relaxed this was about STATE: every host
+		 * per-processor field is saved fresh on each crossing, so a
+		 * thread that moves does not restore another core's tables.
+		 * That part is true and the migration kill stays gone. But
+		 * placement is a different question from state, and it was
+		 * settled by a CLOCK_WATCHDOG_TIMEOUT on the first boot after
+		 * the pin was relaxed: 0x101 is a processor that stopped
+		 * answering the clock, which is what happens when two vCPU
+		 * threads share a core, or when one sits on processor 0 where
+		 * Windows keeps its own clock and most device ISRs.
+		 *
+		 * So: one vCPU per core, processor 0 left to Windows, and a
+		 * refusal rather than a guess if there is no room. A guest one
+		 * processor short boots; a host that bugchecks does not.
+		 */
 		cores  = co_os_cpu_count();
-		chosen = 0;
+		chosen = cores;
 		for (cpu = cores; cpu-- > 1; ) {
 			if (!co_arch_vcpu_core_taken(cpu)) {
 				chosen = cpu;
@@ -1962,20 +2012,28 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		 * worse, because an unplaced thread lands on processor 0
 		 * alongside the boot processor while it waits.
 		 *
-		 * But a thread that cannot be placed is slower, not broken.
-		 * Every register the crossing needs is saved and restored per
-		 * crossing, from the live processor, so a vCPU that ends up
-		 * sharing a core -- or moving between cores -- is correct and
-		 * merely contended. Refusing to start it left the guest a
-		 * processor short for a scheduling reason.
+		 * And a thread that cannot be placed is refused. The state
+		 * argument -- every register saved and restored per crossing --
+		 * says an unplaced vCPU is CORRECT, and that is still true.
+		 * What it is not is safe: an unplaced thread runs wherever
+		 * Windows puts it, which is beside another vCPU or on processor
+		 * 0, and that took the host down with a CLOCK_WATCHDOG_TIMEOUT
+		 * on the first boot after this was relaxed. A guest one
+		 * processor short is a guest that boots.
 		 */
-		if (chosen >= cores || !co_os_pin_cpu_to(chosen))
-			co_debug("KVCPU_RUN: vcpu %d could not be placed on host "
-				 "processor %lu of %lu -- running unplaced, which "
-				 "is slower and not wrong", req_vcpu, chosen, cores);
-		else
-			co_debug("KVCPU_RUN: vcpu %d on host processor %lu of %lu",
-				 req_vcpu, chosen, cores);
+		if (chosen >= cores || !co_os_pin_cpu_to(chosen)) {
+			co_debug_error("KVCPU_RUN: vcpu %d has no free host "
+				       "processor of %lu -- refusing, rather "
+				       "than sharing a core", req_vcpu, cores);
+			params->no_free_core  = PTRUE;
+			params->never_started = PTRUE;
+			params->rc            = CO_RC(ERROR);
+			*return_size          = sizeof(*params);
+			return CO_RC(OK);
+		}
+
+		co_debug("KVCPU_RUN: vcpu %d on host processor %lu of %lu",
+			 req_vcpu, chosen, cores);
 
 		/*
 		 * Into the running guest's own address space. That is the

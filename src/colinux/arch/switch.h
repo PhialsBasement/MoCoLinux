@@ -452,4 +452,7 @@ extern co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* 
  */
 extern int co_arch_vcpu_core_taken(unsigned long cpu);
 
+/* Whether a vCPU slot currently carries a processor -- see switch.c. */
+extern int co_arch_vcpu_active(int index);
+
 #endif

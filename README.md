@@ -149,6 +149,8 @@ ask for:
   server
 - Preemption: the host interrupts a busy-looping task; time advances at real
   speed
+- Experimental cooperative SMP: `--cpus 2` starts a second guest processor on
+  its own host core, with per-vCPU switch state, timers and passage pages
 - Networking: guest ethernet device, host NAT, static address via
   `systemd-networkd`; pacman installs a 791-package desktop over HTTPS at
   16 MB/s
@@ -173,7 +175,8 @@ ask for:
 
 Not yet:
 
-- SMP
+- SMP release readiness. The two-vCPU path is restored for target testing but
+  still needs desktop/KMS, load and performance validation before release
 - The coLinux message layer (`co_monitor_t`, queues, reactor), so upstream's
   `cocon`/`conet` consoles and devices — including `colinux-console-nt` —
   cannot attach

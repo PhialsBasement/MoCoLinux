@@ -3920,6 +3920,24 @@ int co_arch_vcpu_core_taken(unsigned long cpu)
 	return 0;
 }
 
+/*
+ * Is this vCPU slot carrying a processor right now?
+ *
+ * For callers that want to ring one doorbell rather than all of them.
+ * co_os_idle_wake_all() signals every slot in the array whether or not a
+ * thread occupies it, and these are auto-reset events: a signal left on an
+ * empty slot is collected by whatever runs there next, as a wake it did not
+ * ask for. On a path that fires per received network batch that is tens of
+ * thousands of pointless signals over a single download.
+ */
+int co_arch_vcpu_active(int index)
+{
+	if (index < 0 || index >= CO_MAX_VCPUS)
+		return 0;
+
+	return co_vcpu[index].active ? 1 : 0;
+}
+
 void co_arch_boot_abort(void)
 {
 	vcpu_abort_all = 1;
@@ -5214,6 +5232,15 @@ static co_rc_t co_arch_vcpu_run(co_manager_t* manager, co_vcpu_t* vcpu,
 		unsigned long guest_crossings = 0;
 		unsigned long idle_run = 0;
 		/*
+		 * When this processor's next tick falls due, in host monotonic
+		 * 100 ns units -- ABSOLUTE, so that a doorbell arriving inside a
+		 * tick shortens that tick's wait rather than starting a new one.
+		 * Zero until the first idle, and re-armed whenever it is passed.
+		 * See the wait itself for why a relative timeout couples the
+		 * guest's clock rate to the host's doorbell rate.
+		 */
+		unsigned long long tick_due = 0;
+		/*
 		 * When a cooperative tick was last delivered, in host monotonic
 		 * 100 ns units. Zero until the first interrupt crossing, which
 		 * arms it rather than firing -- there is no sensible "last" on
@@ -5251,8 +5278,29 @@ static co_rc_t co_arch_vcpu_run(co_manager_t* manager, co_vcpu_t* vcpu,
 			 * Zero is no limit, for the same reason the console
 			 * deadline is: an interactive guest must not be
 			 * stopped out from under whoever is using it.
+			 *
+			 * THE BOOT PROCESSOR ONLY, and this is not tidiness.
+			 *
+			 * The budget bounds a RUN, and a run ends when vCPU 0
+			 * returns from this loop. A secondary that hits a limit
+			 * does not end anything -- it returns from KVCPU_RUN,
+			 * the daemon's AP thread sees never_started clear and
+			 * retires for good (user/elf_load.c), and the guest is
+			 * left with that processor still in cpu_online_mask and
+			 * nobody executing it. Every on_each_cpu() afterwards --
+			 * every TLB shootdown, every static-key flip -- spins in
+			 * csd_lock_wait() for ever. The guest stays alive, faults
+			 * nothing, logs nothing, and stops.
+			 *
+			 * The old S0 lane a secondary used to run had no budget
+			 * at all (iterations was LLONG_MAX), so merging the loops
+			 * handed it vCPU 0's. The default is 200000
+			 * (user/elf_load.c), a mostly-idle secondary crosses once
+			 * per tick, and 200000 ticks is 200 seconds -- which is
+			 * how long a desktop had been up when pacman started
+			 * writing files and the machine froze.
 			 */
-			if (ctl->max_switches &&
+			if (vcpu->index == 0 && ctl->max_switches &&
 			    guest_crossings >= ctl->max_switches) {
 				out->hit_limit = PTRUE;
 				break;
@@ -5527,7 +5575,27 @@ static co_rc_t co_arch_vcpu_run(co_manager_t* manager, co_vcpu_t* vcpu,
 				 */
 				unsigned long long op = pp->operation;
 
-				guest_crossings++;	/* the guest's own doing */
+				/*
+				 * An IDLE yield is not the guest doing
+				 * something, so it does not spend the budget.
+				 *
+				 * Same rule the replayed hardware interrupt
+				 * already follows above: what the budget bounds
+				 * is guest progress -- work, faults, single
+				 * steps -- not the passage of time. Charging
+				 * idles to it turns a switch count into a wall
+				 * clock, and a bad one, because the rate depends
+				 * on the tick period: at the old ten-millisecond
+				 * backoff 200000 idles was half an hour, and at
+				 * the tick-accurate one-millisecond wait it is
+				 * two hundred seconds. That silently cut every
+				 * interactive session to three minutes.
+				 *
+				 * The wall-clock deadline is the honest bound on
+				 * elapsed time and it already exists.
+				 */
+				if (op != CO_OPERATION_IDLE)
+					guest_crossings++;
 				hb_vol++;
 
 				pp->operation = 0;
@@ -5557,6 +5625,16 @@ static co_rc_t co_arch_vcpu_run(co_manager_t* manager, co_vcpu_t* vcpu,
 				 * work, so the next idle is a pause inside a
 				 * busy period rather than the guest having
 				 * nothing to do. See the sleep below.
+				 */
+				/*
+				 * tick_due is deliberately NOT reset here. It
+				 * is an absolute instant, not a backoff state:
+				 * a guest that did some work and idled again
+				 * still owes its clock the remainder of the
+				 * same tick, and re-arming it on every busy
+				 * crossing would let a guest that alternates
+				 * work and idle push its own tick away for
+				 * ever -- the same coupling in another dress.
 				 */
 				if (op != CO_OPERATION_IDLE)
 					idle_run = 0;
@@ -5779,16 +5857,74 @@ static co_rc_t co_arch_vcpu_run(co_manager_t* manager, co_vcpu_t* vcpu,
 					 * idle a while, and the secondary's flat
 					 * 100 ms ran it at 10 Hz permanently.
 					 *
-					 * The deadline needs no arithmetic here.
-					 * This wakes every tick and the loop
-					 * re-checks the deadline at the top of
-					 * every iteration, so a deadline is
-					 * observed within one tick of expiring.
+					 * The run deadline needs no arithmetic
+					 * here. This wakes at least every tick
+					 * and the loop re-checks it at the top
+					 * of every iteration, so it is observed
+					 * within one tick of expiring.
+					 *
+					 * AN ABSOLUTE TICK DEADLINE, not a fresh
+					 * relative timeout each time round.
+					 *
+					 * This is the part that has to be got
+					 * right, and a relative timeout cannot
+					 * get it right. A doorbell that arrives
+					 * while this vCPU is running leaves its
+					 * auto-reset event signalled, so the next
+					 * wait returns at once with almost no
+					 * time elapsed; co_colinux_take_ticks()
+					 * divides elapsed time by the tick period
+					 * and delivers nothing. Ask for a fresh
+					 * millisecond after each of those and the
+					 * tick never arrives at all: the guest's
+					 * clock rate becomes a function of the
+					 * HOST's doorbell rate rather than of
+					 * time, and a busy producer can drive it
+					 * arbitrarily low while the guest stays
+					 * alive and stops progressing.
+					 *
+					 * Bounding consecutive early wakes and
+					 * then sleeping once was tried and is the
+					 * wrong shape: it makes the tick rate
+					 * 1/Nth of the wake rate instead of zero,
+					 * which is still the wake rate deciding
+					 * the clock. The invariant wanted is that
+					 * the guest gets a tick's worth of
+					 * elapsed clock every tick period NO
+					 * MATTER how often it is woken.
+					 *
+					 * So the deadline is absolute. A doorbell
+					 * still cuts the wait short and the guest
+					 * still reaps its completion promptly --
+					 * that is what a doorbell is for -- but
+					 * the next wait is only ever the REMAINDER
+					 * of the same tick, so the tick lands on
+					 * time however many wakes arrive inside
+					 * it. Wake rate and clock rate stop being
+					 * coupled, which is the property the
+					 * relative timeout never had.
 					 */
-					idle_run++;
-					if (!co_os_idle_wait(vcpu->index,
-							     CO_GUEST_TICK_MS))
-						pp->params[48] += 1;
+					{
+						unsigned long long now =
+							co_os_monotonic_100ns();
+						unsigned int wait_ms;
+
+						if (tick_due <= now)
+							tick_due = now +
+								CO_GUEST_TICK_100NS;
+
+						/* round up: never a zero wait */
+						wait_ms = (unsigned int)
+							((tick_due - now + 9999ULL)
+							 / 10000ULL);
+						if (wait_ms == 0)
+							wait_ms = 1;
+
+						idle_run++;
+						if (!co_os_idle_wait(vcpu->index,
+								     wait_ms))
+							pp->params[48] += 1;
+					}
 
 					/*
 					 * Idle forever is correct cooperative
@@ -6544,6 +6680,25 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		 granted / 10000, (granted / 1000) % 10);
 
 	rc = co_arch_vcpu_run(manager, vcpu, &vcpu_ctl, out);
+
+	/*
+	 * The boot processor has finished, so the run is over -- tell the
+	 * secondaries, whatever ended it.
+	 *
+	 * Only the TERMINATE handler used to do this, and it is the one exit
+	 * that is least likely to be taken: hit_limit, hit_deadline, a fault,
+	 * an unforwardable vector, host-state damage and the halt signature all
+	 * return from that loop without a word to anybody. A secondary leaves
+	 * only on the broadcast abort, a fault of its own, or a voluntary
+	 * crossing, so after any of those exits it keeps looping -- pinned,
+	 * inside the driver -- while the join below waits five seconds, gives
+	 * up, and out_free_pp frees ap_passage[] out from under a processor
+	 * that is still crossing through it.
+	 *
+	 * Broadcasting here rather than at each break means the next exit
+	 * somebody adds to that loop cannot forget to do it.
+	 */
+	co_arch_boot_abort();
 
 	{
 		/*
