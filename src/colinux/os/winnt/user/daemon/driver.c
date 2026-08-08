@@ -812,9 +812,9 @@ co_rc_t co_winnt_test_switch(int mode)
  *
  * Each lane is a thread of this process holding its own driver handle inside
  * a blocking TEST_SMP ioctl -- the exact shape N vCPUs will have, minus the
- * Linux. The driver pins lane N to processor N and refuses lanes the host
- * does not have, so running this on a uniprocessor box reports rather than
- * pretends.
+ * Linux. The driver pins lane N to the Nth active processor (processor masks
+ * may be sparse) and refuses lanes the host does not have, so running this on
+ * a uniprocessor box reports rather than pretends.
  */
 struct co_smp_lane_ctx {
 	co_manager_ioctl_test_smp_t r;

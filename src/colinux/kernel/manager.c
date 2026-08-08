@@ -214,9 +214,9 @@ void co_manager_unload(co_manager_t* manager)
 	 * freed special pool, at the list insert in co_debug_writev.
 	 *
 	 * The loop checks the flag every crossing, which is microseconds, so
-	 * this waits milliseconds in practice. The bound is there because a
-	 * loop that never answers must not hang the unload forever -- and if
-	 * that ever happens the machine is already lost.
+	 * this waits milliseconds in practice. It is intentionally unbounded:
+	 * returning from DriverUnload while one of these threads can still
+	 * execute this image is guaranteed use-after-free.
 	 */
 	if (co_arch_boot_running()) {
 		int spins;
@@ -224,15 +224,14 @@ void co_manager_unload(co_manager_t* manager)
 		co_debug("unload: a monitor loop is still running -- asking it to stop");
 		co_arch_boot_abort();
 
-		for (spins = 0; spins < 1000 && co_arch_boot_running(); spins++)
+		for (spins = 0; co_arch_boot_running(); spins++) {
+			if (spins && (spins % 1000) == 0)
+				co_debug_error("unload: still waiting for the monitor "
+					       "lifecycle to drain");
 			co_os_msleep(10);
+		}
 
-		if (co_arch_boot_running())
-			co_debug_error("unload: the monitor loop did not stop; "
-				       "freeing anyway is not survivable, but "
-				       "neither is waiting");
-		else
-			co_debug("unload: the monitor loop stopped");
+		co_debug("unload: the monitor loop stopped");
 	}
 
 	/* Nothing may still return into a DPC routine after the image unloads. */
@@ -1764,6 +1763,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		co_rc_t trc;
 		int req_lane;
 		long long req_iterations;
+		unsigned long host_cpu, cores;
 
 		params = (typeof(params))(io_buffer);
 
@@ -1783,23 +1783,29 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			return CO_RC(OK);
 		}
 
-		if (req_lane < 0 ||
-		    (unsigned long)req_lane >= co_os_cpu_count()) {
-			co_debug_error("TEST_SMP: lane %d does not name an "
-				       "active processor (%lu active)",
-				       req_lane, co_os_cpu_count());
+		cores = co_os_cpu_count();
+		if (req_lane < 0 || req_lane >= CO_MAX_VCPUS ||
+		    (unsigned long)req_lane >= cores) {
+			co_debug_error("TEST_SMP: lane %d is outside %lu active "
+				       "processor(s) or %d vCPU slots",
+				       req_lane, cores, CO_MAX_VCPUS);
+			params->rc   = CO_RC(INVALID_PARAMETER);
+			*return_size = sizeof(*params);
+			return CO_RC(OK);
+		}
+		host_cpu = co_os_cpu_nth((unsigned long)req_lane);
+		if (host_cpu == (unsigned long)-1) {
 			params->rc   = CO_RC(INVALID_PARAMETER);
 			*return_size = sizeof(*params);
 			return CO_RC(OK);
 		}
 
 		/*
-		 * Pinned to the *named* processor, not the current one --
-		 * distinctness of the lanes is the whole experiment. The
-		 * refusal above means a failure here is a race with hot
-		 * remove, which the host does not do; report it anyway.
+		 * lane is a dense vCPU/test identity. Translate it through the
+		 * active mask before pinning; a population count is not itself a
+		 * processor number when the mask contains holes.
 		 */
-		if (!co_os_pin_cpu_to((unsigned long)req_lane)) {
+		if (!co_os_pin_cpu_to(host_cpu)) {
 			params->rc   = CO_RC(ERROR);
 			*return_size = sizeof(*params);
 			return CO_RC(OK);
@@ -2065,6 +2071,7 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->msr_got       = result.msr_got;
 		params->waited_for_start = result.waited_for_start;
 		params->never_started    = result.never_started;
+		params->no_free_core     = result.no_free_core;
 		params->preflight_failed = result.preflight_failed;
 		params->preflight_level  = result.preflight_level;
 		params->preflight_va     = result.preflight_va;

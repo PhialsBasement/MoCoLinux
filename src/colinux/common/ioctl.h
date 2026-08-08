@@ -287,8 +287,8 @@ typedef struct {
  * interface for CO_MANAGER_IOCTL_TEST_SMP
  *
  * One lane of the concurrent crossing test: two of these ioctls run at once
- * from two threads, each pinned by the driver to the processor named by its
- * lane, each crossing into a guest context of its own. Mirrors
+ * from two threads, each pinned by the driver to the lane-th active processor,
+ * each crossing into a guest context of its own. Mirrors
  * co_arch_smp_test_t in arch/switch.h.
  *
  * lane and iterations travel inwards and are read before the driver clears
@@ -296,7 +296,7 @@ typedef struct {
  */
 typedef struct {
 	co_rc_t		   rc;
-	int		   lane;	/* in: 0 or 1; also the processor to pin to */
+	int		   lane;	/* in: dense test/vCPU lane; mapped through active mask */
 	long long	   iterations;	/* in: voluntary crossings to perform */
 	int		   supported;
 	int		   succeeded;

@@ -71,6 +71,32 @@ void co_os_manager_close(co_manager_handle_t handle)
 	co_os_free(handle);
 }
 
+static co_rc_t co_win32_ioctl_error(DWORD error)
+{
+	switch (error) {
+	case ERROR_ACCESS_DENIED:
+		return CO_RC(ACCESS_DENIED);
+	case ERROR_NOT_ENOUGH_MEMORY:
+	case ERROR_OUTOFMEMORY:
+		return CO_RC(OUT_OF_MEMORY);
+	case ERROR_INVALID_PARAMETER:
+	case ERROR_INSUFFICIENT_BUFFER:
+	case ERROR_INVALID_USER_BUFFER:
+	case ERROR_BAD_LENGTH:
+		return CO_RC(INVALID_PARAMETER);
+	case ERROR_FILE_NOT_FOUND:
+	case ERROR_PATH_NOT_FOUND:
+		return CO_RC(NOT_FOUND);
+	case ERROR_BROKEN_PIPE:
+		return CO_RC(BROKEN_PIPE);
+	case ERROR_SEM_TIMEOUT:
+	case ERROR_TIMEOUT:
+		return CO_RC(TIMEOUT);
+	default:
+		return CO_RC(ERROR);
+	}
+}
+
 co_rc_t co_os_manager_ioctl(
 	co_manager_handle_t kernel_device,
 	unsigned long	    code,
@@ -102,8 +128,10 @@ co_rc_t co_os_manager_ioctl(
 
 		co_terminal_print("DeviceIoControl 0x%08lx failed (Win32 %lu)\n",
 				  code, error);
-		/* Preserve the OS error for the caller's ordinary-log report. */
-		return error ? -(co_rc_t)error : CO_RC(ERROR);
+		/* The raw value is in the log above.  co_rc_t is a packed project
+		 * code/source-line/file-id value; returning -GetLastError() makes
+		 * every CO_RC_GET_* consumer decode unrelated bit fields. */
+		return co_win32_ioctl_error(error);
 	}
 
 	return CO_RC(OK);

@@ -3755,7 +3755,8 @@ bool_t co_arch_forward_host_interrupt(void* host_idt, unsigned long long vector)
  */
 typedef struct {
 	int			index;		/* which vCPU this is */
-	volatile int		active;		/* inside a crossing loop right now */
+	volatile int		active;		/* CO_VCPU_* ownership state */
+	int			diagnostic;	/* owns one TEST_SMP run-gate ref */
 	unsigned long		host_cpu;	/* the processor it is pinned to */
 	co_arch_passage_page_t*	pp;		/* its own passage page */
 	/*
@@ -3807,6 +3808,42 @@ typedef struct {
 } co_vcpu_t;
 
 static co_vcpu_t	   co_vcpu[CO_MAX_VCPUS];
+
+/*
+ * Slot ownership and run admission are separate, deliberately.
+ *
+ * A slot changes FREE -> CLAIMING -> ACTIVE -> STOPPING -> FREE.  Claiming is
+ * atomic, and the structure is not cleared until that transition has won, so
+ * a second ioctl can never erase a live processor's state.
+ *
+ * The run gate closes admission before teardown looks for active APs.  TEST_SMP
+ * uses the high bits as a small reference count so its two independent lanes
+ * may coexist while KBOOT remains excluded.  Keeping state and count in one
+ * atomic word removes the last-user/new-user race a separate counter creates.
+ */
+enum {
+	CO_VCPU_FREE = 0,
+	CO_VCPU_CLAIMING,
+	CO_VCPU_ACTIVE,
+	CO_VCPU_STOPPING,
+};
+
+enum {
+	CO_RUN_IDLE = 0,
+	CO_RUN_STARTING,
+	CO_RUN_RUNNING,
+	CO_RUN_STOPPING,
+	CO_RUN_TEST_STARTING,
+	CO_RUN_TESTING,
+	CO_RUN_TEST_STOPPING,
+};
+
+#define CO_RUN_STATE_MASK  7
+#define CO_RUN_REF_SHIFT   3
+#define CO_RUN_REF_ONE     (1 << CO_RUN_REF_SHIFT)
+
+static volatile int co_run_gate;
+static volatile int co_vcpu_claim_lock;
 /*
  * Broadcast, not per-vCPU: KSTOP and driver unload mean "all of you, now".
  * Monotonic within a run and read by volatile loads on every crossing, so it
@@ -3904,44 +3941,218 @@ static unsigned long long ap_start_rsp[CO_MAX_VCPUS];
 static unsigned long long ap_start_cr3[CO_MAX_VCPUS];
 static unsigned long long ap_start_gs[CO_MAX_VCPUS];
 
-static co_vcpu_t* co_vcpu_claim(int index)
+static int co_atomic_read(volatile int* value)
+{
+	return __sync_val_compare_and_swap(value, 0, 0);
+}
+
+static int co_atomic_cmpxchg(volatile int* value, int old_value,
+			     int new_value)
+{
+	return __sync_val_compare_and_swap(value, old_value, new_value);
+}
+
+static void co_atomic_store(volatile int* value, int new_value)
+{
+	(void)__sync_lock_test_and_set(value, new_value);
+}
+
+static int co_run_state(void)
+{
+	return co_atomic_read(&co_run_gate) & CO_RUN_STATE_MASK;
+}
+
+static void co_run_finish(void);
+
+static bool_t co_run_begin(void)
+{
+	if (co_atomic_cmpxchg(&co_run_gate, CO_RUN_IDLE,
+			      CO_RUN_STARTING) != CO_RUN_IDLE)
+		return PFALSE;
+
+	/* The gate is already closed, so nobody can enter between clearing a
+	 * previous run's abort and publishing this run.  If KSTOP won during
+	 * the clear, the state recheck restores the monotonic stop request. */
+	vcpu_abort_all = 0;
+	__sync_synchronize();
+	if (co_run_state() != CO_RUN_STARTING) {
+		vcpu_abort_all = 1;
+		co_run_finish();
+		return PFALSE;
+	}
+
+	return PTRUE;
+}
+
+static bool_t co_run_publish(void)
+{
+	return co_atomic_cmpxchg(&co_run_gate, CO_RUN_STARTING,
+				 CO_RUN_RUNNING) == CO_RUN_STARTING
+		? PTRUE : PFALSE;
+}
+
+static void co_run_finish(void)
+{
+	int old;
+
+	for (;;) {
+		old = co_atomic_read(&co_run_gate);
+		if ((old & CO_RUN_STATE_MASK) == CO_RUN_IDLE)
+			return;
+		if ((old & CO_RUN_STATE_MASK) != CO_RUN_STOPPING) {
+			co_debug_error("run gate: refusing to publish IDLE from state %d",
+				       old & CO_RUN_STATE_MASK);
+			return;
+		}
+		if (co_atomic_cmpxchg(&co_run_gate, old, CO_RUN_IDLE) == old)
+			return;
+	}
+}
+
+static void co_run_test_leave(void);
+
+static bool_t co_run_test_enter(void)
+{
+	int old, state;
+
+	for (;;) {
+		old = co_atomic_read(&co_run_gate);
+		state = old & CO_RUN_STATE_MASK;
+
+		if (state == CO_RUN_IDLE) {
+			int starting = CO_RUN_TEST_STARTING | CO_RUN_REF_ONE;
+
+			if (co_atomic_cmpxchg(&co_run_gate, old, starting) != old)
+				continue;
+
+			vcpu_abort_all = 0;
+			__sync_synchronize();
+			old = co_atomic_read(&co_run_gate);
+			if (old != starting) {
+				vcpu_abort_all = 1;
+				/* KSTOP changed STARTING to TEST_STOPPING while
+				 * preserving this reference. */
+				co_run_test_leave();
+				return PFALSE;
+			}
+
+			if (co_atomic_cmpxchg(&co_run_gate, starting,
+					      CO_RUN_TESTING | CO_RUN_REF_ONE)
+			    == starting)
+				return PTRUE;
+
+			vcpu_abort_all = 1;
+			co_run_test_leave();
+			return PFALSE;
+		}
+
+		if (state == CO_RUN_TEST_STARTING)
+			continue;
+
+		if (state != CO_RUN_TESTING)
+			return PFALSE;
+
+		if (co_atomic_cmpxchg(&co_run_gate, old,
+				      old + CO_RUN_REF_ONE) == old)
+			return PTRUE;
+	}
+}
+
+static void co_run_test_leave(void)
+{
+	int old, refs, state, next;
+
+	for (;;) {
+		old = co_atomic_read(&co_run_gate);
+		state = old & CO_RUN_STATE_MASK;
+		refs = old >> CO_RUN_REF_SHIFT;
+
+		if ((state != CO_RUN_TESTING &&
+		     state != CO_RUN_TEST_STOPPING &&
+		     state != CO_RUN_TEST_STARTING) || refs <= 0) {
+			co_debug_error("TEST_SMP run gate lost its reference "
+				       "(state %d, refs %d)", state, refs);
+			return;
+		}
+
+		next = refs == 1 ? CO_RUN_IDLE : old - CO_RUN_REF_ONE;
+		if (co_atomic_cmpxchg(&co_run_gate, old, next) == old)
+			return;
+	}
+}
+
+static void co_vcpu_registry_lock(void)
+{
+	while (__sync_lock_test_and_set(&co_vcpu_claim_lock, 1))
+		asm volatile("pause");
+}
+
+static void co_vcpu_registry_unlock(void)
+{
+	__sync_lock_release(&co_vcpu_claim_lock);
+}
+
+static co_vcpu_t* co_vcpu_claim(int index, int diagnostic)
 {
 	co_vcpu_t* vcpu;
+	unsigned long host_cpu;
 
 	if (index < 0 || index >= CO_MAX_VCPUS)
 		return NULL;
 
 	vcpu = &co_vcpu[index];
-	co_memset(vcpu, 0, sizeof(*vcpu));
+	if (co_atomic_cmpxchg(&vcpu->active, CO_VCPU_FREE,
+			      CO_VCPU_CLAIMING) != CO_VCPU_FREE)
+		return NULL;
+
+	host_cpu = co_os_current_cpu();
+	vcpu->diagnostic = diagnostic;
 	vcpu->index    = index;
-	vcpu->host_cpu = co_os_current_cpu();
+	vcpu->host_cpu = host_cpu;
+	vcpu->pp = NULL;
+	vcpu->guest_cr3 = 0;
+	vcpu->start_pending = 0;
+	vcpu->start_rip = 0;
+	vcpu->start_rsp = 0;
+	vcpu->start_cr3 = 0;
+	vcpu->start_gs_base = 0;
+	vcpu->passage_symbol_va = 0;
+	co_memset(vcpu->seen_vector, 0, sizeof(vcpu->seen_vector));
 
-	/*
-	 * The BOOT processor clears a stale abort -- not "whoever is first".
-	 *
-	 * "First in" was written when only the boot loop ever claimed a slot.
-	 * A secondary's thread now starts BEFORE the guest boots, so it became
-	 * first, and by the time vCPU 0 claimed slot 0 co_arch_boot_running()
-	 * was already true -- so the boot processor never cleared the abort
-	 * left by the previous run, and died partway through booting with the
-	 * secondary still parked and no guest instruction executed. That is
-	 * the failure that was mistaken for "a thread waiting inside the
-	 * driver destabilises the boot processor".
-	 *
-	 * A secondary must still never clear it: it would revive a guest that
-	 * KSTOP is in the middle of ending.
-	 */
-	if (index == 0)
-		vcpu_abort_all = 0;
+	if (!co_os_vcpu_kick_bind((unsigned long)index, host_cpu)) {
+		co_atomic_store(&vcpu->active, CO_VCPU_FREE);
+		return NULL;
+	}
 
-	vcpu->active = 1;
+	/* Publish only after every field a kicker or placement scan reads is
+	 * initialized and the DPC is targeted. */
+	__sync_synchronize();
+	co_atomic_store(&vcpu->active, CO_VCPU_ACTIVE);
 	return vcpu;
 }
 
 static void co_vcpu_release(co_vcpu_t* vcpu)
 {
-	vcpu->active = 0;
-	vcpu->pp     = NULL;
+	int diagnostic;
+	int old;
+
+	old = co_atomic_cmpxchg(&vcpu->active, CO_VCPU_ACTIVE,
+				CO_VCPU_STOPPING);
+	if (old != CO_VCPU_ACTIVE) {
+		co_debug_error("vcpu %d: release refused from ownership state %d",
+			       vcpu->index, old);
+		return;
+	}
+
+	diagnostic = vcpu->diagnostic;
+	co_os_vcpu_kick_unbind((unsigned long)vcpu->index);
+	vcpu->pp = NULL;
+	vcpu->diagnostic = 0;
+	__sync_synchronize();
+	co_atomic_store(&vcpu->active, CO_VCPU_FREE);
+
+	if (diagnostic)
+		co_run_test_leave();
 }
 
 /*
@@ -3958,7 +4169,8 @@ int co_arch_vcpu_core_taken(unsigned long cpu)
 	int i;
 
 	for (i = 0; i < CO_MAX_VCPUS; i++)
-		if (co_vcpu[i].active && co_vcpu[i].host_cpu == cpu)
+		if (co_atomic_read(&co_vcpu[i].active) != CO_VCPU_FREE &&
+		    co_vcpu[i].host_cpu == cpu)
 			return 1;
 
 	return 0;
@@ -3979,12 +4191,37 @@ int co_arch_vcpu_active(int index)
 	if (index < 0 || index >= CO_MAX_VCPUS)
 		return 0;
 
-	return co_vcpu[index].active ? 1 : 0;
+	return co_atomic_read(&co_vcpu[index].active) == CO_VCPU_ACTIVE ? 1 : 0;
 }
 
 void co_arch_boot_abort(void)
 {
+	int old, state, next;
+
+	/* Close admission first.  A lane that read RUNNING just before this
+	 * either publishes ACTIVE before teardown's scan, or observes STOPPING
+	 * under the same registry lock and never claims.  Without the lock an
+	 * admitted lane could pause between its state check and FREE->CLAIMING,
+	 * let teardown observe no lanes, and claim after their pages were freed. */
+	co_vcpu_registry_lock();
+	for (;;) {
+		old = co_atomic_read(&co_run_gate);
+		state = old & CO_RUN_STATE_MASK;
+		next = old;
+
+		if (state == CO_RUN_STARTING || state == CO_RUN_RUNNING)
+			next = (old & ~CO_RUN_STATE_MASK) | CO_RUN_STOPPING;
+		else if (state == CO_RUN_TEST_STARTING ||
+			 state == CO_RUN_TESTING)
+			next = (old & ~CO_RUN_STATE_MASK) | CO_RUN_TEST_STOPPING;
+
+		if (next == old || co_atomic_cmpxchg(&co_run_gate, old, next) == old)
+			break;
+	}
+	co_vcpu_registry_unlock();
+
 	vcpu_abort_all = 1;
+	__sync_synchronize();
 	/*
 	 * And wake everyone, because the flag is only read at the top of a
 	 * crossing loop and a parked vCPU is not at the top of anything.
@@ -4001,13 +4238,7 @@ void co_arch_boot_abort(void)
 
 int co_arch_boot_running(void)
 {
-	int i;
-
-	for (i = 0; i < CO_MAX_VCPUS; i++)
-		if (co_vcpu[i].active)
-			return 1;
-
-	return 0;
+	return co_run_state() != CO_RUN_IDLE ? 1 : 0;
 }
 
 /*
@@ -4048,6 +4279,22 @@ static unsigned long long co_smp_sentinel(int lane, int which)
 	       ((unsigned long long)(which + 1) << 20);
 }
 
+static bool_t co_arch_world_switch_allowed(void)
+{
+	/* This check is per current logical processor.  A successful boot-core
+	 * check says nothing about the processor an AP or TEST_SMP lane was
+	 * subsequently pinned to. */
+	if (co_get_cr4() & CO_ARCH_X86_CR4_VMXE) {
+		co_debug_error("CR4.VMXE is set on host processor %lu: something "
+			       "else has VMX claimed. Clearing CR4.PGE under another "
+			       "hypervisor can double-fault the host, so refusing to "
+			       "world-switch.", co_os_current_cpu());
+		return PFALSE;
+	}
+
+	return PTRUE;
+}
+
 co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 			      int lane, long long iterations, int join_guest)
 {
@@ -4064,6 +4311,50 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	co_memset(out, 0, sizeof(*out));
 	out->supported = PTRUE;
 	out->lane      = lane;
+
+	if (lane < 0 || lane >= CO_MAX_VCPUS)
+		return CO_RC(INVALID_PARAMETER);
+
+	/* Dynamic executable-pool mappings into a running guest have no safe
+	 * lifetime here: the old path freed them while both kload_space and,
+	 * sometimes, the grafted live root still contained their PTEs.  A real
+	 * AP always uses its boot-preallocated page; keep the synthetic loop a
+	 * private TEST_SMP operation until a real guest-unmap/TLB protocol exists. */
+	if (join_guest && iterations != 0) {
+		co_debug_error("vcpu %d: live synthetic KVCPU_RUN is disabled; "
+			       "its passage page cannot be unmapped safely", lane);
+		out->never_started = PTRUE;
+		return CO_RC(INVALID_PARAMETER);
+	}
+
+	if (join_guest) {
+		out->waited_for_start = PTRUE;
+		if (co_run_state() != CO_RUN_RUNNING || vcpu_abort_all ||
+		    !ap_start_pending[lane]) {
+			out->never_started = PTRUE;
+			return CO_RC(OK);
+		}
+		/* Flag first, payload second. */
+		__sync_synchronize();
+	}
+
+	if (!co_arch_world_switch_allowed()) {
+		if (join_guest) {
+			/* The request is already pending.  Linux is waiting for this
+			 * CPU, and moving the same attempt to another host core is not
+			 * a safe recovery from an active hypervisor. */
+			out->never_started = PFALSE;
+			ap_start_pending[lane] = 0;
+			co_arch_boot_abort();
+		}
+		return CO_RC(ERROR);
+	}
+
+	if (!join_guest && !co_run_test_enter()) {
+		co_debug_error("TEST_SMP lane %d refused: another run owns the "
+			       "world-switch lifecycle", lane);
+		return CO_RC(ERROR);
+	}
 
 	/*
 	 * Zero is not a small number here, it is a different mode: wait for
@@ -4082,9 +4373,46 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	 * that KSTOP and driver unload need to know about one kind of thing
 	 * holding a thread inside the driver rather than two.
 	 */
-	vcpu = co_vcpu_claim(lane);
-	if (vcpu == NULL)
-		return CO_RC(INVALID_PARAMETER);
+	co_vcpu_registry_lock();
+	if (join_guest &&
+	    (co_run_state() != CO_RUN_RUNNING || vcpu_abort_all ||
+	     !ap_start_pending[lane])) {
+		co_vcpu_registry_unlock();
+		out->never_started = PTRUE;
+		return CO_RC(OK);
+	}
+	if (join_guest && co_arch_vcpu_core_taken(co_os_current_cpu())) {
+		co_vcpu_registry_unlock();
+		out->never_started = PTRUE;
+		out->no_free_core = PTRUE;
+		return CO_RC(OK);
+	}
+	if (!join_guest && co_run_state() != CO_RUN_TESTING) {
+		co_vcpu_registry_unlock();
+		co_run_test_leave();
+		out->aborted = PTRUE;
+		return CO_RC(ERROR);
+	}
+
+	vcpu = co_vcpu_claim(lane, !join_guest);
+	co_vcpu_registry_unlock();
+	if (vcpu == NULL) {
+		if (!join_guest)
+			co_run_test_leave();
+		else
+			out->never_started = PTRUE;
+		return CO_RC(ERROR);
+	}
+
+	/* The first RUNNING read admitted us; this one pairs with teardown's
+	 * close-before-scan ordering.  On failure no passage pointer has been
+	 * read yet, so cleanup may proceed as soon as this slot is released. */
+	if (join_guest &&
+	    (co_run_state() != CO_RUN_RUNNING || vcpu_abort_all)) {
+		out->never_started = PTRUE;
+		co_vcpu_release(vcpu);
+		return CO_RC(OK);
+	}
 
 	co_memset(&setup, 0, sizeof(setup));
 
@@ -4094,7 +4422,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	 * reachable from the guest's own root. Only the trivial test loop,
 	 * which runs in a space of its own, allocates one here.
 	 */
-	if (join_guest && iterations == 0) {
+	if (join_guest) {
 		/*
 		 * The page was allocated and mapped at boot so the graft covers
 		 * it, but it must be BUILT here, on this thread, because
@@ -4109,7 +4437,11 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		if (ap_passage[lane] == NULL) {
 			co_debug_error("vcpu %d: no passage page was made for it at "
 				       "boot -- refusing to start it", lane);
-			out->never_started = PTRUE;
+			/* Linux has already issued START_VCPU and is waiting for this
+			 * CPU.  There is no setup which a later poll could recover. */
+			out->never_started = PFALSE;
+			ap_start_pending[lane] = 0;
+			co_arch_boot_abort();
 			co_vcpu_release(vcpu);
 			return CO_RC(ERROR);
 		}
@@ -4136,99 +4468,14 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 	}
 	vcpu->pp = pp;
 
-	/*
-	 * Join the running guest's address space, rather than the private one
-	 * co_setup_guest_page built for this passage page.
-	 *
-	 * This is the property a real secondary processor needs and the one
-	 * --test-smp does not exercise: two vCPUs crossing into the SAME CR3.
-	 * Each keeps its own passage page -- its own saved state, params, FPU
-	 * area, IST stack, TSS and GDT -- but they share the page tables, which
-	 * is what makes them processors of one machine instead of two guests.
-	 *
-	 * Mapping into kload_space is what makes it reachable. The boot path
-	 * grafts kload_space's top-level entries into the kernel's own table
-	 * (co_kload_adopt_kernel_tables), so a page added under an
-	 * already-grafted slot is visible from the kernel's CR3 without
-	 * touching the kernel's tables at all. A passage page that landed in a
-	 * slot the graft never saw would NOT be reachable, and the preflight
-	 * below is what catches that rather than the guest discovering it by
-	 * failing to fetch its first instruction.
-	 */
-	/*
-	 * Map before waiting to be started, never after.
-	 *
-	 * Mapping populates kload_space, whose top-level entries the boot path
-	 * grafted into the kernel's table -- so it touches structures the guest
-	 * walks. Doing it here, before this thread parks, means it happens
-	 * while the guest is idling in its own steady state. Doing it after the
-	 * wait means doing it at the instant START_VCPU arrives, which is
-	 * inside smp_init(), with the boot processor mid-crossing. That
-	 * reordering is what turned a working bring-up into a triple fault:
-	 * the last build that reached "CPU 1 is up" mapped first and waited
-	 * second.
-	 *
-	 * A real secondary skips this entirely -- its page was mapped at boot,
-	 * before the graft, so nothing needs touching now at all.
-	 */
-	if (join_guest && iterations != 0) {
-		co_arch_guest_space_t* space = co_kload_space();
-		unsigned long long guest_cr3 = co_vcpu[0].guest_cr3;
-		int page;
-
-		if (space == NULL || !co_vcpu[0].active || guest_cr3 == 0) {
-			co_debug_error("vcpu %d: no running guest to join "
-				       "(space %p, vcpu0 active %d, cr3 0x%llx)",
-				       lane, (void*)space, co_vcpu[0].active,
-				       guest_cr3);
-			if (pp != ap_passage[lane]) co_os_free_exec_pages(pp, pages);
-			co_vcpu_release(vcpu);
-			return CO_RC(ERROR);
-		}
-
-		for (page = 0; page < pages; page++) {
-			unsigned char* q = (unsigned char*)pp + page * CO_ARCH_PAGE_SIZE;
-
-			if (!CO_OK(co_arch_guest_map(manager, space,
-						     (unsigned long long)(size_t)q,
-						     co_os_virt_to_phys(q),
-						     _KERNPG_TABLE))) {
-				co_debug_error("vcpu %d: could not map its passage "
-					       "page into the guest's space", lane);
-				if (pp != ap_passage[lane]) co_os_free_exec_pages(pp, pages);
-				co_vcpu_release(vcpu);
-				return CO_RC(ERROR);
-			}
-		}
-
-		pp->linuxvm_state.cr3 = guest_cr3;
-		co_debug("vcpu %d: joined the guest's address space, cr3 0x%llx",
-			 lane, guest_cr3);
-	}
-
-	/*
-	 * co_boot_shim executes sti and jumps to params[20]; step (params[29])
-	 * is zero, so TF stays clear and the guest free-runs with interrupts
-	 * on -- which is what routes this processor's clock through the guest
-	 * IDT while the loop runs.
-	 */
+	/* co_boot_shim executes sti and jumps to params[20]; the private test
+	 * loop free-runs with interrupts on so host interrupts exercise its IDT. */
 	loop_va = (unsigned long long)(size_t)pp->code
 		+ (unsigned long)(&co_switch_guest_loop - &co_switch_full);
 	/*
-	 * The trivial lane's scaffolding, and only for the trivial lane.
-	 *
-	 * params[20] here is co_switch_guest_loop -- the test loop's entry --
-	 * and the four sentinels exist to prove one lane's MSRs never appear in
-	 * another's. A real secondary overwrites all six from ap_start_* once
-	 * the request is seen, so for it these are not merely useless: they run
-	 * on EVERY poll, and a real secondary's page is ap_passage[lane], which
-	 * was mapped into the guest's address space at boot and is walked by the
-	 * live guest. That is a write into a running machine's memory, once per
-	 * poll, for the whole of its boot, to install values that are wrong and
-	 * are then discarded.
-	 *
-	 * iterations == 0 is what distinguishes the two, exactly as it does at
-	 * the passage-page choice above and the wait below.
+	 * The private TEST_SMP lane's scaffolding, and only that lane's.  Live
+	 * synthetic KVCPU_RUN was rejected above, while a real AP has zero
+	 * iterations and receives all of its state from START_VCPU below.
 	 */
 	if (iterations != 0) {
 		pp->params[20] = loop_va;
@@ -4239,18 +4486,10 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		pp->linuxvm_state.lstar          = co_smp_sentinel(lane, 3);
 	}
 
-	/*
-	 * Iterations of zero means "this is a real secondary": wait for the
-	 * guest to say where to begin, rather than running the trivial loop.
-	 *
-	 * The wait is bounded. A guest that never issues START_VCPU is the
-	 * normal case for every build before the kernel could -- and an ioctl
-	 * thread parked in the driver forever is the failure this port has
-	 * paid for more than once.
-	 */
-	if (join_guest && iterations == 0) {
-		int spins;
-
+	/* A real secondary is admitted only after START_VCPU is pending.  The
+	 * daemon does the waiting by polling; this driver call never parks while
+	 * holding a vCPU slot or a pinned host processor. */
+	if (join_guest) {
 		/*
 		 * Not started yet? Return, and let the caller ask again.
 		 *
@@ -4268,18 +4507,6 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		 * thread with nothing to do belongs. The ioctl now answers one
 		 * question -- has the guest asked for this processor yet --
 		 * and either starts it or returns immediately.
-		 */
-		out->waited_for_start = PTRUE;
-		(void)spins;
-
-		/*
-		 * The one thing the log cannot currently say: did this thread
-		 * survive from the KVCPU_RUN debug to here, and what does it see?
-		 *
-		 * Everything between those two points is invisible -- the claim,
-		 * the pin, taking ap_passage[lane] UNBUILT, and the params[20] and
-		 * sentinel writes above, which go into a page mapped into the live
-		 * guest on every poll. One line separates three cases.
 		 */
 		co_debug("vcpu %d: poll on host processor %lu -- pending %d, pp 0x%llx",
 			 lane, (unsigned long)co_os_current_cpu(),
@@ -4345,7 +4572,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 			pp) == NULL) {
 			co_debug_error("vcpu %d: could not build its passage page",
 				       lane);
-			out->never_started = PTRUE;
+			co_arch_boot_abort();
 			co_vcpu_release(vcpu);
 			return CO_RC(ERROR);
 		}
@@ -4402,7 +4629,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 					       lane, ap_start_cr3[lane],
 					       co_vcpu[0].guest_cr3,
 					       (unsigned long long)requested_machine);
-				out->never_started = PTRUE;
+				co_arch_boot_abort();
 				co_vcpu_release(vcpu);
 				return CO_RC(ERROR);
 			}
@@ -4504,8 +4731,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 				co_debug_error("vcpu %d: could not publish its passage "
 					       "page at 0x%llx -- refusing to start it",
 					       lane, slot);
-				out->never_started = PTRUE;
-				if (pp != ap_passage[lane]) co_os_free_exec_pages(pp, pages);
+				co_arch_boot_abort();
 				co_vcpu_release(vcpu);
 				return CO_RC(ERROR);
 			}
@@ -4570,9 +4796,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		 * refusal was itself resetting the machine, before a single
 		 * crossing had happened.
 		 */
-		unsigned long long root_pa = out->waited_for_start
-			? pp->linuxvm_state.cr3
-			: (unsigned long long)co_arch_guest_space_root(co_kload_space());
+		unsigned long long root_pa = pp->linuxvm_state.cr3;
 		co_pfn_t root = (co_pfn_t)((root_pa & CO_ARCH_PAGE_MASK)
 					   >> CO_ARCH_PAGE_SHIFT);
 		int page;
@@ -4584,7 +4808,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		 * adopted Linux's traps.  That is exactly the shape of a silent
 		 * triple fault, so resolve both while still in Windows.
 		 */
-		{
+		if (out->waited_for_start) {
 			const unsigned long long first_touch[] = {
 				ap_start_rip[lane],
 				ap_start_rsp[lane] - 8,
@@ -4603,6 +4827,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 					out->preflight_failed = PTRUE;
 					out->preflight_va     = first_touch[i];
 					out->preflight_level  = level;
+					co_arch_boot_abort();
 					co_vcpu_release(vcpu);
 					return CO_RC(ERROR);
 				}
@@ -4629,7 +4854,7 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 				out->preflight_failed = PTRUE;
 				out->preflight_va     = va;
 				out->preflight_level  = level;
-				if (pp != ap_passage[lane]) co_os_free_exec_pages(pp, pages);
+				co_arch_boot_abort();
 				co_vcpu_release(vcpu);
 				return CO_RC(ERROR);
 			}
@@ -4670,6 +4895,23 @@ co_rc_t co_arch_test_smp_lane(co_manager_t* manager, co_arch_smp_test_t* out,
 		out->msr_ok   = PTRUE;
 
 		vrc = co_arch_vcpu_run(manager, vcpu, &vcpu_ctl, ap_result);
+
+		/* Linux has already put this processor in cpu_online_mask.  There
+		 * is no valid way to retire its host thread after an unexpected
+		 * monitor-loop exit and leave the rest of the guest running: the
+		 * next TLB shootdown or on_each_cpu() waits forever.  A normal
+		 * shutdown has already closed the run gate; every other AP exit is
+		 * fatal to the whole run. */
+		if (co_run_state() == CO_RUN_RUNNING && !vcpu_abort_all) {
+			co_debug_error("vcpu %d left its monitor loop while still "
+				       "online (faulted %d, vector %llu, "
+				       "unforwardable %d, deadline %d) -- "
+				       "aborting the guest", lane,
+				       ap_result->faulted, ap_result->vector,
+				       ap_result->unforwardable,
+				       ap_result->hit_deadline);
+			co_arch_boot_abort();
+		}
 
 		out->completed     = ap_result->switches;
 		out->interrupts    = ap_result->interrupts;
@@ -4960,10 +5202,7 @@ static co_rc_t co_arch_boot_prepare(co_manager_t* manager,
 	 * takes the host with it. Aborting the guest is the only sane answer, and
 	 * it is what the i386 port learned to do.
 	 */
-	if (co_get_cr4() & CO_ARCH_X86_CR4_VMXE) {
-		co_debug_error("CR4.VMXE is set: something else has VMX claimed. "
-			       "Clearing CR4.PGE under another hypervisor is a "
-			       "double fault, so refusing to run a guest.");
+	if (!co_arch_world_switch_allowed()) {
 		out->vmx_present = PTRUE;
 		return CO_RC(ERROR);
 	}
@@ -6109,9 +6348,8 @@ static co_rc_t co_arch_vcpu_run(co_manager_t* manager, co_vcpu_t* vcpu,
 					 * targeted host DPC is its hardware doorbell.
 					 */
 					if (target >= 0 && target < CO_MAX_VCPUS) {
-						if (co_vcpu[target].active)
-							co_os_vcpu_kick(target,
-								co_vcpu[target].host_cpu);
+						if (co_arch_vcpu_active(target))
+							co_os_vcpu_kick(target);
 						else
 							co_os_idle_wake(target);
 					}
@@ -6678,13 +6916,25 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 			    co_arch_boot_t* in, co_arch_boot_result_t* out)
 {
 	co_boot_ctx_t ctx = { NULL, NULL, 0 };
-	co_arch_passage_page_t* pp;
-	struct co_console_ring* ring;
-	co_vcpu_t* vcpu;
+	co_arch_passage_page_t* pp = NULL;
+	struct co_console_ring* ring = NULL;
+	co_vcpu_t* vcpu = NULL;
 	int pages = sizeof(co_arch_passage_page_t) / CO_ARCH_PAGE_SIZE;
-	unsigned long granted;
+	unsigned long granted = 0;
+	int run_owned = 0;
+	int async_started = 0;
+	int timer_acquired = 0;
 	int n;
 	co_rc_t rc;
+
+	co_memset(out, 0, sizeof(*out));
+	out->supported = PTRUE;
+	if (!co_run_begin()) {
+		co_debug_error("KBOOT refused: another boot or TEST_SMP run owns "
+			       "the world-switch lifecycle");
+		return CO_RC(ERROR);
+	}
+	run_owned = 1;
 
 	rc = co_arch_boot_prepare(manager, space, in, out, &ctx);
 	if (!CO_OK(rc))
@@ -6698,7 +6948,9 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	 * and the crossing state it owns is reached through the vCPU, so a
 	 * second one is an index rather than a rewrite.
 	 */
-	vcpu = co_vcpu_claim(0);
+	co_vcpu_registry_lock();
+	vcpu = co_vcpu_claim(0, 0);
+	co_vcpu_registry_unlock();
 	if (vcpu == NULL) {
 		rc = CO_RC(ERROR);
 		goto cleanup;
@@ -6721,7 +6973,9 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	 * branch checks the control struct.
 	 */
 	if (in->async_cobd && in->cobd_io_va) {
-		if (!CO_OK(co_cobd_async_start(manager, in->cobd_io_va))) {
+		if (CO_OK(co_cobd_async_start(manager, in->cobd_io_va))) {
+			async_started = 1;
+		} else {
 			co_debug("boot: async cobd unavailable -- "
 				 "falling back to inline block I/O");
 			in->async_cobd = 0;
@@ -6774,6 +7028,15 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	 */
 	vcpu_ctl.idle_stop_after = 5 * CO_GUEST_HZ;
 
+	/* All shared policy and every preallocated AP page are complete.  This
+	 * is the only transition that admits KVCPU_RUN. */
+	if (!co_run_publish()) {
+		co_debug_error("KBOOT was stopped before its monitor loop could "
+			       "start");
+		rc = CO_RC(ERROR);
+		goto cleanup;
+	}
+
 	/*
 	 * A finer host clock for the duration of the run.
 	 *
@@ -6792,6 +7055,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	 * to add.
 	 */
 	granted = co_os_timer_resolution_acquire();
+	timer_acquired = 1;
 	co_debug("boot: timer resolution %lu.%01lu ms",
 		 granted / 10000, (granted / 1000) % 10);
 
@@ -6838,19 +7102,22 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		 * shutdown, which is exactly what this cost before the wait
 		 * was here.
 		 *
-		 * vcpu_abort_all is already set by the TERMINATE handler, so
+		 * vcpu_abort_all is already set, so
 		 * every lane is on its way out; this only declines to proceed
-		 * until they have arrived. Bounded, because a lane that will
-		 * not end is a worse problem than a lane that ended late, and
-		 * pressing on at least leaves a report.
+		 * until they have arrived. It is deliberately not bounded:
+		 * freeing an AP's executable passage page because a deadline
+		 * expired is a host use-after-free, not recovery. A lane that
+		 * cannot answer abort leaves this call stuck, but keeps its code
+		 * and page tables alive rather than corrupting the host.
 		 */
 		{
 			int spins, v, live;
 
-			for (spins = 0; spins < 500; spins++) {
+			for (spins = 0; ; spins++) {
 				live = 0;
 				for (v = 1; v < CO_MAX_VCPUS; v++)
-					if (co_vcpu[v].active)
+					if (co_atomic_read(&co_vcpu[v].active) !=
+					    CO_VCPU_FREE)
 						live++;
 				if (!live)
 					break;
@@ -6874,20 +7141,22 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 				 * through it.
 				 */
 				co_os_idle_wake_all();
+				if (spins && (spins % 500) == 0)
+					co_debug_error("boot: still waiting for %d "
+						       "secondary lane(s) at teardown",
+						       live);
 				co_os_msleep(10);
 			}
-
-			if (live)
-				co_debug_error("boot: %d secondary lane(s) still "
-					       "running at teardown", live);
 		}
 
-		if (in->async_cobd && in->cobd_io_va) {
+		if (async_started) {
 			co_cobd_async_stop();
 			out->block_errors += co_cobd_async_errors();
+			async_started = 0;
 		}
 
 		co_vcpu_release(vcpu);
+		vcpu = NULL;
 
 		/*
 		 * Give the clock back. Paired with the acquire above: the host
@@ -6895,6 +7164,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 		 * whole machine on a fast tick after the guest has gone.
 		 */
 		co_os_timer_resolution_release();
+		timer_acquired = 0;
 
 		/*
 		 * The stub's ring, which is where the fine-grained trace lives
@@ -6924,6 +7194,21 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	rc = CO_RC(OK);
 
 cleanup:
+	/* Close admission before touching any run-owned allocation.  Prepare
+	 * failures never published RUNNING; the normal path joined all APs
+	 * above before reaching here. */
+	if (run_owned)
+		co_arch_boot_abort();
+
+	if (async_started) {
+		co_cobd_async_stop();
+		out->block_errors += co_cobd_async_errors();
+	}
+	if (vcpu)
+		co_vcpu_release(vcpu);
+	if (timer_acquired)
+		co_os_timer_resolution_release();
+
 	/*
 	 * One cleanup, reached from every exit.
 	 *
@@ -6957,6 +7242,9 @@ cleanup:
 
 	if (ctx.pp)
 		co_os_free_exec_pages(ctx.pp, pages);
+
+	if (run_owned)
+		co_run_finish();
 
 	return rc;
 }

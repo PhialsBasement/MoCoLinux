@@ -428,6 +428,7 @@ typedef struct {
 	unsigned long long preflight_va;
 	int		   waited_for_start;	/* real secondary, not the test loop */
 	int		   never_started;	/* the guest never issued START_VCPU */
+	int		   no_free_core;	/* placement raced another admitted vCPU */
 	int		   validated_only;	/* all AP entry mappings checked, entry gated */
 	unsigned long	   stopped_op;		/* guest operation this loop cannot serve */
 } co_arch_smp_test_t;

@@ -19,6 +19,25 @@
 
 #include "manager.h"
 
+static NTSTATUS co_ioctl_rc_to_status(co_rc_t rc)
+{
+	switch (CO_RC_GET_CODE(rc)) {
+	case CO_RC_INVALID_PARAMETER:
+		return STATUS_INVALID_PARAMETER;
+	case CO_RC_OUT_OF_MEMORY:
+	case CO_RC_OUT_OF_PAGES:
+		return STATUS_INSUFFICIENT_RESOURCES;
+	case CO_RC_ACCESS_DENIED:
+		return STATUS_ACCESS_DENIED;
+	case CO_RC_BROKEN_PIPE:
+		return STATUS_PIPE_BROKEN;
+	case CO_RC_TIMEOUT:
+		return STATUS_IO_TIMEOUT;
+	default:
+		return STATUS_UNSUCCESSFUL;
+	}
+}
+
 static NTAPI void manager_irp_cancel(
 	PDEVICE_OBJECT DeviceObject,
 	PIRP Irp)
@@ -321,19 +340,32 @@ static NTSTATUS manager_dispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 		 */
 		{
 			unsigned long return_size = 0;
+			co_rc_t ioctl_rc;
 
-			co_manager_ioctl(manager, ioctl, ioBuffer,
-					 inputBufferLength,
-					 outputBufferLength,
-					 &return_size,
-					 opened);
+			ioctl_rc = co_manager_ioctl(manager, ioctl, ioBuffer,
+						    inputBufferLength,
+						    outputBufferLength,
+						    &return_size,
+						    opened);
+
+			if (!CO_OK(ioctl_rc)) {
+				ntStatus = co_ioctl_rc_to_status(ioctl_rc);
+				Irp->IoStatus.Information = 0;
+				break;
+			}
+			if (return_size > outputBufferLength) {
+				co_debug_error("ioctl %lu reported %lu output bytes into a "
+					       "%lu-byte buffer", ioctl, return_size,
+					       outputBufferLength);
+				ntStatus = STATUS_INVALID_PARAMETER;
+				Irp->IoStatus.Information = 0;
+				break;
+			}
 
 			Irp->IoStatus.Information = return_size;
+			ntStatus = STATUS_SUCCESS;
 		}
 
-		/* Intrinsic Success / Failure indictation is returned per ioctl. */
-
-		ntStatus = STATUS_SUCCESS;
 		break;
 	}
 	}

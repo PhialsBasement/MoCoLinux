@@ -59,7 +59,15 @@ extern void   co_os_idle_wake_init(void);
 extern void   co_os_idle_wake_shutdown(void);
 extern void   co_os_idle_wake(unsigned long vcpu);
 extern void   co_os_idle_wake_all(void);
-extern void   co_os_vcpu_kick(unsigned long vcpu, unsigned long host_cpu);
+/*
+ * Bind a vCPU's posted-interrupt DPC once, before the vCPU is published as
+ * active.  Kicks then only queue that already-targeted object; teardown
+ * unbinds and drains it before the slot can be reused on another processor.
+ */
+extern bool_t co_os_vcpu_kick_bind(unsigned long vcpu,
+				   unsigned long host_cpu);
+extern void   co_os_vcpu_kick_unbind(unsigned long vcpu);
+extern void   co_os_vcpu_kick(unsigned long vcpu);
 extern void   co_os_vcpu_preempt_start(unsigned long vcpu,
 				       unsigned long host_cpu,
 				       unsigned int period_msec);
