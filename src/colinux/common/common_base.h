@@ -18,19 +18,6 @@ typedef int bool_t;
 #define PACKED_STRUCT __attribute__((packed))
 
 #define CO_MAX_MONITORS                   64
-
-/*
- * Guest processors per instance.
- *
- * One today. The number exists so the state a crossing owns can be indexed
- * rather than global: a vCPU is a pinned host thread with a passage page of
- * its own, and everything the switch saves and restores belongs to one of
- * them. Four is the shape of the machine this runs on (a quad-core host
- * gives at most three vCPUs once Windows and the GPU daemon have a core),
- * and the arrays it sizes are small.
- */
-#define CO_MAX_VCPUS                      4
-
 #define CO_LINUX_PERIPHERY_API_VERSION    34
 
 #define CO_ERRORS_X_MACRO			\

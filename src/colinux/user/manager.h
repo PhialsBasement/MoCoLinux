@@ -108,12 +108,6 @@ extern co_rc_t co_manager_test_switch(co_manager_handle_t handle,
 				      co_manager_ioctl_test_switch_t* out,
 				      int mode);
 
-extern co_rc_t co_manager_test_smp(co_manager_handle_t handle,
-				   co_manager_ioctl_test_smp_t* out);
-
-extern co_rc_t co_manager_kvcpu_run(co_manager_handle_t handle,
-				    co_manager_ioctl_kvcpu_run_t* out);
-
 extern void co_manager_debug(co_manager_handle_t handle,
 			     const char *buf, long size);
 

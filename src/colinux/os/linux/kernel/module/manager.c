@@ -387,21 +387,6 @@ void co_os_unpin_cpu(void)
 {
 }
 
-/*
- * Same story as co_os_pin_cpu above: refusing loudly beats no-opping
- * silently, because the caller is about to run a world switch that cannot
- * survive a migration.
- */
-bool_t co_os_pin_cpu_to(unsigned long cpu)
-{
-	return PFALSE;
-}
-
-unsigned long co_os_cpu_count(void)
-{
-	return (unsigned long)num_online_cpus();
-}
-
 unsigned long co_os_current_cpu(void)
 {
 	return (unsigned long)smp_processor_id();

@@ -71,13 +71,6 @@ typedef void (*co_os_thread_func_t)(void* arg);
 extern void* co_os_thread_start(co_os_thread_func_t func, void* arg);
 extern void  co_os_thread_join(void* thread);
 
-/*
- * How many processors the host has. The vCPU budget is derived from it:
- * each guest processor is a host thread pinned to a host core for the life
- * of the run, so the count bounds what a guest may be given.
- */
-extern unsigned long co_os_active_cpu_count(void);
-
 extern int co_udp_socket_connect(const char* addr, unsigned short int port);
 extern int co_udp_socket_send(int sock, const char* buffer, unsigned long size);
 extern void co_udp_socket_close(int sock);

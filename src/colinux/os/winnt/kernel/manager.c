@@ -310,43 +310,6 @@ void co_os_unpin_cpu(void)
 	KeRevertToUserAffinityThread();
 }
 
-/*
- * Pin to a processor the caller names. Unlike co_os_pin_cpu() there is no
- * read-back dance: the mask is a single bit chosen up front, so the first
- * KeSetSystemAffinityThread is already right -- the thread migrates to that
- * processor at the reschedule the call itself forces.
- *
- * KeQueryActiveProcessors has been exported since NT4, unlike the Vista-era
- * counting APIs, and this driver still loads on XP x64.
- */
-bool_t co_os_pin_cpu_to(unsigned long cpu)
-{
-	KAFFINITY want;
-
-	if (cpu >= sizeof(KAFFINITY) * 8)
-		return PFALSE;
-
-	want = (KAFFINITY)1 << cpu;
-	if (!(KeQueryActiveProcessors() & want))
-		return PFALSE;
-
-	KeSetSystemAffinityThread(want);
-	return PTRUE;
-}
-
-unsigned long co_os_cpu_count(void)
-{
-	KAFFINITY active = KeQueryActiveProcessors();
-	unsigned long count = 0;
-
-	while (active) {
-		count += (unsigned long)(active & 1);
-		active >>= 1;
-	}
-
-	return count;
-}
-
 unsigned long co_os_current_cpu(void)
 {
 	return (unsigned long)KeGetCurrentProcessorNumber();

@@ -34,31 +34,10 @@ extern void co_os_msleep(unsigned int msecs);
  * ioctl). Returns PTRUE if woken, PFALSE on timeout. The event is auto-reset:
  * one wake releases one wait, a wake with no waiter arms the next wait, and
  * nothing accumulates.
- *
- * msecs == 0 means NO timeout: wait until rung. NOTHING USES IT TODAY, and the
- * reason is worth stating so nobody reaches for it: the monitor loop's timeout
- * is not only a doorbell backstop, it is the guest's clock. Ticks are
- * synthesised from elapsed host time by co_colinux_take_ticks(), which runs
- * only when a vCPU's thread wakes and re-enters, so a vCPU that waits
- * indefinitely receives no ticks and every timer in that processor stops
- * expiring. It measured as cobd0 mounting at 13.173s instead of 0.348s.
- *
- * It stays because it becomes correct the moment the guest publishes its next
- * expiry instead of asking for a periodic tick -- a oneshot/NO_HZ clockevent,
- * where the host sleeps until exactly the next event and a doorbell is the only
- * other thing that can wake it.
- *
- * One event per vCPU, because the event is auto-reset: a single event shared
- * by two sleeping vCPUs would release exactly one of them per ring, and which
- * one is the scheduler's business. That is not a fairness wrinkle, it is a
- * lost wake -- the vCPU with the work to do goes on sleeping. So a waiter
- * names itself, and a doorbell that does not know which vCPU wants the news
- * rings co_os_idle_wake_all().
  */
 extern void   co_os_idle_wake_init(void);
-extern void   co_os_idle_wake(unsigned long vcpu);
-extern void   co_os_idle_wake_all(void);
-extern bool_t co_os_idle_wait(unsigned long vcpu, unsigned int msecs);
+extern void   co_os_idle_wake(void);
+extern bool_t co_os_idle_wait(unsigned int msecs);
 
 typedef struct {
 	union {
