@@ -1,6 +1,6 @@
 # MoCoLinux
 
-Cooperative Linux for x86-64: a modern Linux kernel running as a guest inside
+Cooperative Linux for x86-64 (Now with 128GB Fragged RAM support): a modern Linux kernel running as a guest inside
 Windows XP x64, Windows 7 x64, Windows 8.1 x64 and Windows 10 x64 on real
 hardware, without a
 hypervisor, emulation, or virtualization extensions. It is a port of
