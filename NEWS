@@ -1,4 +1,4 @@
-* MoCoLinux cooperative SMP (unreleased, 2026-08-09)
+* MoCoLinux 0.5.9 (2026-08-09)
   Kernel and driver:
   * Start a second Linux processor on its own host core with a per-vCPU passage
     page, switch state, timer, virtual interrupt flag and posted-IPI bitmap.

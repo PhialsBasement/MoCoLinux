@@ -61,6 +61,19 @@ find_src() {
 	mocolinux-setup.exe)	[ -f "$HERE/installer/$1" ] &&
 					{ printf '%s\n' "$HERE/installer/$1"; return 0; }
 				return 1 ;;
+	moco-boot.vbs|moco-icons.vbs|moco-term.bat|stop.bat|xstart1142.bat)
+				# These are source files, not build products. comake's
+				# build-directory entries are cached copies and can remain
+				# valid after the tracked launcher changes.
+				[ -f "$HERE/tools/$1" ] &&
+					{ printf '%s\n' "$HERE/tools/$1"; return 0; }
+				return 1 ;;
+	libvirglrenderer-1.dll|libepoxy-0.dll)
+				# Likewise, the cross prefix is authoritative for the two
+				# renderer DLLs; build-directory entries are only copies.
+				[ -f "$PREFIX/$1" ] &&
+					{ printf '%s\n' "$PREFIX/$1"; return 0; }
+				return 1 ;;
 	esac
 	for d in "$BUILD" "$DIST" "$HERE/tools" "$PREFIX" "$HERE" "$ROOT/download"; do
 		[ -f "$d/$1" ] && { printf '%s\n' "$d/$1"; return 0; }
@@ -94,6 +107,14 @@ for f in $manifest $image $xsrv mocolinux-setup.exe; do
 done
 
 [ -z "$missing" ] || die "not in this tree:$missing"
+
+# Do not merely find launchers with the right names: the copies in the release
+# must be the tracked versions. This catches a cached comake target silently
+# winning source priority and, in particular, dropping new command-line flags.
+for f in moco-boot.vbs moco-icons.vbs moco-term.bat stop.bat xstart1142.bat; do
+	cmp -s "$HERE/tools/$f" "$OUT/$f" ||
+		die "$f is not the tracked launcher"
+done
 
 # Built after the source it was built from, and after the driver code it
 # installs. Both have shipped stale before.
