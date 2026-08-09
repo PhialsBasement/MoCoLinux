@@ -150,16 +150,60 @@ static void vrend_write_fence(void *cookie, uint32_t fence)
  * virgl_renderer_submit_cmd, with the resource already validated as owned by
  * the calling context.
  */
+/*
+ * Recorded here, performed after the command buffer finishes.
+ *
+ * Presenting inline corrupts the guest: this callback runs from inside
+ * virgl_renderer_submit_cmd, part-way through a command buffer vrend is still
+ * executing, and presenting makes a different WGL context current to draw the
+ * overlay. vrend resumes the rest of the buffer against GL state it no longer
+ * owns, and the guest's next CLEAR fails with GL_INVALID_FRAMEBUFFER_OPERATION
+ * (1286) -- after which its context is poisoned and every DRAW_VBO is refused
+ * for the life of the application. glxgears died exactly that way.
+ *
+ * The buffer's own commands therefore run to completion first, which is also
+ * where the earlier ring-driven present ran, and is the ordering the presenter
+ * was written against.
+ */
+static struct {
+	int	 pending;
+	uint32_t res_handle, xid, width, height;
+	uint32_t damage_x, damage_y, damage_width, damage_height;
+} vrend_present_request;
+
 static void vrend_moco_present(void *cookie, uint32_t res_handle, uint32_t xid,
 			       uint32_t width, uint32_t height,
 			       uint32_t damage_x, uint32_t damage_y,
 			       uint32_t damage_width, uint32_t damage_height)
 {
 	(void)cookie;
+	/* Last request in a buffer wins: a frame presented twice in one submit
+	 * has only its final contents on screen anyway. */
+	vrend_present_request.pending	    = 1;
+	vrend_present_request.res_handle    = res_handle;
+	vrend_present_request.xid	    = xid;
+	vrend_present_request.width	    = width;
+	vrend_present_request.height	    = height;
+	vrend_present_request.damage_x	    = damage_x;
+	vrend_present_request.damage_y	    = damage_y;
+	vrend_present_request.damage_width  = damage_width;
+	vrend_present_request.damage_height = damage_height;
+}
+
+static void vrend_present_flush(void)
+{
+	if (!vrend_present_request.pending)
+		return;
+	vrend_present_request.pending = 0;
 	if (vrend_moco_present_cb)
-		vrend_moco_present_cb(res_handle, xid, width, height,
-				      damage_x, damage_y, damage_width,
-				      damage_height);
+		vrend_moco_present_cb(vrend_present_request.res_handle,
+				      vrend_present_request.xid,
+				      vrend_present_request.width,
+				      vrend_present_request.height,
+				      vrend_present_request.damage_x,
+				      vrend_present_request.damage_y,
+				      vrend_present_request.damage_width,
+				      vrend_present_request.damage_height);
 }
 
 static struct virgl_renderer_callbacks vrend_cbs = {
@@ -373,7 +417,15 @@ int cogpu_vrend_submit(uint32_t ctx_id, const void *cmds, uint32_t bytes,
 	memcpy(staging, cmds, bytes);
 	vrend_find_present_hints((const uint32_t *)staging, bytes / 4,
 				 submit_info);
-	return virgl_renderer_submit_cmd(staging, (int)ctx_id, bytes / 4);
+	{
+		int rc = virgl_renderer_submit_cmd(staging, (int)ctx_id,
+						   bytes / 4);
+
+		/* Only now, with the buffer's own commands finished and vrend
+		 * no longer part-way through them. */
+		vrend_present_flush();
+		return rc;
+	}
 }
 
 int cogpu_vrend_resource_create(struct virgl_renderer_resource_create_args *args)
