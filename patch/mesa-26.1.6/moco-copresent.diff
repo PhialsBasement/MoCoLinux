@@ -1,6 +1,6 @@
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/dri/loader_dri3_helper.c b/src/gallium/frontends/dri/loader_dri3_helper.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/loader_dri3_helper.c b/src/gallium/frontends/dri/loader_dri3_helper.c
 --- a/src/gallium/frontends/dri/loader_dri3_helper.c	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/gallium/frontends/dri/loader_dri3_helper.c	2026-08-09 18:02:41.947597100 +1000
++++ b/src/gallium/frontends/dri/loader_dri3_helper.c	2026-08-09 23:00:21.813346800 +1000
 @@ -23,6 +23,7 @@
  
  #include <fcntl.h>
@@ -662,9 +662,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
            draw->dri_screen_render_gpu == draw->dri_screen_display_gpu)
           front = dri3_get_pixmap_buffer(driDrawable,
                                          fourcc,
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/dri/loader_dri3_helper.h b/src/gallium/frontends/dri/loader_dri3_helper.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/loader_dri3_helper.h b/src/gallium/frontends/dri/loader_dri3_helper.h
 --- a/src/gallium/frontends/dri/loader_dri3_helper.h	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/gallium/frontends/dri/loader_dri3_helper.h	2026-08-09 17:43:48.936493700 +1000
++++ b/src/gallium/frontends/dri/loader_dri3_helper.h	2026-08-09 21:52:04.142436800 +1000
 @@ -78,6 +78,10 @@
     uint32_t     flags;
     uint32_t     width, height;
@@ -694,9 +694,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
     /* Currently protects the following fields:
      * event_cnd, has_event_waiter,
      * recv_sbc, ust, msc, recv_msc_serial,
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/dri/meson.build b/src/gallium/frontends/dri/meson.build
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/meson.build b/src/gallium/frontends/dri/meson.build
 --- a/src/gallium/frontends/dri/meson.build	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/gallium/frontends/dri/meson.build	2026-08-09 17:43:49.005492300 +1000
++++ b/src/gallium/frontends/dri/meson.build	2026-08-09 21:52:04.142436800 +1000
 @@ -24,7 +24,7 @@
    if with_dri_platform == 'drm' or with_dri_platform == 'pseudo-drm'
      deps_for_libdri += [dep_xcb_dri3, dep_xcb_present, dep_xcb_sync,
@@ -706,9 +706,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
    endif
  endif
  
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/dri/moco_dri3.c b/src/gallium/frontends/dri/moco_dri3.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/moco_dri3.c b/src/gallium/frontends/dri/moco_dri3.c
 --- a/src/gallium/frontends/dri/moco_dri3.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/src/gallium/frontends/dri/moco_dri3.c	2026-08-09 17:43:05.001364300 +1000
++++ b/src/gallium/frontends/dri/moco_dri3.c	2026-08-09 23:00:21.812346900 +1000
 @@ -0,0 +1,306 @@
 +/*
 + * CoPresent transport for Mesa's normal DRI3 loader.
@@ -1016,9 +1016,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
 +      close(present->socket_fd);
 +   free(present);
 +}
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/dri/moco_dri3.h b/src/gallium/frontends/dri/moco_dri3.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/moco_dri3.h b/src/gallium/frontends/dri/moco_dri3.h
 --- a/src/gallium/frontends/dri/moco_dri3.h	1970-01-01 10:00:00.000000000 +1000
-+++ b/src/gallium/frontends/dri/moco_dri3.h	2026-08-09 17:43:04.933365600 +1000
++++ b/src/gallium/frontends/dri/moco_dri3.h	2026-08-09 23:00:21.812346900 +1000
 @@ -0,0 +1,21 @@
 +#ifndef MESA_MOCO_DRI3_H
 +#define MESA_MOCO_DRI3_H
@@ -1041,9 +1041,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
 +                              uint32_t buffer);
 +
 +#endif
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/dri/moco_dri3_protocol.h b/src/gallium/frontends/dri/moco_dri3_protocol.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/moco_dri3_protocol.h b/src/gallium/frontends/dri/moco_dri3_protocol.h
 --- a/src/gallium/frontends/dri/moco_dri3_protocol.h	1970-01-01 10:00:00.000000000 +1000
-+++ b/src/gallium/frontends/dri/moco_dri3_protocol.h	2026-08-09 17:43:04.865367000 +1000
++++ b/src/gallium/frontends/dri/moco_dri3_protocol.h	2026-08-09 21:52:04.142436800 +1000
 @@ -0,0 +1,57 @@
 +/*
 + * MoCoLinux CoPresent wire ABI.  Keep this layout in sync with
@@ -1102,9 +1102,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
 +   (sizeof(struct copresent_record) == 64) ? 1 : -1];
 +
 +#endif
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/glx/xlib/meson.build b/src/gallium/frontends/glx/xlib/meson.build
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/meson.build b/src/gallium/frontends/glx/xlib/meson.build
 --- a/src/gallium/frontends/glx/xlib/meson.build	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/gallium/frontends/glx/xlib/meson.build	2026-08-09 16:30:57.324021900 +1000
++++ b/src/gallium/frontends/glx/xlib/meson.build	2026-08-09 21:52:04.143436700 +1000
 @@ -3,7 +3,8 @@
  
  libxlib = static_library(
@@ -1115,9 +1115,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
    gnu_symbol_visibility : 'hidden',
    include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_mesa],
    dependencies : [dep_x11, dep_xext, dep_xcb, dep_glproto, idep_mesautil, idep_dispatch_h],
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/glx/xlib/moco_present.c b/src/gallium/frontends/glx/xlib/moco_present.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/moco_present.c b/src/gallium/frontends/glx/xlib/moco_present.c
 --- a/src/gallium/frontends/glx/xlib/moco_present.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/src/gallium/frontends/glx/xlib/moco_present.c	2026-08-09 16:38:43.935670800 +1000
++++ b/src/gallium/frontends/glx/xlib/moco_present.c	2026-08-09 21:52:04.143436700 +1000
 @@ -0,0 +1,397 @@
 +/*
 + * Direct virgl presentation for MoCoLinux's client-side GLX frontend.
@@ -1516,9 +1516,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
 +      close(present->socket_fd);
 +   free(present);
 +}
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/glx/xlib/moco_present.h b/src/gallium/frontends/glx/xlib/moco_present.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/moco_present.h b/src/gallium/frontends/glx/xlib/moco_present.h
 --- a/src/gallium/frontends/glx/xlib/moco_present.h	1970-01-01 10:00:00.000000000 +1000
-+++ b/src/gallium/frontends/glx/xlib/moco_present.h	2026-08-09 16:29:04.970935300 +1000
++++ b/src/gallium/frontends/glx/xlib/moco_present.h	2026-08-09 21:52:04.143436700 +1000
 @@ -0,0 +1,30 @@
 +#ifndef MESA_MOCO_PRESENT_H
 +#define MESA_MOCO_PRESENT_H
@@ -1550,9 +1550,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
 +moco_present_destroy(struct moco_present *present);
 +
 +#endif
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/glx/xlib/moco_present_protocol.h b/src/gallium/frontends/glx/xlib/moco_present_protocol.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/moco_present_protocol.h b/src/gallium/frontends/glx/xlib/moco_present_protocol.h
 --- a/src/gallium/frontends/glx/xlib/moco_present_protocol.h	1970-01-01 10:00:00.000000000 +1000
-+++ b/src/gallium/frontends/glx/xlib/moco_present_protocol.h	2026-08-09 16:38:43.866672000 +1000
++++ b/src/gallium/frontends/glx/xlib/moco_present_protocol.h	2026-08-09 21:52:04.143436700 +1000
 @@ -0,0 +1,57 @@
 +/*
 + * MoCoLinux CoPresent wire ABI.  Keep the record layout in sync with
@@ -1611,9 +1611,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
 +   (sizeof(struct copresent_record) == 64) ? 1 : -1];
 +
 +#endif
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/glx/xlib/xm_api.c b/src/gallium/frontends/glx/xlib/xm_api.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/xm_api.c b/src/gallium/frontends/glx/xlib/xm_api.c
 --- a/src/gallium/frontends/glx/xlib/xm_api.c	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/gallium/frontends/glx/xlib/xm_api.c	2026-08-09 16:32:13.467724900 +1000
++++ b/src/gallium/frontends/glx/xlib/xm_api.c	2026-08-09 21:52:04.143436700 +1000
 @@ -1334,6 +1334,7 @@
  void XMesaSwapBuffers( XMesaBuffer b )
  {
@@ -1648,9 +1648,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
  
     /* TODO: remove this if the framebuffer state doesn't change. */
     st_context_invalidate_state(xmctx->st, ST_INVALIDATE_FB_STATE);
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/glx/xlib/xm_st.c b/src/gallium/frontends/glx/xlib/xm_st.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/xm_st.c b/src/gallium/frontends/glx/xlib/xm_st.c
 --- a/src/gallium/frontends/glx/xlib/xm_st.c	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/gallium/frontends/glx/xlib/xm_st.c	2026-08-09 16:32:00.818940300 +1000
++++ b/src/gallium/frontends/glx/xlib/xm_st.c	2026-08-09 21:52:04.144436700 +1000
 @@ -27,6 +27,7 @@
  
  #include "xm_api.h"
@@ -1763,9 +1763,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
     }
  }
  
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends/glx/xlib/xm_st.h b/src/gallium/frontends/glx/xlib/xm_st.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/xm_st.h b/src/gallium/frontends/glx/xlib/xm_st.h
 --- a/src/gallium/frontends/glx/xlib/xm_st.h	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/gallium/frontends/glx/xlib/xm_st.h	2026-08-09 16:32:00.887939200 +1000
++++ b/src/gallium/frontends/glx/xlib/xm_st.h	2026-08-09 21:52:04.144436700 +1000
 @@ -44,7 +44,8 @@
                                 enum st_attachment_type att);
  
@@ -1776,9 +1776,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/frontends
  
  void
  xmesa_copy_st_framebuffer(struct pipe_frontend_drawable *drawable,
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/targets/libgl-xlib/xlib.c b/src/gallium/targets/libgl-xlib/xlib.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/targets/libgl-xlib/xlib.c b/src/gallium/targets/libgl-xlib/xlib.c
 --- a/src/gallium/targets/libgl-xlib/xlib.c	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/gallium/targets/libgl-xlib/xlib.c	2026-08-09 16:36:05.086576500 +1000
++++ b/src/gallium/targets/libgl-xlib/xlib.c	2026-08-09 21:52:04.144436700 +1000
 @@ -32,16 +32,23 @@
   */
  #include "util/compiler.h"
@@ -1852,9 +1852,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/gallium/targets/l
 -   return NULL;
  }
 -
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/glx/dri3_glx.c b/src/glx/dri3_glx.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/glx/dri3_glx.c b/src/glx/dri3_glx.c
 --- a/src/glx/dri3_glx.c	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/glx/dri3_glx.c	2026-08-09 18:13:58.373615300 +1000
++++ b/src/glx/dri3_glx.c	2026-08-09 21:52:04.144436700 +1000
 @@ -186,6 +186,7 @@
     pdraw->base.xDrawable = xDrawable;
     pdraw->base.drawable = drawable;
@@ -1884,9 +1884,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/glx/dri3_glx.c b/
  
     psc->prefer_back_buffer_reuse = 1;
     if (psc->fd_render_gpu != psc->fd_display_gpu) {
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/glx/dri3_priv.h b/src/glx/dri3_priv.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/glx/dri3_priv.h b/src/glx/dri3_priv.h
 --- a/src/glx/dri3_priv.h	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/glx/dri3_priv.h	2026-08-09 17:43:49.075490900 +1000
++++ b/src/glx/dri3_priv.h	2026-08-09 21:52:04.145436700 +1000
 @@ -84,6 +84,7 @@
      */
     int fd_display_gpu;
@@ -1895,9 +1895,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/glx/dri3_priv.h b
  };
  
  struct dri3_drawable {
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/glx/dri_common.c b/src/glx/dri_common.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/glx/dri_common.c b/src/glx/dri_common.c
 --- a/src/glx/dri_common.c	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/glx/dri_common.c	2026-08-09 18:13:58.446614000 +1000
++++ b/src/glx/dri_common.c	2026-08-09 21:52:04.145436700 +1000
 @@ -255,7 +255,8 @@
      * this usually works except for bare Windows that haven't been made
      * current yet.
@@ -1949,9 +1949,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/glx/dri_common.c 
           pdraw->destroyDrawable(pdraw);
           __glxHashDelete(priv->drawHash, drawable);
           _mesa_set_remove(priv->zombieGLXDrawable, entry);
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/glx/glxclient.h b/src/glx/glxclient.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/glx/glxclient.h b/src/glx/glxclient.h
 --- a/src/glx/glxclient.h	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/glx/glxclient.h	2026-08-09 18:13:58.295616700 +1000
++++ b/src/glx/glxclient.h	2026-08-09 21:52:04.145436700 +1000
 @@ -513,6 +513,7 @@
     bool allow_invalid_glx_destroy_window;
     bool keep_native_window_glx_drawable;
@@ -1960,9 +1960,248 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/glx/glxclient.h b
  
     char *driverName;
  
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/x11/x11_dri3.c b/src/x11/x11_dri3.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/mesa/vbo/vbo_save_api.c b/src/mesa/vbo/vbo_save_api.c
+--- a/src/mesa/vbo/vbo_save_api.c	2026-07-30 03:31:27.000000000 +1000
++++ b/src/mesa/vbo/vbo_save_api.c	2026-08-10 00:20:18.759951100 +1000
+@@ -505,6 +505,183 @@
+ }
+ 
+ 
++/* MoCo display-list cache reorder (used from compile_vertex_list).
++ *
++ * Expand merged GL_TRIANGLE_STRIP prims into an independent-triangle index
++ * list, preserving winding and dropping the degenerate bridge triangles the
++ * strip merge inserted.  Returns a malloc'd array whose [0] is the triangle
++ * count, followed by count*3 indices; NULL when nothing useful came out.
++ */
++static uint32_t *
++vbo_moco_expand_strips(const uint32_t *indices,
++                       const struct _mesa_prim *prims, unsigned prim_count,
++                       unsigned total_indices)
++{
++   uint32_t *out = malloc((1 + (size_t)total_indices * 3) * sizeof(uint32_t));
++   uint32_t n = 0;
++
++   if (!out)
++      return NULL;
++   for (unsigned p = 0; p < prim_count; p++) {
++      unsigned s = prims[p].start;
++      unsigned c = prims[p].count;
++
++      for (unsigned j = 0; j + 2 < c; j++) {
++         uint32_t a = indices[s + j];
++         uint32_t b = indices[s + j + 1];
++         uint32_t d = indices[s + j + 2];
++
++         if (a == b || b == d || a == d)
++            continue;              /* degenerate bridge */
++         if (j & 1) {
++            out[1 + n * 3 + 0] = b;
++            out[1 + n * 3 + 1] = a;
++         } else {
++            out[1 + n * 3 + 0] = a;
++            out[1 + n * 3 + 1] = b;
++         }
++         out[1 + n * 3 + 2] = d;
++         n++;
++      }
++   }
++   if (!n) {
++      free(out);
++      return NULL;
++   }
++   out[0] = n;
++   return out;
++}
++
++
++/* Tipsify (Sander, Nehab, Barczak 2007): linear-time triangle reorder for a
++ * FIFO post-transform cache.  Reorders whole triangles only; the indices
++ * inside each triangle -- and therefore winding -- are untouched.  The
++ * strip order this replaces revisits interior vertices one grid row apart,
++ * which busts the cache on any mesh wider than it; this brings shaded
++ * vertices per triangle back toward 1.
++ */
++static void
++vbo_moco_tipsify(uint32_t *tri_indices, uint32_t tri_count,
++                 uint32_t vertex_count)
++{
++   const uint32_t CACHE = 24;
++   uint32_t *adj_offset = calloc((size_t)vertex_count + 1, sizeof(uint32_t));
++   uint32_t *adj = malloc((size_t)tri_count * 3 * sizeof(uint32_t));
++   uint32_t *live = malloc((size_t)vertex_count * sizeof(uint32_t));
++   uint32_t *entered = calloc(vertex_count, sizeof(uint32_t));
++   uint8_t *emitted = calloc(tri_count, 1);
++   uint32_t *stack = malloc((size_t)tri_count * 3 * sizeof(uint32_t));
++   uint32_t *out = malloc((size_t)tri_count * 3 * sizeof(uint32_t));
++   uint32_t *cand = NULL;
++   uint32_t stack_top = 0, o = 0, timestamp = CACHE + 1, cursor = 0;
++   uint32_t max_degree = 0;
++   uint32_t f;
++
++   if (!adj_offset || !adj || !live || !entered || !emitted || !stack || !out)
++      goto cleanup;
++
++   for (uint32_t t = 0; t < tri_count; t++)
++      for (int k = 0; k < 3; k++)
++         adj_offset[tri_indices[t * 3 + k] + 1]++;
++   for (uint32_t v = 0; v < vertex_count; v++) {
++      if (adj_offset[v + 1] > max_degree)
++         max_degree = adj_offset[v + 1];
++      live[v] = adj_offset[v + 1];
++      adj_offset[v + 1] += adj_offset[v];
++   }
++   {
++      uint32_t *fill = malloc((size_t)vertex_count * sizeof(uint32_t));
++
++      if (!fill)
++         goto cleanup;
++      memcpy(fill, adj_offset, (size_t)vertex_count * sizeof(uint32_t));
++      for (uint32_t t = 0; t < tri_count; t++)
++         for (int k = 0; k < 3; k++)
++            adj[fill[tri_indices[t * 3 + k]]++] = t;
++      free(fill);
++   }
++
++   cand = malloc((size_t)max_degree * 3 * sizeof(uint32_t));
++   if (!cand)
++      goto cleanup;
++
++   f = tri_indices[0];
++   while (f != UINT32_MAX) {
++      uint32_t cand_count = 0;
++
++      for (uint32_t e = adj_offset[f]; e < adj_offset[f + 1]; e++) {
++         uint32_t t = adj[e];
++
++         if (emitted[t])
++            continue;
++         for (int k = 0; k < 3; k++) {
++            uint32_t v = tri_indices[t * 3 + k];
++
++            out[o++] = v;
++            stack[stack_top++] = v;
++            cand[cand_count++] = v;
++            live[v]--;
++            if (timestamp - entered[v] > CACHE)
++               entered[v] = timestamp++;
++         }
++         emitted[t] = 1;
++      }
++
++      f = UINT32_MAX;
++      {
++         int best = -1;
++
++         for (uint32_t c = 0; c < cand_count; c++) {
++            uint32_t v = cand[c];
++            int priority;
++
++            if (!live[v])
++               continue;
++            priority = 0;
++            if (timestamp - entered[v] + 2 * live[v] <= CACHE)
++               priority = (int)(timestamp - entered[v]);
++            if (priority > best) {
++               best = priority;
++               f = v;
++            }
++         }
++      }
++      if (f == UINT32_MAX) {
++         while (stack_top) {
++            uint32_t v = stack[--stack_top];
++
++            if (live[v]) {
++               f = v;
++               break;
++            }
++         }
++      }
++      if (f == UINT32_MAX) {
++         while (cursor < vertex_count) {
++            if (live[cursor]) {
++               f = cursor;
++               break;
++            }
++            cursor++;
++         }
++      }
++   }
++
++   if (o == tri_count * 3)
++      memcpy(tri_indices, out, (size_t)o * sizeof(uint32_t));
++
++cleanup:
++   free(adj_offset);
++   free(adj);
++   free(live);
++   free(entered);
++   free(emitted);
++   free(stack);
++   free(out);
++   free(cand);
++}
++
++
+ /**
+  * Insert the active immediate struct onto the display list currently
+  * being built.
+@@ -761,6 +938,51 @@
+    }
+ 
+    unsigned merged_prim_count = last_valid_prim + 1;
++
++   /* MoCo: optional cache-reorder for large triangle-strip lists.
++    *
++    * MEASURED A REGRESSION on the GT 730 (heavy glbench 40.4 -> 29.0 fps,
++    * 2026-08-10): expanding strips to independent triangles triples index
++    * traffic and the strip order's vertex reuse was not the bottleneck --
++    * per-triangle cost is identical at every draw count, resolution and
++    * index order tried. Kept behind an opt-in for future hardware where
++    * post-transform caching behaves differently; do not enable by default.
++    */
++   if (vertex_to_index && idx >= 512 && merged_prim_count >= 1 &&
++       getenv("MOCO_DLIST_REORDER")) {
++      bool all_strips = true;
++      for (unsigned i = 0; i < merged_prim_count && all_strips; i++)
++         all_strips = merged_prims[i].mode == GL_TRIANGLE_STRIP &&
++                      merged_prims[i].count >= 3;
++      if (all_strips) {
++         uint32_t *tris = vbo_moco_expand_strips(indices, merged_prims,
++                                                 merged_prim_count, idx);
++         if (tris) {
++            uint32_t tri_count = tris[0];
++            uint32_t *tri_indices = tris + 1;
++
++            vbo_moco_tipsify(tri_indices, tri_count, max_index + 1);
++
++            free(indices);
++            indices = tri_indices;
++            idx = tri_count * 3;
++            /* tris[0] (the count slot) stays owned by the same allocation;
++             * shift down so free(indices) later releases it. */
++            memmove(tris, tris + 1, (size_t)idx * sizeof(uint32_t));
++            indices = tris;
++
++            merged_prims = realloc(merged_prims, sizeof(struct _mesa_prim));
++            memset(merged_prims, 0, sizeof(struct _mesa_prim));
++            merged_prims[0].mode = GL_TRIANGLES;
++            merged_prims[0].start = 0;
++            merged_prims[0].count = idx;
++            merged_prims[0].begin = 1;
++            merged_prims[0].end = 1;
++            merged_prim_count = 1;
++         }
++      }
++   }
++
+    node->cold->ib.ptr = NULL;
+    node->cold->ib.count = idx;
+    node->cold->ib.index_size_shift = (GL_UNSIGNED_INT - GL_UNSIGNED_BYTE) >> 1;
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/x11/x11_dri3.c b/src/x11/x11_dri3.c
 --- a/src/x11/x11_dri3.c	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/x11/x11_dri3.c	2026-08-09 17:43:35.981749500 +1000
++++ b/src/x11/x11_dri3.c	2026-08-09 21:52:04.145436700 +1000
 @@ -25,6 +25,8 @@
  
  #include <stdbool.h>
@@ -2013,9 +2252,9 @@ diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/x11/x11_dri3.c b/
     xcb_prefetch_extension_data(c, &xcb_dri3_id);
     xcb_prefetch_extension_data(c, &xcb_present_id);
  
-diff -ruN '--exclude=build-moco' '--exclude=__pycache__' a/src/x11/x11_dri3.h b/src/x11/x11_dri3.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/x11/x11_dri3.h b/src/x11/x11_dri3.h
 --- a/src/x11/x11_dri3.h	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/x11/x11_dri3.h	2026-08-09 17:43:28.446898600 +1000
++++ b/src/x11/x11_dri3.h	2026-08-09 21:52:04.145436700 +1000
 @@ -30,5 +30,6 @@
  
  int x11_dri3_open(xcb_connection_t *conn, xcb_window_t root, uint32_t provider);

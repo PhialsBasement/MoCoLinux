@@ -38,7 +38,7 @@ The Mesa input is the official 26.1.6 release tarball:
 The complete Mesa delta is:
 
     patch/mesa-26.1.6/moco-copresent.diff
-    SHA256 f17035b4c949341d24621613cf938d26ba820dbcd43f22b2496e92fe0a49bc66
+    SHA256 8c539f2f92717275ba6bafee2c96a9fcca15ae75962b4c4305d367052861adf8
 
 It contains every Mesa change, including all new source/header files.
 It applies with `patch -p1 --fuzz=0`; no file from the modified development
