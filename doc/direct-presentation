@@ -1,0 +1,250 @@
+Direct presentation without modifying VcXsrv
+=============================================
+
+Purpose
+-------
+
+Replace VirtualGL's finished-image path with direct presentation of the GL
+texture virglrenderer has already created on the Windows GPU. Applications must
+open ordinary GLX/EGL contexts through Mesa: no vglrun wrapper, LD_PRELOAD,
+faker library, application patch, frame readback, or XPutImage presentation.
+
+VcXsrv 1.14.2.1 is immutable. Its build is an installer input that cannot be
+reconstructed as part of the normal MoCoLinux build, so no rung may depend on a
+patched X server. VcXsrv remains responsible for the things it already does
+well: X protocol semantics, outer HWND lifetime, input, focus, stacking,
+clipboard, titles, icons, menus, shapes, and ordinary CPU-rendered X drawing.
+
+The split is therefore a control plane and a render plane:
+
+    X client ---------------------------------------> stock VcXsrv
+       |                                               outer HWND
+       | Mesa GLX/EGL                                    ^
+       v                                                 |
+    virtio-gpu -> cogpu -> virglrenderer texture -> WGL child HWND
+
+Only commands, resource identity, damage, and fences cross the cooperative
+boundary. Finished pixels do not.
+
+The unmodified-server seam
+--------------------------
+
+The shipped VcXsrv gives an external process all that the presenter needs:
+
+  * every multiwindow HWND carries its XID in the Win32 property
+    "vcxsrv_wid_prop_rl";
+  * its client window has WS_CLIPCHILDREN, so VcXsrv's GDI repaint is clipped
+    around a child owned by cogpu;
+  * VcXsrv's own native-GL implementation uses a WS_CHILD | WS_DISABLED GL
+    window. A disabled child does not steal the input which belongs to the
+    outer X window.
+
+Cogpu can therefore enumerate the stock server's windows, match an XID, create
+and size its own WGL child, and destroy it without injecting code into VcXsrv
+or drawing into a device context whose pixel format somebody else owns.
+
+Non-negotiable invariants
+-------------------------
+
+  * The installed VcXsrv files remain byte-for-byte stock.
+  * An accelerated application starts normally. No per-application launcher or
+    preload environment is part of correctness.
+  * A presented frame is never read back to guest or host system memory.
+  * The host samples the virglrenderer resource in cogpu's existing WGL share
+    group. A GL texture name never crosses a process boundary.
+  * Every buffer has explicit acquire and release ordering. Resource IDs alone
+    are not lifetime protection.
+  * Failure removes the WGL child and exposes VcXsrv's ordinary drawable; it
+    must not leave a permanent black overlay.
+  * OpenGL/EGL delivery and Vulkan delivery are separate projects. Virgl does
+    not become a Vulkan implementation by acquiring a presentation path.
+
+What applications must see
+--------------------------
+
+Direct presentation is not complete merely because pixels move quickly. The
+guest graphics stack must look like an ordinary direct-rendering Linux stack
+to applications which make security and feature decisions from it:
+
+  * /dev/dri/renderD128 is the device Mesa opens and virgl is the renderer;
+  * glXIsDirect and glxinfo report a direct context, never indirect GLX;
+  * DRI3 and Present semantics are visible to guest X clients. A guest-side
+    facade may terminate the Linux dma-buf/fence handoff into CoPresent because
+    an fd cannot be passed into a Windows X server, but applications must not
+    be silently routed to indirect GL when stock VcXsrv cannot consume it;
+  * no vglrun, libvglfaker, LD_PRELOAD, application injection, or executable
+    patch is present in the launch command or process mappings.
+
+Steam, Firefox and sandboxed clients are acceptance tests for this contract,
+not special cases to spoof. R1 proves only the host texture/display seam; R2
+and R3 make the contract real for ordinary clients.
+
+Rungs
+-----
+
+R0 -- prove the immutable VcXsrv/Win32 seam
+
+    Add an opt-in cogpu host probe. It locates a visible VcXsrv HWND through
+    "vcxsrv_wid_prop_rl", creates a disabled WGL child with its own pixel
+    format and a context sharing with cogpu's base context, and renders a sharp
+    diagnostic animation with several independently moving shapes in that
+    child. It then removes the child and invalidates the parent.
+
+    PASS: the animation remains inside the chosen X window; the outer window
+    can be moved, resized, focused and typed into; another window clips it; and
+    the original X contents repaint when the probe exits. VcXsrv is unmodified.
+
+R1 -- present an actual virglrenderer resource
+
+    Wrap virgl_renderer_resource_get_info(), retain a presentation reference
+    to the resource, and draw its host tex_id in the R0 child with a minimal
+    shader. Handle orientation and the formats Mesa actually produces. Restore
+    virglrenderer's context after every present.
+
+    PASS: a known guest-rendered test texture appears in the child with no
+    glReadPixels, StretchDIBits, XPutImage, or frame-sized host/guest message.
+    Destroying the guest resource while it is bound is refused or deferred.
+
+    HOST-SIDE PASS (2026-08-09): an in-guest `moco-gl glxgears` created a
+    300x300 virgl colour target. Cogpu decoded Mesa's in-stream TRANSFER3D,
+    matched its resource to VcXsrv XID 0x200002, obtained host texture 2 from
+    virglrenderer, and sampled it in the shared WGL child. The visible gears
+    ran near 60 Hz; the log measured 1,302 direct frames and 57.1 fps. On
+    process exit the guest unreferenced resource 3, cogpu removed the child and
+    released its GL binding before virglrenderer deletion, and the daemon
+    remained alive.
+
+    This test still launched through VirtualGL solely to produce a known frame
+    and its existing readback command supplied the temporary selection point.
+    The presenter itself sampled the host texture and performed no readback,
+    but the fallback path still copied the frame in parallel. Therefore this
+    was not the no-VGL application-path gate; R2 now replaces that temporary
+    selection point with explicit fenced presentation.
+
+R2 -- make presentation a fenced cooperative service
+
+    Define a versioned CoPresent protocol and a guest broker. The broker owns a
+    Unix socket and accepts a drawable XID, dma-buf, dimensions, damage and an
+    acquire fence from an unprivileged client. It PRIME-imports the dma-buf on
+    the virtio render node, asks DRM_VIRTGPU_RESOURCE_INFO for the imported
+    handle's host resource id, and sends fixed-size BIND, PRESENT and UNBIND
+    records over a small pinned shared-memory ring. The host returns RELEASE
+    records. Connection and resource generations make stale messages harmless
+    after either side restarts.
+
+    IMPLEMENTED (2026-08-09): `moco-present-broker` accepts dma-buf and native
+    fence FDs over a SOCK_SEQPACKET socket, PRIME-imports each buffer on
+    renderD128, and publishes only fixed 64-byte records through an 8 KiB
+    pinned region. Cogpu waits the acquire fence, retains the virgl resource,
+    samples its existing host texture, returns RELEASE, and tears down the WGL
+    child on UNBIND or generation reset. Neither ring can contain pixels.
+
+    HARDWARE RESULT: the standalone two-buffer producer submitted and received
+    RELEASE for all 116,587 frames in a 126-second interactive run. It rebound
+    cleanly at 1000x700, 1200x760, 800x500 and 1500x800; the host log records
+    matched UNBINDs for both resources at every size and after the X window's
+    normal close event. An unmodified GLX client using the same service later
+    completed 33,027 releases in 75 seconds at 900x600, settled at 446.3
+    no-copy fps, and cleanly UNBINDed. The uninterrupted ten-minute producer
+    soak remains the final acceptance run, not a missing protocol component.
+
+    PASS: a standalone guest program cycles two buffers for at least ten
+    minutes while windows are resized and destroyed. No buffer is sampled
+    before acquire or reused before release, and daemon restart leaves no child
+    windows behind.
+
+R3 -- normal 64-bit GLX applications
+
+    Add a Mesa MoCo X11 winsys alongside the existing DRI loaders. It uses the
+    ordinary virtio-gpu render node and Gallium virgl driver, creates normal X
+    windows for control/events, exposes DRI3/Present-compatible semantics to
+    clients, and terminates the Linux fd/fence handoff in CoPresent rather than
+    trying to pass a dma-buf fd into Windows VcXsrv. The selection is
+    system-wide and based on the MoCo device/broker, not a wrapper around an
+    application.
+
+    PASS: unmodified glxinfo reports direct rendering and virgl; guest X
+    clients can query DRI3 and Present; glxgears and kmscube-style tests render
+    in VcXsrv windows; /proc/PID/maps contains no VirtualGL faker library;
+    killing CoPresent falls back cleanly.
+
+    PROTOTYPE (2026-08-09): Mesa 26.1.6's client-side Xlib GLX target now opens
+    renderD128 with Gallium virgl and submits its swaps to CoPresent. Unmodified
+    `glxinfo -B` reports direct rendering, virgl on the GeForce GT 730 and GL
+    4.2; unmodified `glxgears` measured 516--551 fps at 1600x837 while the host
+    settled near 545 fenced no-copy releases/s. The application command has no
+    `moco-gl`, `vglrun`, `LD_PRELOAD` or faker library. This proves the normal
+    GLX application seam, but it is not a full R3 pass: the DRI3/Present query
+    facade, broker-loss fallback, system packaging and broader GLX coverage
+    remain. The source/build boundary is recorded in `doc/building-copresent`.
+
+R4 -- EGL, browsers and the Steam client
+
+    Reuse the same Mesa winsys from EGL/X11, including explicit fences,
+    buffer-age and damage semantics required by Chromium-derived clients.
+    Exercise nested X drawables by resolving their top-level XID and offset
+    before positioning the WGL child.
+
+    PASS: Firefox and Steam start without moco-gl, their GPU processes use
+    /dev/dri/renderD128, and rendered content survives resize, minimize,
+    occlusion, menus and repeated open/close cycles.
+
+R5 -- 32-bit and Steam Runtime integration
+
+    Build and package the same Mesa/broker client ABI for i686. Install both
+    graphics stacks where Steam's pressure-vessel runtime imports host GPU
+    drivers; do not rely on the runtime accidentally inheriting a development
+    path.
+
+    PASS: both 64-bit and 32-bit glxinfo select virgl, Steam's system report
+    sees the same renderer in both ABIs, and a 32-bit OpenGL title presents
+    without VirtualGL.
+
+R6 -- production window semantics and recovery
+
+    Complete drawable-to-top-level resolution, offsets, multiple GL drawables
+    per outer window, shaped windows, DPI, occlusion throttling, buffer release
+    on minimize, X server restart, guest restart and host display reset. Keep
+    ordinary X-rendered popups and decorations outside the GL child.
+
+    PASS: desktop and application soak across XP x64, Windows 7 and Windows 10
+    shows no orphan child, black repaint, input loss or resource leak.
+
+R7 -- performance gate and removal of VirtualGL from the default path
+
+    Instrument command bytes, present records, fence latency, SwapBuffers time,
+    missed releases and host/guest CPU. Make direct presentation the default
+    only after the fallback remains usable and the measured path carries no
+    frame-sized traffic.
+
+    PASS: steady-state present traffic is metadata-sized, frame rate is paced
+    by the application/vsync rather than readback, and the normal launch path
+    contains neither vglrun nor libvglfaker. Retain VirtualGL only as an
+    explicitly selected compatibility fallback until a later release removes
+    it.
+
+R8 -- Vulkan/Proton, separately
+
+    Add virtio-gpu Venus and a Vulkan WSI presentation path using the same HWND
+    and CoPresent lifetime machinery. Do not route Vulkan through the OpenGL
+    texture API or claim Proton/DXVK support before this rung passes.
+
+    PASS: vulkaninfo reports a hardware Venus device in both ABIs and a DXVK
+    test presents through CoPresent with explicit Vulkan fences.
+
+Current implementation boundary
+-------------------------------
+
+R0, R1 and the R2 cooperative service are implemented. The service adds a
+guest broker and matched host protocol but does not modify the driver, guest
+kernel or VcXsrv. `--present-r2` remains deliberately opt-in while normal
+release shortcuts retain VirtualGL.
+
+There is also an early R3 application path: a complete repository patch against
+the checksum-pinned Mesa 26.1.6 release builds an Xlib `libGL.so.1` that selects
+virgl and CoPresent for ordinary GLX programs. It is currently selected as an
+isolated development library, not installed by the rootfs builder. It proves
+direct GLX rendering and no-copy presentation but does not yet emulate the
+DRI3/Present extension contract, cover EGL/browsers, or fall back when the
+broker disappears. Build, selection, rollback and the accepted hashes are in
+`doc/building-copresent`.

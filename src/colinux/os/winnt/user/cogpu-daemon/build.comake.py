@@ -4,6 +4,8 @@ targets['build.o'] = Target(
        Input('vring.o'),
        Input('vrend.o'),
        Input('wgl_winsys.o'),
+       Input('present.o'),
+       Input('copresent.o'),
        Input('xwire.o'),
     ],
 )

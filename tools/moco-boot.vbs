@@ -143,6 +143,15 @@ Else
 	        .ExpandEnvironmentStrings("%SystemDrive%") & "\MoCoLinux"
 End If
 
+' Deliberately narrow development switches. Normal shortcuts pass only the two
+' directories above, so neither presentation rung becomes the default while
+' its protocol is still being proved.
+cogpu_extra = ""
+If argc >= 3 Then
+	If argv(2) = "--present-r1" Then cogpu_extra = " --present-r1"
+	If argv(2) = "--present-r2" Then cogpu_extra = " --present-r2"
+End If
+
 Set shell = CreateObject("WScript.Shell")
 Set wmi   = GetObject("winmgmts:\\.\root\cimv2")
 
@@ -246,7 +255,12 @@ End If
 ' tolerates a late daemon by design, so this ordering is safe rather than
 ' merely convenient.
 If Not Running("cogpu-daemon.exe") Then
-	shell.Run """" & moco & "\cogpu-daemon.exe"" --verbose", HIDDEN, NOWAIT
+	' Per-command tracing writes one line for every fenced frame and materially
+	' throttles direct presentation. Startup, errors, periodic counters and R2
+	' frame-rate reports are logged without --verbose; reserve that flag for a
+	' deliberately launched diagnostic daemon.
+	shell.Run """" & moco & "\cogpu-daemon.exe""" & cogpu_extra, _
+		  HIDDEN, NOWAIT
 End If
 ' The terminal server shares an image name with the guest, so Running()
 ' cannot tell them apart; started only on a cold run. A second one would

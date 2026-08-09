@@ -22,7 +22,8 @@
  * building, and why the poll is deliberately hot rather than a 20 ms sleep
  * like the older daemons.
  *
- *   cogpu-daemon.exe [--verbose] [--selftest] [--once]
+ *   cogpu-daemon.exe [--verbose] [--selftest] [--once] [--present-probe]
+ *                    [--present-r1] [--present-r2]
  */
 
 #include <windows.h>
@@ -39,6 +40,8 @@
 
 #include "vring.h"
 #include "vrend.h"
+#include "present.h"
+#include "copresent.h"
 /*
  * mingw has no sys/uio.h, and virglrenderer's header takes struct iovec as
  * given. Two members, same layout as everywhere else; virglrenderer only ever
@@ -71,6 +74,8 @@ struct co_vgpu_io_abi {
 #define VIRTIO_S_DRIVER_OK	4
 
 static int verbose;
+static int present_r1;
+static int present_r2;
 
 /*
  * Its own log file, written and flushed line by line.
@@ -593,12 +598,43 @@ static uint32_t serve(struct cogpu_chain *chain)
 		}
 
 		{
-			int rc2 = cogpu_vrend_submit(req.ctx_id, cmds, sub.size);
+			struct cogpu_vrend_submit_info submit_info;
+			int rc2 = cogpu_vrend_submit(req.ctx_id, cmds, sub.size,
+				present_r1 ? &submit_info : NULL);
 
 			if (rc2 == 0) {
+				unsigned int hint_index;
+
 				resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 				g_stats.submits++;
 				g_stats.cmd_bytes += sub.size;
+
+				/* Modern Mesa places readback in TRANSFER3D commands inside
+				 * the submitted virgl stream, not in the older outer virtio
+				 * TRANSFER_FROM_HOST_3D request. The parser in vrend.c reports
+				 * only host-to-guest sources; the presenter then applies the
+				 * resource-type and X-window extent checks. */
+				for (hint_index = 0; present_r1 &&
+				     hint_index < submit_info.present_hint_count;
+				     hint_index++) {
+					const struct cogpu_vrend_present_hint *hint =
+						&submit_info.present_hints[hint_index];
+					struct cogpu_vrend_resource_info info;
+					int present_rc;
+
+					if (cogpu_vrend_resource_info(hint->resource_id,
+								     &info) != 0)
+						continue;
+					present_rc = cogpu_present_r1_frame(&info,
+						hint->level, hint->x, hint->y,
+						hint->width, hint->height);
+					if (present_rc < 0) {
+						logline("present R1: disabling after a"
+							" context/window failure\n");
+						cogpu_present_r1_fini();
+						present_r1 = 0;
+					}
+				}
 			} else {
 				resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
 				logline("  SUBMIT_3D ctx %u, %u bytes, refused (%d)\n",
@@ -836,6 +872,8 @@ static uint32_t serve(struct cogpu_chain *chain)
 		 * pagetable" in Xorg with the page table itself overwritten.
 		 * Both are pages that had just been freed and reused.
 		 */
+		cogpu_present_r1_resource_unref(d.resource_id);
+		cogpu_present_r2_resource_unref(d.resource_id);
 		cogpu_vrend_detach_iov(d.resource_id);
 		cogpu_vrend_resource_unref(d.resource_id);
 
@@ -885,6 +923,23 @@ static uint32_t serve(struct cogpu_chain *chain)
 					   t.stride, t.layer_stride,
 					   t.x, t.y, t.z, t.w, t.h, t.d, t.offset);
 		if (rc2 == 0) {
+			if (type == VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D &&
+			    present_r1) {
+				struct cogpu_vrend_resource_info info;
+
+				if (cogpu_vrend_resource_info(t.resource_id,
+							     &info) == 0) {
+					int present_rc = cogpu_present_r1_frame(&info,
+						t.level, t.x, t.y, t.w, t.h);
+
+					if (present_rc < 0) {
+						logline("present R1: disabling after a"
+							" context/window failure\n");
+						cogpu_present_r1_fini();
+						present_r1 = 0;
+					}
+				}
+			}
 			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 			g_stats.transfers++;
 		} else {
@@ -990,7 +1045,8 @@ int main(int argc, char **argv)
 	struct cogpu_vring	vq[CO_VGPU_NUM_VQS];
 	unsigned int		last_kick[CO_VGPU_NUM_VQS] = { 0, 0 };
 	unsigned long long	vgpu_va = 0;
-	int			i, once = 0, idle = 0;
+	int			i, once = 0, present_probe = 0;
+	int			idle = 0;
 	unsigned long long	sweeps = 0;
 
 	for (i = 1; i < argc; i++) {
@@ -998,12 +1054,23 @@ int main(int argc, char **argv)
 			verbose = 1;
 		else if (!strcmp(argv[i], "--once"))
 			once = 1;
+		else if (!strcmp(argv[i], "--present-probe"))
+			present_probe = 1;
+		else if (!strcmp(argv[i], "--present-r1"))
+			present_r1 = 1;
+		else if (!strcmp(argv[i], "--present-r2"))
+			present_r2 = 1;
 		else if (!strcmp(argv[i], "--selftest"))
 			return cogpu_vring_selftest();
 		else {
-			logline("usage: cogpu-daemon [--verbose] [--once] [--selftest]\n");
+			logline("usage: cogpu-daemon [--verbose] [--once] [--selftest]"
+				" [--present-probe] [--present-r1] [--present-r2]\n");
 			return 2;
 		}
+	}
+	if (present_r1 && present_r2) {
+		logline("--present-r1 and --present-r2 are mutually exclusive\n");
+		return 2;
 	}
 
 	/*
@@ -1091,6 +1158,12 @@ int main(int argc, char **argv)
 		cogpu_vrend_capset(1, &v, &sz);
 		logline("virgl capset: version %u, %u bytes\n", v, sz);
 	}
+	if (present_probe)
+		return cogpu_present_probe(12000);
+	if (present_r1)
+		cogpu_present_r1_enable();
+	if (present_r2)
+		cogpu_present_r2_enable();
 
 	handle = co_os_manager_open();
 	g_wake_handle = handle;		/* for cogpu_ring_doorbell(), incl. the X wire */
@@ -1176,6 +1249,11 @@ int main(int argc, char **argv)
 	 * to reaching the X server over slirp exactly as it did before, slowly.
 	 */
 	cogpu_xwire_start();
+	if (present_r2 && cogpu_copresent_start() != 0) {
+		logline("present R2: metadata listener unavailable; disabling R2\n");
+		cogpu_present_r2_fini();
+		present_r2 = 0;
+	}
 
 	memset(vq, 0, sizeof(vq));
 	io->enabled = 1;
@@ -1192,6 +1270,30 @@ int main(int argc, char **argv)
 
 	for (;;) {
 		int did = 0;
+		int present_poll_rc;
+		int copresent_poll_rc;
+
+		present_poll_rc = present_r1 ? cogpu_present_r1_poll() :
+			(present_r2 ? cogpu_present_r2_poll() : 0);
+		if (present_poll_rc < 0) {
+			logline("present: disabling after an overlay/message-pump"
+				" failure\n");
+			if (present_r1) {
+				cogpu_present_r1_fini();
+				present_r1 = 0;
+			} else {
+				cogpu_copresent_fini();
+				cogpu_present_r2_fini();
+				present_r2 = 0;
+			}
+		}
+		copresent_poll_rc = present_r2 ? cogpu_copresent_poll() : 0;
+		if (copresent_poll_rc < 0) {
+			logline("present R2: metadata channel failed; disabling R2\n");
+			cogpu_copresent_fini();
+			cogpu_present_r2_fini();
+			present_r2 = 0;
+		}
 
 		io->host_heartbeat++;
 		sweeps++;
@@ -1316,6 +1418,10 @@ int main(int argc, char **argv)
 	}
 
 	}
+
+	cogpu_copresent_fini();
+	cogpu_present_r2_fini();
+	cogpu_present_r1_fini();
 
 	logline("\nrequests %llu, fenced %llu, refused %llu, sweeps %llu\n",
 	       g_stats.requests, g_stats.fenced, g_stats.refused, sweeps);

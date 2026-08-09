@@ -51,6 +51,76 @@ static cogpu_fence_fn vrend_fence_cb;
 static void	*vrend_fence_ctx;
 
 /*
+ * virgl_renderer_resource_get_info() exposes the GL name and dimensions but
+ * not the Gallium target, bind flags, or sample count. Those are precisely the
+ * fields which distinguish a presentable 2D colour target from a buffer,
+ * depth image, array, or multisample attachment. Keep the successful create
+ * arguments beside the renderer object instead of guessing from a GL name.
+ *
+ * This list is touched only by the daemon's renderer thread. A missing entry
+ * disables presentation for that resource; it must never make rendering fail.
+ */
+struct vrend_resource_meta {
+	struct cogpu_vrend_resource_info info;
+	struct vrend_resource_meta *next;
+};
+
+static struct vrend_resource_meta *vrend_resources;
+
+static struct vrend_resource_meta *vrend_resource_find(uint32_t resource_id)
+{
+	struct vrend_resource_meta *meta;
+
+	for (meta = vrend_resources; meta; meta = meta->next)
+		if (meta->info.resource_id == resource_id)
+			return meta;
+	return NULL;
+}
+
+static void vrend_resource_remember(
+			 const struct virgl_renderer_resource_create_args *args)
+{
+	struct vrend_resource_meta *meta = vrend_resource_find(args->handle);
+
+	if (!meta) {
+		meta = calloc(1, sizeof(*meta));
+		if (!meta)
+			return;
+		meta->next = vrend_resources;
+		vrend_resources = meta;
+	}
+
+	memset(&meta->info, 0, sizeof(meta->info));
+	meta->info.resource_id = args->handle;
+	meta->info.target = args->target;
+	meta->info.format = args->format;
+	meta->info.bind = args->bind;
+	meta->info.width = args->width;
+	meta->info.height = args->height;
+	meta->info.depth = args->depth;
+	meta->info.array_size = args->array_size;
+	meta->info.last_level = args->last_level;
+	meta->info.nr_samples = args->nr_samples;
+	meta->info.flags = args->flags;
+}
+
+static void vrend_resource_forget(uint32_t resource_id)
+{
+	struct vrend_resource_meta **link = &vrend_resources;
+
+	while (*link) {
+		struct vrend_resource_meta *meta = *link;
+
+		if (meta->info.resource_id == resource_id) {
+			*link = meta->next;
+			free(meta);
+			return;
+		}
+		link = &meta->next;
+	}
+}
+
+/*
  * virglrenderer telling us a fence has retired.
  *
  * It is called from inside virgl_renderer_submit_cmd or from
@@ -176,7 +246,83 @@ void cogpu_vrend_ctx_destroy(uint32_t ctx_id)
  */
 #define COGPU_MAX_CMD_BYTES (1u << 20)
 
-int cogpu_vrend_submit(uint32_t ctx_id, const void *cmds, uint32_t bytes)
+/* Command IDs and fields from virgl_protocol.h. That header is private to
+ * virglrenderer and is intentionally absent from the installed SDK; these few
+ * wire values are stable protocol, not renderer internals. */
+#define COGPU_VIRGL_CCMD_TRANSFER3D                   43u
+#define COGPU_VIRGL_CCMD_COPY_TRANSFER3D              45u
+#define COGPU_VIRGL_TRANSFER3D_SIZE                   13u
+#define COGPU_VIRGL_COPY_TRANSFER3D_SIZE              14u
+#define COGPU_VIRGL_TRANSFER_FROM_HOST                 2u
+#define COGPU_VIRGL_COPY_TRANSFER3D_READ_FROM_HOST    (1u << 1)
+
+static void vrend_add_present_hint(struct cogpu_vrend_submit_info *info,
+				   const uint32_t *command)
+{
+	struct cogpu_vrend_present_hint *hint;
+	unsigned int i;
+
+	if (!info)
+		return;
+
+	/* One submit can contain repeated readback packets for the same resource.
+	 * Keep its last box, while preserving distinct candidates for the window
+	 * and colour-target filters in present.c. */
+	for (i = 0; i < info->present_hint_count; i++)
+		if (info->present_hints[i].resource_id == command[1])
+			break;
+	if (i == COGPU_VREND_MAX_PRESENT_HINTS) {
+		memmove(&info->present_hints[0], &info->present_hints[1],
+			(COGPU_VREND_MAX_PRESENT_HINTS - 1) *
+			sizeof(info->present_hints[0]));
+		i--;
+	} else if (i == info->present_hint_count) {
+		info->present_hint_count++;
+	}
+
+	hint = &info->present_hints[i];
+	hint->resource_id = command[1];
+	hint->level = command[2];
+	hint->x = command[6];
+	hint->y = command[7];
+	hint->width = command[9];
+	hint->height = command[10];
+}
+
+static void vrend_find_present_hints(const uint32_t *stream, uint32_t dwords,
+				     struct cogpu_vrend_submit_info *info)
+{
+	uint32_t offset = 0;
+
+	if (!info)
+		return;
+	memset(info, 0, sizeof(*info));
+
+	while (offset < dwords) {
+		const uint32_t *command = &stream[offset];
+		uint32_t length = command[0] >> 16;
+		uint32_t opcode = command[0] & 0xff;
+
+		if (length > dwords - offset - 1)
+			return;
+		if (opcode == COGPU_VIRGL_CCMD_TRANSFER3D &&
+		    length >= COGPU_VIRGL_TRANSFER3D_SIZE &&
+		    command[13] == COGPU_VIRGL_TRANSFER_FROM_HOST)
+			vrend_add_present_hint(info, command);
+		else if (opcode == COGPU_VIRGL_CCMD_COPY_TRANSFER3D &&
+			 length == COGPU_VIRGL_COPY_TRANSFER3D_SIZE &&
+			 (command[14] &
+			  COGPU_VIRGL_COPY_TRANSFER3D_READ_FROM_HOST))
+			/* For FROM_HOST, field 1 is the host texture source and
+			 * field 12 is the guest-backed staging destination. */
+			vrend_add_present_hint(info, command);
+
+		offset += length + 1;
+	}
+}
+
+int cogpu_vrend_submit(uint32_t ctx_id, const void *cmds, uint32_t bytes,
+		       struct cogpu_vrend_submit_info *submit_info)
 {
 	static unsigned char *staging;
 	static uint32_t	      staging_size;
@@ -198,20 +344,58 @@ int cogpu_vrend_submit(uint32_t ctx_id, const void *cmds, uint32_t bytes)
 	}
 
 	memcpy(staging, cmds, bytes);
+	vrend_find_present_hints((const uint32_t *)staging, bytes / 4,
+				 submit_info);
 	return virgl_renderer_submit_cmd(staging, (int)ctx_id, bytes / 4);
 }
 
 int cogpu_vrend_resource_create(struct virgl_renderer_resource_create_args *args)
 {
+	int rc;
+
 	if (!vrend_ready)
 		return -1;
-	return virgl_renderer_resource_create(args, NULL, 0);
+	rc = virgl_renderer_resource_create(args, NULL, 0);
+	if (rc == 0)
+		vrend_resource_remember(args);
+	return rc;
 }
 
 void cogpu_vrend_resource_unref(uint32_t res_id)
 {
-	if (vrend_ready)
+	if (vrend_ready) {
 		virgl_renderer_resource_unref(res_id);
+		vrend_resource_forget(res_id);
+	}
+}
+
+int cogpu_vrend_resource_info(uint32_t res_id,
+			      struct cogpu_vrend_resource_info *info)
+{
+	struct vrend_resource_meta *meta;
+	struct virgl_renderer_resource_info renderer_info;
+	int rc;
+
+	if (!vrend_ready || !info)
+		return -1;
+	meta = vrend_resource_find(res_id);
+	if (!meta)
+		return -1;
+
+	memset(&renderer_info, 0, sizeof(renderer_info));
+	rc = virgl_renderer_resource_get_info((int)res_id, &renderer_info);
+	if (rc != 0 || renderer_info.tex_id == 0)
+		return -1;
+
+	*info = meta->info;
+	/* The renderer is authoritative after resource creation. */
+	info->format = renderer_info.virgl_format;
+	info->width = renderer_info.width;
+	info->height = renderer_info.height;
+	info->depth = renderer_info.depth;
+	info->flags = renderer_info.flags;
+	info->tex_id = renderer_info.tex_id;
+	return 0;
 }
 
 /*

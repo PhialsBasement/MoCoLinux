@@ -35,10 +35,12 @@
 #define WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB 0x00000002
 
 typedef HGLRC (WINAPI *PFNWGLCREATECONTEXTATTRIBSARB)(HDC, HGLRC, const int *);
+typedef BOOL (WINAPI *PFNWGLSWAPINTERVALEXT)(int);
 
 static HWND  ws_wnd;
 static HDC   ws_dc;
 static HGLRC ws_base;          /* the share source, and the fallback current */
+static int   ws_pixel_format;  /* child contexts must use this exact format */
 static PFNWGLCREATECONTEXTATTRIBSARB ws_createattribs;
 
 static LRESULT CALLBACK ws_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -93,6 +95,7 @@ int wgl_winsys_init(void)
 			(unsigned long)GetLastError());
 		return -1;
 	}
+	ws_pixel_format = fmt;
 
 	{
 		HGLRC tmp = wglCreateContext(ws_dc);
@@ -154,6 +157,7 @@ void wgl_winsys_fini(void)
 		DestroyWindow(ws_wnd);
 		ws_wnd = NULL;
 	}
+	ws_pixel_format = 0;
 }
 
 const char *wgl_winsys_renderer(void)
@@ -168,6 +172,135 @@ const char *wgl_winsys_version(void)
 	const char *s = (const char *)glGetString(GL_VERSION);
 
 	return s ? s : "(none)";
+}
+
+/* -------------------------------------- contexts for visible presentation */
+
+int wgl_winsys_window_context_create(HWND window,
+				     struct wgl_window_context *context)
+{
+	PIXELFORMATDESCRIPTOR pfd;
+	int attribs[] = {
+		WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
+		WGL_CONTEXT_MINOR_VERSION_ARB, 3,
+		WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+		0
+	};
+	int current_format;
+
+	if (!window || !context || !ws_base || !ws_createattribs ||
+	    !ws_pixel_format)
+		return -1;
+
+	ZeroMemory(context, sizeof(*context));
+	context->window = window;
+	context->dc = GetDC(window);
+	if (!context->dc) {
+		fprintf(stderr, "winsys: presenter GetDC failed (%lu)\n",
+			(unsigned long)GetLastError());
+		goto fail;
+	}
+
+	/* SetPixelFormat is legal only once per window. The presenter owns this
+	 * child, so zero is expected; accepting the same pre-existing format makes
+	 * cleanup/retry robust without ever sharing across incompatible formats. */
+	current_format = GetPixelFormat(context->dc);
+	if (current_format == 0) {
+		ZeroMemory(&pfd, sizeof(pfd));
+		if (!DescribePixelFormat(context->dc, ws_pixel_format,
+					 sizeof(pfd), &pfd) ||
+		    !SetPixelFormat(context->dc, ws_pixel_format, &pfd)) {
+			fprintf(stderr,
+				"winsys: presenter pixel format %d rejected (%lu)\n",
+				ws_pixel_format, (unsigned long)GetLastError());
+			goto fail;
+		}
+	} else if (current_format != ws_pixel_format) {
+		fprintf(stderr,
+			"winsys: presenter has pixel format %d, expected %d\n",
+			current_format, ws_pixel_format);
+		goto fail;
+	}
+
+	/* Passing ws_base here puts the drawable context in the exact share group
+	 * in which virglrenderer creates its textures. No GL name crosses a process
+	 * boundary: both producer and presenter remain inside cogpu. */
+	context->context = ws_createattribs(context->dc, ws_base, attribs);
+	if (!context->context) {
+		fprintf(stderr, "winsys: presenter context failed (%lu)\n",
+			(unsigned long)GetLastError());
+		goto fail;
+	}
+
+	return 0;
+
+fail:
+	wgl_winsys_window_context_destroy(context);
+	return -1;
+}
+
+int wgl_winsys_window_context_make_current(
+				     const struct wgl_window_context *context)
+{
+	if (!context || !context->dc || !context->context)
+		return -1;
+	return wglMakeCurrent(context->dc, context->context) ? 0 : -1;
+}
+
+int wgl_winsys_swap_interval(int interval)
+{
+	PFNWGLSWAPINTERVALEXT swap_interval;
+
+	if (!wglGetCurrentContext())
+		return -1;
+	swap_interval = (PFNWGLSWAPINTERVALEXT)
+		wglGetProcAddress("wglSwapIntervalEXT");
+	if (!swap_interval)
+		return -1;
+	return swap_interval(interval) ? 0 : -1;
+}
+
+void wgl_winsys_current_save(struct wgl_current_context *saved)
+{
+	if (!saved)
+		return;
+	saved->dc = wglGetCurrentDC();
+	saved->context = wglGetCurrentContext();
+}
+
+int wgl_winsys_current_restore(const struct wgl_current_context *saved)
+{
+	if (!saved)
+		return -1;
+	if (!saved->context)
+		return wglMakeCurrent(NULL, NULL) ? 0 : -1;
+	if (!saved->dc)
+		return -1;
+	return wglMakeCurrent(saved->dc, saved->context) ? 0 : -1;
+}
+
+int wgl_winsys_restore(void)
+{
+	if (!ws_dc || !ws_base)
+		return -1;
+	return wglMakeCurrent(ws_dc, ws_base) ? 0 : -1;
+}
+
+void wgl_winsys_window_context_destroy(struct wgl_window_context *context)
+{
+	if (!context)
+		return;
+	if (context->context) {
+		if (wglGetCurrentContext() == context->context)
+			wgl_winsys_restore();
+		wglDeleteContext(context->context);
+		context->context = NULL;
+	}
+	if (context->dc && context->window) {
+		ReleaseDC(context->window, context->dc);
+		context->dc = NULL;
+	}
+	context->window = NULL;
 }
 
 /* --------------------------------------------- the three virgl callbacks */

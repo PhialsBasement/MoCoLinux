@@ -1,0 +1,12 @@
+[Unit]
+Description=MoCoLinux fenced direct-presentation broker
+After=network.target coxwire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/moco-present-broker
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
