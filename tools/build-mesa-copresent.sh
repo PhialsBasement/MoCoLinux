@@ -14,8 +14,11 @@ WORK=${MOCO_MESA_WORK:-$OUTER/build/mesa-copresent-$VERSION}
 SOURCE=$WORK/mesa-$VERSION
 BUILD=$WORK/build
 VENV=${MOCO_MESA_VENV:-$WORK/venv}
-OUTPUT=${MOCO_MESA_OUTPUT:-$WORK/out/libGL-moco.so.1}
-GALLIUM_OUTPUT=${MOCO_MESA_GALLIUM_OUTPUT:-$WORK/out/libgallium-$VERSION.so}
+BUILD32=$WORK/build32
+# Both ABIs, in the layout mkmanjarorootfs.sh reads them from.
+OUT64=${MOCO_MESA_OUT64:-$WORK/out/lib64}
+OUT32=${MOCO_MESA_OUT32:-$WORK/out/lib32}
+WANT32=${MOCO_MESA_32BIT:-1}
 PREFIX=${MOCO_MESA_PREFIX:-/usr}
 EXPECTED_TARBALL_SHA256=5296b88a0f1e012e2cb9ada150a2bbadf728ca81e5a4fb2ab43c83a4d2158606
 
@@ -75,42 +78,97 @@ case $JOBS in
 	''|*[!0-9]*|0) die "MOCO_BUILD_JOBS must be a positive integer" ;;
 esac
 
-say "configuring Mesa $VERSION"
-if [ -f "$BUILD/meson-private/coredata.dat" ]; then
-	SETUP_MODE=--reconfigure
-else
-	SETUP_MODE=
+# EGL, GBM and GLES are built, not disabled.
+#
+# They were disabled when only GLX mattered, and that quietly capped what the
+# stack could run: modern toolkit and browser clients ask for EGL, and with none
+# of ours present they resolved to the distribution's Mesa, probed real DRI3
+# against the Windows X server, and fell back to software. Firefox with hardware
+# WebRender and Steam's CEF helper are both in that group.
+#
+# LLVM stays disabled and llvmpipe is not built here: software Vulkan for the
+# Steam client comes from the distribution's vulkan-swrast package, which the
+# root filesystem installs for both ABIs. Building it here would add an LLVM
+# dependency to this script for something pacman already ships.
+mesa_configure() {
+	# $1 = build directory, $2... = extra meson arguments
+	_build=$1
+	shift
+	if [ -f "$_build/meson-private/coredata.dat" ]; then
+		_mode=--reconfigure
+	else
+		_mode=
+	fi
+	PYTHONPATH=$VENV_SITE "$VENV/bin/meson" setup $_mode "$_build" "$SOURCE" \
+		--prefix="$PREFIX" \
+		-Dglx=dri \
+		-Dglvnd=disabled \
+		-Dgallium-drivers=virgl,softpipe \
+		-Dvulkan-drivers=[] \
+		-Dplatforms=x11 \
+		-Degl=enabled \
+		-Dgbm=enabled \
+		-Dgles1=disabled \
+		-Dgles2=enabled \
+		-Dllvm=disabled \
+		-Dgallium-va=disabled \
+		-Dvideo-codecs=[] \
+		-Dbuild-tests=false \
+		-Dvalgrind=disabled \
+		-Dlibunwind=disabled \
+		"$@"
+}
+
+# Every library a client can resolve. libGL and the Gallium driver are the
+# pair that does the work; the rest exist so that an application asking for
+# EGL or GLES gets OUR driver rather than the distribution's.
+TARGETS="src/glx/libGL.so.1.2.0
+src/egl/libEGL.so.1.0.0
+src/mesa/glapi/es2api/libGLESv2.so.2.0.0
+src/gallium/targets/dri/libgallium-$VERSION.so
+src/gbm/libgbm.so.1.0.0
+src/gbm/backends/dri/dri_gbm.so"
+
+build_abi() {
+	# $1 = build dir, $2 = output dir, $3 = human label
+	say "building $3 with $JOBS jobs"
+	# shellcheck disable=SC2086
+	PYTHONPATH=$VENV_SITE ninja -C "$1" -j "$JOBS" $TARGETS
+
+	mkdir -p "$2"
+	for t in $TARGETS; do
+		install -m 0755 "$1/$t" "$2/$(basename "$t")"
+		strip --strip-unneeded "$2/$(basename "$t")"
+	done
+}
+
+say "configuring Mesa $VERSION (64-bit)"
+mesa_configure "$BUILD"
+build_abi "$BUILD" "$OUT64" "the 64-bit stack"
+
+# The 32-bit half. Skipped rather than fatal when the build host has no
+# multilib: a 64-bit-only stack is still useful, and failing the whole build
+# would strand anyone who only wants GLX. The root filesystem builder warns
+# loudly if the 32-bit set is missing, which is where it actually matters.
+if [ "$WANT32" = 1 ]; then
+	if PKG_CONFIG_LIBDIR=/usr/lib32/pkgconfig:/usr/share/pkgconfig \
+	   pkg-config --exists x11 xcb libdrm 2>/dev/null &&
+	   printf 'int main(void){return 0;}\n' | cc -m32 -x c - -o /dev/null 2>/dev/null
+	then
+		say "configuring Mesa $VERSION (32-bit)"
+		# xlib-lease is a Vulkan display-lease feature needing 32-bit
+		# libXrandr, which multilib installs do not always carry; no
+		# Vulkan driver is built here, so it has nothing to serve.
+		mesa_configure "$BUILD32" --cross-file="$HERE/tools/i686-cross.ini" \
+			-Dxlib-lease=disabled
+		build_abi "$BUILD32" "$OUT32" "the 32-bit stack"
+	else
+		say "skipping the 32-bit stack: no multilib toolchain or i686 -dev libraries"
+		say "  (Steam's client is i386 and will render in software without it)"
+		OUT32=
+	fi
 fi
-PYTHONPATH=$VENV_SITE "$VENV/bin/meson" setup $SETUP_MODE "$BUILD" "$SOURCE" \
-	--prefix="$PREFIX" \
-	-Dglx=dri \
-	-Dglvnd=disabled \
-	-Dgallium-drivers=virgl,softpipe \
-	-Dvulkan-drivers=[] \
-	-Dplatforms=x11 \
-	-Degl=disabled \
-	-Dgbm=disabled \
-	-Dgles1=disabled \
-	-Dgles2=disabled \
-	-Dllvm=disabled \
-	-Dgallium-va=disabled \
-	-Dvideo-codecs=[] \
-	-Dbuild-tests=false \
-	-Dvalgrind=disabled \
-	-Dlibunwind=disabled
-
-GL_TARGET=src/glx/libGL.so.1.2.0
-GALLIUM_TARGET=src/gallium/targets/dri/libgallium-$VERSION.so
-say "building normal DRI GLX and Gallium virgl with $JOBS jobs"
-PYTHONPATH=$VENV_SITE ninja -C "$BUILD" -j "$JOBS" \
-	"$GL_TARGET" "$GALLIUM_TARGET"
-
-mkdir -p "$(dirname "$OUTPUT")"
-mkdir -p "$(dirname "$GALLIUM_OUTPUT")"
-install -m 0755 "$BUILD/$GL_TARGET" "$OUTPUT"
-install -m 0755 "$BUILD/$GALLIUM_TARGET" "$GALLIUM_OUTPUT"
-strip --strip-unneeded "$OUTPUT" "$GALLIUM_OUTPUT"
 
 say ""
-say "built the matched Mesa DRI3 pair"
-sha256sum "$OUTPUT" "$GALLIUM_OUTPUT"
+say "built the CoPresent GL stack"
+sha256sum "$OUT64"/* ${OUT32:+"$OUT32"/*}

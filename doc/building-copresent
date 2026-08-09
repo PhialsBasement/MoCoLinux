@@ -4,23 +4,41 @@ Building and testing direct DRI3 CoPresent
 Scope
 -----
 
-CoPresent has three separately built pieces. Keeping those boundaries clear
-is important: rebuilding only cogpu-daemon is not enough once the Mesa client
-path is selected.
+CoPresent has two separately built pieces. Keeping that boundary clear is
+important: rebuilding only cogpu-daemon is not enough once the Mesa client
+path is selected, and the two halves share a wire format.
 
-  1. `cogpu-daemon.exe` owns the Windows metadata listener, resolves a guest
-     virgl resource to its existing host GL texture, waits the acquire fence,
-     and displays that texture in a child of the stock VcXsrv window.
-  2. `moco-present-broker` runs in Linux. It PRIME-imports client dma-bufs,
-     turns them into virgl resource IDs, waits native fences, and exchanges
-     fixed 64-byte records with cogpu through an 8 KiB pinned ring.
-  3. A matched patched Mesa `libGL.so.1` and Gallium DRI library make ordinary
-     64-bit GLX clients consume Mesa's normal DRI3 provider, render with virgl
-     on `/dev/dri/renderD128`, and hand the final dma-buf/fence present to the
-     broker.
+  1. `cogpu-daemon.exe` owns the Windows side. It decodes the guest's virgl
+     command stream, and when that stream carries `VIRGL_CCMD_MOCO_PRESENT` it
+     resolves the named resource to its existing host GL texture and displays
+     it in an overlay above the stock VcXsrv window.
+  2. A patched Mesa -- `libGL`, `libEGL`, `libGLESv2`, the Gallium DRI library
+     and `libgbm`, built for BOTH ABIs -- makes ordinary GLX and EGL clients
+     consume Mesa's normal DRI3 provider, render with virgl on
+     `/dev/dri/renderD128`, and emit that presentation command at the point a
+     Linux X server would have been handed a dma-buf.
+
+Presentation rides the command stream deliberately. It travels down the render
+node the client already has open, so nothing else has to be reachable: no
+socket, no extra device, no filesystem share. That is what makes sandboxed
+clients work with no configuration at all -- Firefox's content processes and
+Steam's pressure-vessel container cannot see `/run`, and the earlier
+broker-socket revision was invisible to both, silently falling back to software
+while unsandboxed clients worked.
+
+The broker, its pinned ring, its dma-buf export/PRIME import and its root-only
+pagemap requirement are gone. `moco-present-broker` and `moco-present.service`
+are no longer built, installed or enabled; a guest carrying them from an older
+release can have them removed.
 
 VcXsrv is not rebuilt or patched. It remains the X control plane and owns
 the top-level Windows window, input, focus and ordinary X drawing.
+
+A note on Vulkan: virgl provides OpenGL only, and there is no Vulkan in this
+stack. The modern Steam client will not build its UI without a Vulkan device,
+so the root filesystem installs the distribution's `vulkan-swrast` (lavapipe)
+for both ABIs. That answers the client's probe in software while games keep
+rendering through accelerated GL. Accelerated Vulkan is a separate project.
 
 Authoritative sources
 ---------------------
@@ -66,30 +84,8 @@ The host log is `%SystemDrive%\MoCoLinux\cogpu-daemon.log`. Per-command
 `--verbose` tracing must stay off during performance tests: it logs every
 fenced command and measurably throttles presentation.
 
-Build and install the guest broker
-----------------------------------
-
-On a Linux builder with libdrm, EGL, OpenGL and X11 development files:
-
-    tools/build-copresent-guest.sh
-
-Set `MOCO_COPRESENT_OUTPUT` to choose an output directory. The default is
-`../dist-guest`. The script builds both the broker and the standalone R2
-producer and copies the systemd unit. Install them in the guest with:
-
-    sudo install -Dm0755 moco-present-broker /usr/local/bin/moco-present-broker
-    sudo install -Dm0755 copresent-test /usr/local/bin/copresent-test
-    sudo install -Dm0644 moco-present.service /etc/systemd/system/moco-present.service
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now moco-present.service
-
-`systemctl is-active moco-present.service` must report `active`, and
-`/run/moco-present.sock` must exist before selecting the patched Mesa library.
-The service is root only because current Linux pagemap policy hides PFNs from
-unprivileged processes; clients and rendering remain unprivileged.
-
-Build the Mesa GLX library
---------------------------
+Build the Mesa GL stack
+-----------------------
 
 The canonical build is one command:
 
@@ -102,26 +98,38 @@ The script:
   * creates a Python virtual environment with Meson 1.11.2, Mako 1.4.1,
     MarkupSafe 3.0.3, PyYAML 6.0.3 and packaging 26.3;
   * configures Mesa's normal DRI GLX provider and Gallium virgl/softpipe, with
-    GLVND, EGL, GBM, Vulkan, LLVM, VA and tests disabled;
-  * builds `src/glx/libGL.so.1.2.0` and
-    `src/gallium/targets/dri/libgallium-26.1.6.so` with Ninja; and
-  * builds with a fixed `/usr` runtime prefix and strips the matched pair to
-    `../build/mesa-copresent-26.1.6/out/libGL-moco.so.1` and
-    `../build/mesa-copresent-26.1.6/out/libgallium-26.1.6.so`.
+    EGL, GBM and GLES2 ENABLED and GLVND, Vulkan, LLVM, VA and tests disabled;
+  * builds `libGL`, `libEGL`, `libGLESv2`, the Gallium DRI library, `libgbm`
+    and its DRI backend with Ninja; and
+  * repeats the whole build for i686 using `tools/i686-cross.ini`, stripping
+    each ABI into `../build/mesa-copresent-26.1.6/out/lib64` and `.../lib32`.
+
+EGL and GLES are built rather than disabled because modern clients ask for
+them: with no EGL of ours present, Firefox's hardware WebRender and Steam's CEF
+helper resolved to the distribution's Mesa, probed real DRI3 against the
+Windows X server and fell back to software.
+
+The 32-bit half is not optional in practice. Steam's client is i386 and asks
+the 32-bit loader for both GL and Vulkan; without it the client renders in
+software and its Vulkan probe fails with `VK_ERROR_INCOMPATIBLE_DRIVER`. The
+script skips that half rather than failing when the build host has no multilib
+toolchain, and says so; set `MOCO_MESA_32BIT=0` to skip it deliberately.
 
 The build host needs a C/C++ toolchain, Python venv support, Ninja, patch,
 pkg-config and the development files Meson reports for X11/XCB, libdrm,
-expat, zlib, zstd, sensors and SPIR-V Tools. The resulting library is
-dynamically linked, so the guest must provide matching runtime libraries.
-The accepted build host and guest both use glibc 2.44.
+expat, zlib, zstd, sensors and SPIR-V Tools -- and, for the 32-bit half,
+`gcc -m32` plus the i686 development libraries for the same set. The resulting
+libraries are dynamically linked, so the guest must provide matching runtime
+libraries. The accepted build host and guest both use glibc 2.44.
 
 Useful overrides are:
 
     MOCO_MESA_TARBALL   path to the verified 26.1.6 tarball
     MOCO_MESA_WORK      persistent source/build/venv directory
     MOCO_MESA_VENV      an existing or new Python virtual environment
-    MOCO_MESA_OUTPUT    final stripped libGL path
-    MOCO_MESA_GALLIUM_OUTPUT final stripped Gallium DRI library path
+    MOCO_MESA_OUT64     final stripped 64-bit output directory
+    MOCO_MESA_OUT32     final stripped 32-bit output directory
+    MOCO_MESA_32BIT     set to 0 to skip the 32-bit half
     MOCO_MESA_PREFIX    embedded Mesa data/config prefix (default `/usr`)
     MOCO_BUILD_JOBS     Ninja worker count
 
@@ -170,9 +178,40 @@ prototype intact for rollback. The selector archives the old higher-versioned
 `libGL.so.1.5.0` outside the ldconfig directory so it cannot silently win over
 the DRI library.
 
-The DRI3 path contains an emergency XPutImage fallback and reconnect/rebind
-logic when the broker disappears. Deliberate service stop/restart, resize and
-longer soak are still required before making this selection a release default.
+The shipped root filesystem installs this stack by default, for both ABIs, from
+`../dist-guest/lib64` and `../dist-guest/lib32` -- see the GPU section of
+`tools/mkmanjarorootfs.sh`. The reversible selector above remains the way to
+test a build without rebuilding an image.
+
+Accepted hardware result, 2026-08-10 (command-stream transport)
+--------------------------------------------------------------
+
+Measured on the same Windows 10 / GeForce GT 730 host, with the broker service
+stopped and `/run/moco-present.sock` deleted, proving the socket is no longer
+part of the path:
+
+    64-bit  tools/glbench  1280x720  543 fps
+    32-bit  tools/glbench  1280x720  602 fps
+
+The host log recorded 3,170 presented frames over the same interval, so the
+frames were drawn rather than silently dropped. `glxgears` reported ~275 fps and
+`glxinfo -B` direct virgl throughout.
+
+Sandboxed clients were the point of the change and were checked as such. Steam's
+own `console-linux.txt` logs `MoCo DRI3: direct virgl/CoPresent active` for
+three drawables on every launch, from inside its pressure-vessel container, with
+no environment variable and no container configuration. Firefox presents
+directly and remains interactive; the overlay is created `WS_EX_LAYERED |
+WS_EX_TRANSPARENT` so clicks reach VcXsrv beneath it. Returning `HTTRANSPARENT`
+from `WM_NCHITTEST` is NOT sufficient there -- that only forwards the hit test
+to windows of the same thread, and VcXsrv is another process, so an earlier
+non-layered overlay swallowed every click while rendering correctly.
+
+Outstanding: Steam's own UI still does not appear. Its CEF helper fails in
+`clienthandler.cpp` with "Failed to create browser window" -- with GPU
+initialisation clean, a Vulkan device enumerated and disk space free. The same
+failure occurs with this stack disabled and the distribution's Mesa in use, so
+it is not a CoPresent defect; it is CEF against VcXsrv 1.14.
 
 Accepted hardware result, 2026-08-09
 ------------------------------------

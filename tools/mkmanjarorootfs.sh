@@ -127,29 +127,38 @@ PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 	  ttf-liberation ttf-dejavu \
 	  xorg-xauth xorg-xhost xorg-xrandr xterm \
 	  xcb-util-cursor \
-	  virtualgl mesa-utils openssh \
-	  lib32-glibc lib32-gcc-libs \
-	  lib32-virtualgl lib32-libjpeg-turbo lib32-mesa"
+	  mesa-utils openssh \
+	  vulkan-swrast lib32-vulkan-swrast \
+	  lib32-glibc lib32-gcc-libs lib32-mesa"
 
-# virtualgl is what makes the GPU reachable, and it is the whole reason this
-# release exists. The guest has no display of its own: applications draw 2D
-# over the X protocol to the X server on Windows, which has no acceleration,
-# and their GL used to fall back to llvmpipe -- or fail outright, since
-# software GLX against that server dies with GLXBadDrawable. VirtualGL
-# redirects the GL onto /dev/dri/renderD128, which is virgl, which is the
-# host's real card; the finished frames are pushed into the same X windows. So
-# windows stay native and rootless while the drawing happens on the GPU.
+# How the GPU is reached, and why VirtualGL is no longer in this list.
 #
-# lib32-virtualgl and its 32-bit libjpeg-turbo/mesa are not optional the moment
-# a 32-bit GL program is run -- Steam's client is the one everybody reaches for.
-# vglrun preloads a faker matching the target's word size, so a 32-bit process
-# needs the 32-bit libvglfaker/libdlfaker (lib32-virtualgl) and the 32-bit
-# libturbojpeg its proxy transport uses (lib32-libjpeg-turbo). Without them the
-# preload silently fails, the program falls through to indirect GLX against the
-# Windows X server, and dies with the same GLXBadDrawable VirtualGL exists to
-# avoid -- which is exactly how it presented: "libturbojpeg.so.0 cannot open",
-# "libvglfaker from LD_PRELOAD cannot be preloaded", then GLXBadDrawable. The
-# 64-bit set alone shipped in every release before this one.
+# The guest has no display of its own: applications draw 2D over the X protocol
+# to the X server on Windows, which has no acceleration. Their GL is executed
+# by virglrenderer on the host's real card through /dev/dri/renderD128, and the
+# finished frames are shown by cogpu-daemon in the same X windows, so windows
+# stay native and rootless while the drawing happens on the GPU.
+#
+# Releases up to 0.5.9 did that through VirtualGL: an LD_PRELOAD faker that
+# intercepted GLX. It is gone, and its absence is deliberate. CoPresent is a
+# patched Mesa that IS the driver, installed below, so there is nothing to
+# preload and no wrapper an application can be started without. The faker was
+# also actively harmful to the applications people actually run: vglrun exports
+# LD_PRELOAD=libdlfaker.so:libvglfaker.so, every child process inherits it, and
+# libvglfaker links libturbojpeg -- so Steam's plain /bin/bash helpers died with
+# "libturbojpeg.so.0: cannot open shared object file" and the client never
+# started. Removing the wrapper removed that entire class of failure.
+#
+# lib32-mesa stays: 32-bit clients need the 32-bit Mesa runtime around our own
+# 32-bit libGL/libEGL, and Steam's client is i386, so the 32-bit half of the
+# stack is not optional. It is installed below alongside the 64-bit one.
+#
+# vulkan-swrast, both ABIs, because the modern Steam client refuses to build its
+# UI without a Vulkan device: with none present it logs "BInit - Unable to
+# initialize Vulkan!" and quits. virgl offers OpenGL only, so lavapipe answers
+# the query in software while games keep rendering through accelerated GL. The
+# 32-bit copy matters for the same reason as lib32-mesa -- the client is i386,
+# and a 64-bit-only ICD leaves it failing with VK_ERROR_INCOMPATIBLE_DRIVER.
 #
 # mesa-utils is glxinfo and glxgears: how anyone checks whether that actually
 # happened, rather than trusting it. openssh because a serial console is the
@@ -665,35 +674,36 @@ EOF
 # reaches an X server listening on 127.0.0.1:6000 on the Windows machine, with
 # no port redirection and nothing new in the driver.
 #
-# OpenGL, and the one wrapper that matters.
+# OpenGL.
 #
 # The guest has a GPU: /dev/dri/renderD128 is virtio-gpu talking to
 # virglrenderer on the Windows side, which executes the GL on the host's real
 # card. What it does not have is a display -- applications draw 2D over the X
 # protocol to the X server on Windows, and that server has no acceleration.
 #
-# So the two halves are separated. VirtualGL redirects a program's GL onto the
-# render node and pushes the finished frames into the same X windows, which
-# leaves the windows native and rootless while the drawing happens on the GT
-# 730. Measured on this hardware: glxgears at 132 fps against llvmpipe, and
-# Firefox rendering rather than falling back.
+# CoPresent joins those two halves without either side being wrapped: the
+# patched Mesa installed further down IS the system's GL driver, renders on the
+# render node, and asks the host to show the finished texture through a command
+# in its own stream. Windows stay native and rootless, and no application has to
+# be started in any particular way -- which is the point, because the ones that
+# matter (browsers, Steam) start their own child processes and a wrapper cannot
+# follow them.
 #
-# The old advice was `glhw`, which set LIBGL_ALWAYS_INDIRECT=1 to send GLX
-# protocol to the X server. That path is worse than it looked: capped at GL 1.4
-# by the wire protocol, and on this server it does not work at all -- software
-# GLX fails with GLXBadDrawable before a frame is drawn. glhw is kept only as a
-# shim onto the working path, so anything that already invokes it keeps running.
+# Two older entry points are kept as shims so anything that still names them
+# keeps working. `glhw` set LIBGL_ALWAYS_INDIRECT=1 to send GLX protocol to the
+# X server: capped at GL 1.4 by the wire protocol, and on this server it fails
+# outright with GLXBadDrawable before a frame is drawn. `moco-gl` ran VirtualGL.
+# Neither is needed now, and both simply exec their argument.
 mkdir -p "$MNT/usr/local/bin"
 cat > "$MNT/usr/local/bin/glhw" <<'EOF'
 #!/bin/sh
-# Superseded by moco-gl, which this now calls.
+# Historical shim. OpenGL already runs on the host's card for every process.
 #
 # glhw used to set LIBGL_ALWAYS_INDIRECT=1, sending GLX protocol to the X
 # server on Windows. That is limited to GL 1.4 by the wire protocol and on this
-# server fails outright with GLXBadDrawable. moco-gl renders on the host's card
-# through virgl instead, at full GL 4.2.
-echo "glhw: superseded by moco-gl; running that instead" >&2
-exec moco-gl "$@"
+# server fails outright with GLXBadDrawable. CoPresent renders on the host's
+# card through virgl instead, at full GL 4.2, with no wrapper at all.
+exec "$@"
 EOF
 chmod 0755 "$MNT/usr/local/bin/glhw"
 
@@ -758,9 +768,9 @@ export DISPLAY=:0
 export EDITOR=nano
 export PATH="$HOME/.local/bin:$PATH"
 
-# OpenGL renders in this guest's CPU by default -- complete, and slow, because
-# there is no GPU here. Run a single program through `glhw` to use the host's
-# graphics card instead; it is capped at GL 1.4 by the GLX protocol.
+# OpenGL runs on the host's graphics card, for every program, with nothing to
+# prefix or configure: CoPresent is this system's GL driver. `glxinfo -B` should
+# report direct rendering and a virgl renderer.
 SKEL
 
 cat > "$MNT/etc/skel/.zprofile" <<'SKEL'
@@ -852,37 +862,109 @@ chmod 0440 "$MNT/etc/sudoers.d/10-wheel"
 # reason in reverse: if the new system will not boot, the one that built it
 # still will.
 
-say "installing the GPU wrapper"
+say "installing the GPU stack"
 
-# One command that runs an application on the host's GPU, with the three
-# settings that are not optional and not guessable.
+# ------------------------------------------------------------- CoPresent Mesa
 #
-# VGL_COMPRESS=proxy is the one that matters. With a remote DISPLAY -- which
-# this always is, the X server being on Windows -- VirtualGL otherwise selects
-# its own transport and tries to connect to a vglclient on the display host.
-# Nothing is listening, so it blocks in connect() forever: no error, no
-# timeout, no log line, just an application that starts and never draws. An
-# evening was lost to that. "proxy" means send the frames down the X
-# connection that is already open, which needs no client at all.
+# The patched Mesa that makes the GPU reachable. It is a driver, not a wrapper:
+# ordinary GLX and EGL clients consume Mesa's normal DRI3 provider, render with
+# virgl on /dev/dri/renderD128, and the final present -- the one operation a
+# Linux X server would perform -- is emitted as VIRGL_CCMD_MOCO_PRESENT inside
+# the client's own command stream. The host already owns that texture, so no
+# pixels and no file descriptors cross anything.
 #
-# VGL_PROBEGLX=0 skips VirtualGL's probe of the 2D server for stereo visuals.
-# That probe asks the X server for GLX capabilities, and this one answers in a
-# way that hangs the probe -- again silently.
+# Riding the command stream is what makes sandboxed applications work without
+# being configured. The earlier revision used a Unix socket and a root-only
+# broker under /run, which no sandbox can see: Firefox's content processes and
+# Steam's pressure-vessel container silently fell back to software while
+# unsandboxed clients worked, and no amount of per-application configuration is
+# an acceptable fix for that. A render node is the one thing every sandbox that
+# renders must already have.
 #
-# -d egl0 selects the EGL device by index. Naming the DRM node directly
-# (-d /dev/dri/renderD128) is refused with "Invalid EGL device": virglrenderer's
-# node does not advertise itself through EGL_EXT_device_drm the way VirtualGL
-# expects, but it is there and it is first.
+# BOTH ABIs are installed. Steam's client is i386 and a 64-bit-only stack
+# leaves it on software; measured on the GT 730, 64-bit 543 fps and 32-bit 602
+# fps through this path with no broker and no socket present at all.
+#
+# The libraries are COPIED, never built here, for exactly the reason coxwire is
+# below: this script's most important caller is the seed image building the
+# real root filesystem on first boot, and that guest has no Mesa build tree. So
+# each generation carries the next one's copy, and a developer seeding the very
+# first image supplies them from ../dist-guest.
+say "installing the CoPresent GPU stack (both ABIs)"
+
+moco_gpu_src() {
+	# $1 = lib64 | lib32; the running system first, then the build tree.
+	case $1 in
+	lib64)	[ -d /usr/local/lib/moco-copresent ] &&
+			{ printf '%s\n' /usr/local/lib/moco-copresent; return 0; } ;;
+	lib32)	[ -d /usr/local/lib32/moco-copresent ] &&
+			{ printf '%s\n' /usr/local/lib32/moco-copresent; return 0; } ;;
+	esac
+	d="$(dirname "$SELF")/../../dist-guest/$1"
+	[ -d "$d" ] && { printf '%s\n' "$d"; return 0; }
+	return 1
+}
+
+moco_gpu_installed=0
+for abi in lib64 lib32; do
+	src=$(moco_gpu_src "$abi") || continue
+	case $abi in
+	lib64)	dst=$MNT/usr/local/lib/moco-copresent ;;
+	lib32)	dst=$MNT/usr/local/lib32/moco-copresent ;;
+	esac
+
+	mkdir -p "$dst"
+	for f in libGL.so.1.2.0 libEGL.so.1.0.0 libGLESv2.so.2.0.0 \
+		 libgallium-26.1.6.so libgbm.so.1.0.0 dri_gbm.so; do
+		[ -f "$src/$f" ] && install -m 0755 "$src/$f" "$dst/$f"
+	done
+
+	# Both the versioned soname and the bare development name. Toolkits and
+	# CEF-based applications dlopen "libEGL.so" rather than "libEGL.so.1",
+	# and without the bare link they resolve to the distribution's own Mesa
+	# -- so the application renders through a driver that cannot present.
+	( cd "$dst" &&
+	  ln -sfn libGL.so.1.2.0     libGL.so.1     && ln -sfn libGL.so.1.2.0     libGL.so &&
+	  ln -sfn libEGL.so.1.0.0    libEGL.so.1    && ln -sfn libEGL.so.1.0.0    libEGL.so &&
+	  ln -sfn libGLESv2.so.2.0.0 libGLESv2.so.2 && ln -sfn libGLESv2.so.2.0.0 libGLESv2.so &&
+	  ln -sfn libgbm.so.1.0.0    libgbm.so.1 )
+
+	moco_gpu_installed=1
+done
+
+if [ "$moco_gpu_installed" = 1 ]; then
+	# ldconfig ordering is the whole selection mechanism: our directory is
+	# searched before /usr/lib, so an unmodified application picks up the
+	# presenting driver with no environment variable and no wrapper. The
+	# distribution's Mesa is left untouched underneath it, which is what
+	# makes this reversible by deleting one file.
+	printf '/usr/local/lib/moco-copresent\n/usr/local/lib32/moco-copresent\n' \
+		> "$MNT/etc/ld.so.conf.d/00-moco-copresent.conf"
+	inside "ldconfig" >/dev/null 2>&1 || say "  WARNING: ldconfig failed"
+	say "  installed CoPresent Mesa for 64-bit and 32-bit clients"
+else
+	# Loud: the desktop still comes up, and every GL application quietly
+	# runs on llvmpipe instead of the host's card. That is the failure this
+	# whole release exists to prevent, and it is invisible without a check.
+	say "  WARNING: no CoPresent Mesa found -- GL will be software only"
+	say "           (expected in ../dist-guest/lib64 and ../dist-guest/lib32)"
+fi
+
+# Kept only so that shortcuts and documentation naming it keep working. There
+# is nothing left to wrap: CoPresent is the system's GL, for every process,
+# whether or not anybody remembered a prefix. This used to exec vglrun with
+# three non-obvious VirtualGL settings; see the package list above for why that
+# is gone.
 install -Dm 0755 /dev/stdin "$MNT/usr/local/bin/moco-gl" <<'MOCOGL'
 #!/bin/sh
-# Run a program with its OpenGL on the host's GPU.
+# Run a program. Its OpenGL is already on the host's GPU.
 #
 #   moco-gl firefox
-#   moco-gl glxgears
 #
-# Without this wrapper an application gets software rendering at best, and at
-# worst no GL at all -- software GLX against the Windows X server fails with
-# GLXBadDrawable.
+# This wrapper is a historical no-op: CoPresent is installed as the system's
+# OpenGL driver, so an application gets the GPU whether or not it is started
+# through here. It remains because desktop shortcuts created by earlier
+# releases invoke it.
 if [ $# -eq 0 ]; then
 	echo "usage: moco-gl <program> [args...]" >&2
 	exit 2
@@ -891,7 +973,7 @@ fi
 : "${DISPLAY:=:0}"
 export DISPLAY
 
-exec env VGL_PROBEGLX=0 VGL_COMPRESS=proxy vglrun -d egl0 "$@"
+exec "$@"
 MOCOGL
 
 # sshd, because diagnosing this system through a serial console is worse than
