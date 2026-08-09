@@ -1341,15 +1341,43 @@ int cogpu_present_r2_bind(const struct copresent_record *record,
 	return COPRESENT_OK;
 }
 
+/*
+ * Where a presented frame's host time goes, accumulated per 2 s report.
+ * Diagnostic only: the question this answers is which serial segment of the
+ * synchronous present starves the GPU between frames -- context switches,
+ * the finish drain, the swap, or none of them.
+ */
+struct r2_segments {
+	LARGE_INTEGER frequency;
+	uint64_t make_current;
+	uint64_t draw;
+	uint64_t finish;
+	uint64_t swap;
+	uint64_t restore;
+	uint64_t samples;
+};
+
+static struct r2_segments r2_segments;
+
+static double r2_segment_us(uint64_t ticks)
+{
+	if (!r2_segments.samples || !r2_segments.frequency.QuadPart)
+		return 0.0;
+	return (double)ticks * 1000000.0 /
+		((double)r2_segments.frequency.QuadPart * r2_segments.samples);
+}
+
 static int r2_draw_resource(const struct cogpu_vrend_resource_info *resource,
 			    uint32_t present_flags)
 {
 	struct wgl_current_context saved;
 	GLenum error;
 	GLint red_type = GL_NONE;
+	LARGE_INTEGER t0, t1, t2, t3, t4, t5;
 	DWORD now;
 	int rc = COPRESENT_PRESENT_FAILED;
 
+	QueryPerformanceCounter(&t0);
 	wgl_winsys_current_save(&saved);
 	if (!saved.context) {
 		logline("present R2: renderer left no WGL context current\n");
@@ -1359,6 +1387,7 @@ static int r2_draw_resource(const struct cogpu_vrend_resource_info *resource,
 		logline("present R2: could not make presentation context current\n");
 		goto restore;
 	}
+	QueryPerformanceCounter(&t1);
 
 	while (glGetError() != GL_NO_ERROR)
 		;
@@ -1399,16 +1428,19 @@ static int r2_draw_resource(const struct cogpu_vrend_resource_info *resource,
 	glBindSampler(0, r1.scene.sampler);
 	glBindVertexArray(r1.scene.vao);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
+	QueryPerformanceCounter(&t2);
 
 	/* RELEASE means the producer may immediately render into this texture.
 	 * Finish the sampling draw before publishing it. Swap then only consumes
 	 * the overlay's back buffer, not the guest texture. */
 	glFinish();
+	QueryPerformanceCounter(&t3);
 	if (!SwapBuffers(r1.context.dc)) {
 		logline("present R2: SwapBuffers failed (%lu)\n",
 			(unsigned long)GetLastError());
 		goto unbind;
 	}
+	QueryPerformanceCounter(&t4);
 	rc = COPRESENT_OK;
 
 	now = GetTickCount();
@@ -1421,8 +1453,15 @@ static int r2_draw_resource(const struct cogpu_vrend_resource_info *resource,
 			(double)r1.frames * 1000.0 / (now - r1.first_frame) : 0.0;
 
 		r1.last_report = now;
-		logline("present R2: %u released no-copy frames, %.1f fps\n",
-			r1.frames, fps);
+		logline("present R2: %u released no-copy frames, %.1f fps;"
+			" avg us: current %.0f draw %.0f finish %.0f swap %.0f"
+			" restore %.0f\n",
+			r1.frames, fps,
+			r2_segment_us(r2_segments.make_current),
+			r2_segment_us(r2_segments.draw),
+			r2_segment_us(r2_segments.finish),
+			r2_segment_us(r2_segments.swap),
+			r2_segment_us(r2_segments.restore));
 	}
 
 unbind:
@@ -1436,6 +1475,17 @@ restore:
 	}
 	if (pump_messages() != 0)
 		rc = COPRESENT_PRESENT_FAILED;
+	if (rc == COPRESENT_OK) {
+		QueryPerformanceCounter(&t5);
+		if (!r2_segments.frequency.QuadPart)
+			QueryPerformanceFrequency(&r2_segments.frequency);
+		r2_segments.make_current += (uint64_t)(t1.QuadPart - t0.QuadPart);
+		r2_segments.draw += (uint64_t)(t2.QuadPart - t1.QuadPart);
+		r2_segments.finish += (uint64_t)(t3.QuadPart - t2.QuadPart);
+		r2_segments.swap += (uint64_t)(t4.QuadPart - t3.QuadPart);
+		r2_segments.restore += (uint64_t)(t5.QuadPart - t4.QuadPart);
+		r2_segments.samples++;
+	}
 	return rc;
 }
 

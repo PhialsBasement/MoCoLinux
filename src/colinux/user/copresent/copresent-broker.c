@@ -288,20 +288,41 @@ static void *response_thread(void *opaque)
 	struct broker *broker = opaque;
 	struct copresent_region *region = broker->region;
 
+	unsigned int idle_spins = 0;
+
 	while (!region->closed) {
 		uint32_t head = load_acquire(&region->rx_head);
 		uint32_t tail = region->rx_tail;
 
 		if (head == tail) {
-			struct pollfd control = { .fd = broker->control,
-				.events = POLLIN | POLLHUP | POLLERR };
+			/*
+			 * RELEASE delivery latency is on every presented frame's
+			 * critical path: the client is asleep in its recv() until
+			 * this thread notices the host's ring write. The original
+			 * 1 ms poll added up to a millisecond per frame -- measured
+			 * against host frame segments of ~0.7 ms, the single
+			 * largest avoidable term. Sleep in 50 us quanta instead and
+			 * fall back to the cheap 1 ms poll (which also watches for
+			 * host disconnect) only after ~20 ms of real idleness.
+			 */
+			if (idle_spins < 400) {
+				idle_spins++;
+				usleep(50);
+				region->guest_heartbeat++;
+				continue;
+			}
+			{
+				struct pollfd control = { .fd = broker->control,
+					.events = POLLIN | POLLHUP | POLLERR };
 
-			if (poll(&control, 1, 1) > 0 &&
-			    (control.revents & (POLLHUP | POLLERR)))
-				break;
+				if (poll(&control, 1, 1) > 0 &&
+				    (control.revents & (POLLHUP | POLLERR)))
+					break;
+			}
 			region->guest_heartbeat++;
 			continue;
 		}
+		idle_spins = 0;
 		if ((uint32_t)(head - tail) > COPRESENT_RING_SLOTS) {
 			fprintf(stderr, "moco-present: corrupt release occupancy\n");
 			break;
