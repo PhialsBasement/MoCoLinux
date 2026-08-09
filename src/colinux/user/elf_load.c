@@ -2849,6 +2849,26 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		co_dump_net_rings(handle, pl);
 		co_terminal_print("  -----------------------------------------------------------\n");
 
+		/*
+		 * The GPU daemon maps and polls this run's RAM from its own
+		 * process and has no way to hear that the run ended. Left
+		 * alive across KLOAD_END it reads freed guest memory -- the
+		 * recurring cross-process teardown bugcheck -- and its manager
+		 * handle wedges the next driver unload at STOP_PENDING. It is
+		 * the one coLinux process that is safe to hard-kill (its
+		 * threads never enter the crossing), and the launcher starts a
+		 * fresh one with the next boot.
+		 */
+		{
+			unsigned int killed =
+				co_os_terminate_process_by_name("cogpu-daemon.exe");
+
+			if (killed)
+				co_terminal_print("\n  cogpu-daemon: %u instance(s)"
+						  " terminated before the run's RAM"
+						  " is freed\n", killed);
+		}
+
 		goto out_end;
 	}
 

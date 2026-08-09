@@ -11,7 +11,9 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <colinux/os/alloc.h>
 #include <colinux/os/user/misc.h>
@@ -315,4 +317,37 @@ unsigned long co_os_active_cpu_count(void)
 
 	GetSystemInfo(&si);
 	return si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1;
+}
+
+unsigned int co_os_terminate_process_by_name(const char* image_name)
+{
+	HANDLE snapshot;
+	PROCESSENTRY32 entry;
+	unsigned int killed = 0;
+
+	snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE)
+		return 0;
+
+	memset(&entry, 0, sizeof(entry));
+	entry.dwSize = sizeof(entry);
+	if (Process32First(snapshot, &entry)) {
+		do {
+			HANDLE process;
+
+			if (_stricmp(entry.szExeFile, image_name) != 0)
+				continue;
+			if (entry.th32ProcessID == GetCurrentProcessId())
+				continue;
+			process = OpenProcess(PROCESS_TERMINATE, FALSE,
+					      entry.th32ProcessID);
+			if (!process)
+				continue;
+			if (TerminateProcess(process, 1))
+				killed++;
+			CloseHandle(process);
+		} while (Process32Next(snapshot, &entry));
+	}
+	CloseHandle(snapshot);
+	return killed;
 }

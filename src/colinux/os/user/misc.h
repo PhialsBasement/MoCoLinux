@@ -78,6 +78,21 @@ extern void  co_os_thread_join(void* thread);
  */
 extern unsigned long co_os_active_cpu_count(void);
 
+/*
+ * Terminate every other process running the named image. Returns how many
+ * were killed.
+ *
+ * This exists for exactly one caller: the boot daemon's teardown kills
+ * cogpu-daemon.exe before KLOAD_END frees the run's guest RAM. The GPU
+ * daemon maps and polls that memory from its own process; a run torn down
+ * underneath it leaves it reading freed space -- the recurring bugcheck.
+ * cogpu is the one coLinux process that is safe to hard-kill: its thread
+ * never enters the driver's crossing, it holds only a manager handle, and it
+ * is restarted by the launcher on the next boot. The boot daemon itself must
+ * never be killed this way.
+ */
+extern unsigned int co_os_terminate_process_by_name(const char* image_name);
+
 extern int co_udp_socket_connect(const char* addr, unsigned short int port);
 extern int co_udp_socket_send(int sock, const char* buffer, unsigned long size);
 extern void co_udp_socket_close(int sock);
