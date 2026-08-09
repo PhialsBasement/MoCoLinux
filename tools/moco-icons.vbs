@@ -68,27 +68,25 @@ For Each entry In apps
 	part = Split(entry, "|")
 	Set lnk = shell.CreateShortcut(desktop & "\" & part(0) & " (Linux).lnk")
 	lnk.TargetPath       = daemon
-	' Every application goes through moco-gl, whether or not it draws with
-	' OpenGL.
+	' The application is launched directly. There is nothing to wrap.
 	'
-	' The wrapper points the program's GL at /dev/dri/renderD128 -- virgl,
-	' which is the host's real graphics card -- and pushes the finished
-	' frames into the same X window. A program that never issues a GL call
-	' loses nothing by being wrapped; one that does and is NOT wrapped gets
-	' software rendering, or no GL at all, because software GLX against the
-	' X server on Windows fails outright with GLXBadDrawable. Wrapping
-	' everything is therefore the safe default, and it means a user never
-	' has to know which of these applications happen to use the GPU.
-	' Quoted, because --run takes ONE argument.
+	' These shortcuts used to run everything through moco-gl, which ran
+	' VirtualGL, because that was the only way a program's OpenGL reached
+	' the host's card. CoPresent replaced it: the patched Mesa in the root
+	' filesystem IS the system's GL driver, so every process gets the GPU
+	' whether or not anything remembered a prefix. Wrapping is not merely
+	' unnecessary now, it was actively harmful -- vglrun exported LD_PRELOAD
+	' into every child process, and the faker it preloaded pulled in
+	' libturbojpeg, which is what stopped Steam's own helper scripts from
+	' running at all.
 	'
-	' The daemon parses this with the single-argument form, so an unquoted
-	' "--run moco-gl xterm" hands it the command "moco-gl" and leaves "xterm"
-	' as a stray token. The guest then runs the wrapper with no application to
-	' wrap, which exits immediately -- so every one of these shortcuts opened
-	' nothing at all, silently, with the console window flashing past too fast
-	' to read. Launching the same thing by hand always worked, because a
-	' quoted command is the natural way to type it.
-	lnk.Arguments        = "--run " & Chr(34) & "moco-gl " & part(1) & Chr(34)
+	' moco-gl still exists in the guest as a no-op, so shortcuts written by
+	' an older release keep working.
+	'
+	' Quoted, because --run takes ONE argument. The daemon parses this with
+	' the single-argument form, so an unquoted "--run xterm -geometry ..."
+	' hands it the command "xterm" and leaves the rest as stray tokens.
+	lnk.Arguments        = "--run " & Chr(34) & part(1) & Chr(34)
 	lnk.WorkingDirectory = moco
 	lnk.IconLocation     = part(2)
 	lnk.Description      = part(1) & ", running in MoCoLinux on the GPU"

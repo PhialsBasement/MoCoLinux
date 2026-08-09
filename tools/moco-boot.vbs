@@ -143,13 +143,24 @@ Else
 	        .ExpandEnvironmentStrings("%SystemDrive%") & "\MoCoLinux"
 End If
 
-' Deliberately narrow development switches. Normal shortcuts pass only the two
-' directories above, so neither presentation rung becomes the default while
-' its protocol is still being proved.
-cogpu_extra = ""
+' Direct presentation is ON by default. It is how the guest's OpenGL reaches
+' the screen: the patched Mesa in the root filesystem emits its presentation
+' request inside the virgl command stream, and cogpu-daemon only acts on that
+' request when it was started with --present-r2.
+'
+' This defaulted to OFF while the protocol was being proved, and leaving it
+' that way would ship the GPU stack inert -- worse than inert, because the
+' guest has no way to discover that the host is not presenting: it emits the
+' command, the host ignores it, and the window simply never updates. The two
+' halves ship together, so they are configured together.
+'
+' --no-present is the way back to software rendering, for a host whose driver
+' or card cannot do it. --present-r1 selects the older prototype rung.
+cogpu_extra = " --present-r2"
 If argc >= 3 Then
 	If argv(2) = "--present-r1" Then cogpu_extra = " --present-r1"
 	If argv(2) = "--present-r2" Then cogpu_extra = " --present-r2"
+	If argv(2) = "--no-present"  Then cogpu_extra = ""
 End If
 
 Set shell = CreateObject("WScript.Shell")

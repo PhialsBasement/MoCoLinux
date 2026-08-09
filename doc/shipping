@@ -211,6 +211,28 @@ a fatal-error dialog on a headless machine. -wgl, -multiwindow, -clipboard,
 -ac and -notrayicon are all present. tools/xstart1142.bat is xstart.bat
 without it.
 
+What this server does NOT have, and cannot be given
+---------------------------------------------------
+
+It advertises 23 extensions. Two absences have consequences, and neither is
+fixable with a command-line flag:
+
+XFree86-VidModeExtension is not built into this binary. Some applications --
+Discord and other Electron builds are the ones reported -- query it during
+startup. Passing `+extension XFree86-VidModeExtension` was tried on 2026-08-10:
+the server starts without complaint and the extension list is still the same
+23 names, because `+extension` can only enable a module that was compiled in.
+Getting it would mean a newer VcXsrv, which is exactly what the XP support
+this version was pinned for rules out, or building the server -- and this
+project deliberately does not patch or rebuild VcXsrv.
+
+MIT-SHM is absent, and that one is correct rather than a limitation: the
+clients are in the guest, which does not share memory with the Windows process
+serving the display, so a shared-memory transport could not work even if the
+extension were advertised. Applications that check for it fall back on their
+own; CoPresent does not use it, since accelerated frames never travel over the
+X connection at all.
+
 Verified end to end on the M92p with the guest of the commit that made the
 release loadable: installed to its own directory with /S /D so the 1.20 build
 already there was left alone, launched through WScript.Shell, and then from
