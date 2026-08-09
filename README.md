@@ -152,30 +152,38 @@ for mingw behind a WGL winsys, replays the guest's GL onto the host's actual
 card: the guest reports `virgl (GeForce GT 730/PCIe/SSE2)`, GL 4.2, where
 indirect GLX gave it 1.4 in software.
 
-Release presentation is still VirtualGL: applications run through the
-`moco-gl` wrapper, render on `/dev/dri/renderD128`, and push finished frames
-into the same VcXsrv windows. That remains the packaged compatibility path.
-
-The opt-in development path has reached normal Mesa DRI3 GLX. A matched Mesa
-26.1.6 `libGL` and Gallium build uses Mesa's upstream DRI3 loader, opens
-`/dev/dri/renderD128`, and preserves its ordinary DRI images, buffer queue,
-buffer age and native fences. Only the final operation a Linux X server would
-normally perform is redirected: a guest broker translates exported dma-bufs
-into virgl resource IDs and sends BIND/PRESENT/UNBIND metadata through an 8 KiB
-pinned ring, then cogpu samples the texture virglrenderer already owns on the
-Windows GPU. This seam is necessary because stock VcXsrv on Windows cannot
-receive or import a Linux file descriptor; VcXsrv itself remains the unmodified
+Presentation is CoPresent, and it ships enabled. VirtualGL and the `moco-gl`
+wrapper are gone. A matched Mesa 26.1.6 build -- `libGL`, `libEGL`,
+`libGLESv2`, Gallium and `libgbm`, for **both** the 64-bit and 32-bit ABI --
+is the system's GL driver: it uses Mesa's upstream DRI3 loader, opens
+`/dev/dri/renderD128`, and keeps its ordinary DRI images, buffer queue, buffer
+age and native fences. Only the final operation a Linux X server would perform
+is redirected. The client emits `VIRGL_CCMD_MOCO_PRESENT` inside the command
+stream it is already rendering through, and cogpu displays the texture
+virglrenderer already owns on the Windows GPU. VcXsrv remains the unmodified
 window and input control plane.
 
-Unmodified 64-bit `glxinfo`, `glxgears` and `glxspheres64` now use this path
-without `moco-gl`, `vglrun`, `LD_PRELOAD` or faker libraries. Hardware
-validation reported direct virgl GL 4.2, and `/proc/PID/maps` contained the
-matched `libGL.so.1.2.0` and `libgallium-26.1.6.so` with no VirtualGL library.
-This is the roughly 75%-usable direct-GLX checkpoint. The next step is native-
-speed presentation: allow multiple buffers in flight and replace the current
-per-frame `glFinish`/synchronous RELEASE. Integrating the resulting pair and
-broker into the rootfs and installer is deliberately the last step. The staged
-gates are in
+Carrying presentation in the command stream is what makes it work for real
+applications. It travels down the render node the client already has open, so
+nothing else has to be reachable -- no socket, no extra device, no filesystem
+share -- and sandboxed clients need no configuration at all. The earlier
+revision used a broker socket under `/run`, which no sandbox can see: Firefox's
+content processes and Steam's pressure-vessel container silently fell back to
+software while unsandboxed clients worked. The broker, its pinned ring, its
+dma-buf export and its root-only pagemap requirement have all been deleted.
+
+Measured on the GT 730, with the broker stopped and its socket deleted to prove
+it is out of the path: **543 fps 64-bit and 602 fps 32-bit** on the project's
+own `glbench` at 1280x720, and 550 fps booting with no flags at all, as the
+desktop shortcut does. Steam's own log reports `MoCo DRI3: direct
+virgl/CoPresent active` for three drawables from inside its container. Firefox
+renders directly and stays interactive.
+
+Two limits are worth stating plainly. Geometry-heavy loads still run about 1.8x
+slower than the same binary natively, so this is accelerated, not native.
+And there is no Vulkan: virgl is OpenGL only, so the image ships lavapipe
+(software Vulkan, both ABIs) purely because the modern Steam client refuses to
+build its UI without a Vulkan device. The staged gates are in
 [`doc/direct-presentation`](doc/direct-presentation); the checksum-pinned Mesa
 patch and exact rebuild/rollback procedure are in
 [`doc/building-copresent`](doc/building-copresent).
@@ -202,14 +210,15 @@ ask for:
 - Networking: guest ethernet device, host NAT, static address via
   `systemd-networkd`; pacman installs a 791-package desktop over HTTPS at
   16 MB/s
-- Hardware-accelerated OpenGL on the host's card: virtio-gpu in the guest,
-  virglrenderer on the host, VirtualGL to the windows. Firefox renders through
-  virgl on the GT 730 with zero renderer errors; guest Xorg with glamor
-  reports direct rendering; `colinux-daemon --run moco-gl glxgears` — the
-  exact command a desktop shortcut issues — draws at 128 fps
-- Opt-in normal DRI3 GLX presentation: CoPresent carries resource identity and
-  native fences instead of finished frames. Unmodified 64-bit GLX programs load
-  Mesa's DRI3 provider, report direct virgl and present without VirtualGL
+- Hardware-accelerated OpenGL on the host's card, enabled by default and with
+  no wrapper: virtio-gpu in the guest, virglrenderer on the host, and CoPresent
+  carrying resource identity — not finished frames — in the guest's own virgl
+  command stream. Unmodified GLX and EGL programs of both ABIs load Mesa's DRI3
+  provider and report direct virgl; 543 fps 64-bit and 602 fps 32-bit on
+  `tools/glbench` at 1280x720 on a GT 730
+- Sandboxed clients work untouched, because presentation needs only the render
+  node they already have: Firefox renders directly and stays interactive, and
+  Steam logs direct CoPresent from inside its pressure-vessel container
 - Inbound port redirects (`-r tcp:2222:22` reaches the guest's sshd)
 - 32-bit binaries (the guest keeps its own `int $0x80` gate)
 - Landlock and user namespaces (required by pacman 7 and modern sandboxes)
@@ -236,13 +245,19 @@ Not yet:
   `cocon`/`conet` consoles and devices — including `colinux-console-nt` —
   cannot attach
 - DHCP in the guest (static address only)
-- Direct presentation as the packaged default. The release still selects
-  VirtualGL, while the development stack now handles ordinary 64-bit GLX
-  through Mesa's normal DRI3 loader. For that GLX track, the next task is an
-  asynchronous multi-buffered release path; rootfs/installer integration comes
-  last. Direct server-extension queries, EGL/browser behavior, 32-bit clients
-  and Vulkan/Proton remain separate coverage rungs and are not implied by this
-  checkpoint
+- Native-speed presentation. Direct presentation is now the packaged default
+  for both ABIs, but geometry-heavy loads still cost about 1.8x the same binary
+  natively, and roughly 4-5 ms per frame goes to the synchronous present
+  round-trip. An asynchronous multi-buffered release path is the next task
+- Vulkan. virgl is OpenGL only; the image ships software lavapipe so the Steam
+  client will start, and accelerated Vulkan (and therefore Proton/DXVK) is a
+  separate project that this checkpoint does not imply
+- Steam's own storefront UI. Its CEF helper fails to create a browser window
+  against VcXsrv 1.14 — with GPU initialisation clean, a Vulkan device present
+  and CoPresent active for its other drawables. The same failure occurs with
+  this stack disabled, so it is a CEF/X-server problem rather than a graphics
+  one, and `XFree86-VidModeExtension` is likewise absent and cannot be enabled
+  on the pinned XP-compatible server
 
 ### Cooperative SMP milestone
 
@@ -310,7 +325,7 @@ ceiling, not a claim that a 128 GB host has already been tested.
 | `src/colinux/kernel/net.c` | network rings, host half — read, consume, inject |
 | `src/colinux/kernel/vgpu.c` | virtio-gpu transport, host half — publish, retire, idle gate |
 | `src/colinux/os/winnt/user/cogpu-daemon/` | the GPU device: vring service, virglrenderer, the WGL winsys |
-| `src/colinux/user/copresent/` | the guest CoPresent broker, fenced producer and shared metadata ABI |
+| `src/colinux/user/copresent/` | the standalone fenced producer used to test presentation without a GL application |
 | `src/colinux/user/conet_ring.c` | the ring format and its decoder, shared by both readers |
 | `src/colinux/user/slirp/` | vendored slirp, with its Win64 repairs |
 | `src/colinux/user/elf_load.c` | the daemon: ELF loading, symbol resolution, boot |
@@ -325,8 +340,8 @@ ceiling, not a claim that a 128 GB host has already been tested.
 | `tools/pe-clear-laa.py` | confine the slirp daemon to 2 GB of address space |
 | `doc/runbook` | box to desktop, and host to installed Manjaro |
 | `doc/porting-x86_64` | design notes for the port |
-| `doc/direct-presentation` | staged plan and acceptance gates for replacing VirtualGL's frame transport |
-| `doc/building-copresent` | exact host, broker and direct DRI3 Mesa build; isolated test, system selection and rollback |
+| `doc/direct-presentation` | staged plan and acceptance gates for the presentation path |
+| `doc/building-copresent` | exact host and dual-ABI DRI3 Mesa build; isolated test, system selection and rollback |
 | `doc/building-modern` | the working build recipe |
 
 ## Building
@@ -365,10 +380,11 @@ their default locations; `COLINUX_TARGET_KERNEL_SOURCE` and
 `root-arch.img` — both are slow and change rarely — and reports whether the
 staged copies are present.
 
-CoPresent adds separately built Linux broker and Mesa pieces; `build.sh` cannot
-silently manufacture those as part of a Windows build. Run
-`tools/build-copresent-guest.sh` for the broker/test binaries and
-`tools/build-mesa-copresent.sh` for the matched patched DRI GLX/Gallium pair.
+CoPresent adds separately built Linux Mesa pieces; `build.sh` cannot silently
+manufacture those as part of a Windows build. Run
+`tools/build-mesa-copresent.sh` for the matched patched GL stack, which builds
+both the 64-bit and 32-bit ABI, and `tools/build-copresent-guest.sh` for the
+standalone test producer.
 The latter verifies the official Mesa 26.1.6 SHA-256 and applies the complete
 repository patch with zero fuzz. See
 [`doc/building-copresent`](doc/building-copresent) before enabling the
@@ -417,8 +433,8 @@ colinux-daemon.exe --run konsole           (start one app in a running guest)
 - For a desktop, start an X server on the Windows side in multiwindow mode
   (`vcxsrv :0 -multiwindow -ac`, or `dist-x64/xstart.bat`) and run X clients
   in the guest. `DISPLAY=10.0.2.2:0` is already in the image's environment.
-  Run GL applications through `moco-gl` (every installed shortcut already
-  does); `moco-gl glxinfo | grep renderer` is how to check the card is
+  GL applications need no wrapper: CoPresent is the system's GL driver, so
+  `glxinfo | grep renderer` reporting `virgl` is how to check the card is
   actually being used rather than trusting it.
 - `tools/mkrootfs.sh` builds the minimal BusyBox image (`--init /bin/sh`);
   `tools/mkmanjarorootfs.sh` builds the Manjaro desktop image (needs a Linux
