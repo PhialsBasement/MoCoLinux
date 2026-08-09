@@ -523,7 +523,30 @@ struct vcxsrv_match {
 	unsigned int height;
 };
 
-static struct r1_presenter r1;
+/*
+ * One presenter per window, not one presenter.
+ *
+ * This was a single global, and with two GL windows on screen it thrashed
+ * catastrophically: every frame that arrived for a different XID tore the
+ * whole target down -- unhook, destroy the GL context, DestroyWindow,
+ * InvalidateRect the parent -- and built the next one back up, compiling and
+ * linking the presenter's shaders again. All of it on the renderer thread, so
+ * the virtio queue stopped being serviced and every OTHER application froze
+ * with it, whether or not it was presenting. It also left frames on the wrong
+ * window while the overlay was being rebuilt against stale geometry.
+ *
+ * Each window now keeps its own overlay, context and compiled scene, so
+ * switching between them is a wglMakeCurrent and nothing more. `r1` names
+ * whichever slot the frame in hand belongs to; every existing r1.field
+ * reference keeps working, which is why this is a macro rather than a rename.
+ * The token r1 is replaced whole, so r1_slots, r1_current and r1_drop_target
+ * are untouched by it.
+ */
+#define R1_MAX_PRESENTERS 8
+static struct r1_presenter r1_slots[R1_MAX_PRESENTERS];
+static struct r1_presenter *r1_current = &r1_slots[0];
+#define r1 (*r1_current)
+
 static struct r2_binding r2_bindings[R2_MAX_BINDINGS];
 static int r2_enabled;
 static uint32_t r2_generation;
@@ -545,14 +568,30 @@ static void CALLBACK r1_movesize_event(HWINEVENTHOOK hook, DWORD event,
 				       LONG child_id, DWORD thread_id,
 				       DWORD event_time)
 {
+	struct r1_presenter *saved;
+	unsigned int i;
+
 	(void)hook;
 	(void)object_id;
 	(void)child_id;
 	(void)thread_id;
 	(void)event_time;
 
-	if (window != r1.parent)
+	/* Find the presenter for the window that actually moved. Each window
+	 * hooks its own events, but the hook fires on whatever slot happens to
+	 * be selected at the time, so pausing "the" presenter would pause an
+	 * unrelated window and leave the moving one drawing at stale
+	 * coordinates. */
+	saved = r1_current;
+	for (i = 0; i < R1_MAX_PRESENTERS; i++) {
+		if (r1_slots[i].parent == window) {
+			r1_current = &r1_slots[i];
+			break;
+		}
+	}
+	if (i == R1_MAX_PRESENTERS)
 		return;
+
 	if (event == EVENT_SYSTEM_MOVESIZESTART) {
 		r1.live_sizing = 1;
 		r1.resize_pending = 1;
@@ -568,6 +607,7 @@ static void CALLBACK r1_movesize_event(HWINEVENTHOOK hook, DWORD event,
 		logline("present %s: live move/resize ended; waiting for stable"
 			" drawable dimensions\n", present_rung());
 	}
+	r1_current = saved;
 }
 
 static const char r1_vertex_shader[] =
@@ -833,6 +873,65 @@ static void r1_drop_target(void)
 	r1.resize_last_change = 0;
 	r1.last_poll = 0;
 	r1.rung = 0;
+}
+
+/*
+ * Point `r1` at the slot serving this XID, keeping every other window's
+ * overlay and compiled scene alive.
+ *
+ * A window that is already presenting is found and selected; a new one takes a
+ * free slot. Only when all eight are in use is anything torn down, and then it
+ * is the least recently drawn -- never the window whose frame is in hand. The
+ * common cases (one window, or several taking turns) therefore cost a pointer
+ * assignment.
+ */
+static void r1_select(uint32_t xid)
+{
+	struct r1_presenter *free_slot = NULL;
+	struct r1_presenter *oldest = &r1_slots[0];
+	unsigned int i;
+
+	for (i = 0; i < R1_MAX_PRESENTERS; i++) {
+		struct r1_presenter *slot = &r1_slots[i];
+
+		if (slot->parent && slot->xid == (uintptr_t)xid) {
+			r1_current = slot;
+			return;
+		}
+		if (!slot->parent && !free_slot)
+			free_slot = slot;
+		/* Ties and zeroes resolve to the first slot, which is what a
+		 * never-drawn entry should look like to an evictor. */
+		if (slot->last_poll < oldest->last_poll)
+			oldest = slot;
+	}
+
+	if (free_slot) {
+		r1_current = free_slot;
+		return;
+	}
+
+	r1_current = oldest;
+	if (r1.parent) {
+		logline("present %s: evicting XID 0x%x, all %d presenters in use\n",
+			present_rung(), (unsigned int)r1.xid,
+			R1_MAX_PRESENTERS);
+		r1_drop_target();
+	}
+}
+
+/* Drop every presenter: teardown, and the eviction path's last resort. */
+static void r1_drop_all(void)
+{
+	struct r1_presenter *saved = r1_current;
+	unsigned int i;
+
+	for (i = 0; i < R1_MAX_PRESENTERS; i++) {
+		r1_current = &r1_slots[i];
+		if (r1.parent)
+			r1_drop_target();
+	}
+	r1_current = saved;
 }
 
 /* Return 1 for a drawable parent, 0 while it is hidden/minimised, and -1
@@ -1544,7 +1643,8 @@ int cogpu_present_r2_present(const struct copresent_record *record)
 		return COPRESENT_STALE;
 	}
 
-	if (r1.parent && (r1.rung != 2 || r1.xid != binding->xid))
+	r1_select(binding->xid);
+	if (r1.parent && r1.rung != 2)
 		r1_drop_target();
 	poll_rc = present_surface_poll();
 	if (poll_rc < 0)
@@ -1632,9 +1732,11 @@ void cogpu_present_stream(uint32_t res_handle, uint32_t xid,
 	    (info.bind & COGPU_PIPE_BIND_DEPTH_STENCIL))
 		return;
 
-	/* A different window than the one currently bound: release the old
-	 * overlay first so two drawables never fight over one surface. */
-	if (r1.parent && (r1.rung != 2 || r1.xid != (uintptr_t)xid))
+	/* Select this window's own presenter. Other windows keep theirs, which
+	 * is what stops two drawables from destroying each other's overlay --
+	 * and their compiled shaders -- once per frame. */
+	r1_select(xid);
+	if (r1.parent && r1.rung != 2)
 		r1_drop_target();
 	if (present_surface_poll() < 0)
 		return;
@@ -1683,8 +1785,20 @@ int cogpu_present_r2_unbind(const struct copresent_record *record)
 	if (!binding)
 		return COPRESENT_STALE;
 	resource_id = binding->resource.resource_id;
-	if (r1.rung == 2 && r1.resource_id == resource_id)
-		r1_drop_target();
+	/* Whichever window was showing this resource, not merely the selected
+	 * one: the buffer is going away for all of them. */
+	{
+		struct r1_presenter *saved = r1_current;
+		unsigned int i;
+
+		for (i = 0; i < R1_MAX_PRESENTERS; i++) {
+			r1_current = &r1_slots[i];
+			if (r1.parent && r1.rung == 2 &&
+			    r1.resource_id == resource_id)
+				r1_drop_target();
+		}
+		r1_current = saved;
+	}
 	ZeroMemory(binding, sizeof(*binding));
 	logline("present R2: UNBIND connection %u buffer %u resource %u\n",
 		record->connection, record->buffer, resource_id);
@@ -1725,8 +1839,10 @@ void cogpu_present_r2_reset(unsigned int generation)
 
 void cogpu_present_r2_fini(void)
 {
-	if (r1.rung == 2)
-		r1_drop_target();
+	/* Every window's presenter, not just the selected one -- otherwise
+	 * shutdown leaks an overlay and a GL context per window that was on
+	 * screen. */
+	r1_drop_all();
 	ZeroMemory(r2_bindings, sizeof(r2_bindings));
 	r2_generation = 0;
 	r2_enabled = 0;
