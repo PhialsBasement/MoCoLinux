@@ -1,7 +1,7 @@
 #!/bin/sh
-# Build the MoCoLinux direct-present libGL from an untouched Mesa 26.1.6
-# release tarball.  The source patch is part of this tree; the modified tree
-# under download/ is never an input.
+# Build the MoCoLinux direct DRI3/CoPresent GL stack from an untouched Mesa
+# 26.1.6 release tarball.  The source patch is part of this tree; the modified
+# tree under download/ is never an input.
 
 set -eu
 
@@ -15,6 +15,7 @@ SOURCE=$WORK/mesa-$VERSION
 BUILD=$WORK/build
 VENV=${MOCO_MESA_VENV:-$WORK/venv}
 OUTPUT=${MOCO_MESA_OUTPUT:-$WORK/out/libGL-moco.so.1}
+GALLIUM_OUTPUT=${MOCO_MESA_GALLIUM_OUTPUT:-$WORK/out/libgallium-$VERSION.so}
 PREFIX=${MOCO_MESA_PREFIX:-/usr}
 EXPECTED_TARBALL_SHA256=5296b88a0f1e012e2cb9ada150a2bbadf728ca81e5a4fb2ab43c83a4d2158606
 
@@ -76,13 +77,14 @@ esac
 
 say "configuring Mesa $VERSION"
 if [ -f "$BUILD/meson-private/coredata.dat" ]; then
-	SETUP_MODE=--wipe
+	SETUP_MODE=--reconfigure
 else
 	SETUP_MODE=
 fi
 PYTHONPATH=$VENV_SITE "$VENV/bin/meson" setup $SETUP_MODE "$BUILD" "$SOURCE" \
 	--prefix="$PREFIX" \
-	-Dglx=xlib \
+	-Dglx=dri \
+	-Dglvnd=disabled \
 	-Dgallium-drivers=virgl,softpipe \
 	-Dvulkan-drivers=[] \
 	-Dplatforms=x11 \
@@ -97,14 +99,18 @@ PYTHONPATH=$VENV_SITE "$VENV/bin/meson" setup $SETUP_MODE "$BUILD" "$SOURCE" \
 	-Dvalgrind=disabled \
 	-Dlibunwind=disabled
 
-TARGET=src/gallium/targets/libgl-xlib/libGL.so.1.5.0
-say "building $TARGET with $JOBS jobs"
-PYTHONPATH=$VENV_SITE ninja -C "$BUILD" -j "$JOBS" "$TARGET"
+GL_TARGET=src/glx/libGL.so.1.2.0
+GALLIUM_TARGET=src/gallium/targets/dri/libgallium-$VERSION.so
+say "building normal DRI GLX and Gallium virgl with $JOBS jobs"
+PYTHONPATH=$VENV_SITE ninja -C "$BUILD" -j "$JOBS" \
+	"$GL_TARGET" "$GALLIUM_TARGET"
 
 mkdir -p "$(dirname "$OUTPUT")"
-install -m 0755 "$BUILD/$TARGET" "$OUTPUT"
-strip --strip-unneeded "$OUTPUT"
+mkdir -p "$(dirname "$GALLIUM_OUTPUT")"
+install -m 0755 "$BUILD/$GL_TARGET" "$OUTPUT"
+install -m 0755 "$BUILD/$GALLIUM_TARGET" "$GALLIUM_OUTPUT"
+strip --strip-unneeded "$OUTPUT" "$GALLIUM_OUTPUT"
 
 say ""
-say "built $OUTPUT"
-sha256sum "$OUTPUT"
+say "built the matched Mesa DRI3 pair"
+sha256sum "$OUTPUT" "$GALLIUM_OUTPUT"

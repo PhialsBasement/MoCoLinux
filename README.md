@@ -156,15 +156,26 @@ Release presentation is still VirtualGL: applications run through the
 `moco-gl` wrapper, render on `/dev/dri/renderD128`, and push finished frames
 into the same VcXsrv windows. That remains the packaged compatibility path.
 
-The opt-in CoPresent R2 path now removes finished pixels from the transport.
-A guest broker translates exported dma-bufs into virgl resource IDs and sends
-only BIND/PRESENT/UNBIND metadata plus fences through an 8 KiB pinned ring;
-cogpu samples the texture virglrenderer already owns on the Windows GPU. Stock
-VcXsrv remains the window/input control plane and is neither rebuilt nor
-patched. A Mesa 26.1.6 GLX prototype runs unmodified `glxinfo` and `glxgears`
-without `moco-gl`, `vglrun`, `LD_PRELOAD` or faker libraries: it reports direct
-virgl GL 4.2 and measured 516--551 fps at 1600x837, with the host settling near
-545 fenced no-copy releases/s. The staged gates are in
+The opt-in development path has reached normal Mesa DRI3 GLX. A matched Mesa
+26.1.6 `libGL` and Gallium build uses Mesa's upstream DRI3 loader, opens
+`/dev/dri/renderD128`, and preserves its ordinary DRI images, buffer queue,
+buffer age and native fences. Only the final operation a Linux X server would
+normally perform is redirected: a guest broker translates exported dma-bufs
+into virgl resource IDs and sends BIND/PRESENT/UNBIND metadata through an 8 KiB
+pinned ring, then cogpu samples the texture virglrenderer already owns on the
+Windows GPU. This seam is necessary because stock VcXsrv on Windows cannot
+receive or import a Linux file descriptor; VcXsrv itself remains the unmodified
+window and input control plane.
+
+Unmodified 64-bit `glxinfo`, `glxgears` and `glxspheres64` now use this path
+without `moco-gl`, `vglrun`, `LD_PRELOAD` or faker libraries. Hardware
+validation reported direct virgl GL 4.2, and `/proc/PID/maps` contained the
+matched `libGL.so.1.2.0` and `libgallium-26.1.6.so` with no VirtualGL library.
+This is the roughly 75%-usable direct-GLX checkpoint. The next step is native-
+speed presentation: allow multiple buffers in flight and replace the current
+per-frame `glFinish`/synchronous RELEASE. Integrating the resulting pair and
+broker into the rootfs and installer is deliberately the last step. The staged
+gates are in
 [`doc/direct-presentation`](doc/direct-presentation); the checksum-pinned Mesa
 patch and exact rebuild/rollback procedure are in
 [`doc/building-copresent`](doc/building-copresent).
@@ -196,9 +207,9 @@ ask for:
   virgl on the GT 730 with zero renderer errors; guest Xorg with glamor
   reports direct rendering; `colinux-daemon --run moco-gl glxgears` — the
   exact command a desktop shortcut issues — draws at 128 fps
-- Opt-in fenced direct presentation: CoPresent carries resource identity and
-  native fences instead of finished frames, while an unmodified GLX test client
-  reports direct virgl and reaches roughly 545 no-copy frames/s on the same GPU
+- Opt-in normal DRI3 GLX presentation: CoPresent carries resource identity and
+  native fences instead of finished frames. Unmodified 64-bit GLX programs load
+  Mesa's DRI3 provider, report direct virgl and present without VirtualGL
 - Inbound port redirects (`-r tcp:2222:22` reaches the guest's sshd)
 - 32-bit binaries (the guest keeps its own `int $0x80` gate)
 - Landlock and user namespaces (required by pacman 7 and modern sandboxes)
@@ -225,12 +236,13 @@ Not yet:
   `cocon`/`conet` consoles and devices — including `colinux-console-nt` —
   cannot attach
 - DHCP in the guest (static address only)
-- Direct presentation as the packaged default. R2 has proved metadata-only,
-  fenced presentation through stock VcXsrv windows, and the Mesa GLX prototype
-  has proved ordinary direct virgl clients. The release still selects
-  VirtualGL, so its finished frames still cross the X transport. Before that
-  default changes, R3/R4 still need the DRI3/Present-visible contract, clean
-  broker-loss fallback, rootfs packaging, EGL/browser coverage and longer soak
+- Direct presentation as the packaged default. The release still selects
+  VirtualGL, while the development stack now handles ordinary 64-bit GLX
+  through Mesa's normal DRI3 loader. For that GLX track, the next task is an
+  asynchronous multi-buffered release path; rootfs/installer integration comes
+  last. Direct server-extension queries, EGL/browser behavior, 32-bit clients
+  and Vulkan/Proton remain separate coverage rungs and are not implied by this
+  checkpoint
 
 ### Cooperative SMP milestone
 
@@ -298,7 +310,7 @@ ceiling, not a claim that a 128 GB host has already been tested.
 | `src/colinux/kernel/net.c` | network rings, host half — read, consume, inject |
 | `src/colinux/kernel/vgpu.c` | virtio-gpu transport, host half — publish, retire, idle gate |
 | `src/colinux/os/winnt/user/cogpu-daemon/` | the GPU device: vring service, virglrenderer, the WGL winsys |
-| `src/colinux/user/copresent/` | the R2 guest broker, fenced producer and shared metadata ABI |
+| `src/colinux/user/copresent/` | the guest CoPresent broker, fenced producer and shared metadata ABI |
 | `src/colinux/user/conet_ring.c` | the ring format and its decoder, shared by both readers |
 | `src/colinux/user/slirp/` | vendored slirp, with its Win64 repairs |
 | `src/colinux/user/elf_load.c` | the daemon: ELF loading, symbol resolution, boot |
@@ -314,7 +326,7 @@ ceiling, not a claim that a 128 GB host has already been tested.
 | `doc/runbook` | box to desktop, and host to installed Manjaro |
 | `doc/porting-x86_64` | design notes for the port |
 | `doc/direct-presentation` | staged plan and acceptance gates for replacing VirtualGL's frame transport |
-| `doc/building-copresent` | exact R2 host, broker and Mesa build; isolated test, system selection and rollback |
+| `doc/building-copresent` | exact host, broker and direct DRI3 Mesa build; isolated test, system selection and rollback |
 | `doc/building-modern` | the working build recipe |
 
 ## Building
@@ -356,10 +368,11 @@ staged copies are present.
 CoPresent adds separately built Linux broker and Mesa pieces; `build.sh` cannot
 silently manufacture those as part of a Windows build. Run
 `tools/build-copresent-guest.sh` for the broker/test binaries and
-`tools/build-mesa-copresent.sh` for the patched GLX library. The latter verifies
-the official Mesa 26.1.6 SHA-256 and applies the complete repository patch with
-zero fuzz. See [`doc/building-copresent`](doc/building-copresent) before enabling
-the prototype system-wide; it also contains the non-destructive rollback.
+`tools/build-mesa-copresent.sh` for the matched patched DRI GLX/Gallium pair.
+The latter verifies the official Mesa 26.1.6 SHA-256 and applies the complete
+repository patch with zero fuzz. See
+[`doc/building-copresent`](doc/building-copresent) before enabling the
+development stack system-wide; it also contains the non-destructive rollback.
 
 To drive `comake` directly, or for the underlying recipe and every
 environment variable, see `doc/building-modern`. The guest kernel is separate:

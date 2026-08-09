@@ -1,5 +1,5 @@
-Building and testing CoPresent R2
-=================================
+Building and testing direct DRI3 CoPresent
+===========================================
 
 Scope
 -----
@@ -14,8 +14,10 @@ path is selected.
   2. `moco-present-broker` runs in Linux. It PRIME-imports client dma-bufs,
      turns them into virgl resource IDs, waits native fences, and exchanges
      fixed 64-byte records with cogpu through an 8 KiB pinned ring.
-  3. A patched Mesa `libGL.so.1` makes ordinary Xlib GLX clients render with
-     Gallium virgl on `/dev/dri/renderD128` and hands swaps to the broker.
+  3. A matched patched Mesa `libGL.so.1` and Gallium DRI library make ordinary
+     64-bit GLX clients consume Mesa's normal DRI3 provider, render with virgl
+     on `/dev/dri/renderD128`, and hand the final dma-buf/fence present to the
+     broker.
 
 VcXsrv is not rebuilt or patched. It remains the X control plane and owns
 the top-level Windows window, input, focus and ordinary X drawing.
@@ -36,9 +38,9 @@ The Mesa input is the official 26.1.6 release tarball:
 The complete Mesa delta is:
 
     patch/mesa-26.1.6/moco-copresent.diff
-    SHA256 2a7cc61ebce0c3ec73864f4ee88c3c203e9bfef73d2ebc0ace8fa12e29056c7b
+    SHA256 f17035b4c949341d24621613cf938d26ba820dbcd43f22b2496e92fe0a49bc66
 
-It contains every Mesa change, including the three new source/header files.
+It contains every Mesa change, including all new source/header files.
 It applies with `patch -p1 --fuzz=0`; no file from the modified development
 tree under `download/mesa-26.1.6` is required.
 
@@ -99,11 +101,13 @@ The script:
   * refuses patch fuzz and records the applied patch hash;
   * creates a Python virtual environment with Meson 1.11.2, Mako 1.4.1,
     MarkupSafe 3.0.3, PyYAML 6.0.3 and packaging 26.3;
-  * configures only Xlib GLX and Gallium virgl/softpipe, with EGL, GBM,
-    Vulkan, LLVM, VA and tests disabled;
-  * builds `src/gallium/targets/libgl-xlib/libGL.so.1.5.0` with Ninja; and
-  * builds with a fixed `/usr` runtime prefix and strips the result to
-    `../build/mesa-copresent-26.1.6/out/libGL-moco.so.1`.
+  * configures Mesa's normal DRI GLX provider and Gallium virgl/softpipe, with
+    GLVND, EGL, GBM, Vulkan, LLVM, VA and tests disabled;
+  * builds `src/glx/libGL.so.1.2.0` and
+    `src/gallium/targets/dri/libgallium-26.1.6.so` with Ninja; and
+  * builds with a fixed `/usr` runtime prefix and strips the matched pair to
+    `../build/mesa-copresent-26.1.6/out/libGL-moco.so.1` and
+    `../build/mesa-copresent-26.1.6/out/libgallium-26.1.6.so`.
 
 The build host needs a C/C++ toolchain, Python venv support, Ninja, patch,
 pkg-config and the development files Meson reports for X11/XCB, libdrm,
@@ -116,7 +120,8 @@ Useful overrides are:
     MOCO_MESA_TARBALL   path to the verified 26.1.6 tarball
     MOCO_MESA_WORK      persistent source/build/venv directory
     MOCO_MESA_VENV      an existing or new Python virtual environment
-    MOCO_MESA_OUTPUT    final stripped library path
+    MOCO_MESA_OUTPUT    final stripped libGL path
+    MOCO_MESA_GALLIUM_OUTPUT final stripped Gallium DRI library path
     MOCO_MESA_PREFIX    embedded Mesa data/config prefix (default `/usr`)
     MOCO_BUILD_JOBS     Ninja worker count
 
@@ -127,12 +132,14 @@ new patch on an old source tree.
 Test without changing the guest graphics stack
 -----------------------------------------------
 
-Copy `libGL-moco.so.1` into the guest, then select it for just the diagnostic
-process. `LD_LIBRARY_PATH` here is only an isolated development-library
-selector; CoPresent does not use `LD_PRELOAD`, VirtualGL or a faker library.
+Copy both matched outputs into the guest, then select them for just the
+diagnostic process. `LD_LIBRARY_PATH` here is only an isolated development-
+library selector; CoPresent does not use `LD_PRELOAD`, VirtualGL or a faker
+library.
 
     mkdir -p /tmp/moco-lib
     ln -sf /path/to/libGL-moco.so.1 /tmp/moco-lib/libGL.so.1
+    cp /path/to/libgallium-26.1.6.so /tmp/moco-lib/
     DISPLAY=:0 LD_LIBRARY_PATH=/tmp/moco-lib glxinfo -B
     DISPLAY=:0 LD_LIBRARY_PATH=/tmp/moco-lib glxgears -geometry 1600x837
 
@@ -142,10 +149,11 @@ Expected identity is `direct rendering: Yes`, renderer `virgl`, and Mesa
 Opt-in system selection and rollback
 ------------------------------------
 
-For normal command lines during R2 development, copy
+For normal command lines during direct-DRI3 development, copy
 `tools/install-mesa-copresent.sh` into the guest and run:
 
-    sudo ./install-mesa-copresent.sh enable /path/to/libGL-moco.so.1
+    sudo ./install-mesa-copresent.sh enable /path/to/build-output-directory
+    # or: enable /path/to/libGL-moco.so.1 /path/to/libgallium-26.1.6.so
     ./install-mesa-copresent.sh status
     glxinfo -B
 
@@ -155,28 +163,50 @@ roll back immediately:
 
     sudo ./install-mesa-copresent.sh disable
 
-The accepted guest test resolved normal `glxinfo` to the CoPresent library,
-reported direct virgl, then disabled it and restored `/usr/lib/libGL.so.1`.
+The accepted guest test resolved normal `glxinfo` to
+`/usr/local/lib/moco-copresent/libGL.so.1.2.0`, loaded the matched Gallium
+library, reported direct virgl, and kept both package-owned Mesa and the old R2
+prototype intact for rollback. The selector archives the old higher-versioned
+`libGL.so.1.5.0` outside the ldconfig directory so it cannot silently win over
+the DRI library.
 
-The R2 GLX prototype currently has no software-present fallback when the
-broker or host presenter is absent. Do not make this selection a release
-default until the fallback and the remaining R3 application contract pass.
+The DRI3 path contains an emergency XPutImage fallback and reconnect/rebind
+logic when the broker disappears. Deliberate service stop/restart, resize and
+longer soak are still required before making this selection a release default.
 
 Accepted hardware result, 2026-08-09
 ------------------------------------
 
-On the Windows 10 / GeForce GT 730 test host, the patched library reported:
+On the Windows 10 / GeForce GT 730 test host, the normal DRI3 build reported:
 
     direct rendering: Yes
     OpenGL renderer: virgl (NVIDIA GeForce GT 730/PCIe/SSE2)
     OpenGL 4.2 (Core and Compatibility Profile) Mesa 26.1.6
 
-Unmodified `glxgears` at 1600x837 measured 516--551 fps in the guest while
-the host settled near 545 released no-copy frames/s. A 75-second 900x600
-run completed 33,027 fenced releases at 446.3 fps and cleanly UNBINDed the
-resource. The previously inverted image is corrected by carrying XMesa's
-logical Y orientation in `COPRESENT_F_Y_0_TOP` and combining it with
-virglrenderer's resource-storage orientation on the host.
+`LIBGL_DEBUG=verbose glxinfo -B` logged `Using DRI3 with MoCo CoPresent for
+screen 0`. VcXsrv 1.14 initially answered Mesa's optional raw-window
+`X_GLXGetDrawableAttributes` probe with fatal GLXBadDrawable; the final patch
+uses ordinary X window attributes for that inference only in MoCo mode. No
+VcXsrv file changed.
+
+Unmodified `glxgears` then completed consecutive five-second samples of 1,343
+and 1,412 frames, or 268.6 and 282.2 fps. While it ran, `/proc/PID/maps`
+contained:
+
+    /usr/local/lib/moco-copresent/libGL.so.1.2.0
+    /usr/local/lib/moco-copresent/libgallium-26.1.6.so
+
+There was no libvgl or faker mapping. The earlier R2 Xlib prototype is kept in
+history, but these measurements are from the normal `-Dglx=dri` provider.
+
+For a non-trivial load, unmodified `glxspheres64` rendered 3,513,600 polygons
+per frame at 1920x1080 and sustained roughly 15.5 fps. Windows performance
+counters measured 81--87% utilization on cogpu-daemon.exe's 3D engine. This
+proves that the ordinary GLX client is executing on the real host GPU; it does
+not claim native efficiency. The present path currently waits the acquire
+fence, draws the sampled texture, calls `glFinish`, completes `SwapBuffers`,
+returns RELEASE and only then lets the producer continue. Removing that
+one-frame-in-flight serialization is the next implementation step.
 
 The standalone two-buffer producer also submitted and received RELEASE for
 all 116,587 frames in a 126-second interactive resize/destruction run. It
@@ -184,13 +214,16 @@ rebound at 1000x700, 1200x760, 800x500 and 1500x800, and the host recorded a
 matched UNBIND for both buffers at each size and on normal window closure. The
 uninterrupted ten-minute soak in `doc/direct-presentation` remains outstanding.
 
-The clean scripted `/usr`-prefix build was copied into the guest, where
-unmodified `glxinfo` reported the identity above and unmodified `glxgears`
-presented at 433--456 fps at 1000x700. Its stripped SHA-256 was:
+After the runtime test, a new clean build was made solely from the official
+tarball and the repository patch using the canonical script. That pair was
+installed with the reversible selector; its installed hashes matched the build
+outputs and unmodified `glxinfo -B` again completed through direct DRI3 virgl.
+The two stripped outputs were:
 
-    a2ddb078720eea9ad889b9fe89941ca41bbe9acf338f18358185e1ed3c1f5cc9
+    37a0d93b3b9f49d4038cbd31a51316ab71495b406a45bceaf3e291f36a5d7bec  libGL-moco.so.1
+    6f845c23ebf579293008a5367c85bd100f2efc6992ce4ced96290e5ad9c0d2b2  libgallium-26.1.6.so
 
-That output hash is evidence for this toolchain and dependency set, not a
-promise that every compiler will produce a byte-identical ELF file. The
+Those output hashes are evidence for this toolchain and dependency set, not a
+promise that every compiler will produce byte-identical ELF files. The
 release tarball checksum and a zero-fuzz application of the repository patch
 are the reproducible source boundary.

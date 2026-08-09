@@ -25,17 +25,27 @@
      texture virglrenderer already owns in a child of the stock VcXsrv window.
      No finished pixels cross the cooperative boundary. The matched host,
      broker and protocol sources are in-tree.
-   * DONE 2026-08-09: the experimental normal-GLX seam is reproducible. The
-     official Mesa 26.1.6 tarball is checksum-pinned, its complete zero-fuzz
-     delta is patch/mesa-26.1.6/moco-copresent.diff, and the exact build,
-     isolated test, opt-in system selection and rollback are scripted and
-     documented in doc/building-copresent.
-   * Finish R3 before making this a default: expose DRI3/Present-compatible
-     query semantics, fall back cleanly when the broker/host presenter dies,
-     package the selected library and broker in the rootfs, and cover GLX
-     drawable variants beyond the current Xlib path.
-   * R4/R5 remain EGL/browser behavior, 32-bit Mesa and Steam Runtime import.
-     R8 remains Venus/Vulkan/Proton and must not be inferred from virgl OpenGL.
+   * DONE 2026-08-09: ordinary 64-bit GLX applications now consume Mesa's
+     normal DRI3 provider. The matched libGL/Gallium pair opens renderD128,
+     keeps Mesa's DRI images, buffer queue and native fences, and replaces only
+     the X-server dma-buf/Present handoff with CoPresent. Unmodified glxinfo,
+     glxgears and glxspheres64 report direct virgl and process maps contain no
+     VirtualGL library. The official Mesa 26.1.6 tarball is checksum-pinned,
+     its complete zero-fuzz delta is patch/mesa-26.1.6/moco-copresent.diff,
+     and build, selection and rollback are scripted in doc/building-copresent.
+   * NEXT: make presentation approach native speed. The correctness-first path
+     currently permits one frame in flight: the host samples, calls glFinish
+     and SwapBuffers, returns RELEASE, and only then does the client continue.
+     Replace glFinish with host GL fences, retire RELEASE asynchronously, and
+     let Mesa's buffer queue keep two or three frames in flight. Instrument
+     guest-fence wait, virgl work, presentation fence and SwapBuffers time.
+   * LAST for the 64-bit GLX track: package the matched libGL/Gallium pair and
+     broker in the rootfs and installer, after the optimized path passes resize,
+     broker-restart and soak tests. Do not make the development selector the
+     release default before then.
+   * Direct server-side DRI3 queries, EGL/browser behavior, 32-bit Mesa and
+     Steam Runtime import remain later coverage. Venus/Vulkan/Proton is a
+     separate project and must not be inferred from virgl OpenGL.
 
  * Consoles:
    * Focus change handling.

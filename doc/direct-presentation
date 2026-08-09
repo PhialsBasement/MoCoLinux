@@ -68,10 +68,15 @@ to applications which make security and feature decisions from it:
 
   * /dev/dri/renderD128 is the device Mesa opens and virgl is the renderer;
   * glXIsDirect and glxinfo report a direct context, never indirect GLX;
-  * DRI3 and Present semantics are visible to guest X clients. A guest-side
-    facade may terminate the Linux dma-buf/fence handoff into CoPresent because
-    an fd cannot be passed into a Windows X server, but applications must not
-    be silently routed to indirect GL when stock VcXsrv cannot consume it;
+  * ordinary GLX applications consume Mesa's normal DRI3 provider, including
+    its DRI images, buffer queue, buffer-age tracking and native fences. A
+    guest-side transport may terminate the final Linux dma-buf/Present handoff
+    in CoPresent because an fd cannot be passed into a Windows X server, but it
+    must not replace DRI3 with indirect GL, an Xlib-only renderer or a wrapper;
+  * a program which directly queries the X server's DRI3 or Present extension
+    still needs a compatible query facade. Stock VcXsrv cannot advertise those
+    Linux fd protocols, so that server-query case must not be confused with the
+    now-working normal GLX DRI3 loader;
   * no vglrun, libvglfaker, LD_PRELOAD, application injection, or executable
     patch is present in the launch command or process mappings.
 
@@ -155,28 +160,40 @@ R2 -- make presentation a fenced cooperative service
 
 R3 -- normal 64-bit GLX applications
 
-    Add a Mesa MoCo X11 winsys alongside the existing DRI loaders. It uses the
-    ordinary virtio-gpu render node and Gallium virgl driver, creates normal X
-    windows for control/events, exposes DRI3/Present-compatible semantics to
-    clients, and terminates the Linux fd/fence handoff in CoPresent rather than
-    trying to pass a dma-buf fd into Windows VcXsrv. The selection is
-    system-wide and based on the MoCo device/broker, not a wrapper around an
-    application.
+    Extend Mesa's existing DRI3 GLX loader instead of adding another Xlib GLX
+    implementation. It opens the ordinary virtio-gpu render node, loads
+    Gallium virgl, creates normal X windows for control/events, and preserves
+    Mesa's DRI images, buffer queue, buffer age and native fences. Only the
+    operation the Linux X server would normally perform at the end is replaced:
+    CoPresent receives the dma-buf and fence because Windows VcXsrv cannot.
+    Selection is system-wide from the MoCo device and broker, not a wrapper
+    around an application.
 
-    PASS: unmodified glxinfo reports direct rendering and virgl; guest X
-    clients can query DRI3 and Present; glxgears and kmscube-style tests render
-    in VcXsrv windows; /proc/PID/maps contains no VirtualGL faker library;
-    killing CoPresent falls back cleanly.
+    PASS for this rung: unmodified 64-bit GLX programs enter Mesa's DRI3
+    provider, report direct virgl, render in VcXsrv windows, and contain neither
+    VirtualGL nor a preload faker in /proc/PID/maps. Resize, drawable lifetime
+    and broker loss must fail cleanly. Programs which directly query the X
+    server's DRI3 extension, EGL, Vulkan and 32-bit clients belong to their
+    explicit later coverage rungs.
 
-    PROTOTYPE (2026-08-09): Mesa 26.1.6's client-side Xlib GLX target now opens
-    renderD128 with Gallium virgl and submits its swaps to CoPresent. Unmodified
-    `glxinfo -B` reports direct rendering, virgl on the GeForce GT 730 and GL
-    4.2; unmodified `glxgears` measured 516--551 fps at 1600x837 while the host
-    settled near 545 fenced no-copy releases/s. The application command has no
-    `moco-gl`, `vglrun`, `LD_PRELOAD` or faker library. This proves the normal
-    GLX application seam, but it is not a full R3 pass: the DRI3/Present query
-    facade, broker-loss fallback, system packaging and broader GLX coverage
-    remain. The source/build boundary is recorded in `doc/building-copresent`.
+    75% CHECKPOINT (2026-08-09): the canonical Mesa build now uses `-Dglx=dri`
+    and produces a matched `libGL.so.1.2.0` and `libgallium-26.1.6.so`.
+    Unmodified `glxinfo -B` logs "Using DRI3 with MoCo CoPresent", reports
+    `direct rendering: Yes`, virgl on the GeForce GT 730, and OpenGL 4.2.
+    VcXsrv 1.14's fatal GLXBadDrawable response to Mesa's optional raw-window
+    drawable-type query is avoided only in MoCo mode; ordinary X window
+    attributes provide the same information without changing VcXsrv.
+
+    Unmodified `glxgears` presented 1,343 and 1,412 frames in consecutive
+    five-second samples (268.6 and 282.2 fps). Its live process map contained
+    the matched CoPresent libGL and Gallium libraries and no libvgl. A heavier
+    `glxspheres64` run at 1920x1080 with 3,513,600 polygons per frame sustained
+    about 15.5 fps while Windows measured 81--87% utilization for
+    cogpu-daemon's 3D engine. That proves genuine GPU execution but also exposes
+    the next bottleneck: the correctness-first presenter drains and releases
+    every frame synchronously. An emergency XPutImage fallback exists for a
+    lost broker; deliberate stop/restart and longer soak remain acceptance
+    tests, not assumptions.
 
 R4 -- EGL, browsers and the Steam client
 
@@ -223,6 +240,15 @@ R7 -- performance gate and removal of VirtualGL from the default path
     explicitly selected compatibility fallback until a later release removes
     it.
 
+    NEXT AFTER THE R3 CHECKPOINT: pull the performance part of this rung forward.
+    The current call chain is render, acquire-fence wait, host presentation draw,
+    glFinish, SwapBuffers, RELEASE, then the next frame. Replace glFinish with a
+    host GL fence, retire RELEASE asynchronously per buffer, and permit Mesa's
+    queue to keep two or three frames in flight. Record time separately for the
+    guest fence, virglrenderer, the sampling fence, SwapBuffers and the metadata
+    round trip. Installer integration remains last so it packages the optimized
+    path rather than freezing the checkpoint implementation into the image.
+
 R8 -- Vulkan/Proton, separately
 
     Add virtio-gpu Venus and a Vulkan WSI presentation path using the same HWND
@@ -240,11 +266,13 @@ guest broker and matched host protocol but does not modify the driver, guest
 kernel or VcXsrv. `--present-r2` remains deliberately opt-in while normal
 release shortcuts retain VirtualGL.
 
-There is also an early R3 application path: a complete repository patch against
-the checksum-pinned Mesa 26.1.6 release builds an Xlib `libGL.so.1` that selects
-virgl and CoPresent for ordinary GLX programs. It is currently selected as an
-isolated development library, not installed by the rootfs builder. It proves
-direct GLX rendering and no-copy presentation but does not yet emulate the
-DRI3/Present extension contract, cover EGL/browsers, or fall back when the
-broker disappears. Build, selection, rollback and the accepted hashes are in
+R3 has reached the normal 64-bit GLX DRI3 loader and is approximately 75% of
+the way to a usable replacement for that release path. A complete repository
+patch against the checksum-pinned Mesa 26.1.6 release builds the matched DRI
+`libGL` and Gallium libraries, and the reversible system selector has been
+validated in the running guest. This is not yet the rootfs or installer
+default. The immediate work is asynchronous multi-buffered release and
+performance measurement; packaging is deliberately last. Direct server DRI3
+queries, EGL/browsers, 32-bit clients and Vulkan remain separately named rungs.
+Build, selection, rollback and accepted hashes are in
 `doc/building-copresent`.
