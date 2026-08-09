@@ -920,13 +920,33 @@ static int r1_create_target(const struct vcxsrv_candidate *target,
 	r1.rung = rung;
 
 	/* No HWND parent and no owner: this surface must never enter VcXsrv's
-	 * cross-process child enumeration/resize path. Disabled + NOACTIVATE and
-	 * HTTRANSPARENT leave all keyboard and pointer ownership with X11. */
+	 * cross-process child enumeration/resize path. NOACTIVATE, TRANSPARENT
+	 * and the HTTRANSPARENT hit test leave all keyboard and pointer
+	 * ownership with X11.
+	 *
+	 * Deliberately NOT WS_DISABLED. Disabling was right while this surface
+	 * was a child of the VcXsrv window -- a disabled child hands its input
+	 * to the parent -- but as an independent top-level it instead SWALLOWS
+	 * every click over the drawable: Firefox rendered correctly and was
+	 * completely unclickable (2026-08-10).
+	 *
+	 * WS_EX_LAYERED is what actually makes the clicks reach VcXsrv.
+	 * Returning HTTRANSPARENT from WM_NCHITTEST only forwards the hit test
+	 * to other windows OF THE SAME THREAD, so it can do nothing for a
+	 * server in another process; LAYERED|TRANSPARENT is the documented
+	 * combination that takes the window out of hit-testing entirely, and
+	 * it is what hardware-rendered game overlays use. Opaque alpha keeps
+	 * the presented frame fully visible; DWM composes it either way. */
 	r1.overlay = CreateWindowExA(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
-		WS_EX_TRANSPARENT, PRESENTER_CLASS, "",
-		WS_POPUP | WS_DISABLED | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+		WS_EX_TRANSPARENT | WS_EX_LAYERED, PRESENTER_CLASS, "",
+		WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
 		x, y, width, height, NULL, NULL,
 		GetModuleHandle(NULL), NULL);
+	if (r1.overlay &&
+	    !SetLayeredWindowAttributes(r1.overlay, 0, 255, LWA_ALPHA))
+		logline("present %s: layered attributes refused (%lu);"
+			" input may not reach the X server\n",
+			present_rung(), (unsigned long)GetLastError());
 	if (!r1.overlay) {
 		logline("present %s: independent overlay create failed (%lu)\n",
 			present_rung(), (unsigned long)GetLastError());
@@ -1497,13 +1517,32 @@ int cogpu_present_r2_present(const struct copresent_record *record)
 	int width, height;
 	int poll_rc;
 
+	/* A refused PRESENT must say why: the guest only sees a failed status
+	 * and falls back to the X path, so a silent branch here reads as
+	 * "presenter lost" with no cause (the ATTACH_BACKING lesson,
+	 * 2026-08-10). Rate-limited so a persistent refusal cannot flood. */
+	static DWORD refuse_last_report;
+#define R2_REFUSE(why, ...) do {                                          \
+		DWORD now_ = GetTickCount();                              \
+		if (now_ - refuse_last_report >= 1000) {                  \
+			refuse_last_report = now_;                        \
+			logline("present R2: PRESENT refused: " why "\n", \
+				##__VA_ARGS__);                           \
+		}                                                         \
+	} while (0)
+
 	if (!r2_enabled || !record ||
-	    !(record->flags & COPRESENT_F_ACQUIRE_WAITED))
+	    !(record->flags & COPRESENT_F_ACQUIRE_WAITED)) {
+		R2_REFUSE("no acquire fence or R2 disabled");
 		return COPRESENT_BAD_RECORD;
+	}
 	binding = r2_find_binding(record);
 	if (!binding || binding->resource.resource_id != record->resource_id ||
-	    binding->xid != record->xid)
+	    binding->xid != record->xid) {
+		R2_REFUSE("stale binding (buffer %u resource %u xid 0x%x)",
+			  record->buffer, record->resource_id, record->xid);
 		return COPRESENT_STALE;
+	}
 
 	if (r1.parent && (r1.rung != 2 || r1.xid != binding->xid))
 		r1_drop_target();
@@ -1513,28 +1552,124 @@ int cogpu_present_r2_present(const struct copresent_record *record)
 
 	if (!r1.parent) {
 		ZeroMemory(&target, sizeof(target));
-		if (r2_find_target(binding->xid, &target) != 0)
+		if (r2_find_target(binding->xid, &target) != 0) {
+			R2_REFUSE("no visible VcXsrv window carries XID 0x%x",
+				  binding->xid);
 			return COPRESENT_NO_WINDOW;
-		if (!GetClientRect(target.window, &rect))
+		}
+		if (!GetClientRect(target.window, &rect)) {
+			R2_REFUSE("client rect unavailable for XID 0x%x",
+				  binding->xid);
 			return COPRESENT_NO_WINDOW;
+		}
 		width = rect.right - rect.left;
 		height = rect.bottom - rect.top;
 		if (width != (int)binding->resource.width ||
-		    height != (int)binding->resource.height)
+		    height != (int)binding->resource.height) {
+			R2_REFUSE("XID 0x%x client %dx%d != buffer %ux%u",
+				  binding->xid, width, height,
+				  binding->resource.width,
+				  binding->resource.height);
 			return COPRESENT_STALE;
+		}
 		if (r1_create_target(&target, binding->resource.width,
-				     binding->resource.height, 2) != 0)
+				     binding->resource.height, 2) != 0) {
+			R2_REFUSE("overlay creation failed for XID 0x%x",
+				  binding->xid);
 			return COPRESENT_PRESENT_FAILED;
+		}
 	}
 	if (r1.surface_hidden || r1.live_sizing || r1.resize_pending)
 		return COPRESENT_OK; /* Deliberate mailbox drop; buffer is reusable. */
 	if (r1.drawable_width != (int)binding->resource.width ||
-	    r1.drawable_height != (int)binding->resource.height)
+	    r1.drawable_height != (int)binding->resource.height) {
+		R2_REFUSE("drawable %dx%d != buffer %ux%u",
+			  r1.drawable_width, r1.drawable_height,
+			  binding->resource.width, binding->resource.height);
 		return COPRESENT_STALE;
+	}
+#undef R2_REFUSE
 
 	r1.resource_id = binding->resource.resource_id;
 	r1.texture_id = binding->resource.tex_id;
 	return r2_draw_resource(&binding->resource, record->flags);
+}
+
+/*
+ * Presentation requested from inside the guest's command stream.
+ *
+ * This is the sandbox-proof path: the request arrived through the render node
+ * the client was already drawing through, so containers -- Steam's
+ * pressure-vessel, Firefox's content sandbox -- need no configuration and no
+ * extra socket. There is no BIND/RELEASE handshake because there is nothing
+ * to hand back: the command sits after the draws it presents in the same
+ * buffer, so by the time the decoder reaches it the rendering is already in
+ * the host's queue, and the guest is throttled by its own fences.
+ */
+void cogpu_present_stream(uint32_t res_handle, uint32_t xid,
+			  uint32_t width, uint32_t height,
+			  uint32_t damage_x, uint32_t damage_y,
+			  uint32_t damage_width, uint32_t damage_height)
+{
+	struct cogpu_vrend_resource_info info;
+	struct vcxsrv_candidate target;
+	static DWORD last_refuse;
+	RECT rect;
+	int client_width, client_height;
+
+	(void)damage_x;
+	(void)damage_y;
+	(void)damage_width;
+	(void)damage_height;
+
+	if (!r2_enabled || !xid || !width || !height)
+		return;
+	if (cogpu_vrend_resource_info(res_handle, &info) != 0)
+		return;
+	if (info.target != COGPU_PIPE_TEXTURE_2D || info.nr_samples > 1 ||
+	    info.depth != 1 ||
+	    !(info.bind & COGPU_PIPE_BIND_RENDER_TARGET) ||
+	    (info.bind & COGPU_PIPE_BIND_DEPTH_STENCIL))
+		return;
+
+	/* A different window than the one currently bound: release the old
+	 * overlay first so two drawables never fight over one surface. */
+	if (r1.parent && (r1.rung != 2 || r1.xid != (uintptr_t)xid))
+		r1_drop_target();
+	if (present_surface_poll() < 0)
+		return;
+
+	if (!r1.parent) {
+		ZeroMemory(&target, sizeof(target));
+		if (r2_find_target(xid, &target) != 0 ||
+		    !GetClientRect(target.window, &rect))
+			return;	/* unmapped/offscreen drawable: X keeps it */
+		client_width = rect.right - rect.left;
+		client_height = rect.bottom - rect.top;
+		if (client_width != (int)info.width ||
+		    client_height != (int)info.height) {
+			DWORD now = GetTickCount();
+
+			if (now - last_refuse >= 2000) {
+				last_refuse = now;
+				logline("present stream: XID 0x%x client %dx%d !="
+					" buffer %ux%u\n", xid, client_width,
+					client_height, info.width, info.height);
+			}
+			return;
+		}
+		if (r1_create_target(&target, info.width, info.height, 2) != 0)
+			return;
+	}
+	if (r1.surface_hidden || r1.live_sizing || r1.resize_pending)
+		return;
+	if (r1.drawable_width != (int)info.width ||
+	    r1.drawable_height != (int)info.height)
+		return;
+
+	r1.resource_id = info.resource_id;
+	r1.texture_id = info.tex_id;
+	(void)r2_draw_resource(&info, COPRESENT_F_Y_0_TOP);
 }
 
 int cogpu_present_r2_unbind(const struct copresent_record *record)

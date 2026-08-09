@@ -49,6 +49,12 @@ static int	 vrend_ready;
 static uint64_t	 vrend_fences_written;
 static cogpu_fence_fn vrend_fence_cb;
 static void	*vrend_fence_ctx;
+static cogpu_moco_present_fn vrend_moco_present_cb;
+
+void cogpu_vrend_set_present_hook(cogpu_moco_present_fn fn)
+{
+	vrend_moco_present_cb = fn;
+}
 
 /*
  * virgl_renderer_resource_get_info() exposes the GL name and dimensions but
@@ -136,12 +142,33 @@ static void vrend_write_fence(void *cookie, uint32_t fence)
 		vrend_fence_cb(vrend_fence_ctx, fence);
 }
 
+/*
+ * The guest asked for a resource to be shown, through a command in its own
+ * rendering stream rather than through a side channel. That is what makes
+ * sandboxed clients work untouched: a container that can render can present,
+ * because presenting IS rendering. Called on the renderer thread from inside
+ * virgl_renderer_submit_cmd, with the resource already validated as owned by
+ * the calling context.
+ */
+static void vrend_moco_present(void *cookie, uint32_t res_handle, uint32_t xid,
+			       uint32_t width, uint32_t height,
+			       uint32_t damage_x, uint32_t damage_y,
+			       uint32_t damage_width, uint32_t damage_height)
+{
+	(void)cookie;
+	if (vrend_moco_present_cb)
+		vrend_moco_present_cb(res_handle, xid, width, height,
+				      damage_x, damage_y, damage_width,
+				      damage_height);
+}
+
 static struct virgl_renderer_callbacks vrend_cbs = {
-	.version	   = 1,
+	.version	   = 5,
 	.write_fence	   = vrend_write_fence,
 	.create_gl_context = wgl_create_context,
 	.destroy_gl_context = wgl_destroy_context,
 	.make_current	   = wgl_make_current,
+	.moco_present	   = vrend_moco_present,
 };
 
 int cogpu_vrend_init(cogpu_fence_fn fence_cb, void *fence_ctx)

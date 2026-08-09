@@ -83,4 +83,19 @@ void	    cogpu_vrend_detach_iov(uint32_t res_id);
 void	    cogpu_vrend_poll(void);
 uint64_t    cogpu_vrend_fences(void);
 
+/*
+ * The guest's own rendering stream carries its presentation requests
+ * (VIRGL_CCMD_MOCO_PRESENT), so a client needs nothing but the render node it
+ * already draws through -- no socket, no extra device, no filesystem share.
+ * That is what lets sandboxed applications and containers present without
+ * being configured for it. Called on the renderer thread during submit, with
+ * the resource already validated as belonging to the calling context.
+ */
+typedef void (*cogpu_moco_present_fn)(uint32_t res_handle, uint32_t xid,
+				      uint32_t width, uint32_t height,
+				      uint32_t damage_x, uint32_t damage_y,
+				      uint32_t damage_width,
+				      uint32_t damage_height);
+void	    cogpu_vrend_set_present_hook(cogpu_moco_present_fn fn);
+
 #endif

@@ -711,8 +711,18 @@ static uint32_t serve(struct cogpu_chain *chain)
 		 * pointer it is given -- see vrend.c. Handing this array
 		 * straight to it made every resource share one backing
 		 * description.
+		 *
+		 * Sized for real applications, not just probes: Firefox's
+		 * texture-atlas staging arrives as one ATTACH_BACKING with a
+		 * page entry per 4 KB -- a 16 MB atlas is 4096 entries. The
+		 * old 2048-entry cap refused that WITHOUT LOGGING; the
+		 * resource then existed with no backing, the first
+		 * COPY_TRANSFER3D through it poisoned the whole context, and
+		 * every subsequent draw died (found 2026-08-10 after a night
+		 * of the browser black-screening). A refusal must never be
+		 * silent again.
 		 */
-		static struct iovec iov[4096];
+		static struct iovec iov[16384];
 		const char *p;
 		uint32_t i;
 		int bad = 0, niov = 0;
@@ -723,7 +733,10 @@ static uint32_t serve(struct cogpu_chain *chain)
 		}
 		memcpy(&a, (char *)chain->in[0].addr + sizeof(req), sizeof(a));
 
-		if (a.nr_entries == 0 || a.nr_entries > 2048) {
+		if (a.nr_entries == 0 || a.nr_entries > 16384) {
+			logline("  ATTACH_BACKING res %u: %u entries refused"
+				" (limit 16384)\n",
+				a.resource_id, a.nr_entries);
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
 			break;
 		}
@@ -1162,8 +1175,13 @@ int main(int argc, char **argv)
 		return cogpu_present_probe(12000);
 	if (present_r1)
 		cogpu_present_r1_enable();
-	if (present_r2)
+	if (present_r2) {
 		cogpu_present_r2_enable();
+		/* Presentation requests carried in the guest's own command
+		 * stream, which is what makes sandboxed clients work with no
+		 * configuration -- see cogpu_present_stream(). */
+		cogpu_vrend_set_present_hook(cogpu_present_stream);
+	}
 
 	handle = co_os_manager_open();
 	g_wake_handle = handle;		/* for cogpu_ring_doorbell(), incl. the X wire */
@@ -1300,13 +1318,16 @@ int main(int argc, char **argv)
 
 		if (GetTickCount() - last > 2000) {
 			last = GetTickCount();
+			/* submits/cmd_bytes ride along so per-frame command volume
+			 * is a subtraction between two lines, not an exit report the
+			 * teardown kill never lets print. */
 			logline("[%lus] status 0x%x q0 num %u kick %u  q1 num %u kick %u"
-			       "  served %llu\n",
+			       "  served %llu  submits %llu  cmd %llu\n",
 			       (unsigned long)((last - t0) / 1000),
 			       io->status,
 			       io->vq[0].num, io->vq[0].kick,
 			       io->vq[1].num, io->vq[1].kick,
-			       g_stats.requests);
+			       g_stats.requests, g_stats.submits, g_stats.cmd_bytes);
 		}
 
 		/*

@@ -1,6 +1,92 @@
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/loader_dri3_helper.c b/src/gallium/frontends/dri/loader_dri3_helper.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/egl/drivers/dri2/platform_x11_dri3.c b/src/egl/drivers/dri2/platform_x11_dri3.c
+--- a/src/egl/drivers/dri2/platform_x11_dri3.c	2026-07-30 03:31:27.000000000 +1000
++++ b/src/egl/drivers/dri2/platform_x11_dri3.c	2026-08-10 00:39:26.190509900 +1000
+@@ -192,6 +192,13 @@
+       goto cleanup_pixmap;
+    }
+ 
++   /* MoCo: same seam as the GLX loader (dri3_glx.c) -- the shared dri3
++    * helper terminates the final dma-buf/present handoff in CoPresent
++    * because the Windows X server cannot import a Linux fd.  Everything
++    * else (DRI images, buffer age, fences) stays Mesa's own.  The flag
++    * must be set before loader_dri3_drawable_init reads it. */
++   dri3_surf->loader_drawable.moco = x11_dri3_is_moco();
++
+    if (loader_dri3_drawable_init(
+           dri2_dpy->conn, drawable, egl_to_loader_dri3_drawable_type(type),
+           dri2_dpy->dri_screen_render_gpu, dri2_dpy->dri_screen_display_gpu,
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/drivers/virgl/virgl_encode.c b/src/gallium/drivers/virgl/virgl_encode.c
+--- a/src/gallium/drivers/virgl/virgl_encode.c	2026-07-30 03:31:27.000000000 +1000
++++ b/src/gallium/drivers/virgl/virgl_encode.c	2026-08-10 01:47:40.839043800 +1000
+@@ -1901,3 +1901,48 @@
+    virgl_encoder_write_res(ctx, out_res);
+    virgl_encoder_write_res(ctx, res);
+ }
++
++/*
++ * MoCoLinux CoPresent: ask the host to show this resource in an X window.
++ *
++ * Deliberately just another command in the rendering stream. It travels down
++ * the render node the application already has open, so a sandboxed client --
++ * a browser content process, a Steam game inside pressure-vessel -- needs no
++ * socket, no additional device and no filesystem share to present. Ordering
++ * comes for free: this lands after the draws it presents, in the same buffer.
++ *
++ * Called from the DRI3 loader (moco_dri3.c), which is why it takes plain
++ * pipe types rather than virgl ones.
++ */
++void virgl_moco_encode_present(struct pipe_context *pctx,
++                               struct pipe_resource *pres,
++                               uint32_t xid,
++                               uint32_t width, uint32_t height,
++                               uint32_t damage_x, uint32_t damage_y,
++                               uint32_t damage_width, uint32_t damage_height)
++{
++   struct virgl_context *ctx;
++   struct virgl_resource *res;
++
++   if (!pctx || !pres)
++      return;
++   ctx = virgl_context(pctx);
++   res = virgl_resource(pres);
++
++   virgl_encoder_write_cmd_dword(ctx, VIRGL_CMD0(VIRGL_CCMD_MOCO_PRESENT, 0,
++                                                 VIRGL_MOCO_PRESENT_SIZE));
++   /* write_res also records the reference, so the host keeps the resource
++    * attached to this context for the lifetime of the command buffer. */
++   virgl_encoder_write_res(ctx, res);
++   virgl_encoder_write_dword(ctx->cbuf, xid);
++   virgl_encoder_write_dword(ctx->cbuf, width);
++   virgl_encoder_write_dword(ctx->cbuf, height);
++   virgl_encoder_write_dword(ctx->cbuf, damage_x);
++   virgl_encoder_write_dword(ctx->cbuf, damage_y);
++   virgl_encoder_write_dword(ctx->cbuf, damage_width);
++   virgl_encoder_write_dword(ctx->cbuf, damage_height);
++
++   /* A frame the user is waiting to see must not sit in the command buffer
++    * until something else happens to flush it. */
++   pctx->flush(pctx, NULL, PIPE_FLUSH_END_OF_FRAME);
++}
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/drivers/virgl/virgl_encode.h b/src/gallium/drivers/virgl/virgl_encode.h
+--- a/src/gallium/drivers/virgl/virgl_encode.h	2026-07-30 03:31:27.000000000 +1000
++++ b/src/gallium/drivers/virgl/virgl_encode.h	2026-08-10 01:49:46.445817900 +1000
+@@ -347,4 +347,13 @@
+ 
+ enum virgl_formats pipe_to_virgl_format(enum pipe_format format);
+ enum pipe_format virgl_to_pipe_format(enum virgl_formats format);
++/* MoCoLinux CoPresent: emit a presentation request into this context's
++ * command stream. Called from the DRI3 loader, hence plain pipe types. */
++void virgl_moco_encode_present(struct pipe_context *pctx,
++                               struct pipe_resource *pres,
++                               uint32_t xid,
++                               uint32_t width, uint32_t height,
++                               uint32_t damage_x, uint32_t damage_y,
++                               uint32_t damage_width, uint32_t damage_height);
++
+ #endif
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/dri/loader_dri3_helper.c b/src/gallium/frontends/dri/loader_dri3_helper.c
 --- a/src/gallium/frontends/dri/loader_dri3_helper.c	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/gallium/frontends/dri/loader_dri3_helper.c	2026-08-09 23:00:21.813346800 +1000
++++ b/src/gallium/frontends/dri/loader_dri3_helper.c	2026-08-10 01:49:23.625222300 +1000
 @@ -23,6 +23,7 @@
  
  #include <fcntl.h>
@@ -9,15 +95,17 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
  #include <unistd.h>
  #include <string.h>
  
-@@ -43,6 +44,7 @@
+@@ -43,6 +44,9 @@
  #include "drm-uapi/drm_fourcc.h"
  #include "dri_screen.h"
  #include "dri_util.h"
++#include "dri_context.h"
++#include "state_tracker/st_context.h"
 +#include "moco_dri3.h"
  
  /**
   * A cached blit context.
-@@ -65,6 +67,31 @@
+@@ -65,6 +69,31 @@
  static struct loader_dri3_buffer *
  dri3_find_back_alloc(struct loader_dri3_drawable *draw);
  
@@ -49,7 +137,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
  static xcb_screen_t *
  get_screen_for_root(xcb_connection_t *conn, xcb_window_t root)
  {
-@@ -341,10 +368,17 @@
+@@ -341,10 +370,18 @@
     if (!buffer)
        return;
  
@@ -58,7 +146,8 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
 -   xcb_sync_destroy_fence(draw->conn, buffer->sync_fence);
 -   xshmfence_unmap_shm(buffer->shm_fence);
 +   if (draw->moco) {
-+      moco_dri3_present_unbind(draw->moco_present, buffer->pixmap);
++      /* Nothing bound host-side: the resource is named per frame in the
++       * command stream, so a buffer going away needs no protocol at all. */
 +      if (buffer->moco_dma_fd >= 0)
 +         close(buffer->moco_dma_fd);
 +   } else {
@@ -71,7 +160,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     dri2_destroy_image(buffer->image);
     if (buffer->linear_buffer)
        dri2_destroy_image(buffer->linear_buffer);
-@@ -366,6 +400,9 @@
+@@ -366,6 +403,9 @@
     for (i = 0; i < ARRAY_SIZE(draw->buffers); i++)
        dri3_free_render_buffer(draw, i);
  
@@ -81,7 +170,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     if (draw->special_event) {
        xcb_void_cookie_t cookie =
           xcb_present_select_input_checked(draw->conn, draw->eid, draw->drawable,
-@@ -405,7 +442,7 @@
+@@ -405,7 +445,7 @@
     draw->region = 0;
     draw->dri_screen_render_gpu = dri_screen_render_gpu;
     draw->dri_screen_display_gpu = dri_screen_display_gpu;
@@ -90,7 +179,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     draw->prefer_back_buffer_reuse = prefer_back_buffer_reuse;
     draw->queries_buffer_age = false;
  
-@@ -438,7 +475,7 @@
+@@ -438,7 +478,7 @@
        draw->block_on_depleted_buffers = block_on_depleted_buffers;
     }
  
@@ -99,12 +188,12 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
        set_adaptive_sync_property(conn, draw->drawable, false);
  
     draw->swap_interval = dri_get_initial_swap_interval(draw->dri_screen_render_gpu);
-@@ -452,10 +489,24 @@
+@@ -452,10 +492,24 @@
     if (!draw->dri_drawable)
        return 1;
  
 +   if (draw->moco) {
-+      draw->moco_present = moco_dri3_present_create(drawable);
++      draw->moco_present = moco_dri3_present_create(conn, drawable);
 +      if (!draw->moco_present) {
 +         driDestroyDrawable(draw->dri_drawable);
 +         draw->dri_drawable = NULL;
@@ -124,7 +213,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
        return 1;
     }
  
-@@ -616,6 +667,18 @@
+@@ -616,6 +670,18 @@
                           int64_t divisor, int64_t remainder,
                           int64_t *ust, int64_t *msc, int64_t *sbc)
  {
@@ -143,7 +232,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     xcb_void_cookie_t cookie = xcb_present_notify_msc(draw->conn,
                                                       draw->drawable,
                                                       draw->eid,
-@@ -653,6 +716,15 @@
+@@ -653,6 +719,15 @@
                           int64_t target_sbc, int64_t *ust,
                           int64_t *msc, int64_t *sbc)
  {
@@ -159,7 +248,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     /* From the GLX_OML_sync_control spec:
      *
      *     "If <target_sbc> = 0, the function will block until all previous
-@@ -852,6 +924,28 @@
+@@ -852,6 +927,28 @@
     if (!back)
        return;
  
@@ -188,7 +277,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     y = draw->height - y - height;
  
     if (draw->dri_screen_render_gpu != draw->dri_screen_display_gpu) {
-@@ -903,6 +997,46 @@
+@@ -903,6 +1000,46 @@
     loader_dri3_flush(draw, __DRI2_FLUSH_DRAWABLE, __DRI2_THROTTLE_COPYSUBBUFFER);
  
     struct loader_dri3_buffer *front = dri3_front_buffer(draw);
@@ -235,7 +324,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     if (front)
        dri3_fence_reset(draw->conn, front);
  
-@@ -927,6 +1061,9 @@
+@@ -927,6 +1064,9 @@
  
     front = dri3_front_buffer(draw);
  
@@ -245,7 +334,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     loader_dri3_copy_drawable(draw, front->pixmap, draw->drawable);
  
     /* In the psc->is_different_gpu case, the linear buffer has been updated,
-@@ -957,6 +1094,13 @@
+@@ -957,6 +1097,13 @@
     if (!front)
        return;
  
@@ -259,7 +348,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     /* In the psc->is_different_gpu case, we update the linear_buffer
      * before updating the real front.
      */
-@@ -977,6 +1121,9 @@
+@@ -977,6 +1124,9 @@
  static void
  dri3_flush_present_events(struct loader_dri3_drawable *draw)
  {
@@ -269,7 +358,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     /* Check to see if any configuration changes have occurred
      * since we were last invoked
      */
-@@ -995,6 +1142,192 @@
+@@ -995,6 +1145,196 @@
     }
  }
  
@@ -437,22 +526,26 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
 +      }
 +   }
 +
-+   if (ctx) {
-+      fence = dri_create_fence_fd(ctx, -1);
-+      if (fence)
-+         fence_fd = dri_get_fence_fd(draw->dri_screen_render_gpu, fence);
++   /* Emit the presentation as a command in the stream this context is
++    * already rendering through. No fence fd is exported and no buffer is
++    * handed anywhere: the command lands after the draws it presents, in the
++    * same buffer, so the host sees them in order by construction. This is
++    * what makes sandboxed clients work untouched. */
++   if (ctx && ctx->st && ctx->st->pipe && buffer->image &&
++       moco_dri3_present_xid(draw->moco_present)) {
++      virgl_moco_encode_present(ctx->st->pipe, buffer->image->texture,
++                                moco_dri3_present_xid(draw->moco_present),
++                                buffer->width, buffer->height,
++                                damage_x, damage_y,
++                                damage_width, damage_height);
++      presented = true;
++      if (moco_dri3_present_announce(draw->moco_present))
++         fprintf(stderr,
++                 "MoCo DRI3: direct virgl/CoPresent active for XID 0x%x\n",
++                 moco_dri3_present_xid(draw->moco_present));
 +   }
-+   if (fence_fd >= 0)
-+      presented = moco_dri3_present_frame(draw->moco_present,
-+                                          buffer->pixmap,
-+                                          buffer->moco_dma_fd, fence_fd,
-+                                          buffer->width, buffer->height,
-+                                          damage_x, damage_y,
-+                                          damage_width, damage_height);
-+   if (fence_fd >= 0)
-+      close(fence_fd);
-+   if (fence)
-+      dri_destroy_fence(draw->dri_screen_render_gpu, fence);
++   (void)fence;
++   (void)fence_fd;
 +
 +   if (!presented)
 +      return moco_xput_image(draw, buffer, draw->drawable);
@@ -462,7 +555,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
  /** loader_dri3_swap_buffers_msc
   *
   * Make the current back buffer visible using the present extension
-@@ -1038,6 +1371,9 @@
+@@ -1038,6 +1378,9 @@
     if (!draw->have_back || draw->type == LOADER_DRI3_DRAWABLE_PIXMAP)
        return ret;
  
@@ -472,7 +565,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     draw->vtable->flush_drawable(draw, flush_flags);
  
     back = dri3_find_back_alloc(draw);
-@@ -1047,7 +1383,7 @@
+@@ -1047,7 +1390,7 @@
  
     mtx_lock(&draw->mtx);
  
@@ -481,7 +574,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
        set_adaptive_sync_property(draw->conn, draw->drawable, true);
        draw->adaptive_sync_active = true;
     }
-@@ -1085,6 +1421,20 @@
+@@ -1085,6 +1428,20 @@
     dri3_flush_present_events(draw);
  
     if (draw->type == LOADER_DRI3_DRAWABLE_WINDOW) {
@@ -502,7 +595,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
        dri3_fence_reset(draw->conn, back);
  
        /* Compute when we want the frame shown by taking the last known
-@@ -1215,6 +1565,16 @@
+@@ -1215,6 +1572,16 @@
        draw->send_sbc++;
        draw->recv_sbc = back->last_swap = draw->send_sbc;
  
@@ -519,7 +612,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
        /* Pixmap is imported as front buffer image when same GPU case, so just
         * locally blit back buffer image to it is enough. Otherwise front buffer
         * is a fake one which needs to be synced with pixmap by xserver remotely.
-@@ -1232,6 +1592,7 @@
+@@ -1232,6 +1599,7 @@
        }
     }
  
@@ -527,7 +620,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     ret = (int64_t) draw->send_sbc;
  
     /* Schedule a server-side back-preserving blit if necessary.
-@@ -1240,7 +1601,7 @@
+@@ -1240,7 +1608,7 @@
      * b) We need to preserve the back buffer,
      * c) We don't have local blit capabilities.
      */
@@ -536,7 +629,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
         draw->cur_blit_source != LOADER_DRI3_BACK_ID(draw->cur_back)) {
        struct loader_dri3_buffer *new_back = dri3_back_buffer(draw);
        struct loader_dri3_buffer *src = draw->buffers[draw->cur_blit_source];
-@@ -1419,7 +1780,8 @@
+@@ -1419,7 +1787,8 @@
     xcb_pixmap_t pixmap;
     xcb_sync_fence_t sync_fence;
     struct xshmfence *shm_fence;
@@ -546,7 +639,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     int num_planes = 0;
     uint64_t *modifiers = NULL;
     uint32_t count = 0;
-@@ -1443,6 +1805,7 @@
+@@ -1443,6 +1812,7 @@
     buffer = calloc(1, sizeof *buffer);
     if (!buffer)
        goto no_buffer;
@@ -554,7 +647,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
  
     buffer->cpp = dri3_cpp_for_fourcc(fourcc);
     if (!buffer->cpp)
-@@ -1572,8 +1935,6 @@
+@@ -1572,8 +1942,6 @@
           image = pixmap_buffer;
        }
  
@@ -563,7 +656,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
        ret = dri2_query_image(image, __DRI_IMAGE_ATTRIB_FD,
                                           &buffer_fds[i]);
        ret &= dri2_query_image(image, __DRI_IMAGE_ATTRIB_STRIDE,
-@@ -1621,6 +1982,25 @@
+@@ -1621,6 +1989,25 @@
  
     pixmap = xcb_generate_id(draw->conn);
  
@@ -589,7 +682,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     xcb_void_cookie_t cookie_pix, cookie_fence;
     if (draw->multiplanes_available &&
         buffer->modifier != DRM_FORMAT_MOD_INVALID) {
-@@ -1670,10 +2050,10 @@
+@@ -1670,10 +2057,10 @@
     return buffer;
  
  no_buffer_attrib:
@@ -602,7 +695,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     dri2_destroy_image(pixmap_buffer);
  no_linear_buffer:
     if (draw->dri_screen_render_gpu != draw->dri_screen_display_gpu)
-@@ -1729,6 +2109,12 @@
+@@ -1729,6 +2116,12 @@
  static bool
  dri3_setup_present_event(struct loader_dri3_drawable *draw)
  {
@@ -615,7 +708,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     /* No need to setup for pixmap drawable. */
     if (draw->type == LOADER_DRI3_DRAWABLE_PIXMAP ||
         draw->type == LOADER_DRI3_DRAWABLE_PBUFFER)
-@@ -2076,7 +2462,7 @@
+@@ -2076,7 +2469,7 @@
                                       MIN2(buffer->width, new_buffer->width),
                                       MIN2(buffer->height, new_buffer->height),
                                       0, 0, 0) &&
@@ -624,7 +717,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
              dri3_fence_reset(draw->conn, new_buffer);
              dri3_copy_area(draw->conn,
                             buffer->pixmap,
-@@ -2091,14 +2477,19 @@
+@@ -2091,14 +2484,19 @@
        } else if (buffer_type == loader_dri3_buffer_front) {
           /* Fill the new fake front with data from a real front */
           loader_dri3_swapbuffer_barrier(draw);
@@ -652,7 +745,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
  
           if (new_buffer->linear_buffer) {
              dri3_fence_await(draw->conn, draw, new_buffer);
-@@ -2234,7 +2625,8 @@
+@@ -2234,7 +2632,8 @@
         * content will get synced with the fake front
         * buffer.
         */
@@ -662,7 +755,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
            draw->dri_screen_render_gpu == draw->dri_screen_display_gpu)
           front = dri3_get_pixmap_buffer(driDrawable,
                                          fourcc,
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/loader_dri3_helper.h b/src/gallium/frontends/dri/loader_dri3_helper.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/dri/loader_dri3_helper.h b/src/gallium/frontends/dri/loader_dri3_helper.h
 --- a/src/gallium/frontends/dri/loader_dri3_helper.h	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/gallium/frontends/dri/loader_dri3_helper.h	2026-08-09 21:52:04.142436800 +1000
 @@ -78,6 +78,10 @@
@@ -694,7 +787,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     /* Currently protects the following fields:
      * event_cnd, has_event_waiter,
      * recv_sbc, ust, msc, recv_msc_serial,
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/meson.build b/src/gallium/frontends/dri/meson.build
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/dri/meson.build b/src/gallium/frontends/dri/meson.build
 --- a/src/gallium/frontends/dri/meson.build	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/gallium/frontends/dri/meson.build	2026-08-09 21:52:04.142436800 +1000
 @@ -24,7 +24,7 @@
@@ -706,342 +799,147 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
    endif
  endif
  
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/moco_dri3.c b/src/gallium/frontends/dri/moco_dri3.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/dri/moco_dri3.c b/src/gallium/frontends/dri/moco_dri3.c
 --- a/src/gallium/frontends/dri/moco_dri3.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/src/gallium/frontends/dri/moco_dri3.c	2026-08-09 23:00:21.812346900 +1000
-@@ -0,0 +1,306 @@
++++ b/src/gallium/frontends/dri/moco_dri3.c	2026-08-10 01:48:47.458863200 +1000
+@@ -0,0 +1,84 @@
 +/*
 + * CoPresent transport for Mesa's normal DRI3 loader.
 + *
-+ * Mesa still allocates DRI images, exports dma-bufs, produces native fences,
-+ * tracks buffer age and performs all normal GLX drawable bookkeeping.  This
-+ * file replaces only the operation a Linux X server normally performs at the
-+ * end: importing the dma-buf and presenting it.  Stock VcXsrv remains the X
-+ * control plane and never receives a Linux file descriptor.
++ * Mesa still allocates DRI images, tracks buffer age, produces fences and
++ * performs all normal GLX/EGL drawable bookkeeping. Only the final operation
++ * a Linux X server would perform is replaced: instead of handing a dma-buf to
++ * the server, the client emits a presentation command into the virgl stream
++ * it is already rendering through, and the host -- which already owns that
++ * texture -- shows it.
++ *
++ * Everything the earlier revision needed (a Unix socket, a root-only broker,
++ * a pinned metadata ring, dma-buf export and PRIME import) is gone. Those
++ * were invisible to sandboxed clients: Firefox's content processes and
++ * Steam's pressure-vessel container cannot see /run, so presentation silently
++ * fell back to software there. A render node is the one thing every sandbox
++ * that renders must already have, so presentation now needs nothing else.
 + */
 +
 +#include "moco_dri3.h"
-+#include "moco_dri3_protocol.h"
 +
-+#include <errno.h>
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
-+#include <sys/socket.h>
-+#include <sys/un.h>
-+#include <time.h>
-+#include <unistd.h>
-+
-+#define MOCO_DRI3_MAX_BUFFERS 16
-+#define MOCO_DRI3_RETRY_NS    1000000000ULL
-+
-+struct moco_dri3_binding {
-+   uint32_t id;
-+   bool active;
-+   bool bound;
-+};
 +
 +struct moco_dri3_present {
-+   int socket_fd;
 +   uint32_t xid;
-+   uint32_t serial;
-+   uint64_t retry_after_ns;
-+   bool direct_announced;
-+   bool fallback_announced;
-+   struct moco_dri3_binding bindings[MOCO_DRI3_MAX_BUFFERS];
++   bool announced;
 +};
 +
-+static uint64_t
-+monotonic_ns(void)
-+{
-+   struct timespec now;
-+
-+   clock_gettime(CLOCK_MONOTONIC, &now);
-+   return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
-+}
-+
-+static int
-+connect_broker(void)
-+{
-+   struct sockaddr_un address;
-+   int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-+
-+   if (fd < 0)
-+      return -1;
-+   memset(&address, 0, sizeof(address));
-+   address.sun_family = AF_UNIX;
-+   snprintf(address.sun_path, sizeof(address.sun_path), "%s",
-+            COPRESENT_LOCAL_PATH);
-+   if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
-+      close(fd);
-+      return -1;
-+   }
-+   return fd;
-+}
-+
-+static int
-+send_record_fd(int socket_fd, const struct copresent_record *record,
-+               int passed_fd)
-+{
-+   struct iovec iov = {
-+      .iov_base = (void *)record,
-+      .iov_len = sizeof(*record),
-+   };
-+   char control[CMSG_SPACE(sizeof(int))];
-+   struct msghdr message;
-+
-+   memset(&message, 0, sizeof(message));
-+   message.msg_iov = &iov;
-+   message.msg_iovlen = 1;
-+   if (passed_fd >= 0) {
-+      struct cmsghdr *cmsg;
-+
-+      memset(control, 0, sizeof(control));
-+      message.msg_control = control;
-+      message.msg_controllen = sizeof(control);
-+      cmsg = CMSG_FIRSTHDR(&message);
-+      cmsg->cmsg_level = SOL_SOCKET;
-+      cmsg->cmsg_type = SCM_RIGHTS;
-+      cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-+      memcpy(CMSG_DATA(cmsg), &passed_fd, sizeof(passed_fd));
-+   }
-+
-+   return sendmsg(socket_fd, &message, MSG_NOSIGNAL) == sizeof(*record) ?
-+          0 : -1;
-+}
-+
-+static int
-+wait_for_response(struct moco_dri3_present *present, uint32_t opcode,
-+                  uint32_t buffer)
-+{
-+   for (;;) {
-+      struct copresent_record response;
-+      ssize_t got = recv(present->socket_fd, &response, sizeof(response), 0);
-+
-+      if (got != sizeof(response) || response.version != COPRESENT_VERSION)
-+         return -1;
-+      if (response.buffer != buffer)
-+         continue;
-+      if (response.opcode == COPRESENT_ERROR)
-+         return -1;
-+      if (response.opcode == opcode)
-+         return response.status == COPRESENT_OK ? 0 : -1;
-+   }
-+}
-+
-+static void
-+disconnect_broker(struct moco_dri3_present *present)
-+{
-+   unsigned i;
-+
-+   if (present->socket_fd >= 0)
-+      close(present->socket_fd);
-+   present->socket_fd = -1;
-+   present->retry_after_ns = monotonic_ns() + MOCO_DRI3_RETRY_NS;
-+   for (i = 0; i < MOCO_DRI3_MAX_BUFFERS; i++)
-+      present->bindings[i].bound = false;
-+}
-+
-+static int
-+ensure_connected(struct moco_dri3_present *present)
-+{
-+   uint64_t now;
-+
-+   if (present->socket_fd >= 0)
-+      return 0;
-+   now = monotonic_ns();
-+   if (now < present->retry_after_ns)
-+      return -1;
-+
-+   present->socket_fd = connect_broker();
-+   if (present->socket_fd < 0) {
-+      present->retry_after_ns = now + MOCO_DRI3_RETRY_NS;
-+      if (!present->fallback_announced) {
-+         fprintf(stderr,
-+                 "MoCo DRI3: CoPresent unavailable for XID 0x%x; using X fallback\n",
-+                 present->xid);
-+         present->fallback_announced = true;
-+      }
-+      return -1;
-+   }
-+   return 0;
-+}
-+
-+static struct moco_dri3_binding *
-+find_binding(struct moco_dri3_present *present, uint32_t id, bool allocate)
-+{
-+   struct moco_dri3_binding *free_binding = NULL;
-+   unsigned i;
-+
-+   for (i = 0; i < MOCO_DRI3_MAX_BUFFERS; i++) {
-+      struct moco_dri3_binding *binding = &present->bindings[i];
-+
-+      if (binding->active && binding->id == id)
-+         return binding;
-+      if (!binding->active && !free_binding)
-+         free_binding = binding;
-+   }
-+   if (!allocate || !free_binding)
-+      return NULL;
-+   free_binding->active = true;
-+   free_binding->id = id;
-+   return free_binding;
-+}
-+
-+static int
-+bind_buffer(struct moco_dri3_present *present,
-+            struct moco_dri3_binding *binding, int dma_fd,
-+            uint32_t width, uint32_t height)
-+{
-+   struct copresent_record record;
-+
-+   memset(&record, 0, sizeof(record));
-+   record.opcode = COPRESENT_BIND;
-+   record.version = COPRESENT_VERSION;
-+   record.buffer = binding->id;
-+   record.xid = present->xid;
-+   record.width = width;
-+   record.height = height;
-+   if (send_record_fd(present->socket_fd, &record, dma_fd) != 0 ||
-+       wait_for_response(present, COPRESENT_BOUND, binding->id) != 0)
-+      return -1;
-+   binding->bound = true;
-+   return 0;
-+}
-+
 +struct moco_dri3_present *
-+moco_dri3_present_create(uint32_t xid)
++moco_dri3_present_create(xcb_connection_t *conn, uint32_t xid)
 +{
 +   struct moco_dri3_present *present = calloc(1, sizeof(*present));
 +
 +   if (!present)
 +      return NULL;
-+   present->socket_fd = -1;
 +   present->xid = xid;
++
++   /* The host matches XIDs against the property the Windows X server puts on
++    * TOP-LEVEL windows only. Toolkit clients (Firefox, GTK/Qt, Steam) render
++    * into a child of their top-level, so the drawable's own XID matches
++    * nothing host-side. Walk the ancestor chain once, here. */
++   if (conn) {
++      uint32_t walk = xid;
++
++      for (int depth = 0; depth < 32; depth++) {
++         xcb_query_tree_cookie_t cookie = xcb_query_tree(conn, walk);
++         xcb_query_tree_reply_t *reply =
++            xcb_query_tree_reply(conn, cookie, NULL);
++
++         if (!reply)
++            break;
++         if (reply->parent == XCB_NONE || reply->parent == reply->root) {
++            present->xid = walk;
++            free(reply);
++            break;
++         }
++         walk = reply->parent;
++         free(reply);
++      }
++   }
 +   return present;
 +}
 +
-+bool
-+moco_dri3_present_frame(struct moco_dri3_present *present,
-+                        uint32_t buffer, int dma_fd, int fence_fd,
-+                        uint32_t width, uint32_t height,
-+                        uint32_t damage_x, uint32_t damage_y,
-+                        uint32_t damage_width, uint32_t damage_height)
++uint32_t
++moco_dri3_present_xid(struct moco_dri3_present *present)
 +{
-+   struct moco_dri3_binding *binding;
-+   struct copresent_record record;
-+
-+   if (!present || dma_fd < 0 || fence_fd < 0 || width == 0 || height == 0 ||
-+       ensure_connected(present) != 0)
-+      return false;
-+
-+   binding = find_binding(present, buffer, true);
-+   if (!binding ||
-+       (!binding->bound && bind_buffer(present, binding, dma_fd,
-+                                       width, height) != 0))
-+      goto fail;
-+
-+   memset(&record, 0, sizeof(record));
-+   record.opcode = COPRESENT_PRESENT;
-+   record.version = COPRESENT_VERSION;
-+   record.buffer = buffer;
-+   record.serial = ++present->serial;
-+   record.width = width;
-+   record.height = height;
-+   record.damage_x = damage_x;
-+   record.damage_y = damage_y;
-+   record.damage_width = damage_width;
-+   record.damage_height = damage_height;
-+   record.flags = COPRESENT_F_Y_0_TOP;
-+   if (send_record_fd(present->socket_fd, &record, fence_fd) != 0 ||
-+       wait_for_response(present, COPRESENT_RELEASE, buffer) != 0)
-+      goto fail;
-+
-+   if (!present->direct_announced || present->fallback_announced) {
-+      fprintf(stderr,
-+              "MoCo DRI3: direct virgl/CoPresent active for XID 0x%x\n",
-+              present->xid);
-+      present->direct_announced = true;
-+      present->fallback_announced = false;
-+   }
-+   return true;
-+
-+fail:
-+   disconnect_broker(present);
-+   if (!present->fallback_announced) {
-+      fprintf(stderr,
-+              "MoCo DRI3: presenter lost for XID 0x%x; using X fallback\n",
-+              present->xid);
-+      present->fallback_announced = true;
-+   }
-+   return false;
++   return present ? present->xid : 0;
 +}
 +
-+void
-+moco_dri3_present_unbind(struct moco_dri3_present *present, uint32_t buffer)
++bool
++moco_dri3_present_announce(struct moco_dri3_present *present)
 +{
-+   struct moco_dri3_binding *binding;
-+
-+   if (!present)
-+      return;
-+   binding = find_binding(present, buffer, false);
-+   if (!binding)
-+      return;
-+
-+   if (binding->bound && present->socket_fd >= 0) {
-+      struct copresent_record record;
-+
-+      memset(&record, 0, sizeof(record));
-+      record.opcode = COPRESENT_UNBIND;
-+      record.version = COPRESENT_VERSION;
-+      record.buffer = buffer;
-+      if (send_record_fd(present->socket_fd, &record, -1) != 0 ||
-+          wait_for_response(present, COPRESENT_UNBOUND, buffer) != 0)
-+         disconnect_broker(present);
-+   }
-+   memset(binding, 0, sizeof(*binding));
++   if (!present || present->announced)
++      return false;
++   present->announced = true;
++   return true;
 +}
 +
 +void
 +moco_dri3_present_destroy(struct moco_dri3_present *present)
 +{
-+   unsigned i;
-+
-+   if (!present)
-+      return;
-+   for (i = 0; i < MOCO_DRI3_MAX_BUFFERS; i++)
-+      if (present->bindings[i].active)
-+         moco_dri3_present_unbind(present, present->bindings[i].id);
-+   if (present->socket_fd >= 0)
-+      close(present->socket_fd);
 +   free(present);
 +}
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/moco_dri3.h b/src/gallium/frontends/dri/moco_dri3.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/dri/moco_dri3.h b/src/gallium/frontends/dri/moco_dri3.h
 --- a/src/gallium/frontends/dri/moco_dri3.h	1970-01-01 10:00:00.000000000 +1000
-+++ b/src/gallium/frontends/dri/moco_dri3.h	2026-08-09 23:00:21.812346900 +1000
-@@ -0,0 +1,21 @@
++++ b/src/gallium/frontends/dri/moco_dri3.h	2026-08-10 01:48:31.856139700 +1000
+@@ -0,0 +1,48 @@
 +#ifndef MESA_MOCO_DRI3_H
 +#define MESA_MOCO_DRI3_H
 +
 +#include <stdbool.h>
 +#include <stdint.h>
 +
-+struct moco_dri3_present;
++#include <xcb/xcb.h>
 +
-+struct moco_dri3_present *moco_dri3_present_create(uint32_t xid);
++struct moco_dri3_present;
++struct pipe_context;
++struct pipe_resource;
++
++/*
++ * MoCoLinux CoPresent.
++ *
++ * Presentation is carried as an ordinary command inside the client's own
++ * virgl command stream, down the render node it is already drawing through.
++ * That is the whole design: a client that can render can present, so
++ * sandboxed applications and containers -- a browser content process, a Steam
++ * title inside pressure-vessel -- work with no socket, no extra device, no
++ * filesystem share and no per-application configuration.
++ *
++ * This object holds only what the stream cannot carry by itself: the
++ * top-level XID the frames belong to.
++ */
++struct moco_dri3_present *moco_dri3_present_create(xcb_connection_t *conn,
++                                                   uint32_t xid);
 +void moco_dri3_present_destroy(struct moco_dri3_present *present);
 +
-+bool moco_dri3_present_frame(struct moco_dri3_present *present,
-+                             uint32_t buffer, int dma_fd, int fence_fd,
-+                             uint32_t width, uint32_t height,
-+                             uint32_t damage_x, uint32_t damage_y,
-+                             uint32_t damage_width, uint32_t damage_height);
++/* The resolved top-level XID; 0 if it could not be determined. */
++uint32_t moco_dri3_present_xid(struct moco_dri3_present *present);
 +
-+void moco_dri3_present_unbind(struct moco_dri3_present *present,
-+                              uint32_t buffer);
++/* Announce the first successful frame once, for the log. */
++bool moco_dri3_present_announce(struct moco_dri3_present *present);
++
++/*
++ * Emit the presentation command. Defined in the virgl driver
++ * (src/gallium/drivers/virgl/virgl_encode.c); both it and this frontend end
++ * up inside libgallium, so this is a direct call rather than a transport.
++ */
++void virgl_moco_encode_present(struct pipe_context *pctx,
++                               struct pipe_resource *pres,
++                               uint32_t xid,
++                               uint32_t width, uint32_t height,
++                               uint32_t damage_x, uint32_t damage_y,
++                               uint32_t damage_width, uint32_t damage_height);
 +
 +#endif
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/dri/moco_dri3_protocol.h b/src/gallium/frontends/dri/moco_dri3_protocol.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/dri/moco_dri3_protocol.h b/src/gallium/frontends/dri/moco_dri3_protocol.h
 --- a/src/gallium/frontends/dri/moco_dri3_protocol.h	1970-01-01 10:00:00.000000000 +1000
 +++ b/src/gallium/frontends/dri/moco_dri3_protocol.h	2026-08-09 21:52:04.142436800 +1000
 @@ -0,0 +1,57 @@
@@ -1102,7 +1000,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
 +   (sizeof(struct copresent_record) == 64) ? 1 : -1];
 +
 +#endif
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/meson.build b/src/gallium/frontends/glx/xlib/meson.build
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/glx/xlib/meson.build b/src/gallium/frontends/glx/xlib/meson.build
 --- a/src/gallium/frontends/glx/xlib/meson.build	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/gallium/frontends/glx/xlib/meson.build	2026-08-09 21:52:04.143436700 +1000
 @@ -3,7 +3,8 @@
@@ -1115,7 +1013,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
    gnu_symbol_visibility : 'hidden',
    include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_mesa],
    dependencies : [dep_x11, dep_xext, dep_xcb, dep_glproto, idep_mesautil, idep_dispatch_h],
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/moco_present.c b/src/gallium/frontends/glx/xlib/moco_present.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/glx/xlib/moco_present.c b/src/gallium/frontends/glx/xlib/moco_present.c
 --- a/src/gallium/frontends/glx/xlib/moco_present.c	1970-01-01 10:00:00.000000000 +1000
 +++ b/src/gallium/frontends/glx/xlib/moco_present.c	2026-08-09 21:52:04.143436700 +1000
 @@ -0,0 +1,397 @@
@@ -1516,7 +1414,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
 +      close(present->socket_fd);
 +   free(present);
 +}
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/moco_present.h b/src/gallium/frontends/glx/xlib/moco_present.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/glx/xlib/moco_present.h b/src/gallium/frontends/glx/xlib/moco_present.h
 --- a/src/gallium/frontends/glx/xlib/moco_present.h	1970-01-01 10:00:00.000000000 +1000
 +++ b/src/gallium/frontends/glx/xlib/moco_present.h	2026-08-09 21:52:04.143436700 +1000
 @@ -0,0 +1,30 @@
@@ -1550,7 +1448,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
 +moco_present_destroy(struct moco_present *present);
 +
 +#endif
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/moco_present_protocol.h b/src/gallium/frontends/glx/xlib/moco_present_protocol.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/glx/xlib/moco_present_protocol.h b/src/gallium/frontends/glx/xlib/moco_present_protocol.h
 --- a/src/gallium/frontends/glx/xlib/moco_present_protocol.h	1970-01-01 10:00:00.000000000 +1000
 +++ b/src/gallium/frontends/glx/xlib/moco_present_protocol.h	2026-08-09 21:52:04.143436700 +1000
 @@ -0,0 +1,57 @@
@@ -1611,7 +1509,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
 +   (sizeof(struct copresent_record) == 64) ? 1 : -1];
 +
 +#endif
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/xm_api.c b/src/gallium/frontends/glx/xlib/xm_api.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/glx/xlib/xm_api.c b/src/gallium/frontends/glx/xlib/xm_api.c
 --- a/src/gallium/frontends/glx/xlib/xm_api.c	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/gallium/frontends/glx/xlib/xm_api.c	2026-08-09 21:52:04.143436700 +1000
 @@ -1334,6 +1334,7 @@
@@ -1648,7 +1546,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
  
     /* TODO: remove this if the framebuffer state doesn't change. */
     st_context_invalidate_state(xmctx->st, ST_INVALIDATE_FB_STATE);
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/xm_st.c b/src/gallium/frontends/glx/xlib/xm_st.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/glx/xlib/xm_st.c b/src/gallium/frontends/glx/xlib/xm_st.c
 --- a/src/gallium/frontends/glx/xlib/xm_st.c	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/gallium/frontends/glx/xlib/xm_st.c	2026-08-09 21:52:04.144436700 +1000
 @@ -27,6 +27,7 @@
@@ -1763,7 +1661,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     }
  }
  
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/frontends/glx/xlib/xm_st.h b/src/gallium/frontends/glx/xlib/xm_st.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/frontends/glx/xlib/xm_st.h b/src/gallium/frontends/glx/xlib/xm_st.h
 --- a/src/gallium/frontends/glx/xlib/xm_st.h	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/gallium/frontends/glx/xlib/xm_st.h	2026-08-09 21:52:04.144436700 +1000
 @@ -44,7 +44,8 @@
@@ -1776,7 +1674,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
  
  void
  xmesa_copy_st_framebuffer(struct pipe_frontend_drawable *drawable,
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/gallium/targets/libgl-xlib/xlib.c b/src/gallium/targets/libgl-xlib/xlib.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/gallium/targets/libgl-xlib/xlib.c b/src/gallium/targets/libgl-xlib/xlib.c
 --- a/src/gallium/targets/libgl-xlib/xlib.c	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/gallium/targets/libgl-xlib/xlib.c	2026-08-09 21:52:04.144436700 +1000
 @@ -32,16 +32,23 @@
@@ -1852,7 +1750,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
 -   return NULL;
  }
 -
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/glx/dri3_glx.c b/src/glx/dri3_glx.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/glx/dri3_glx.c b/src/glx/dri3_glx.c
 --- a/src/glx/dri3_glx.c	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/glx/dri3_glx.c	2026-08-09 21:52:04.144436700 +1000
 @@ -186,6 +186,7 @@
@@ -1884,7 +1782,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
  
     psc->prefer_back_buffer_reuse = 1;
     if (psc->fd_render_gpu != psc->fd_display_gpu) {
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/glx/dri3_priv.h b/src/glx/dri3_priv.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/glx/dri3_priv.h b/src/glx/dri3_priv.h
 --- a/src/glx/dri3_priv.h	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/glx/dri3_priv.h	2026-08-09 21:52:04.145436700 +1000
 @@ -84,6 +84,7 @@
@@ -1895,7 +1793,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
  };
  
  struct dri3_drawable {
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/glx/dri_common.c b/src/glx/dri_common.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/glx/dri_common.c b/src/glx/dri_common.c
 --- a/src/glx/dri_common.c	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/glx/dri_common.c	2026-08-09 21:52:04.145436700 +1000
 @@ -255,7 +255,8 @@
@@ -1949,7 +1847,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
           pdraw->destroyDrawable(pdraw);
           __glxHashDelete(priv->drawHash, drawable);
           _mesa_set_remove(priv->zombieGLXDrawable, entry);
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/glx/glxclient.h b/src/glx/glxclient.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/glx/glxclient.h b/src/glx/glxclient.h
 --- a/src/glx/glxclient.h	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/glx/glxclient.h	2026-08-09 21:52:04.145436700 +1000
 @@ -513,6 +513,7 @@
@@ -1960,7 +1858,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
  
     char *driverName;
  
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/mesa/vbo/vbo_save_api.c b/src/mesa/vbo/vbo_save_api.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/mesa/vbo/vbo_save_api.c b/src/mesa/vbo/vbo_save_api.c
 --- a/src/mesa/vbo/vbo_save_api.c	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/mesa/vbo/vbo_save_api.c	2026-08-10 00:20:18.759951100 +1000
 @@ -505,6 +505,183 @@
@@ -2199,10 +2097,57 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     node->cold->ib.ptr = NULL;
     node->cold->ib.count = idx;
     node->cold->ib.index_size_shift = (GL_UNSIGNED_INT - GL_UNSIGNED_BYTE) >> 1;
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/x11/x11_dri3.c b/src/x11/x11_dri3.c
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/virtio/virtio-gpu/virgl_protocol.h b/src/virtio/virtio-gpu/virgl_protocol.h
+--- a/src/virtio/virtio-gpu/virgl_protocol.h	2026-07-30 03:31:27.000000000 +1000
++++ b/src/virtio/virtio-gpu/virgl_protocol.h	2026-08-10 01:41:30.700602700 +1000
+@@ -145,6 +145,16 @@
+    VIRGL_CCMD_CLEAR_SURFACE,
+    VIRGL_CCMD_GET_PIPE_RESOURCE_LAYOUT,
+ 
++   /* MoCoLinux CoPresent.
++    *
++    * Presentation travels as an ordinary command in this stream, down the
++    * render node the client already has open, so a sandboxed application
++    * needs no extra socket, device or filesystem share: if it can render it
++    * can present. Numbered explicitly and far above the upstream range so
++    * the guest and host copies of this header cannot drift into each other
++    * as either side gains commands. */
++   VIRGL_CCMD_MOCO_PRESENT = 200,
++
+    VIRGL_MAX_COMMANDS
+ };
+ 
+@@ -799,4 +809,26 @@
+ #define VIRGL_RESOURCE_LAYOUT_HANDLE_OUT     1
+ #define VIRGL_RESOURCE_LAYOUT_HANDLE_TARGET  2
+ 
++/* VIRGL_CCMD_MOCO_PRESENT
++ *
++ * "Show this resource in the X window with this XID." The resource is named
++ * by the ordinary virgl resource handle the host already knows, so nothing
++ * is imported, mapped or copied, and no pixels ride the stream. Ordering is
++ * free: the command sits after the drawing commands it presents, in the same
++ * buffer, so the host's fence for that buffer already covers the rendering.
++ *
++ * The XID is the client's TOP-LEVEL window. Toolkit clients render into a
++ * child, and the Windows X server only tags top-levels, so the guest
++ * resolves the ancestor before emitting.
++ */
++#define VIRGL_MOCO_PRESENT_SIZE              8
++#define VIRGL_MOCO_PRESENT_RES_HANDLE        1
++#define VIRGL_MOCO_PRESENT_XID               2
++#define VIRGL_MOCO_PRESENT_WIDTH             3
++#define VIRGL_MOCO_PRESENT_HEIGHT            4
++#define VIRGL_MOCO_PRESENT_DAMAGE_X          5
++#define VIRGL_MOCO_PRESENT_DAMAGE_Y          6
++#define VIRGL_MOCO_PRESENT_DAMAGE_WIDTH      7
++#define VIRGL_MOCO_PRESENT_DAMAGE_HEIGHT     8
++
+ #endif
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/x11/x11_dri3.c b/src/x11/x11_dri3.c
 --- a/src/x11/x11_dri3.c	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/x11/x11_dri3.c	2026-08-09 21:52:04.145436700 +1000
-@@ -25,6 +25,8 @@
++++ b/src/x11/x11_dri3.c	2026-08-10 01:52:34.225844500 +1000
+@@ -25,13 +25,60 @@
  
  #include <stdbool.h>
  #include <stdlib.h>
@@ -2210,8 +2155,9 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
 +#include <strings.h>
  #include <fcntl.h>
  #include <unistd.h>
++#include <xf86drm.h>
  #include <xcb/xcb.h>
-@@ -32,6 +34,20 @@
+ #include <xcb/dri3.h>
  #include <xcb/present.h>
  #include <xcb/xfixes.h>
  
@@ -2219,20 +2165,50 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
 +x11_dri3_is_moco(void)
 +{
 +   const char *selection = getenv("MOCO_DRI3");
++   static int cached = -1;
++   drmVersionPtr version;
++   bool is_virtio;
++   int fd;
 +
 +   if (selection && (!strcmp(selection, "0") ||
 +                     !strcasecmp(selection, "false") ||
 +                     !strcasecmp(selection, "off")))
 +      return false;
 +
-+   return access("/run/moco-present.sock", F_OK) == 0 &&
-+          access("/dev/dri/renderD128", R_OK | W_OK) == 0;
++   if (cached >= 0)
++      return cached != 0;
++
++   /* Detect from the render node ALONE.
++    *
++    * This used to also require /run/moco-present.sock, back when
++    * presentation went through a broker socket. That made the whole stack
++    * invisible to any sandboxed process: Firefox's content processes and
++    * Steam's pressure-vessel container cannot see /run, so they silently
++    * fell back to software rendering while unsandboxed clients worked.
++    * Presentation now travels in the virgl command stream, so the render
++    * node the client is already allowed to open is the only thing that has
++    * to be true -- which is exactly what every sandbox already permits.
++    */
++   fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
++   if (fd < 0) {
++      cached = 0;
++      return false;
++   }
++   version = drmGetVersion(fd);
++   is_virtio = version && version->name &&
++               !strcmp(version->name, "virtio_gpu");
++   if (version)
++      drmFreeVersion(version);
++   close(fd);
++
++   cached = is_virtio ? 1 : 0;
++   return is_virtio;
 +}
 +
  /** x11_dri3_open
   *
   * Wrapper around xcb_dri3_open
-@@ -48,6 +64,9 @@
+@@ -48,6 +95,9 @@
     int                          fd;
     const xcb_query_extension_reply_t *extension;
  
@@ -2242,7 +2218,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     xcb_prefetch_extension_data(conn, &xcb_dri3_id);
     extension = xcb_get_extension_data(conn, &xcb_dri3_id);
     if (!(extension && extension->present))
-@@ -104,6 +123,9 @@
+@@ -104,6 +154,9 @@
     xcb_generic_error_t                  *error;
     const xcb_query_extension_reply_t    *extension;
  
@@ -2252,7 +2228,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
     xcb_prefetch_extension_data(c, &xcb_dri3_id);
     xcb_prefetch_extension_data(c, &xcb_present_id);
  
-diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build-moco' a/src/x11/x11_dri3.h b/src/x11/x11_dri3.h
+diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha256' '--exclude=build*' a/src/x11/x11_dri3.h b/src/x11/x11_dri3.h
 --- a/src/x11/x11_dri3.h	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/x11/x11_dri3.h	2026-08-09 21:52:04.145436700 +1000
 @@ -30,5 +30,6 @@

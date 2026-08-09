@@ -2,6 +2,8 @@
 #ifndef MOCO_COGPU_PRESENT_H
 #define MOCO_COGPU_PRESENT_H
 
+#include <stdint.h>
+
 struct cogpu_vrend_resource_info;
 struct copresent_record;
 
@@ -22,6 +24,13 @@ void cogpu_present_r1_fini(void);
 /* R2 consumes metadata records whose acquire fence has already retired in the
  * guest broker. RELEASE is returned only after the host has finished sampling
  * the texture, so buffer reuse remains explicit in both directions. */
+/* Presentation carried in the guest's own virgl command stream: the
+ * sandbox-proof path, needing only the render node the client already uses. */
+void cogpu_present_stream(uint32_t res_handle, uint32_t xid,
+			  uint32_t width, uint32_t height,
+			  uint32_t damage_x, uint32_t damage_y,
+			  uint32_t damage_width, uint32_t damage_height);
+
 void cogpu_present_r2_enable(void);
 int  cogpu_present_r2_poll(void);
 int  cogpu_present_r2_bind(const struct copresent_record *record,
