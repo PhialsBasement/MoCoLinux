@@ -1807,6 +1807,14 @@ int main(int argc, char **argv)
 	}
 
 	/*
+	 * vkr's own diagnostics, into cogpu-vrend.log. Cheap when nothing
+	 * fails; the only voice in the room when a venus device refuses to
+	 * create and every layer above shows a bare -3.
+	 */
+	if (GetEnvironmentVariableA("VKR_DEBUG", NULL, 0) == 0)
+		SetEnvironmentVariableA("VKR_DEBUG", "all");
+
+	/*
 	 * The renderer, before anything else that matters. If it will not come
 	 * up there is no point servicing a ring: the guest would get OK to
 	 * everything and render nothing, which is worse than a device that

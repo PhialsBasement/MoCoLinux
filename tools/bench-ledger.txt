@@ -121,3 +121,20 @@ regression you are about to hide in mountains of code.
   Frame pacing is now shippable; remaining overshoot ~= one Windows
   wake floor + vn backoff, the physics-parity endpoint.
 ================================================================
+
+2026-08-11  (first pixels)  M92p GT730 Win10  (vkclear)
+  512x512 RGBA8 cleared on the GPU (0.25/0.5/0.75/1.0), copied to a
+  host-visible buffer, read back through the window path: 262144
+  pixels, 0 wrong. Green is 127 not 128 -- 127.5 is a UNORM tie and
+  NVIDIA rounds it down; spec-legal, and the first checker failed
+  every pixel over it.
+  FOUND ON THE WAY (robustness debt, not fixed): a guest app that
+  violates valid-usage (an image bound to a memory type outside its
+  memoryTypeBits) crashes the host vkr worker SILENTLY inside the
+  NVIDIA driver; venus then refuses all device creation (-3) until
+  the daemon restarts, and the guest's vn aborts (SIGABRT) on its
+  ring timeout. vkr feeds guest UB straight into the driver -- a
+  hostile or buggy guest app can poison the GPU service. Options
+  when it matters: host-side validation layer, per-context worker
+  isolation, or a worker-death watchdog that recycles venus.
+================================================================
