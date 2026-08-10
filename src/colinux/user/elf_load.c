@@ -1787,6 +1787,37 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 				  m.p2m_pages, m.m2p_mask);
 
 		/*
+		 * The window arena, for the virtio transport's shm region. An
+		 * older kernel without the symbols simply never advertises a
+		 * host-visible region, which is the correct degradation --
+		 * so unlike the p2m bounds, absence is not an error.
+		 */
+		{
+			co_elf_symbol_t* s_base =
+				co_get_symbol_by_name(pl, "co_colinux_window_base");
+			co_elf_symbol_t* s_top =
+				co_get_symbol_by_name(pl, "co_colinux_window_top");
+
+			if (s_base && s_top) {
+				rc = co_manager_kload_chunk(handle,
+					co_elf_get_symbol_value(s_base),
+					&m.window_base, sizeof(m.window_base), 0);
+				if (CO_OK(rc))
+					rc = co_manager_kload_chunk(handle,
+						co_elf_get_symbol_value(s_top),
+						&m.window_top, sizeof(m.window_top), 0);
+				if (!CO_OK(rc)) {
+					co_terminal_print("  publishing window bounds failed (rc %x)\n",
+							  (int)rc);
+					goto out_end;
+				}
+				co_terminal_print("    window arena: 0x%llx..0x%llx (%llu MB)\n",
+						  m.window_base, m.window_top,
+						  (m.window_top - m.window_base) >> 20);
+			}
+		}
+
+		/*
 		 * The root device, attached before the guest runs so that the
 		 * driver's probe finds it. Fatal if it was asked for and could
 		 * not be opened: booting on anyway would reach prepare_namespace

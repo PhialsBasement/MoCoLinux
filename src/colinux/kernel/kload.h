@@ -78,6 +78,8 @@ extern co_rc_t		  co_kload_window_map(const co_pfn_t* mfns,
 extern void		  co_kload_window_unmap(co_pa_t pseudo,
 						unsigned long count);
 extern unsigned long	  co_kload_p2m_pages(void);
+extern void		  co_kload_window_bounds(unsigned long long* base,
+						 unsigned long long* top);
 extern unsigned long long co_kload_m2p_mask(void);
 /*
  * One guest virtual address resolved once to a host pointer, for readers

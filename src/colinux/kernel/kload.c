@@ -1843,6 +1843,20 @@ unsigned long co_kload_ram_pages(void)
 	return kload_ram_pages;
 }
 
+/*
+ * The window arena, stated by its owner. The guest transport advertises this
+ * range as the virtio-gpu host-visible shm region and the daemon computes
+ * MAP_BLOB offsets against its base; both read it from here so there is no
+ * second party deriving the same numbers from adjacent facts (the e820 top
+ * happens to equal the arena base today, and relying on that would be an
+ * implicit contract).
+ */
+void co_kload_window_bounds(unsigned long long* base, unsigned long long* top)
+{
+	*base = ((unsigned long long)kload_backed_pages) << CO_ARCH_PAGE_SHIFT;
+	*top  = ((unsigned long long)kload_p2m_capacity) << CO_ARCH_PAGE_SHIFT;
+}
+
 unsigned long co_kload_p2m_pages(void)
 {
 	/*

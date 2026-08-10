@@ -504,6 +504,14 @@ typedef struct {
 	unsigned long long va;		/* out: co_colinux_vgpu_io, guest virtual */
 	unsigned long long query_va;	/* in:  a guest virtual address, or 0 */
 	unsigned long long query_pa;	/* out: what it resolves to */
+	/*
+	 * The window arena, for MAP_BLOB offset arithmetic: a mapped blob's
+	 * shm offset is pseudo_pa - window_base, and the base is stated by
+	 * the driver rather than re-derived from the e820 top, which merely
+	 * happens to coincide with it.
+	 */
+	unsigned long long window_base;	/* out: guest pa, arena start */
+	unsigned long long window_top;	/* out: guest pa, arena end */
 } co_manager_ioctl_vgpu_t;
 
 /*
@@ -691,6 +699,8 @@ typedef struct {
 	unsigned long long total_usable;/* out: usable bytes across all ranges */
 	unsigned long long p2m_pages;	/* out: dense p2m entries in use */
 	unsigned long long m2p_mask;	/* out: reverse-hash slot mask */
+	unsigned long long window_base;	/* out: guest pa, window arena start */
+	unsigned long long window_top;	/* out: guest pa, window arena end */
 	int		   range_count;	/* out */
 	struct {
 		unsigned long long pa;		/* guest pseudo-physical base */

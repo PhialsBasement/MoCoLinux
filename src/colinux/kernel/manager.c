@@ -1192,6 +1192,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->va	 = co_vgpu_address();
 		params->query_pa = 0;
 		params->rc	 = CO_RC(OK);
+		co_kload_window_bounds(&params->window_base,
+				       &params->window_top);
 
 		/*
 		 * One guest virtual address translated, if asked. The daemon's
@@ -1378,6 +1380,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->phys_base    = co_kload_phys_base();
 		params->p2m_pages    = co_kload_p2m_pages();
 		params->m2p_mask     = co_kload_m2p_mask();
+		co_kload_window_bounds(&params->window_base,
+				       &params->window_top);
 		params->range_count  = co_kload_range_count();
 		if (params->range_count > CO_KRAM_MAX_RANGES)
 			params->range_count = CO_KRAM_MAX_RANGES;
