@@ -494,6 +494,31 @@ int cogpu_vrend_submit(uint32_t ctx_id, const void *cmds, uint32_t bytes,
 	}
 }
 
+/*
+ * Upload host-memory pixels into a virgl resource with an explicit iovec --
+ * the bridge that lets a Venus frame (a vkr blob, host memory, no GL name)
+ * become a REAL virgl texture and ride the one presenter this project
+ * trusts: the GL stream path, overlay lifecycle and teardown included.
+ */
+int cogpu_vrend_upload(uint32_t res_id, uint32_t stride,
+		       uint32_t w, uint32_t h,
+		       const void *pixels, uint64_t bytes)
+{
+	struct virgl_box box;
+	struct iovec iov;
+
+	if (!vrend_ready)
+		return -1;
+
+	box.x = 0; box.y = 0; box.z = 0;
+	box.w = w; box.h = h; box.d = 1;
+	iov.iov_base = (void *)pixels;
+	iov.iov_len  = (size_t)bytes;
+
+	return virgl_renderer_transfer_write_iov(res_id, 0, 0, stride, 0,
+						 &box, 0, &iov, 1);
+}
+
 int cogpu_vrend_resource_create(struct virgl_renderer_resource_create_args *args)
 {
 	int rc;

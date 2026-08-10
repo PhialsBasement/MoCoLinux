@@ -6644,3 +6644,178 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
  	len = __stop_ftrace_eval_maps - __start_ftrace_eval_maps;
  	trace_event_update_with_eval_map(NULL, __start_ftrace_eval_maps, len);
  }
+diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/include/uapi/drm/virtgpu_drm.h b/include/uapi/drm/virtgpu_drm.h
+--- a/include/uapi/drm/virtgpu_drm.h	2026-07-25 00:21:27.000000000 +1000
++++ b/include/uapi/drm/virtgpu_drm.h	2026-08-11 04:28:29.344090700 +1000
+@@ -269,6 +269,28 @@
+ 	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIRTGPU_CONTEXT_INIT,		\
+ 		struct drm_virtgpu_context_init)
+ 
++/*
++ * MoCoLinux: present a blob-backed buffer host-side. Pixels never cross a
++ * wire: the host daemon already holds the blob's memory and displays it at
++ * the X window's position, which the host also already tracks. This is the
++ * GL CoPresent design carried to Vulkan -- see moco_dri3.c in Mesa for the
++ * GL half and copresent.h for the record it mirrors.
++ */
++#define DRM_VIRTGPU_MOCO_PRESENT 0x0c	/* sequential: the ioctl table is dense */
++
++struct drm_virtgpu_moco_present {
++	__u32 bo_handle;	/* in: GEM handle of the blob buffer */
++	__u32 xid;		/* in: X window to present into */
++	__u32 width;
++	__u32 height;
++	__u32 stride;		/* in: bytes per row */
++	__u32 flags;		/* in: reserved, 0 */
++};
++
++#define DRM_IOCTL_VIRTGPU_MOCO_PRESENT					\
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIRTGPU_MOCO_PRESENT,		\
++		struct drm_virtgpu_moco_present)
++
+ #if defined(__cplusplus)
+ }
+ #endif
+diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/include/uapi/linux/virtio_gpu.h b/include/uapi/linux/virtio_gpu.h
+--- a/include/uapi/linux/virtio_gpu.h	2026-07-25 00:21:27.000000000 +1000
++++ b/include/uapi/linux/virtio_gpu.h	2026-08-11 04:17:12.871630900 +1000
+@@ -98,7 +98,15 @@
+ 
+ 	/* cursor commands */
+ 	VIRTIO_GPU_CMD_UPDATE_CURSOR = 0x0300,
+-	VIRTIO_GPU_CMD_MOVE_CURSOR,
++
++	/*
++	 * MoCoLinux device commands, well clear of every spec range.
++	 * MOCO_PRESENT: display a blob resource host-side at an X window.
++	 * Transcribed into cogpu-daemon by copy, never by counting -- two
++	 * of the five venus bring-up bugs were hand-counted enum values.
++	 */
++	VIRTIO_GPU_CMD_MOCO_PRESENT = 0x0400,
++	VIRTIO_GPU_CMD_MOVE_CURSOR = 0x0301,
+ 
+ 	/* success responses */
+ 	VIRTIO_GPU_RESP_OK_NODATA = 0x1100,
+@@ -457,4 +465,15 @@
+ 	__le32 padding;
+ };
+ 
++/* VIRTIO_GPU_CMD_MOCO_PRESENT: pixels stay host-side; this is metadata. */
++struct virtio_gpu_moco_present {
++	struct virtio_gpu_ctrl_hdr hdr;
++	__le32 resource_id;
++	__le32 xid;
++	__le32 width;
++	__le32 height;
++	__le32 stride;
++	__le32 flags;
++};
++
+ #endif
+diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/gpu/drm/virtio/virtgpu_vq.c b/drivers/gpu/drm/virtio/virtgpu_vq.c
+--- a/drivers/gpu/drm/virtio/virtgpu_vq.c	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/gpu/drm/virtio/virtgpu_vq.c	2026-08-11 04:17:35.444708500 +1000
+@@ -625,6 +625,34 @@
+ 	virtio_gpu_cleanup_object(bo);
+ }
+ 
++/*
++ * MoCoLinux present: fire-and-forget metadata. No fence, no response
++ * consumed -- the host displays its own copy of the pixels and a dropped
++ * frame costs one frame. See DRM_IOCTL_VIRTGPU_MOCO_PRESENT.
++ */
++void virtio_gpu_cmd_moco_present(struct virtio_gpu_device *vgdev,
++				 uint32_t resource_id, uint32_t xid,
++				 uint32_t width, uint32_t height,
++				 uint32_t stride, uint32_t flags)
++{
++	struct virtio_gpu_moco_present *cmd_p;
++	struct virtio_gpu_vbuffer *vbuf;
++
++	cmd_p = virtio_gpu_alloc_cmd(vgdev, &vbuf, sizeof(*cmd_p));
++	memset(cmd_p, 0, sizeof(*cmd_p));
++
++	cmd_p->hdr.type    = cpu_to_le32(VIRTIO_GPU_CMD_MOCO_PRESENT);
++	cmd_p->resource_id = cpu_to_le32(resource_id);
++	cmd_p->xid	   = cpu_to_le32(xid);
++	cmd_p->width	   = cpu_to_le32(width);
++	cmd_p->height	   = cpu_to_le32(height);
++	cmd_p->stride	   = cpu_to_le32(stride);
++	cmd_p->flags	   = cpu_to_le32(flags);
++
++	virtio_gpu_queue_ctrl_buffer(vgdev, vbuf);
++	virtio_gpu_notify(vgdev);
++}
++
+ void virtio_gpu_cmd_unref_resource(struct virtio_gpu_device *vgdev,
+ 				   struct virtio_gpu_object *bo)
+ {
+diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h	2026-08-11 04:28:20.946259200 +1000
+@@ -290,7 +290,7 @@
+ };
+ 
+ /* virtgpu_ioctl.c */
+-#define DRM_VIRTIO_NUM_IOCTLS 12
++#define DRM_VIRTIO_NUM_IOCTLS 13	/* +1: MoCoLinux MOCO_PRESENT */
+ extern struct drm_ioctl_desc virtio_gpu_ioctls[DRM_VIRTIO_NUM_IOCTLS];
+ void virtio_gpu_create_context(struct drm_device *dev, struct drm_file *file);
+ 
+@@ -334,6 +334,10 @@
+ 				    struct virtio_gpu_object_params *params,
+ 				    struct virtio_gpu_object_array *objs,
+ 				    struct virtio_gpu_fence *fence);
++void virtio_gpu_cmd_moco_present(struct virtio_gpu_device *vgdev,
++				 uint32_t resource_id, uint32_t xid,
++				 uint32_t width, uint32_t height,
++				 uint32_t stride, uint32_t flags);
+ void virtio_gpu_cmd_unref_resource(struct virtio_gpu_device *vgdev,
+ 				   struct virtio_gpu_object *bo);
+ int virtio_gpu_panic_cmd_transfer_to_host_2d(struct virtio_gpu_device *vgdev,
+diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/gpu/drm/virtio/virtgpu_ioctl.c b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+--- a/drivers/gpu/drm/virtio/virtgpu_ioctl.c	2026-07-25 00:21:27.000000000 +1000
++++ b/drivers/gpu/drm/virtio/virtgpu_ioctl.c	2026-08-11 04:18:34.987146500 +1000
+@@ -198,6 +198,34 @@
+ 	return 0;
+ }
+ 
++/*
++ * MoCoLinux present: resolve the blob's resource id and hand the host one
++ * cache line of metadata. The pixels are already the host's; see the note
++ * in virtgpu_drm.h.
++ */
++static int virtio_gpu_moco_present_ioctl(struct drm_device *dev, void *data,
++					  struct drm_file *file)
++{
++	struct virtio_gpu_device *vgdev = dev->dev_private;
++	struct drm_virtgpu_moco_present *mp = data;
++	struct drm_gem_object *gobj;
++	struct virtio_gpu_object *qobj;
++
++	if (!mp->xid || !mp->width || !mp->height || mp->flags)
++		return -EINVAL;
++
++	gobj = drm_gem_object_lookup(file, mp->bo_handle);
++	if (gobj == NULL)
++		return -ENOENT;
++	qobj = gem_to_virtio_gpu_obj(gobj);
++
++	virtio_gpu_cmd_moco_present(vgdev, qobj->hw_res_handle, mp->xid,
++				    mp->width, mp->height, mp->stride, 0);
++
++	drm_gem_object_put(gobj);
++	return 0;
++}
++
+ static int virtio_gpu_resource_info_ioctl(struct drm_device *dev, void *data,
+ 					  struct drm_file *file)
+ {
+@@ -732,4 +760,7 @@
+ 
+ 	DRM_IOCTL_DEF_DRV(VIRTGPU_CONTEXT_INIT, virtio_gpu_context_init_ioctl,
+ 			  DRM_RENDER_ALLOW),
++
++	DRM_IOCTL_DEF_DRV(VIRTGPU_MOCO_PRESENT, virtio_gpu_moco_present_ioctl,
++			  DRM_RENDER_ALLOW),
+ };

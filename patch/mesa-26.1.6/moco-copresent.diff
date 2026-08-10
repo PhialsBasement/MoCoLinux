@@ -2238,3 +2238,250 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
 +bool x11_dri3_is_moco(void);
  
  #endif
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/include/drm-uapi/virtgpu_drm.h b/include/drm-uapi/virtgpu_drm.h
+--- a/include/drm-uapi/virtgpu_drm.h	2026-07-30 03:31:27.000000000 +1000
++++ b/include/drm-uapi/virtgpu_drm.h	2026-08-11 05:51:50.444664500 +1000
+@@ -269,6 +269,22 @@
+ 	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIRTGPU_CONTEXT_INIT,		\
+ 		struct drm_virtgpu_context_init)
+ 
++/* MoCoLinux host-side present; mirrors the guest kernel's uapi exactly. */
++#define DRM_VIRTGPU_MOCO_PRESENT 0x0c
++
++struct drm_virtgpu_moco_present {
++	__u32 bo_handle;
++	__u32 xid;
++	__u32 width;
++	__u32 height;
++	__u32 stride;
++	__u32 flags;
++};
++
++#define DRM_IOCTL_VIRTGPU_MOCO_PRESENT					\
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIRTGPU_MOCO_PRESENT,		\
++		struct drm_virtgpu_moco_present)
++
+ #if defined(__cplusplus)
+ }
+ #endif
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+--- a/src/virtio/vulkan/vn_renderer.h	2026-07-30 03:31:27.000000000 +1000
++++ b/src/virtio/vulkan/vn_renderer.h	2026-08-11 05:51:50.442368400 +1000
+@@ -162,6 +162,12 @@
+ 
+    bool (*destroy)(struct vn_renderer *renderer, struct vn_renderer_bo *bo);
+ 
++   /* MoCoLinux host-side present; optional, NULL where unsupported. */
++   VkResult (*moco_present)(struct vn_renderer *renderer,
++                            struct vn_renderer_bo *bo,
++                            uint32_t xid, uint32_t width, uint32_t height,
++                            uint32_t stride);
++
+    int (*export_dma_buf)(struct vn_renderer *renderer,
+                          struct vn_renderer_bo *bo);
+ 
+@@ -393,6 +399,17 @@
+    return renderer->bo_ops.map(renderer, bo, placed_addr);
+ }
+ 
++static inline VkResult
++vn_renderer_bo_moco_present(struct vn_renderer *renderer,
++                            struct vn_renderer_bo *bo, uint32_t xid,
++                            uint32_t width, uint32_t height, uint32_t stride)
++{
++   if (!renderer->bo_ops.moco_present)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   return renderer->bo_ops.moco_present(renderer, bo, xid, width, height,
++                                        stride);
++}
++
+ static inline void
+ vn_renderer_bo_flush(struct vn_renderer *renderer,
+                      struct vn_renderer_bo *bo,
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/src/virtio/vulkan/vn_renderer_virtgpu.c b/src/virtio/vulkan/vn_renderer_virtgpu.c
+--- a/src/virtio/vulkan/vn_renderer_virtgpu.c	2026-07-30 03:31:27.000000000 +1000
++++ b/src/virtio/vulkan/vn_renderer_virtgpu.c	2026-08-11 05:51:50.443602500 +1000
+@@ -1113,6 +1113,28 @@
+    /* nop because kernel makes every mapping coherent */
+ }
+ 
++/* MoCoLinux host-side present: one ioctl, no pixels. */
++static VkResult
++virtgpu_bo_moco_present(struct vn_renderer *renderer,
++                        struct vn_renderer_bo *_bo, uint32_t xid,
++                        uint32_t width, uint32_t height, uint32_t stride)
++{
++   struct virtgpu *gpu = (struct virtgpu *)renderer;
++   struct virtgpu_bo *bo = (struct virtgpu_bo *)_bo;
++   struct drm_virtgpu_moco_present args = {
++      .bo_handle = bo->gem_handle,
++      .xid = xid,
++      .width = width,
++      .height = height,
++      .stride = stride,
++      .flags = 0,
++   };
++
++   if (virtgpu_ioctl(gpu, DRM_IOCTL_VIRTGPU_MOCO_PRESENT, &args))
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   return VK_SUCCESS;
++}
++
+ static void *
+ virtgpu_bo_map(struct vn_renderer *renderer,
+                struct vn_renderer_bo *_bo,
+@@ -1808,6 +1830,7 @@
+    gpu->base.bo_ops.export_sync_file =
+       vn_renderer_bo_export_sync_file_internal;
+    gpu->base.bo_ops.map = virtgpu_bo_map;
++   gpu->base.bo_ops.moco_present = virtgpu_bo_moco_present;
+    gpu->base.bo_ops.flush = virtgpu_bo_flush;
+    gpu->base.bo_ops.invalidate = virtgpu_bo_invalidate;
+ 
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
+--- a/src/virtio/vulkan/vn_wsi.c	2026-07-30 03:31:27.000000000 +1000
++++ b/src/virtio/vulkan/vn_wsi.c	2026-08-11 05:51:50.455388600 +1000
+@@ -14,6 +14,7 @@
+ #include "wsi_common_entrypoints.h"
+ 
+ #include "vn_device.h"
++#include "vn_device_memory.h"
+ #include "vn_image.h"
+ #include "vn_instance.h"
+ #include "vn_physical_device.h"
+@@ -128,6 +129,31 @@
+       &physical_dev->instance->base.vk, pName);
+ }
+ 
++/*
++ * MoCoLinux host-side present: hand the frame's blob and window id to the
++ * host through the render node (one ioctl); the host, which already owns
++ * the pixels, displays them. The GL twin is the MOCO_PRESENT virgl stream
++ * command; this is its Vulkan shape, and like it, needs no sockets and
++ * survives app sandboxes.
++ */
++static VkResult
++vn_wsi_moco_present(VkDevice dev_h, VkDeviceMemory mem_h, uint32_t xid,
++                    uint32_t width, uint32_t height, uint32_t stride)
++{
++   struct vn_device *dev = vn_device_from_handle(dev_h);
++   struct vn_device_memory *mem = vn_device_memory_from_handle(mem_h);
++
++   if (!dev || !mem || !mem->base_bo) {
++      static int logged;
++      if (logged++ < 3)
++         fprintf(stderr, "moco vn: dev %p mem %p bo %p\n", (void *)dev,
++                 (void *)mem, mem ? (void *)mem->base_bo : NULL);
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   }
++   return vn_renderer_bo_moco_present(dev->renderer, mem->base_bo, xid,
++                                      width, height, stride);
++}
++
+ VkResult
+ vn_wsi_init(struct vn_physical_device *physical_dev)
+ {
+@@ -186,6 +212,7 @@
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   physical_dev->wsi_device.moco_present = vn_wsi_moco_present;
+    physical_dev->wsi_device.supports_scanout = false;
+    physical_dev->wsi_device.supports_modifiers =
+       physical_dev->base.vk.supported_extensions.EXT_image_drm_format_modifier;
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+--- a/src/vulkan/wsi/wsi_common.h	2026-07-30 03:31:27.000000000 +1000
++++ b/src/vulkan/wsi/wsi_common.h	2026-08-11 05:51:50.440095000 +1000
+@@ -161,6 +161,18 @@
+ 
+    bool sw;
+ 
++   /*
++    * MoCoLinux host-side present. When set, the X11 software presenter
++    * hands the frame's device memory + window id to the driver instead of
++    * pushing pixels through xcb_put_image: on this platform the host
++    * already holds the pixels and displays them itself, and put_image was
++    * both the slow path and (measured) a broken one. Returns VK_SUCCESS
++    * when the frame was presented; any error falls back to put_image.
++    */
++   VkResult (*moco_present)(VkDevice device, VkDeviceMemory memory,
++                            uint32_t xid, uint32_t width, uint32_t height,
++                            uint32_t stride);
++
+    /* Set to true if the implementation is ok with linear WSI images. */
+    bool wants_linear;
+ 
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
+--- a/src/vulkan/wsi/wsi_common_x11.c	2026-07-30 03:31:27.000000000 +1000
++++ b/src/vulkan/wsi/wsi_common_x11.c	2026-08-11 05:56:07.473806100 +1000
+@@ -343,6 +343,27 @@
+    wsi_conn->is_xwayland = wsi_x11_detect_xwayland(conn, randr_reply,
+                                                    xwl_reply);
+ 
++   /*
++    * MoCoLinux: the X server neither renders nor presents for us -- the host
++    * daemon does, through MOCO_PRESENT. Its Present/DRI3/SHM capabilities are
++    * therefore irrelevant, and *calling* one of those extension stubs on a
++    * server that lacks it (VcXsrv has no Present) makes libxcb shut the whole
++    * connection down with XCB_CONN_CLOSED_EXT_NOTSUPPORTED. That poisons the
++    * next GetGeometry, which this file reads as VK_ERROR_SURFACE_LOST_KHR and
++    * latches into the swapchain, so every later acquire fails instantly and
++    * the app spins forever on an unrecoverable surface: one frame, then a
++    * dead picture. Measured by name: "extspy: Present present=0" immediately
++    * before "conn_err 2".
++    *
++    * X keeps window management -- creation, mapping, geometry, events, all
++    * core protocol, all healthy. We only refuse to ask it to draw.
++    */
++   wsi_conn->has_dri3 = false;
++   wsi_conn->has_present = false;
++   wsi_conn->has_mit_shm = false;
++   has_dri3_v1_2 = has_dri3_v1_4 = false;
++   has_present_v1_2 = has_present_v1_4 = false;
++
+    wsi_conn->has_dri3_modifiers = has_dri3_v1_2 && has_present_v1_2;
+    wsi_conn->has_dri3_explicit_sync = has_dri3_v1_4 && has_present_v1_4;
+    wsi_conn->is_proprietary_x11 = false;
+@@ -1506,6 +1527,34 @@
+    assert(!chain->base.image_info.explicit_sync);
+    struct x11_image *image = &chain->images[image_index];
+ 
++   /*
++    * MoCoLinux, modelled exactly on the GL path (moco_present_buffer in
++    * loader_dri3_helper.c): emit the present, mark the image reusable, and
++    * return -- FIRE AND FORGET. No geometry query, no completion wait, no X
++    * request of any kind for the pixels; X keeps window management, the host
++    * keeps the pixels. The tail of this function does the opposite: it asks
++    * X for geometry and turns any hiccup into a sticky SURFACE_LOST that
++    * kills the swapchain after ONE frame -- which is precisely what a
++    * single frozen picture looked like for hours.
++    */
++   if (chain->base.wsi->moco_present) {
++      VkDeviceMemory frame_mem = image->base.blit.memory != VK_NULL_HANDLE
++         ? image->base.blit.memory : image->base.memory;
++      VkResult mr = chain->base.wsi->moco_present(
++         chain->base.device, frame_mem, chain->window,
++         chain->extent.width, chain->extent.height,
++         (uint32_t)image->base.row_pitches[0]);
++      static int moco_n;
++
++      if (moco_n++ < 5)
++         fprintf(stderr, "moco wsi: present#%d -> %d (fire-and-forget)\n",
++                 moco_n, mr);
++      if (mr == VK_SUCCESS) {
++         wsi_queue_push(&chain->acquire_queue, image_index);
++         return VK_SUCCESS;
++      }
++   }
++
+    /* Begin querying this before submitting the frame for improved async performance.
+     * In this _sw() mode we're expecting network round-trip delay, not just UNIX socket delay. */
+    xcb_get_geometry_cookie_t geom_cookie = xcb_get_geometry(chain->conn, chain->window);
+@@ -1564,6 +1613,7 @@
+       }
+    }
+ 
++present_done:
+    xcb_flush(chain->conn);
+ 
+    /* We don't have queued present here.

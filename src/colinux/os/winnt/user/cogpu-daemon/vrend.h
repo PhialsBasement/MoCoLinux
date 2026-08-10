@@ -75,6 +75,10 @@ int	    cogpu_vrend_submit(uint32_t ctx_id, const void *cmds, uint32_t bytes,
 
 int	    cogpu_vrend_resource_create(struct virgl_renderer_resource_create_args *args);
 void	    cogpu_vrend_resource_unref(uint32_t res_id);
+/* Host pixels -> virgl texture, explicit iovec; the Venus present bridge. */
+int	    cogpu_vrend_upload(uint32_t res_id, uint32_t stride,
+			       uint32_t w, uint32_t h,
+			       const void *pixels, uint64_t bytes);
 int	    cogpu_vrend_resource_info(uint32_t res_id,
 					 struct cogpu_vrend_resource_info *info);
 int	    cogpu_vrend_attach_iov(uint32_t res_id, struct iovec *iov, int niov);

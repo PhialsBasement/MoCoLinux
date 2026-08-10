@@ -148,3 +148,37 @@ regression you are about to hide in mountains of code.
   square). That is the CoPresent-for-Vulkan workstream: a present
   ioctl on renderD128, per the sandbox-flaw design note.
 ================================================================
+
+2026-08-11  (VULKAN PRESENTS)  M92p GT730 Win10  (vkcube on screen)
+  vkcube --present_mode 0: 368 FPS steady (6000 frames/16.33s; 3000
+  frames gave 316, 600 gave 152 -- startup dominates short runs).
+  A SPINNING CUBE, host-presented, X owning the window.
+  Coexistence matrix, dmesg "response 0x1200" errors in each:
+    GL alone (gears 855 FPS)                  0
+    VK alone (cube 368 FPS)                   0
+    GL + VK together (both render)            0
+    VK + VK together (both render)            0
+    VK + VK, staggered exit (survivor fine)   0
+  Per-window bridges proven: slot 0 res 0x4d4f4300 XID 0x200000
+  500x500 and slot 1 XID 0x280000 800x600 live at once, each created
+  once (no per-frame churn).
+  TWO ROOT CAUSES, both found by measurement after hours of wrong
+  theories -- the record is in the message of this commit:
+  1. Mesa's x11 WSI calls a Present-extension stub. VcXsrv has no
+     Present, and libxcb SHUTS THE CONNECTION DOWN on a stub call for
+     a missing extension (conn_err 2 = EXT_NOTSUPPORTED). Named by
+     shimming xcb_get_extension_data: "Present present=0" immediately
+     before the failure.
+  2. That killed GetGeometry, which the present tail reads as
+     VK_ERROR_SURFACE_LOST_KHR and LATCHES into the swapchain: every
+     later acquire returns it instantly, vkcube spins at 85% CPU with
+     ZERO syscalls, and exactly one frame is ever displayed. A frozen
+     picture for hours, from one extension call.
+  Red herring for the record: 9350 "SUBMIT_3D refused (22)" lines in
+  the daemon log were all ctx 2 = Firefox's GPU process after its
+  5000-fish WebGL aquarium died. The count did not move under VK or
+  GL afterwards. Firefox's crash was its own GL context, not Vulkan.
+  Known property, matching the GL path: presents are fire-and-forget,
+  so there is no vsync throttle and FIFO is not honoured -- vkcube
+  spins framerate-independently, by design, like gears at 973.
+================================================================

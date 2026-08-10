@@ -123,6 +123,10 @@ struct cogpu_blob_map {
 	uint32_t	   res_id;
 	unsigned long long pseudo_pa;
 	unsigned long long bytes;
+	/* The mapping MAP_BLOB created and still holds; a second
+	 * resource_map on a live blob is refused, so a consumer that wants
+	 * the pixels (MOCO_PRESENT) reads through this one. */
+	void		  *host_va;
 };
 static struct cogpu_blob_map g_blob_map[1024];
 
@@ -139,7 +143,7 @@ static struct cogpu_blob_map *blob_map_find(uint32_t res_id)
 }
 
 static int blob_map_track(uint32_t res_id, unsigned long long pseudo_pa,
-			  unsigned long long bytes)
+			  unsigned long long bytes, void *host_va)
 {
 	unsigned int i;
 
@@ -148,6 +152,7 @@ static int blob_map_track(uint32_t res_id, unsigned long long pseudo_pa,
 			g_blob_map[i].res_id	= res_id;
 			g_blob_map[i].pseudo_pa = pseudo_pa;
 			g_blob_map[i].bytes	= bytes;
+			g_blob_map[i].host_va	= host_va;
 			return 0;
 		}
 	}
@@ -533,6 +538,88 @@ static void *chain_gather(struct cogpu_chain *chain, int first,
  */
 #define VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB	0x0208
 #define VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB	0x0209
+/* MoCoLinux device command; transcribed from uapi/linux/virtio_gpu.h. */
+#define VIRTIO_GPU_CMD_MOCO_PRESENT		0x0400
+/*
+ * The daemon-private virgl resources Venus frames are bridged through, one
+ * PER WINDOW -- ids far above anything the guest kernel allocates.
+ *
+ * Per window, not one global: the GL path gives every drawable its own
+ * buffers, and a single shared bridge would have two Vulkan clients of
+ * different sizes destroying and recreating the same resource every frame,
+ * each showing the other's pixels in between.
+ */
+#define MOCO_BRIDGE_RES_BASE			0x4d4f4300u
+#define MOCO_BRIDGE_SLOTS			8
+
+static struct moco_bridge_slot {
+	uint32_t xid;
+	uint32_t width, height;
+	unsigned long long used;	/* for LRU eviction */
+} g_bridge[MOCO_BRIDGE_SLOTS];
+static unsigned long long g_bridge_clock;
+
+/*
+ * The slot for this window, sized for this frame. Returns the virgl
+ * resource id, or 0 if the resource could not be created.
+ */
+static uint32_t moco_bridge_resource(uint32_t xid, uint32_t width,
+				     uint32_t height)
+{
+	struct virgl_renderer_resource_create_args a;
+	unsigned int i, pick = 0;
+	uint32_t res_id;
+
+	for (i = 0; i < MOCO_BRIDGE_SLOTS; i++) {
+		if (g_bridge[i].xid == xid) {
+			pick = i;
+			goto have_slot;
+		}
+	}
+	/* Free slot first, else the least recently used. */
+	for (i = 0; i < MOCO_BRIDGE_SLOTS; i++) {
+		if (g_bridge[i].xid == 0) {
+			pick = i;
+			goto have_slot;
+		}
+		if (g_bridge[i].used < g_bridge[pick].used)
+			pick = i;
+	}
+	if (g_bridge[pick].width)
+		cogpu_vrend_resource_unref(MOCO_BRIDGE_RES_BASE + pick);
+	g_bridge[pick].width = g_bridge[pick].height = 0;
+
+have_slot:
+	res_id = MOCO_BRIDGE_RES_BASE + pick;
+	g_bridge[pick].xid = xid;
+	g_bridge[pick].used = ++g_bridge_clock;
+
+	if (g_bridge[pick].width == width &&
+	    g_bridge[pick].height == height)
+		return res_id;
+
+	if (g_bridge[pick].width)
+		cogpu_vrend_resource_unref(res_id);
+
+	memset(&a, 0, sizeof(a));
+	a.handle     = res_id;
+	a.target     = 2;		/* PIPE_TEXTURE_2D */
+	a.format     = 1;		/* B8G8R8A8_UNORM */
+	a.bind	     = 1 << 1;		/* PIPE_BIND_RENDER_TARGET */
+	a.width	     = width;
+	a.height     = height;
+	a.depth	     = 1;
+	a.array_size = 1;
+	if (cogpu_vrend_resource_create(&a) != 0) {
+		g_bridge[pick].width = g_bridge[pick].height = 0;
+		return 0;
+	}
+	g_bridge[pick].width = width;
+	g_bridge[pick].height = height;
+	logline("  MOCO_PRESENT: bridge slot %u res %u for XID 0x%x %ux%u\n",
+		pick, res_id, xid, width, height);
+	return res_id;
+}
 
 #define VIRTIO_GPU_CMD_CTX_CREATE		0x0200
 #define VIRTIO_GPU_CMD_CTX_DESTROY		0x0201
@@ -1368,7 +1455,8 @@ static uint32_t serve(struct cogpu_chain *chain)
 			break;
 		}
 
-		if (blob_map_track(m.resource_id, pseudo_pa, mapped_bytes) != 0) {
+		if (blob_map_track(m.resource_id, pseudo_pa, mapped_bytes,
+				   va) != 0) {
 			logline("  MAP_BLOB res %u: tracking table full\n",
 				m.resource_id);
 			co_manager_kunwindow(g_wake_handle, pseudo_pa,
@@ -1388,6 +1476,110 @@ static uint32_t serve(struct cogpu_chain *chain)
 			" cache %u\n", m.resource_id, va,
 			(unsigned long long)pseudo_pa,
 			(unsigned long long)mapped_bytes, info);
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_MOCO_PRESENT: {
+		/*
+		 * The Vulkan present: metadata in, pixels stay put. The
+		 * blob's memory is mapped for the duration of one texture
+		 * upload and released -- vkMapMemory host-side, cheap, and
+		 * holding it would pin vkr allocations the guest may free.
+		 */
+		struct {
+			uint32_t resource_id, xid, width, height,
+				 stride, flags;
+		} mp;
+		void *px = NULL;
+		uint64_t sz = 0;
+
+		if (chain->in[0].len < sizeof(req) + sizeof(mp)) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+		memcpy(&mp, (char *)chain->in[0].addr + sizeof(req),
+		       sizeof(mp));
+
+		{
+			/*
+			 * Guest-mapped blobs (the common case: the frame the
+			 * guest just wrote through its own mapping) are
+			 * already host-mapped by MAP_BLOB, and a second
+			 * resource_map on a live blob is refused -- measured,
+			 * not assumed. Read through the mapping we hold.
+			 */
+			struct cogpu_blob_map *bm =
+				blob_map_find(mp.resource_id);
+
+			if (bm && bm->host_va) {
+				px = bm->host_va;
+				sz = bm->bytes;
+			} else {
+				/*
+				 * REFUSED rather than mapped: resource_map
+				 * from the serve thread reaches into the vkr
+				 * worker's VkDevice cross-thread, and the one
+				 * time it ran the worker wedged and the guest
+				 * spun forever on its ring. WSI buffers are
+				 * guest-mapped at swapchain creation, so a
+				 * missing held mapping is itself a bug worth
+				 * a logline, not a fallback.
+				 */
+				logline("  MOCO_PRESENT res %u: no held"
+					" mapping -- refused\n",
+					mp.resource_id);
+				resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+				break;
+			}
+
+			if (!px || sz < (uint64_t)mp.stride * mp.height) {
+				logline("  MOCO_PRESENT res %u: unmappable or"
+					" short (%llu < %ux%u)\n",
+					mp.resource_id,
+					(unsigned long long)sz,
+					mp.stride, mp.height);
+				resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+				break;
+			}
+
+			/*
+			 * Bridge the Venus frame into a REAL virgl texture
+			 * and present through the ONE presenter this project
+			 * trusts -- the GL stream path, exactly as gears
+			 * uses it, overlay lifecycle and teardown included.
+			 * The hand-rolled parallel presenter this replaces
+			 * is preserved, as instructed, in
+			 * I-AM-A-LITTLE-PIECE-OF-SHIT-FILTH.diff outside the
+			 * repo, as a monument.
+			 */
+			{
+				uint32_t res = moco_bridge_resource(mp.xid,
+					mp.width, mp.height);
+
+				if (!res) {
+					logline("  MOCO_PRESENT: bridge"
+						" create refused\n");
+					resp->type =
+						VIRTIO_GPU_RESP_ERR_UNSPEC;
+					break;
+				}
+
+				if (cogpu_vrend_upload(res, mp.stride,
+						       mp.width, mp.height,
+						       px, sz) != 0) {
+					logline("  MOCO_PRESENT: upload"
+						" refused\n");
+					resp->type =
+						VIRTIO_GPU_RESP_ERR_UNSPEC;
+					break;
+				}
+
+				cogpu_present_stream(res, mp.xid, mp.width,
+						     mp.height, 0, 0,
+						     mp.width, mp.height);
+				resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+			}
+		}
 		break;
 	}
 
