@@ -353,6 +353,9 @@ ask for:
   memory maps at the machine's DRAM ceiling (4.6-4.8 GiB/s) through a window
   arena in the p2m with no BAR involved, and `vkcube` presents into its own
   native window at 368 fps beside an OpenGL client
+- Direct3D 11, through Wine 11.14 and DXVK 1.10.3 on top of that Vulkan:
+  Unigine Heaven 4.0 renders at 26 fps (1024x768, low, no tessellation) as a
+  native window, and `tools/d3dbench.c` measures 304 fps for the path itself
 - Sandboxed clients work untouched, because presentation needs only the render
   node they already have -- for both APIs: Firefox renders directly and stays
   interactive, and Steam logs direct CoPresent from inside its pressure-vessel
@@ -392,11 +395,13 @@ Not yet:
 - Vsync. Presents are fire-and-forget in both APIs, so `FIFO` is not throttled
   and a client renders as fast as the card allows. Nothing has needed it yet;
   a game will
-- Proton, DXVK and Wine. Accelerated Vulkan exists now (see
-  [Vulkan](#vulkan)), which removes the reason this was previously listed as a
-  separate project -- but no D3D title has been run, no Wine prefix has been
-  built on this box, and the honest state is "unblocked, untried". Zink over
-  Venus is in the same position
+- Proton, and games. Wine and DXVK are no longer on this list: Direct3D 11
+  runs on the host's card and Unigine Heaven renders through it, so see
+  [Direct3D, through Wine and DXVK](#direct3d-through-wine-and-dxvk). What has
+  not been done is a *game*: no title has been launched, Proton has never been
+  installed here (GE-Proton standalone plus `umu-launcher` is the route that
+  needs no Steam), and D3D9 and D3D12 are both untested -- only D3D11 has run.
+  Zink over Venus is likewise still untried
 - Steam's client. It launches and its helpers run, but the storefront UI is
   still the CEF failure below, and a 5000-fish WebGL load killed its GPU
   process on this hardware
