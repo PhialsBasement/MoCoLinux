@@ -278,11 +278,45 @@ the cube together, two Vulkan clients together, one exiting while the other
 keeps presenting -- verified with zero DRM errors in every configuration, which
 is what the screenshot above is showing.
 
-Two honest limits. Presents are fire-and-forget, like the GL path's, so FIFO is
-not throttled and a Vulkan client will spin as fast as the card allows rather
-than to a refresh rate. And DXVK -- the reason this exists -- has not been run
-yet. lavapipe stays installed underneath as the software fallback for a host
-whose driver cannot serve Venus.
+#### Direct3D, through Wine and DXVK
+
+The reason the Vulkan work exists. Wine 11.14 with DXVK runs Direct3D 11 in the
+guest: the application's D3D calls become Vulkan, Venus carries them to the
+host's own driver, and the frames come back through the same presenter as
+everything else.
+
+![Unigine Heaven 4.0 rendering in Direct3D 11 as a native Windows window, with
+the guest's kernel log beside it](doc/img/uniginedxvkwine.png)
+
+That is Unigine Heaven 4.0 -- a 2013 D3D11 benchmark, not a synthetic test --
+at **26 fps**, 1024x768, low quality, tessellation off. A project D3D11 frame
+loop (`tools/d3dbench.c`, clear and present, no geometry) measures **304 fps**
+through the same stack, which is the path's own cost rather than the card's.
+
+Three version facts decide whether this works at all, and each cost a
+diagnosis:
+
+- **DXVK 1.10.3, not 2.x or 3.x.** NVIDIA caps Kepler at Vulkan 1.2, Venus
+  reports exactly that, and DXVK 2.0 and later require Vulkan 1.3 -- newer
+  releases enumerate the GT 730, skip it as unsupported, and then fail with no
+  adapters at all
+- **`d3dcompiler_42`** from `winetricks`. Heaven imports that exact DLL, and
+  Wine's builtin HLSL compiler rejects its 2013-era `half` types with 2396
+  `E5017: not yet implemented` errors -- which renders as a black scene with a
+  working HUD, because only the simple shaders survive
+- **Every Present-extension call gated.** VcXsrv has no Present, and libxcb
+  closes the connection on a stub call for a missing extension. Three such
+  calls existed; the last was `xcb_register_for_special_xge`, which does not
+  match a search for `xcb_present_*` and killed each client one frame after
+  its swapchain came up
+
+Two honest limits remain. Presents are fire-and-forget, like the GL path's, so
+FIFO is not throttled and a client renders as fast as the card allows rather
+than to a refresh rate. And 26 fps has no native reference beside it yet: the
+same binary through `wined3d` (D3D11 to OpenGL to virgl) and a host-side run
+are what would say how much of that is the GT 730 and how much is us. lavapipe
+stays installed underneath as the software fallback for a host whose driver
+cannot serve Venus.
 
 ## Status
 

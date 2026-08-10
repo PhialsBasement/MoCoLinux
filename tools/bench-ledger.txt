@@ -208,3 +208,41 @@ regression you are about to hide in mountains of code.
   top-level windows only, and a child XID makes it decorate some other
   window of the same size.
 ================================================================
+
+2026-08-11  (DIRECT3D 11)  M92p GT730 Win10  (Wine 11.14 + DXVK 1.10.3)
+  tools/d3dbench.c (clear+present, no geometry): 3040 frames in 10.00 s
+  = 304 FPS. D3D11 -> DXVK -> Vulkan -> Venus -> the host's NVIDIA driver
+  -> GT 730 -> MOCO_PRESENT -> a native window.
+  Unigine Heaven 4.0, a real 2013 D3D11 benchmark: 26 FPS at 1024x768,
+  quality low, tessellation off, no AA. exit 0, zero DRM errors.
+  NO NATIVE REFERENCE YET, so 26 means little on its own. The one figure
+  the web offers for this card is 10.3 FPS / score 260 at Ultra + Extreme
+  tessellation + 1600x900 + 8xAA (AnandTech's scores thread) -- much
+  heavier settings, so ours being 2.5x that is directionally sane and
+  nothing more. The fair pair (same binary through wined3d) and a
+  host-side run are what would settle it.
+  VERSION FACTS, each one a diagnosis:
+    DXVK 1.10.3, not 2.x/3.x -- NVIDIA caps Kepler at Vulkan 1.2, Venus
+      reports 1.2.175, and DXVK >= 2.0 demands 1.3: it enumerated the GT
+      730, skipped it as unsupported, then failed with no adapters.
+    d3dcompiler_42 via winetricks -- the DLL Heaven actually imports.
+      Wine's builtin HLSL compiler rejects its `half` types: 2396 E5017
+      "not yet implemented" errors, which look like a black scene with a
+      working HUD because only the simple shaders survive. With the real
+      compiler: 0 errors.
+    Every Present-extension call gated. The last one was
+      xcb_register_for_special_xge, which does not match a grep for
+      xcb_present_* and killed each client one frame after its swapchain.
+
+2026-08-11  (blob table)  M92p GT730 Win10  (found by Heaven, not by us)
+  cogpu's blob tracking table was a fixed 1024 entries, sized by what
+  vkcube needed. Heaven holds more than that mapped at once, so:
+    tracking table full         164
+    guest DRM errors            164 in matched pairs --
+      response 0x1200 (command 0x208)  MAP_BLOB refused
+      response 0x1200 (command 0x209)  UNMAP_BLOB of an untracked res
+    maps/unmaps over the run    3806 / 3806
+  The table now doubles on demand (1024 -> 2048 under Heaven). After:
+  exit 0, ZERO DRM errors. A capacity bug that only a real workload was
+  ever going to find.
+================================================================

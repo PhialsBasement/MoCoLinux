@@ -128,7 +128,26 @@ struct cogpu_blob_map {
 	 * the pixels (MOCO_PRESENT) reads through this one. */
 	void		  *host_va;
 };
-static struct cogpu_blob_map g_blob_map[1024];
+/*
+ * GROWN ON DEMAND, not a fixed 1024.
+ *
+ * A fixed table was sized by what vkcube needed, and the first real workload
+ * walked straight past it: Unigine Heaven mapped more than 1024 blobs at
+ * once, so MAP_BLOB began answering ERR_UNSPEC, and every later UNMAP_BLOB
+ * for one of those untracked resources answered ERR too -- 164 refusals in
+ * matched pairs, which the guest reported as
+ *
+ *   [drm] *ERROR* response 0x1200 (command 0x208)   <- MAP_BLOB
+ *   [drm] *ERROR* response 0x1200 (command 0x209)   <- UNMAP_BLOB
+ *
+ * and the application as a crash. The entries are 32 bytes; a workload that
+ * genuinely holds a million mappings is welcome to 32 MB of table.
+ */
+static struct cogpu_blob_map *g_blob_map;
+static unsigned int	      g_blob_map_slots;
+
+/* Defined below; the table's growth wants to report itself. */
+void logline(const char *fmt, ...);
 
 static struct cogpu_blob_map *blob_map_find(uint32_t res_id)
 {
@@ -136,7 +155,7 @@ static struct cogpu_blob_map *blob_map_find(uint32_t res_id)
 
 	if (res_id == 0)
 		return NULL;
-	for (i = 0; i < sizeof(g_blob_map) / sizeof(g_blob_map[0]); i++)
+	for (i = 0; i < g_blob_map_slots; i++)
 		if (g_blob_map[i].res_id == res_id)
 			return &g_blob_map[i];
 	return NULL;
@@ -147,16 +166,37 @@ static int blob_map_track(uint32_t res_id, unsigned long long pseudo_pa,
 {
 	unsigned int i;
 
-	for (i = 0; i < sizeof(g_blob_map) / sizeof(g_blob_map[0]); i++) {
-		if (g_blob_map[i].res_id == 0) {
-			g_blob_map[i].res_id	= res_id;
-			g_blob_map[i].pseudo_pa = pseudo_pa;
-			g_blob_map[i].bytes	= bytes;
-			g_blob_map[i].host_va	= host_va;
-			return 0;
-		}
+	for (i = 0; i < g_blob_map_slots; i++) {
+		if (g_blob_map[i].res_id == 0)
+			goto have_slot;
 	}
-	return -1;
+
+	{
+		/* Full: double it (1024 to start), keeping every live entry. */
+		unsigned int want = g_blob_map_slots ? g_blob_map_slots * 2 : 1024;
+		struct cogpu_blob_map *bigger =
+			realloc(g_blob_map, want * sizeof(*bigger));
+
+		if (!bigger) {
+			logline("  MAP_BLOB: cannot grow the tracking table"
+				" past %u entries\n", g_blob_map_slots);
+			return -1;
+		}
+		memset(bigger + g_blob_map_slots, 0,
+		       (want - g_blob_map_slots) * sizeof(*bigger));
+		i = g_blob_map_slots;
+		g_blob_map = bigger;
+		g_blob_map_slots = want;
+		logline("  MAP_BLOB: tracking table grown to %u entries\n",
+			want);
+	}
+
+have_slot:
+	g_blob_map[i].res_id	= res_id;
+	g_blob_map[i].pseudo_pa = pseudo_pa;
+	g_blob_map[i].bytes	= bytes;
+	g_blob_map[i].host_va	= host_va;
+	return 0;
 }
 
 static void blob_map_forget(uint32_t res_id)

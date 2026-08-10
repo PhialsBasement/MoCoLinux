@@ -2413,7 +2413,7 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache_
  
 diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache__' a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
 --- a/src/vulkan/wsi/wsi_common_x11.c	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/vulkan/wsi/wsi_common_x11.c	2026-08-11 06:50:01.626370700 +1000
++++ b/src/vulkan/wsi/wsi_common_x11.c	2026-08-11 07:40:38.669860700 +1000
 @@ -343,6 +343,27 @@
     wsi_conn->is_xwayland = wsi_x11_detect_xwayland(conn, randr_reply,
                                                     xwl_reply);
@@ -2442,7 +2442,7 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache_
     wsi_conn->has_dri3_modifiers = has_dri3_v1_2 && has_present_v1_2;
     wsi_conn->has_dri3_explicit_sync = has_dri3_v1_4 && has_present_v1_4;
     wsi_conn->is_proprietary_x11 = false;
-@@ -1118,6 +1139,18 @@
+@@ -1118,6 +1139,22 @@
  struct x11_swapchain {
     struct wsi_swapchain                        base;
  
@@ -2458,10 +2458,14 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache_
 +    */
 +   xcb_window_t                                 moco_toplevel;
 +
++   /* No Present extension: no special-event registration, so no event
++    * thread was started and none may be joined. */
++   bool                                         moco_no_events;
++
     bool                                         has_dri3_modifiers;
     bool                                         has_mit_shm;
     bool                                         has_async_may_tear;
-@@ -1506,6 +1539,86 @@
+@@ -1506,6 +1543,139 @@
     assert(!chain->base.image_info.explicit_sync);
     struct x11_image *image = &chain->images[image_index];
  
@@ -2479,25 +2483,46 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache_
 +      VkDeviceMemory frame_mem = image->base.blit.memory != VK_NULL_HANDLE
 +         ? image->base.blit.memory : image->base.memory;
 +
-+      /* The app's own top-level, found once: see moco_toplevel above. */
++      /*
++       * The app's own top-level, found once -- on a PRIVATE CONNECTION.
++       *
++       * Never on chain->conn. That connection may not be ours to speak on:
++       * Wine drives X through Xlib, and Xlib tracks sequence numbers for the
++       * xcb connection underneath it. A raw xcb round trip issued from a
++       * presenter thread desynchronises that bookkeeping, the server sees a
++       * malformed request, and it kills the client -- "X connection to :0
++       * broken", one frame after the swapchain came up, every single run.
++       *
++       * A separate connection costs one socket per swapchain and cannot
++       * interfere with anybody: XIDs are server-wide, so the answer is just
++       * as valid. If it cannot be opened, the drawable's own XID is used,
++       * which is correct for every application that renders into its
++       * top-level directly.
++       */
 +      if (chain->moco_toplevel == XCB_NONE) {
-+         xcb_window_t walk = chain->window;
++         xcb_connection_t *probe = xcb_connect(NULL, NULL);
 +
 +         chain->moco_toplevel = chain->window;
-+         for (int depth = 0; depth < 32; depth++) {
-+            xcb_query_tree_reply_t *tree =
-+               xcb_query_tree_reply(chain->conn,
-+                                    xcb_query_tree(chain->conn, walk), NULL);
-+            if (!tree)
-+               break;
-+            if (tree->parent == XCB_NONE || tree->parent == tree->root) {
-+               chain->moco_toplevel = walk;
++         if (probe && !xcb_connection_has_error(probe)) {
++            xcb_window_t walk = chain->window;
++
++            for (int depth = 0; depth < 32; depth++) {
++               xcb_query_tree_reply_t *tree =
++                  xcb_query_tree_reply(probe,
++                                       xcb_query_tree(probe, walk), NULL);
++               if (!tree)
++                  break;
++               if (tree->parent == XCB_NONE || tree->parent == tree->root) {
++                  chain->moco_toplevel = walk;
++                  free(tree);
++                  break;
++               }
++               walk = tree->parent;
 +               free(tree);
-+               break;
 +            }
-+            walk = tree->parent;
-+            free(tree);
 +         }
++         if (probe)
++            xcb_disconnect(probe);
 +         fprintf(stderr, "moco wsi: drawable 0x%x -> top-level 0x%x\n",
 +                 (unsigned)chain->window, (unsigned)chain->moco_toplevel);
 +      }
@@ -2534,11 +2559,43 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache_
 +          * after one frame. The host owns presentation, so a size mismatch is
 +          * the host's business, not a reason to kill the swapchain.
 +          */
-+         xcb_get_geometry_cookie_t pump =
-+            xcb_get_geometry(chain->conn, chain->window);
++         /*
++          * The read-back pump is OPTIONAL and off by default.
++          *
++          * It exists because a swapchain that never touches the connection
++          * looked like it had killed the application's event flow. That was
++          * a misattribution: the connection was already dead, killed by the
++          * Present stub gated above, and reading a reply merely made the
++          * corpse twitch. With the connection alive an application's own
++          * xcb_poll_for_event reads the socket perfectly well.
++          *
++          * Keeping it ON is actively harmful where the connection is not
++          * ours: Wine drives X through Xlib, and raw xcb requests issued
++          * from a presenter thread on an Xlib-owned connection desynchronise
++          * the sequence numbers Xlib is tracking. The X server then sees a
++          * malformed request and kills the client -- "X connection to :0
++          * broken", every run, immediately after the swapchain came up.
++          *
++          * MOCO_WSI_PUMP=1 restores it for anyone diagnosing an application
++          * that genuinely starves its own event loop.
++          */
++         static int pump_mode = -1;
 +
-+         xcb_flush(chain->conn);
-+         free(xcb_get_geometry_reply(chain->conn, pump, NULL));
++         if (pump_mode < 0) {
++            const char *e = getenv("MOCO_WSI_PUMP");
++
++            pump_mode = e && *e == '1';
++         }
++
++         if (pump_mode) {
++            xcb_get_geometry_cookie_t pump =
++               xcb_get_geometry(chain->conn, chain->window);
++
++            xcb_flush(chain->conn);
++            free(xcb_get_geometry_reply(chain->conn, pump, NULL));
++         }
++         /* Otherwise: not one X call. The host has the pixels, the
++          * application owns its connection, and we stay off it. */
 +
 +         wsi_queue_push(&chain->acquire_queue, image_index);
 +         return VK_SUCCESS;
@@ -2548,7 +2605,7 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache_
     /* Begin querying this before submitting the frame for improved async performance.
      * In this _sw() mode we're expecting network round-trip delay, not just UNIX socket delay. */
     xcb_get_geometry_cookie_t geom_cookie = xcb_get_geometry(chain->conn, chain->window);
-@@ -1564,6 +1677,7 @@
+@@ -1564,6 +1734,7 @@
        }
     }
  
@@ -2556,7 +2613,44 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache_
     xcb_flush(chain->conn);
  
     /* We don't have queued present here.
-@@ -2664,13 +2778,33 @@
+@@ -2454,7 +2625,9 @@
+    /* Push a UINT32_MAX to wake up the manager */
+    wsi_queue_push(&chain->present_queue, UINT32_MAX);
+    thrd_join(chain->queue_manager, NULL);
+-   thrd_join(chain->event_manager, NULL);
++   /* Only if one was started -- see moco_no_events. */
++   if (!chain->moco_no_events)
++      thrd_join(chain->event_manager, NULL);
+ 
+    if (!chain->base.image_info.explicit_sync)
+       wsi_queue_destroy(&chain->acquire_queue);
+@@ -2463,12 +2636,19 @@
+    for (uint32_t i = 0; i < chain->base.image_count; i++)
+       x11_image_finish(chain, pAllocator, &chain->images[i]);
+ #ifdef HAVE_X11_DRM
+-   xcb_void_cookie_t cookie;
+-   xcb_unregister_for_special_event(chain->conn, chain->special_event);
+-   cookie = xcb_present_select_input_checked(chain->conn, chain->event_id,
+-                                             chain->window,
+-                                             XCB_PRESENT_EVENT_MASK_NO_EVENT);
+-   xcb_discard_reply(chain->conn, cookie.sequence);
++   /* Teardown must respect the same gate as setup: unregistering a
++    * registration never made, or clearing a Present event mask on a server
++    * with no Present, kills the connection on the way out instead of on the
++    * way in. */
++   if (chain->special_event) {
++      xcb_void_cookie_t cookie;
++
++      xcb_unregister_for_special_event(chain->conn, chain->special_event);
++      cookie = xcb_present_select_input_checked(chain->conn, chain->event_id,
++                                                chain->window,
++                                                XCB_PRESENT_EVENT_MASK_NO_EVENT);
++      xcb_discard_reply(chain->conn, cookie.sequence);
++   }
+ #endif
+    mtx_destroy(&chain->present_progress_mutex);
+    u_cnd_monotonic_destroy(&chain->present_progress_cond);
+@@ -2664,13 +2844,33 @@
  
     uint32_t present_caps = 0;
  #ifdef HAVE_X11_DRM
@@ -2597,7 +2691,7 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache_
     }
  #endif
  
-@@ -2788,7 +2922,12 @@
+@@ -2788,14 +2988,32 @@
                           XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY;
     if (!chain->base.image_info.explicit_sync)
        event_mask |= XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY;
@@ -2611,3 +2705,40 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache_
  
     /* Create an XCB event queue to hold present events outside of the usual
      * application event queue
++    *
++    * ONLY where the server has Present. This registration names the Present
++    * extension, so on a server without it libxcb shuts the connection down
++    * exactly as the two calls above do -- and this one is easy to miss,
++    * because it is not spelled xcb_present_*. It was the last survivor: DXVK
++    * built its device, its extensions and a 792x566 swapchain, printed the
++    * adapter, and the connection died before the first frame.
++    *
++    * With no registration there is no event source, so the event thread that
++    * blocks on it is not started either (see below). Nothing is lost: these
++    * are Present COMPLETE/IDLE events, and this platform's presentation is
++    * fire-and-forget with the acquire queue refilled by the present itself.
+     */
+-   chain->special_event =
+-      xcb_register_for_special_xge(chain->conn, &xcb_present_id,
+-                                   chain->event_id, NULL);
++   if (wsi_conn->has_present)
++      chain->special_event =
++         xcb_register_for_special_xge(chain->conn, &xcb_present_id,
++                                      chain->event_id, NULL);
+ #endif
+    /* Create the graphics context. */
+    chain->gc = xcb_generate_id(chain->conn);
+@@ -2848,7 +3066,12 @@
+       goto fail_init_fifo_queue;
+    }
+ 
+-   ret = thrd_create(&chain->event_manager,
++   /* No event source, no event thread: it would block for ever in
++    * xcb_wait_for_special_event on a registration we deliberately did not
++    * make. See the note on xcb_register_for_special_xge above. */
++   chain->moco_no_events = chain->special_event == NULL;
++   ret = chain->moco_no_events ? thrd_success :
++         thrd_create(&chain->event_manager,
+                      x11_manage_event_queue, chain);
+    if (ret != thrd_success) {
+       result = VK_ERROR_OUT_OF_HOST_MEMORY;
