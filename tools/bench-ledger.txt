@@ -138,3 +138,13 @@ regression you are about to hide in mountains of code.
   when it matters: host-side validation layer, per-context worker
   isolation, or a worker-death watchdog that recycles venus.
 ================================================================
+
+2026-08-11  858de931+  M92p GT730 Win10  (gears record post-surgery)
+  glxgears (MoCo GL): 973 FPS -- the pre-surgery band was 579-721.
+  The timer surgery sped the GL path ~35%: every wait in the stack
+  (fences, presents, sleeps) sharpened from ms-quantized to precise.
+  Zink-over-Venus gears: BLOCKED on Vulkan presentation (zink needs
+  Vulkan WSI; VcXsrv offers no DRI3 -- same wall as vkcube's black
+  square). That is the CoPresent-for-Vulkan workstream: a present
+  ioctl on renderD128, per the sandbox-flaw design note.
+================================================================
