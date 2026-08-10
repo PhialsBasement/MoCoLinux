@@ -62,3 +62,15 @@ regression you are about to hide in mountains of code.
                                          tens of us. Watch this number.
   GL gate: gears 608 FPS, in band.
 ================================================================
+
+2026-08-11  (fence-only fix)  M92p GT730 Win10  (vkbench-venus rerun)
+  map-write            3797.8 MiB/s   (single run; 4619 seen -- band TBD)
+  map-read              209.2 MiB/s
+  submit-rtt           1512.7 us      <- ~unchanged though fences now
+                                         REALLY cross vkr + parking: the
+                                         1.4 ms is delivery (doorbell ->
+                                         guest drain), not vkr. dmesg: 0
+                                         errors (was: 0x1200 per empty
+                                         submit, fence signalled by an
+                                         ERROR response, renderer never
+                                         asked).

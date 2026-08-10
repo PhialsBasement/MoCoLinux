@@ -763,6 +763,22 @@ static uint32_t serve(struct cogpu_chain *chain)
 		 * dozens of fragments -- and taking only the first one hands
 		 * the decoder a prefix that ends mid-command.
 		 */
+		/*
+		 * Zero bytes is not malformed -- it is a fence-only
+		 * submission, which is how an empty vkQueueSubmit arrives.
+		 * Refusing it looked harmless because the error response
+		 * still carried the fence flag and the guest treated THAT as
+		 * the completion: every empty submit's fence signalled
+		 * early, through an error, with the renderer never asked.
+		 * The fence tail below handles it properly -- for a Venus
+		 * context that means a real vkr fence, parked and published
+		 * in order.
+		 */
+		if (sub.size == 0) {
+			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+			break;
+		}
+
 		cmds = chain_gather(chain, 0, sizeof(req) + sizeof(sub),
 				    sub.size, &avail);
 		if (!cmds || avail < sub.size) {
