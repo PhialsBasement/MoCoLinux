@@ -107,3 +107,17 @@ regression you are about to hide in mountains of code.
   has priors, but hires timers raise clock interrupt rates; if it
   recurs under load, rate-limit the arms and suspect us first.
 ================================================================
+
+2026-08-11  d8f9a37c+  M92p GT730 Win10  (Venus after timer surgery)
+  vkbench-venus: map-write 4822 MiB/s (ceiling), submit 10.8us,
+  spin-rtt 136us, sleep-rtt 2133 -> 1058us (two Windows wake floors:
+  vn backoff nap + wake -- native parity for the same pattern).
+  vkbench-frames, overshoot per frame (before -> after):
+    8ms/120fps class: 2.62 -> 1.50 ms   124 -> 144 fps (ideal 184)
+    16ms/60fps class: 2.48 -> 1.18 ms   53.3 -> 57.3  (ideal 61.5)
+    33ms/30fps class: 2.41 -> 1.51 ms   28.6 -> 29.4  (ideal 30.7)
+  HITCHES: 60fps-class p99 25.99 -> 18.41 ms (within 1ms of median;
+  the every-3-seconds micro-stutter is gone). 8ms p99 9.0 -> 7.9.
+  Frame pacing is now shippable; remaining overshoot ~= one Windows
+  wake floor + vn backoff, the physics-parity endpoint.
+================================================================
