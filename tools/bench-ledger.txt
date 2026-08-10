@@ -1,0 +1,27 @@
+The speed ledger. One row block per milestone, appended, never rewritten.
+A milestone without a number here is not done. Run tools/vkbench.py in the
+guest (root), copy the rows, note date / commit / box. Compare against the
+block above yours before committing anything: a drop you cannot explain is a
+regression you are about to hide in mountains of code.
+
+================================================================
+2026-08-10  d497171c  M92p GT730 Win10  (ad-hoc, 2 MB working set)
+  CACHE-SCALE numbers -- 2 MB fits L3; kept because they prove the
+  window adds no overhead even cache-hot, NOT as bandwidth claims:
+  window-write 15034.9 / anon-write 14941.7 MiB/s   (parity)
+  window-read  16055.2 / anon-read  16168.7 MiB/s   (parity)
+
+2026-08-10  73e1323f  M92p GT730 Win10  (ad-hoc, pre-vkbench)
+  transfer-to-host      738.2 MiB/s   (16 MB tex x16, TRANSFER+WAIT)
+  guest-blob create: 16 MB / 18 iovecs OK; mapped+written
+  glxgears (X, CoPresent): 679 FPS -- GL path unregressed
+
+2026-08-10  73e1323f  M92p GT730 Win10  (vkbench, 256 MB total, DRAM scale)
+  anon-write           4439.4 MiB/s   <- the box's memory bus, the ceiling
+  anon-read            4933.1 MiB/s
+  blob-write           4916.2 MiB/s   <- PARITY with anon: mapping is free
+  blob-read            5012.8 MiB/s
+  transfer-to-host     1029.4 MiB/s   <- staged path: ~4.8x under the blob
+  Lesson recorded: the first ledger row compared cache-scale to DRAM-scale
+  and read as 20x. Honest gap is ~4.8x. The instrument caught its author.
+================================================================
