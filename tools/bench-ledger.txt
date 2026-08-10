@@ -39,4 +39,26 @@ regression you are about to hide in mountains of code.
   assignment, hotter glibc path than ctypes.memmove) -- an instrument
   difference, not a machine one. Rule: rows are only comparable when the
   code that produced them is the same. Second catch of the evening.
+
+2026-08-10  e4270515  M92p GT730 Win10  (Venus renderer live, GL gate)
+  glxgears x4: 579 / 707 / 721 / 605 FPS -- pre-Venus 679 sits mid-band.
+  Single gears runs vary ~10% (first run after boot is the low tail);
+  never compare single runs. GL unregressed under the Venus DLL + the
+  async-fence rework. "venus: up", capset id 4 = v0/160 bytes on GT730.
+
+2026-08-11  25ffffe1  M92p GT730 Win10  (VENUS ENUMERATES; vkbench-venus)
+  vulkaninfo: "Virtio-GPU Venus (NVIDIA GeForce GT 730)", DISCRETE_GPU.
+  vkMapMemory 64 MB, NV memory type 9 (HOST_VISIBLE|COHERENT):
+  map-write            4619.0 MiB/s   <- DRAM ceiling (native 4668): the
+                                         zero-copy claim holds for REAL
+                                         Vulkan memory end to end
+  map-read              223.4 MiB/s   <- NV backs type 9 with WC pages;
+                                         reads this slow are native-
+                                         correct, apps never read maps
+  submit-rtt           1428.4 us      <- empty submit+fence round trip;
+                                         OPTIMIZATION TARGET (completion
+                                         path: vkr signal -> queue ->
+                                         publish -> doorbell). Native is
+                                         tens of us. Watch this number.
+  GL gate: gears 608 FPS, in band.
 ================================================================
