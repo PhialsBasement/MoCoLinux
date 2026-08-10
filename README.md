@@ -342,9 +342,14 @@ ceiling, not a claim that a 128 GB host has already been tested.
 | `doc/porting-x86_64` | design notes for the port |
 | `doc/direct-presentation` | staged plan and acceptance gates for the presentation path |
 | `doc/building-copresent` | exact host and dual-ABI DRI3 Mesa build; isolated test, system selection and rollback |
-| `doc/building-modern` | the working build recipe |
+| `doc/building-release` | **end to end: every product, the order, the traps, cutting a release** |
+| `doc/building-modern` | the Windows driver and daemons in detail |
 
 ## Building
+
+**[`doc/building-release`](doc/building-release) is the end-to-end recipe** —
+what each of the six products is, which script builds it, the order their
+dependencies force, and the traps in each step. Start there.
 
 Requires a cross toolchain (`mingw-w64-gcc`, `binutils`), `osslsigncode` for
 the driver signature, and two kernel trees: the Windows side builds against

@@ -97,18 +97,26 @@ fails there rather than at install time on the box.
 tools/build.sh adds only what is outside comake's world: the installer
 executable, staging into dist-x64, and --release.
 
-CoPresent R2 adds two Linux-side build products which cannot be hidden inside
-that Windows build: the guest broker/test and a patched Mesa 26.1.6 Xlib GLX
-library. Build them with:
+CoPresent adds Linux-side build products which cannot be hidden inside that
+Windows build: a patched Mesa 26.1.6, built for both the 64-bit and 32-bit ABI,
+and the standalone present test producer. Build them with:
 
-    tools/build-copresent-guest.sh
     MOCO_BUILD_JOBS=16 tools/build-mesa-copresent.sh
+    tools/build-copresent-guest.sh
 
 The Mesa script verifies the official release checksum, applies
 `patch/mesa-26.1.6/moco-copresent.diff` with zero fuzz, creates a pinned Meson
-environment and emits a stripped `libGL-moco.so.1`. The complete dependency,
+environment and emits a stripped stack per ABI. The complete dependency,
 install, isolated-test and rollback procedure is in `doc/building-copresent`.
 VcXsrv is deliberately not a build input to this path and remains stock.
+
+The broker this used to build is gone: presentation travels in the guest's own
+virgl command stream, so there is no daemon and no socket on the guest side.
+
+This document covers the Windows daemons and driver. For the whole pipeline --
+the renderer DLLs the build below depends on, the guest GL stack, the root
+filesystem image, cutting a release, and the traps in each -- see
+`doc/building-release`.
 
 COLINUX_TARGET_KERNEL_BUILD does not have to exist. Set it to something other
 than the source directory: it selects the out-of-tree include list. (Both lists

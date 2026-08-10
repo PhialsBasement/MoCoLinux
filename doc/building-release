@@ -1,0 +1,240 @@
+Building MoCoLinux end to end
+=============================
+
+From a clean checkout to the zip that gets published. `doc/building-modern`
+covers the Windows daemons and driver in detail and `doc/building-copresent`
+covers the GL stack; this is the ordering that ties them together, the
+prerequisites each step actually needs, and the traps that have cost real time.
+
+Everything here runs on a Linux build host. Nothing is built on Windows.
+
+
+0. What is built, and by what
+-----------------------------
+
+Six independent products end up in a release. Knowing which script owns which
+matters, because rebuilding the wrong one is the usual reason a fix does not
+appear on the test box.
+
+    product                     built by                     lands in
+    ------------------------    -------------------------    ----------------
+    driver + daemons            tools/build.sh               dist-x64/
+      linux.sys, colinux-daemon.exe, colinux-slirp-net-daemon.exe,
+      cogpu-daemon.exe, coxwire, and the installer
+    renderer DLLs               meson, by hand (step 2)      download/prefix-mingw/bin
+      libvirglrenderer-1.dll, libepoxy-0.dll
+    guest kernel                the 7.1.5 patch + make       dist-x64/vmlinux
+    guest GL stack              tools/build-mesa-copresent.sh
+      libGL/libEGL/libGLESv2/gallium/libgbm, BOTH ABIs       build/mesa-copresent-26.1.6/out/{lib64,lib32}
+    guest root filesystem       tools/mkmanjarorootfs.sh     an image file
+    the release directory       tools/mkrelease.sh VERSION   release/MoCoLinux-VERSION
+
+The X server is not built. VcXsrv 1.14.2.1 ships as its stock installer and is
+deliberately never patched or rebuilt.
+
+
+1. Build host prerequisites
+---------------------------
+
+A current Arch-derived distribution is the accepted host; CachyOS is what these
+were verified on. Per step:
+
+  * Windows side: `mingw-w64-gcc`, `python3`, `osslsigncode`.
+  * Renderer DLLs: `meson`, `ninja`, and a Python with **PyYAML** — see the
+    trap in step 2.
+  * Guest GL stack: a C/C++ toolchain, `python3` with venv support, `ninja`,
+    `patch`, `pkg-config`, and the development files for X11/XCB, libdrm,
+    expat, zlib, zstd, sensors and SPIR-V Tools.
+  * The 32-bit half of the GL stack additionally needs `gcc -m32` (multilib)
+    and the i686 development libraries for that same set. On Arch those are the
+    `lib32-*` packages. Without them the script skips the 32-bit half and says
+    so — see the trap in step 4.
+  * Root filesystem: `pacman` and `e2fsprogs`.
+  * Release: `bsdtar` (there is no `zip` on the accepted host), and `gh` to
+    publish.
+
+
+2. The renderer DLLs
+--------------------
+
+Build these first: `cogpu-daemon` includes `<virgl/virglrenderer.h>` and
+`<epoxy/gl.h>` from `download/prefix-mingw`, so the Windows build fails without
+them.
+
+virglrenderer is the pristine 1.3.0 release tarball plus the patches in
+`download/virgl-patches/`, applied in order:
+
+    01-drm-h-windows-no-ioccom.patch   supplies the fixed-width types and
+                                       collapses the ioctl encoders, because
+                                       Windows has no <sys/ioccom.h> and this
+                                       side never issues a DRM ioctl
+    02-moco-virgl.patch                the MoCoLinux delta: the
+                                       VIRGL_CCMD_MOCO_PRESENT command and its
+                                       decoder, the v5 present callback, and
+                                       two shader-emission fixes
+
+Then, from `download/virglrenderer-1.3.0`:
+
+    meson setup build-clean \
+        -Dprefix=<repo>/download/prefix-mingw \
+        -Dplatforms= -Dtests=false -Dvenus=false \
+        -Dminigbm_allocation=false \
+        --cross-file=<repo>/download/mingw64-cross.ini
+    ninja -C build-clean
+    ninja -C build-clean install
+
+**Trap: meson needs PyYAML, and the error does not say so usefully.** It fails
+with "python3 is missing modules: yaml". If the system Python lacks it, create a
+virtual environment with `meson` and `PyYAML` in it and put that environment's
+`bin` first on `PATH` for the whole invocation — meson re-executes Python for
+generated sources, so exporting `PYTHONPATH` alone is not enough.
+
+**Trap: bumping the callback ABI silently disables the GPU.** `vrend_if_cbs`
+and `virgl_renderer_callbacks` are versioned, and
+`virgl_renderer_init` rejects a callbacks struct whose `version` exceeds
+`VIRGL_RENDERER_CALLBACKS_VERSION`. Raising the version in cogpu without raising
+that constant makes the daemon log "virglrenderer would not initialise -- no GPU
+today" and exit, after which the guest hangs on its first GPU command because
+nothing services the virtio queue. Change both, and rebuild both.
+
+
+3. The Windows side
+-------------------
+
+    tools/build.sh
+
+That is the whole recipe. It runs `bin/make.py`, signs the driver, builds the
+installer, and stages everything into `../dist-x64`. Section 3 of
+`doc/building-modern` explains what it does and how to build pieces of it by
+hand for compiler diagnostics; note that a raw build directory is not an
+install.
+
+**Trap: never pipe this through `tail` or `head`.** The exit status then comes
+from the pager, so a failed build reports success — and if it is followed by a
+deploy in the same `&&` chain, the previous binary ships instead. This has
+happened; run it bare and read the output.
+
+
+4. The guest GL stack
+---------------------
+
+    MOCO_BUILD_JOBS=16 tools/build-mesa-copresent.sh
+
+Verifies the official Mesa 26.1.6 tarball checksum, applies
+`patch/mesa-26.1.6/moco-copresent.diff` with zero fuzz, and builds
+`libGL`, `libEGL`, `libGLESv2`, the Gallium DRI library and `libgbm` — twice,
+once native and once for i686 via `tools/i686-cross.ini`.
+
+Both ABIs matter. Steam's client is i386 and asks the 32-bit loader for GL and
+Vulkan; with a 64-bit-only stack it renders in software and its Vulkan probe
+fails with `VK_ERROR_INCOMPATIBLE_DRIVER`. The script skips rather than fails
+when the host has no multilib toolchain, so **read its output** — "skipping the
+32-bit stack" means the release will be half a stack.
+
+**Trap: the 32-bit configure needs `-Dxlib-lease=disabled`.** The script passes
+it. It is a Vulkan display-lease feature requiring 32-bit libXrandr, which
+multilib installs frequently lack, and no Vulkan driver is built here anyway.
+
+**Trap: the i686 pkg-config path needs two directories.** `/usr/lib32/pkgconfig`
+alone fails with "Package xproto was not found" — the header-only X protocol
+packages exist once, in `/usr/share/pkgconfig`, for both ABIs. The cross file
+sets both.
+
+Copy the two output directories to `../dist-guest/lib64` and
+`../dist-guest/lib32`, which is where the root filesystem builder looks for
+them.
+
+
+5. Guest binaries that run in the guest
+---------------------------------------
+
+    tools/build-copresent-guest.sh    the standalone present test producer
+    tools/glbench/build.sh            the benchmark, built for WGL and GLX
+
+**Trap: strip `.note.gnu.property` from anything built for the guest.** A build
+host defaulting to x86-64-v3 (CachyOS does) stamps its own ISA level onto the
+CRT objects even when the source is compiled `-march=x86-64`, and the guest
+loader then refuses the binary before `main()` with "CPU ISA level is lower than
+required". `objcopy --remove-section=.note.gnu.property` is the fix; the
+existing scripts already do it, and anything new must too.
+
+
+6. The guest root filesystem
+----------------------------
+
+    tools/mkmanjarorootfs.sh <image-or-device> [size]
+
+Needs `pacman` and `e2fsprogs`, and downloads about 2.5 GB. It installs the
+CoPresent GL stack for both ABIs from `../dist-guest`, adds the ldconfig
+directory that selects it, installs `vulkan-swrast` for both ABIs, and bakes
+itself plus `coxwire` into the image so the installed system can build the next
+one.
+
+Read its warnings. "no CoPresent Mesa found -- GL will be software only" means
+step 4 did not land where it looks, and the resulting image will boot fine and
+render everything on the CPU.
+
+**The shipped `root-arch.img` is a seed, not a desktop.** It carries this
+script and a first-boot unit; the guest builds its real root filesystem onto a
+second disk on first boot. So a guest-side change ships by going *into the
+seed*, where it propagates.
+
+Updating the seed does not mean rebuilding it. Mounting needs root; use
+`debugfs`, which writes into the ext filesystem directly and unprivileged:
+
+    debugfs -w -f commands.debugfs root-arch.img
+    e2fsck -fy root-arch.img
+
+Useful commands inside that file are `cd`, `rm`, `write <hostfile> <name>`,
+`mkdir`, `symlink <link> <target>` and `sif <name> mode 0100755`. `dumpe2fs -h`
+shows the free space. **Verify by dumping the files back out** with
+`debugfs -R "dump <path> <out>"` and `cmp` — a failed `write` is otherwise
+silent.
+
+
+7. Cutting a release
+--------------------
+
+Bump `MOCO_VERSION` in `installer/setup.c`, rebuild so the installer carries it,
+then:
+
+    tools/mkrelease.sh 0.6.1
+
+The manifest is not written by that script — it is read out of `setup.c`'s
+payload array, so a file the installer expects and the tree does not have stops
+the build instead of the install. It also refuses to proceed when the driver is
+unsigned or was modified after signing, when the installer is older than
+`setup.c`, when a launcher in the release differs from the tracked one, or when
+any shipped binary links the Universal CRT or depends on a DLL the release does
+not carry.
+
+Then package and publish:
+
+    cd release
+    bsdtar -a -c -f MoCoLinux-0.6.1.zip MoCoLinux-0.6.1
+    gh release create v0.6.1 MoCoLinux-0.6.1.zip \
+        --title "MoCoLinux 0.6.1" --notes-file <notes> --target mocolinux
+
+**Before publishing, check the daemon you are shipping is the one you tested.**
+`sha256sum` the release copy against `dist-x64` and against the file installed
+on the test box. They should be identical; when they are not, something was
+rebuilt after the measurement and the numbers in the release notes describe a
+binary nobody will download.
+
+
+8. Order of operations
+----------------------
+
+For a clean tree, the dependencies force this order:
+
+    1. renderer DLLs        (the Windows build includes their headers)
+    2. tools/build.sh       (driver, daemons, installer, staging)
+    3. guest GL stack       (both ABIs, into ../dist-guest)
+    4. guest binaries       (test producer, glbench)
+    5. root filesystem      (consumes ../dist-guest)
+    6. tools/mkrelease.sh   (consumes dist-x64 and the image)
+
+Steps 3 to 5 are only needed when the guest side changed. A host-only fix — the
+common case for a hotfix — is steps 2 and 6, reusing the existing image, which
+is why `cogpu-daemon.exe` can be the only file that differs between two
+releases.
