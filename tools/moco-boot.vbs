@@ -143,10 +143,13 @@ Else
 	        .ExpandEnvironmentStrings("%SystemDrive%") & "\MoCoLinux"
 End If
 
-' Direct presentation is ON by default. It is how the guest's OpenGL reaches
-' the screen: the patched Mesa in the root filesystem emits its presentation
-' request inside the virgl command stream, and cogpu-daemon only acts on that
-' request when it was started with --present-r2.
+' Direct presentation is ON by default. It is how the guest's OpenGL AND its
+' Vulkan reach the screen: the patched Mesa in the root filesystem emits its
+' presentation request inside the virgl command stream, Venus emits the same
+' request through a MOCO_PRESENT ioctl on the render node, and cogpu-daemon
+' acts on either only when it was started with --present-r2. One flag, both
+' APIs, one presenter -- which is why a Vulkan client and an OpenGL client can
+' hold their own overlays at the same time.
 '
 ' This defaulted to OFF while the protocol was being proved, and leaving it
 ' that way would ship the GPU stack inert -- worse than inert, because the
@@ -155,7 +158,9 @@ End If
 ' halves ship together, so they are configured together.
 '
 ' --no-present is the way back to software rendering, for a host whose driver
-' or card cannot do it. --present-r1 selects the older prototype rung.
+' or card cannot do it. It now silences Vulkan as well as OpenGL: a Vulkan
+' client will run and render but nothing will appear, exactly as its GL
+' counterpart does. --present-r1 selects the older prototype rung.
 cogpu_extra = " --present-r2"
 If argc >= 3 Then
 	If argv(2) = "--present-r1" Then cogpu_extra = " --present-r1"

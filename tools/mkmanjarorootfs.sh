@@ -127,7 +127,7 @@ PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 	  ttf-liberation ttf-dejavu \
 	  xorg-xauth xorg-xhost xorg-xrandr xterm \
 	  xcb-util-cursor \
-	  mesa-utils openssh \
+	  mesa-utils vulkan-tools openssh \
 	  vulkan-swrast lib32-vulkan-swrast \
 	  lib32-glibc lib32-gcc-libs lib32-mesa"
 
@@ -161,7 +161,10 @@ PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 # and a 64-bit-only ICD leaves it failing with VK_ERROR_INCOMPATIBLE_DRIVER.
 #
 # mesa-utils is glxinfo and glxgears: how anyone checks whether that actually
-# happened, rather than trusting it. openssh because a serial console is the
+# happened, rather than trusting it. vulkan-tools is the same instrument for the
+# other API -- vkcube and vulkaninfo -- and the desktop ships a shortcut for
+# each, because the GL and Vulkan stacks fail independently and a user needs to
+# know which of the two is broken. openssh because a serial console is the
 # wrong instrument for diagnosing a graphics stack, and slirp can redirect a
 # port to it (see -r on the network daemon).
 
@@ -915,9 +918,69 @@ for abi in lib64 lib32; do
 
 	mkdir -p "$dst"
 	for f in libGL.so.1.2.0 libEGL.so.1.0.0 libGLESv2.so.2.0.0 \
-		 libgallium-26.1.6.so libgbm.so.1.0.0 dri_gbm.so; do
+		 libgallium-26.1.6.so libgbm.so.1.0.0 dri_gbm.so \
+		 libvulkan_virtio.so; do
 		[ -f "$src/$f" ] && install -m 0755 "$src/$f" "$dst/$f"
 	done
+
+	# Venus, the Vulkan half -- and the manifest without which it does not
+	# exist as far as the loader is concerned.
+	#
+	# libvulkan_virtio.so serialises the guest's Vulkan to the host, where
+	# the host's own driver runs it on the real card; the finished frame
+	# reaches the screen through the same present the GL driver uses, so
+	# both APIs share one presenter and one overlay lifecycle. Installed
+	# from the same source as the GL libraries above and for the same
+	# reason: the seed image building the next root filesystem has no Mesa
+	# build tree, so each generation carries the next one's copy.
+	#
+	# The manifest must carry an ABSOLUTE library_path, because these
+	# libraries deliberately live outside the distribution's search path --
+	# and library_arch, or a 32-bit client loads the 64-bit driver and
+	# fails with VK_ERROR_INCOMPATIBLE_DRIVER. api_version is read from
+	# Mesa's own generated manifest when one sits beside the library, so it
+	# tracks the build rather than this comment.
+	#
+	# vulkan-swrast stays installed underneath: lavapipe answers for a host
+	# whose card or driver cannot serve Venus, and Steam refuses to start
+	# with no Vulkan device at all.
+	if [ -f "$dst/libvulkan_virtio.so" ]; then
+		case $abi in
+		lib64)	icd_name=moco_venus.x86_64.json
+			icd_arch=64
+			icd_lib=/usr/local/lib/moco-copresent/libvulkan_virtio.so ;;
+		lib32)	icd_name=moco_venus.i686.json
+			icd_arch=32
+			icd_lib=/usr/local/lib32/moco-copresent/libvulkan_virtio.so ;;
+		esac
+
+		# Beside the library first (a developer's dist-guest), then this
+		# running system's own manifest -- which is the authoritative
+		# answer when a guest is building the next guest, and is exactly
+		# the file this block wrote when THIS system was built. That is
+		# what stops the version drifting: each generation reads what
+		# the previous one recorded, rather than a constant in a comment.
+		icd_api=$(cat "$src"/*icd*.json \
+			      /usr/share/vulkan/icd.d/moco_venus.*.json \
+			      /usr/share/vulkan/icd.d/*virtio*.json 2>/dev/null |
+			  tr -d ' "' |
+			  awk -F: '/api_version/ { print $2; exit }' |
+			  tr -d ',')
+		[ -n "$icd_api" ] || icd_api=1.4.354
+
+		mkdir -p "$MNT/usr/share/vulkan/icd.d"
+		cat > "$MNT/usr/share/vulkan/icd.d/$icd_name" <<ICD
+{
+    "ICD": {
+        "api_version": "$icd_api",
+        "library_arch": "$icd_arch",
+        "library_path": "$icd_lib"
+    },
+    "file_format_version": "1.0.1"
+}
+ICD
+		say "  installed the Venus Vulkan driver for $abi ($icd_api)"
+	fi
 
 	# Both the versioned soname and the bare development name. Toolkits and
 	# CEF-based applications dlopen "libEGL.so" rather than "libEGL.so.1",

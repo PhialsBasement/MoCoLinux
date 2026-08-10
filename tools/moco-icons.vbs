@@ -54,6 +54,21 @@ startup = shell.SpecialFolders("AllUsersStartup")
 daemon = moco & "\colinux-daemon.exe"
 
 ' name | command in the guest | icon
+' Two GPU tests, one per API, because the two stacks fail independently and a
+' user needs to know WHICH one is broken. glxgears goes through the patched
+' Mesa's virgl driver; vkcube goes through Venus to the host's own Vulkan
+' driver -- and then both frames reach the screen through the same presenter.
+' Both animate when the GPU path is healthy; a still picture means the host
+' is not presenting (see --no-present in moco-boot.vbs).
+'
+' vkcube takes no arguments on purpose. Presentation is fire-and-forget, so
+' FIFO is not throttled and the default present mode runs: measured 326 FPS
+' at 500x500 on a GT 730.
+'
+' The comment lives here rather than inside the array because VBScript does
+' not allow a comment between a line-continuation underscore and the line it
+' continues -- it is a syntax error, and a syntax error in this script means
+' an install with no shortcuts at all.
 apps = Array( _
 	"Konsole|konsole|shell32.dll,3", _
 	"xterm|xterm|shell32.dll,3", _
@@ -61,7 +76,9 @@ apps = Array( _
 	"Firefox|firefox|shell32.dll,14", _
 	"Files (Dolphin)|dolphin|shell32.dll,4", _
 	"System Monitor|plasma-systemmonitor|shell32.dll,24", _
-	"System Settings|systemsettings|shell32.dll,21" )
+	"System Settings|systemsettings|shell32.dll,21", _
+	"GPU test (OpenGL)|glxgears|shell32.dll,18", _
+	"GPU test (Vulkan)|vkcube|shell32.dll,18" )
 
 made = 0
 For Each entry In apps
