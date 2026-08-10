@@ -162,6 +162,86 @@ static void blob_map_forget(uint32_t res_id)
 		bm->res_id = 0;
 }
 
+/*
+ * Which capset each context was created for. Venus contexts (capset 4) get
+ * real per-context fences and deferred completion; everything else keeps the
+ * inline path that has carried GL since R4. Mesa's ctx ids are small; one
+ * byte per possible id costs nothing.
+ */
+#define COGPU_MAX_CTX 4096
+static uint8_t g_ctx_capset[COGPU_MAX_CTX];
+
+static int ctx_is_venus(uint32_t ctx_id)
+{
+	return ctx_id < COGPU_MAX_CTX && g_ctx_capset[ctx_id] == 4;
+}
+
+/*
+ * Requests whose completion is a fence that has not signalled yet. The chain
+ * is already answered (response header written), but the used-ring element
+ * is withheld until vkr says the fence retired -- that withholding IS the
+ * virtio-gpu fence contract, and the guest's dma_fence sleeps on it.
+ */
+struct cogpu_parked {
+	int	 vq;		/* -1 = free slot */
+	uint16_t head;
+	uint32_t written;
+	uint32_t ctx_id;
+	uint32_t ring_idx;
+	uint64_t fence_id;
+};
+static struct cogpu_parked g_parked[512];
+static int g_parked_init_done;
+
+/*
+ * Fence signals crossing from vkr's ring threads. write_context_fence runs
+ * over there; the vrings belong to the main thread. A small locked ring
+ * carries the (ctx, ring, fence) triples across, and the main loop drains
+ * it every pass. Fences per ring signal in order, so a triple stands for
+ * "everything on this ring up to fence_id".
+ */
+static CRITICAL_SECTION g_fence_lock;
+static struct { uint32_t ctx_id, ring_idx; uint64_t fence_id; } g_fence_sig[256];
+static unsigned g_fence_sig_head, g_fence_sig_tail;
+static volatile LONG g_fence_sig_dropped;
+
+static void cogpu_ctx_fence_signal(uint32_t ctx_id, uint32_t ring_idx,
+				   uint64_t fence_id)
+{
+	EnterCriticalSection(&g_fence_lock);
+	if (g_fence_sig_head - g_fence_sig_tail <
+	    sizeof(g_fence_sig) / sizeof(g_fence_sig[0])) {
+		unsigned slot = g_fence_sig_head++ %
+			(sizeof(g_fence_sig) / sizeof(g_fence_sig[0]));
+		g_fence_sig[slot].ctx_id   = ctx_id;
+		g_fence_sig[slot].ring_idx = ring_idx;
+		g_fence_sig[slot].fence_id = fence_id;
+	} else {
+		/* Never silent: a dropped signal is a hung guest fence. */
+		InterlockedIncrement(&g_fence_sig_dropped);
+	}
+	LeaveCriticalSection(&g_fence_lock);
+}
+
+static int cogpu_park(int vq, uint16_t head, uint32_t written,
+		      uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id)
+{
+	unsigned i;
+
+	for (i = 0; i < sizeof(g_parked) / sizeof(g_parked[0]); i++) {
+		if (g_parked[i].vq < 0) {
+			g_parked[i].vq	     = vq;
+			g_parked[i].head     = head;
+			g_parked[i].written  = written;
+			g_parked[i].ctx_id   = ctx_id;
+			g_parked[i].ring_idx = ring_idx;
+			g_parked[i].fence_id = fence_id;
+			return 0;
+		}
+	}
+	return -1;
+}
+
 void cogpu_ring_doorbell(void)
 {
 	if (g_wake_handle)
@@ -463,6 +543,7 @@ static void *chain_gather(struct cogpu_chain *chain, int first,
 #define VIRTIO_GPU_RESP_ERR_UNSPEC		0x1200
 
 #define VIRTIO_GPU_FLAG_FENCE			(1 << 0)
+#define VIRTIO_GPU_FLAG_INFO_RING_IDX		(1 << 1)
 
 struct virtio_gpu_ctrl_hdr {
 	uint32_t type;
@@ -497,6 +578,17 @@ static struct gpu_stats g_stats;
  * an error; it produces a thread that never wakes, which is why the fence id
  * is copied rather than recomputed.
  */
+/*
+ * The one request whose completion must wait. Set by serve() when a fenced
+ * request belongs to a Venus context; the loop parks the chain instead of
+ * publishing it, and the fence callback releases it later.
+ */
+static struct {
+	int	 pending;
+	uint32_t ctx_id, ring_idx;
+	uint64_t fence_id;
+} g_park_req;
+
 static uint32_t serve(struct cogpu_chain *chain)
 {
 	struct virtio_gpu_ctrl_hdr req, *resp;
@@ -565,7 +657,13 @@ static uint32_t serve(struct cogpu_chain *chain)
 			memcpy(&q, (char *)chain->in[0].addr + sizeof(req), sizeof(q));
 
 		/* index 0 -> VIRGL (1), index 1 -> VIRGL2 (2) */
-		info->capset_id = (q.capset_index == 0) ? 1 : 2;
+		/*
+		 * Index 2 is Venus (capset id 4). When the renderer came up
+		 * without Vulkan, get_cap_set answers version 0 / size 0 for
+		 * it and Mesa moves on -- an honest absence, no special case.
+		 */
+		info->capset_id = (q.capset_index == 0) ? 1 :
+				  (q.capset_index == 1) ? 2 : 4;
 		cogpu_vrend_capset(info->capset_id, &info->version, &info->size);
 		info->pad = 0;
 
@@ -608,6 +706,12 @@ static uint32_t serve(struct cogpu_chain *chain)
 		if (cogpu_vrend_ctx_create(req.ctx_id, c.name,
 					   c.namelen > 63 ? 63 : c.namelen,
 					   c.ctx_init) == 0) {
+			/* Capset 0 means the legacy default, VIRGL2 -- the
+			 * same rule vrend.c applies when creating it. */
+			if (req.ctx_id < COGPU_MAX_CTX)
+				g_ctx_capset[req.ctx_id] =
+					(c.ctx_init & 0xff) ? (c.ctx_init & 0xff)
+							    : 2;
 			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 			if (verbose)
 				logline("  ctx %u created, capset %u\n",
@@ -620,6 +724,8 @@ static uint32_t serve(struct cogpu_chain *chain)
 
 	case VIRTIO_GPU_CMD_CTX_DESTROY:
 		cogpu_vrend_ctx_destroy(req.ctx_id);
+		if (req.ctx_id < COGPU_MAX_CTX)
+			g_ctx_capset[req.ctx_id] = 0;
 		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 		break;
 
@@ -1316,11 +1422,43 @@ static uint32_t serve(struct cogpu_chain *chain)
 	}
 
 	if (req.flags & VIRTIO_GPU_FLAG_FENCE) {
-		resp->flags    = VIRTIO_GPU_FLAG_FENCE;
+		resp->flags    = req.flags &
+			(VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX);
 		resp->fence_id = req.fence_id;
 		resp->ctx_id   = req.ctx_id;
 		resp->ring_idx = req.ring_idx;
 		g_stats.fenced++;
+
+		/*
+		 * GL completes inline because virgl_renderer_submit_cmd is
+		 * synchronous -- by the time this runs, the work is done, and
+		 * that path stays exactly as it has been since R4. Venus is
+		 * not: vkr executes on its own ring threads, and the virtio
+		 * fence contract is that THIS RESPONSE does not appear in the
+		 * used ring until the fence retires. So a real per-context
+		 * fence is created and the loop parks the chain; the fence
+		 * callback releases it. An error response is not parked --
+		 * nothing was submitted, so nothing will ever signal it.
+		 */
+		if (ctx_is_venus(req.ctx_id) &&
+		    resp->type != VIRTIO_GPU_RESP_ERR_UNSPEC) {
+			uint32_t ring =
+				(req.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX)
+					? req.ring_idx : 0;
+
+			if (cogpu_vrend_ctx_fence(req.ctx_id, ring,
+						  req.fence_id) == 0) {
+				g_park_req.pending  = 1;
+				g_park_req.ctx_id   = req.ctx_id;
+				g_park_req.ring_idx = ring;
+				g_park_req.fence_id = req.fence_id;
+			} else {
+				logline("  ctx %u ring %u: fence %llu refused"
+					" by renderer -- completing inline\n",
+					req.ctx_id, ring,
+					(unsigned long long)req.fence_id);
+			}
+		}
 	}
 
 	g_stats.requests++;
@@ -1612,6 +1750,35 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	InitializeCriticalSection(&g_fence_lock);
+	{
+		unsigned i;
+
+		for (i = 0; i < sizeof(g_parked) / sizeof(g_parked[0]); i++)
+			g_parked[i].vq = -1;
+		g_parked_init_done = 1;
+	}
+	cogpu_vrend_set_ctx_fence_cb(cogpu_ctx_fence_signal);
+
+	/*
+	 * The ICD, for a box where it is not registered. This machine's
+	 * NVIDIA install never wrote HKLM\SOFTWARE\Khronos\Vulkan\Drivers,
+	 * so the loader enumerates zero devices unless told per-process.
+	 * Only when unset, only if the json actually exists -- on any other
+	 * machine this is a no-op and the registry does its normal job.
+	 */
+	if (GetEnvironmentVariableA("VK_ICD_FILENAMES", NULL, 0) == 0) {
+		const char *icd = "C:\\Windows\\System32\\DriverStore\\"
+			"FileRepository\\nvhdc.inf_amd64_3142914239be99ea\\"
+			"nv-vk64.json";
+
+		if (GetFileAttributesA(icd) != INVALID_FILE_ATTRIBUTES) {
+			SetEnvironmentVariableA("VK_ICD_FILENAMES", icd);
+			logline("VK_ICD_FILENAMES set to the unregistered"
+				" NVIDIA ICD\n");
+		}
+	}
+
 	/*
 	 * The renderer, before anything else that matters. If it will not come
 	 * up there is no point servicing a ring: the guest would get OK to
@@ -1628,11 +1795,20 @@ int main(int argc, char **argv)
 	}
 	if (!kwindow_test) {
 		logline("renderer: %s\n", cogpu_vrend_renderer());
+		logline("venus: %s\n", cogpu_vrend_has_venus()
+			? "up -- Vulkan forwarding available"
+			: "not available -- GL only (no vulkan-1.dll or no"
+			  " ICD); everything still works");
 		{
 			unsigned int v = 0, sz = 0;
 
 			cogpu_vrend_capset(1, &v, &sz);
 			logline("virgl capset: version %u, %u bytes\n", v, sz);
+			if (cogpu_vrend_has_venus()) {
+				cogpu_vrend_capset(4, &v, &sz);
+				logline("venus capset: version %u, %u bytes\n",
+					v, sz);
+			}
 		}
 		if (present_probe)
 			return cogpu_present_probe(12000);
@@ -1875,9 +2051,73 @@ int main(int argc, char **argv)
 			while (cogpu_vring_pop(&vq[i], resolve_gpa, NULL, &chain)) {
 				uint32_t written = serve(&chain);
 
+				/*
+				 * A fenced Venus request is answered but not
+				 * published: the used element appears when
+				 * the fence retires, which is the virtio
+				 * fence contract. A full park table falls
+				 * back to inline completion -- wrong ordering
+				 * is survivable, a lost request is not.
+				 */
+				if (g_park_req.pending) {
+					g_park_req.pending = 0;
+					if (cogpu_park(i, chain.head, written,
+						       g_park_req.ctx_id,
+						       g_park_req.ring_idx,
+						       g_park_req.fence_id) == 0)
+						continue;
+					logline("park table full; completing"
+						" ctx %u fence %llu inline\n",
+						g_park_req.ctx_id,
+						(unsigned long long)
+						g_park_req.fence_id);
+				}
 				cogpu_vring_push(&vq[i], &chain, written);
 				did = 1;
 			}
+		}
+
+		/*
+		 * Fences that retired on vkr's threads since the last pass.
+		 * Publishing happens HERE, on the thread that owns the
+		 * vrings; the callback only queued the triple. One signal
+		 * releases every parked request on that ring up to the id,
+		 * because per-ring fences retire in order.
+		 */
+		if (g_fence_sig_head != g_fence_sig_tail) {
+			EnterCriticalSection(&g_fence_lock);
+			while (g_fence_sig_tail != g_fence_sig_head) {
+				unsigned slot = g_fence_sig_tail++ %
+					(sizeof(g_fence_sig) /
+					 sizeof(g_fence_sig[0]));
+				uint32_t ctx  = g_fence_sig[slot].ctx_id;
+				uint32_t ring = g_fence_sig[slot].ring_idx;
+				uint64_t id   = g_fence_sig[slot].fence_id;
+				unsigned p;
+
+				for (p = 0; p < sizeof(g_parked) /
+					    sizeof(g_parked[0]); p++) {
+					struct cogpu_parked *pk = &g_parked[p];
+					struct cogpu_chain stub;
+
+					if (pk->vq < 0 || pk->ctx_id != ctx ||
+					    pk->ring_idx != ring ||
+					    pk->fence_id > id)
+						continue;
+					stub.head = pk->head;
+					cogpu_vring_push(&vq[pk->vq], &stub,
+							 pk->written);
+					pk->vq = -1;
+					did = 1;
+				}
+			}
+			LeaveCriticalSection(&g_fence_lock);
+		}
+		if (g_fence_sig_dropped) {
+			logline("WARNING: %ld fence signals dropped -- guest"
+				" fences may hang; enlarge g_fence_sig\n",
+				(long)g_fence_sig_dropped);
+			g_fence_sig_dropped = 0;
 		}
 
 		if (did) {

@@ -206,12 +206,41 @@ static void vrend_present_flush(void)
 				      vrend_present_request.damage_height);
 }
 
+/*
+ * Venus fences retire on vkr's ring threads, NOT on the thread that
+ * submitted -- that is the point of ASYNC_FENCE_CB. This forwards to the
+ * daemon, which must treat it as a cross-thread signal and do nothing to the
+ * vrings here.
+ */
+static cogpu_ctx_fence_fn vrend_ctx_fence_cb;
+
+static void vrend_write_context_fence(void *cookie, uint32_t ctx_id,
+				      uint32_t ring_idx, uint64_t fence_id)
+{
+	(void)cookie;
+	if (vrend_ctx_fence_cb)
+		vrend_ctx_fence_cb(ctx_id, ring_idx, fence_id);
+}
+
+void cogpu_vrend_set_ctx_fence_cb(cogpu_ctx_fence_fn fn)
+{
+	vrend_ctx_fence_cb = fn;
+}
+
+static int vrend_venus;
+
+int cogpu_vrend_has_venus(void)
+{
+	return vrend_venus;
+}
+
 static struct virgl_renderer_callbacks vrend_cbs = {
 	.version	   = 5,
 	.write_fence	   = vrend_write_fence,
 	.create_gl_context = wgl_create_context,
 	.destroy_gl_context = wgl_destroy_context,
 	.make_current	   = wgl_make_current,
+	.write_context_fence = vrend_write_context_fence,
 	.moco_present	   = vrend_moco_present,
 };
 
@@ -231,13 +260,41 @@ int cogpu_vrend_init(cogpu_fence_fn fence_cb, void *fence_ctx)
 	 * above are the alternative the library documents, and the cookie must
 	 * be non-NULL -- virgl_renderer_init checks `!cookie || !cbs` and
 	 * returns -1, which cost an hour the first time.
+	 *
+	 * Venus first, GL alone as the fallback. The DLL does not import
+	 * vulkan-1.dll -- it loads it at runtime -- so on a machine with no
+	 * Vulkan the VENUS init fails cleanly and the retry without it is
+	 * the machine's honest capability, not an error.
 	 */
-	rc = virgl_renderer_init(&vrend_cbs, 0, &vrend_cbs);
-	if (rc != 0)
-		return rc;
+	rc = virgl_renderer_init(&vrend_cbs,
+				 VIRGL_RENDERER_VENUS |
+				 VIRGL_RENDERER_ASYNC_FENCE_CB,
+				 &vrend_cbs);
+	if (rc == 0) {
+		vrend_venus = 1;
+	} else {
+		rc = virgl_renderer_init(&vrend_cbs, 0, &vrend_cbs);
+		if (rc != 0)
+			return rc;
+	}
 
 	vrend_ready = 1;
 	return 0;
+}
+
+/*
+ * A per-context fence for a Venus ring. The completion arrives later on
+ * vrend_write_context_fence; fences on one ring retire in submission order,
+ * which is what lets the daemon publish every parked request up to the
+ * signalled id.
+ */
+int cogpu_vrend_ctx_fence(uint32_t ctx_id, uint32_t ring_idx,
+			  uint64_t fence_id)
+{
+	if (!vrend_ready)
+		return -1;
+	return virgl_renderer_context_create_fence(ctx_id, 0, ring_idx,
+						   fence_id);
 }
 
 const char *cogpu_vrend_renderer(void)

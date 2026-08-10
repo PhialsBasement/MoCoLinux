@@ -2462,7 +2462,14 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 					 * is advertised is what the host GL
 					 * can actually do.
 					 */
-					hdr.num_capsets	  = 2;
+					/*
+					 * Index 2 is Venus. If the daemon's
+					 * renderer came up GL-only, the capset
+					 * answers version 0 and Mesa skips it
+					 * -- the count can be honest either
+					 * way.
+					 */
+					hdr.num_capsets	  = 3;
 					/*
 					 * VERSION_1 (bit 32), VIRGL (bit 0) and
 					 * CONTEXT_INIT (bit 4).

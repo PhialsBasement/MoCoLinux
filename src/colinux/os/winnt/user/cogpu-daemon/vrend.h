@@ -79,6 +79,12 @@ int	    cogpu_vrend_resource_info(uint32_t res_id,
 					 struct cogpu_vrend_resource_info *info);
 int	    cogpu_vrend_attach_iov(uint32_t res_id, struct iovec *iov, int niov);
 void	    cogpu_vrend_detach_iov(uint32_t res_id);
+typedef void (*cogpu_ctx_fence_fn)(uint32_t ctx_id, uint32_t ring_idx,
+				   uint64_t fence_id);
+void	    cogpu_vrend_set_ctx_fence_cb(cogpu_ctx_fence_fn fn);
+int	    cogpu_vrend_has_venus(void);
+int	    cogpu_vrend_ctx_fence(uint32_t ctx_id, uint32_t ring_idx,
+				  uint64_t fence_id);
 int	    cogpu_vrend_create_blob(uint32_t ctx_id, uint32_t res_id,
 				    uint32_t blob_mem, uint32_t blob_flags,
 				    uint64_t blob_id, uint64_t size,
