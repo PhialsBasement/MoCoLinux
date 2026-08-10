@@ -60,6 +60,23 @@ extern void*		  co_kload_frame_va(co_pfn_t pfn);
 extern void*		  co_kload_pseudo_frame_va(co_pfn_t pfn);
 extern co_rc_t		  co_kload_pseudo_to_machine(co_pa_t pseudo,
 					     co_pa_t* machine);
+/*
+ * Make host memory appear in the guest's physical address space.
+ *
+ * For Venus, where the guest must write into memory the host's GPU reads. The
+ * caller owns the machine frames and must keep them resident for as long as
+ * the window is mapped -- locked with an MDL, in practice, since the guest
+ * will be handed page-table entries naming them.
+ *
+ * Nothing is reserved in advance: address space is taken here and returned by
+ * the unmap, so OUT_OF_MEMORY is an ordinary answer rather than a failure.
+ * Frame zero is rejected, being indistinguishable from an unmapped page.
+ */
+extern co_rc_t		  co_kload_window_map(const co_pfn_t* mfns,
+					      unsigned long count,
+					      co_pa_t* pseudo_out);
+extern void		  co_kload_window_unmap(co_pa_t pseudo,
+						unsigned long count);
 extern unsigned long	  co_kload_p2m_pages(void);
 extern unsigned long long co_kload_m2p_mask(void);
 /*

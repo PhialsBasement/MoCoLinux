@@ -63,6 +63,8 @@ typedef enum {
 	CO_MANAGER_IOCTL_KMAP_RANGE,
 	CO_MANAGER_IOCTL_TEST_SMP,
 	CO_MANAGER_IOCTL_KVCPU_RUN,
+	CO_MANAGER_IOCTL_KWINDOW,
+	CO_MANAGER_IOCTL_KUNWINDOW,
 } co_manager_ioctl_t;
 
 /*
@@ -455,6 +457,37 @@ typedef struct {
 	co_rc_t		   rc;
 	unsigned long	   released;	/* out: slices unmapped */
 } co_manager_ioctl_kunmap_t;
+
+/*
+ * KMAP's mirror: host memory made visible to the GUEST.
+ *
+ * KMAP gives a host process a window onto guest RAM. This gives the guest a
+ * window onto host memory, which is what Venus needs -- Vulkan requires the
+ * application to write into memory the GPU reads, and the application is in
+ * the guest while the GPU allocation is on the host.
+ *
+ * The caller passes its own virtual range; the driver locks those pages and
+ * publishes their machine frames in the guest's p2m, returning the pseudo-
+ * physical address at which the guest will find them. The pages stay locked
+ * until KUNWINDOW, because the guest is handed page-table entries naming them
+ * and a page that moved underneath would be silent corruption of whatever
+ * took its place.
+ *
+ * Nothing is reserved: a window is taken when asked for and returned on
+ * release, so a refusal here is ordinary and the caller is expected to cope.
+ */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long va;		/* in: caller's virtual address */
+	unsigned long long bytes;	/* in: length, page multiples only */
+	unsigned long long pseudo_pa;	/* out: where the guest sees it */
+} co_manager_ioctl_kwindow_t;
+
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long pseudo_pa;	/* in: as returned by KWINDOW */
+	unsigned long long bytes;	/* in: the same length */
+} co_manager_ioctl_kunwindow_t;
 
 /*
  * interface for CO_MANAGER_IOCTL_VGPU: where the guest's transport structure

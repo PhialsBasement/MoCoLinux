@@ -167,11 +167,127 @@ static bool_t kload_machine_to_pseudo_pfn(co_pfn_t mfn, co_pfn_t* ppfn_out)
 
 static bool_t kload_pseudo_to_machine_pfn(co_pfn_t ppfn, co_pfn_t* mfn_out)
 {
-	if (kload_p2m == NULL || ppfn >= kload_backed_pages)
+	if (kload_p2m == NULL || ppfn >= kload_p2m_capacity)
+		return PFALSE;
+
+	/*
+	 * Pages above backed RAM are host windows (see the window allocator
+	 * below), and only the ones actually mapped may translate. The array is
+	 * zeroed at allocation and machine frame zero is never a guest page, so
+	 * a zero entry is exactly "nothing is mapped here" -- which is the same
+	 * answer this used to give for every address above guest RAM, only now
+	 * it is a fact about the entry rather than about the boundary.
+	 */
+	if (ppfn >= kload_backed_pages && kload_p2m[ppfn] == 0)
 		return PFALSE;
 
 	*mfn_out = kload_p2m[ppfn];
 	return PTRUE;
+}
+
+/*
+ * Host memory windows in the guest's address space.
+ *
+ * Vulkan's contract is that the application writes into memory the GPU reads,
+ * so a guest running Venus needs host GPU-visible memory to appear in its own
+ * physical address space. The p2m already performs exactly that translation
+ * for guest RAM; a window is the same mechanism pointed at frames the host
+ * obtained from somewhere else.
+ *
+ * Nothing is reserved. QEMU's Windows Venus port pins a fixed multi-gigabyte
+ * region up front because WHPX makes it establish guest-physical ranges in
+ * advance, whether or not anything ever uses them. We own the p2m, so we can
+ * do what the rest of this file already does with guest RAM: take what the
+ * host can give, at the moment something asks for it, and give it back on
+ * release. A refusal is an ordinary outcome and the caller is expected to
+ * cope -- the same contract as kload_block_alloc returning NULL.
+ *
+ * Windows are allocated downward from the top of p2m capacity while guest RAM
+ * grows upward from zero, so neither has to predict how much the other will
+ * want; they simply must not meet.
+ *
+ * m2p is deliberately NOT populated. The reverse map answers "which guest page
+ * is this machine frame", and these frames are not guest pages -- they belong
+ * to a host allocation that merely appears in the guest's address space. A
+ * reverse entry would let a page-table walk mistake GPU memory for guest RAM.
+ */
+static unsigned long kload_window_next;	/* lowest window PFN handed out */
+
+co_rc_t co_kload_window_map(const co_pfn_t* mfns, unsigned long count,
+			    co_pa_t* pseudo_out)
+{
+	unsigned long first, i;
+
+	if (mfns == NULL || pseudo_out == NULL || count == 0)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(kload_lock);
+
+	if (kload_p2m == NULL) {
+		co_os_mutex_release(kload_lock);
+		return CO_RC(ERROR);
+	}
+
+	/* The two allocators meet in the middle; whoever asks second loses. */
+	if (kload_window_next < count ||
+	    kload_window_next - count < kload_backed_pages) {
+		co_os_mutex_release(kload_lock);
+		return CO_RC(OUT_OF_MEMORY);
+	}
+
+	first = kload_window_next - count;
+	for (i = 0; i < count; i++) {
+		/*
+		 * Frame zero would be indistinguishable from an unmapped entry
+		 * and would silently punch a hole in the middle of a window.
+		 */
+		if (mfns[i] == 0) {
+			while (i-- > 0)
+				kload_p2m[first + i] = 0;
+			co_os_mutex_release(kload_lock);
+			return CO_RC(INVALID_PARAMETER);
+		}
+		kload_p2m[first + i] = mfns[i];
+	}
+
+	kload_window_next = first;
+	*pseudo_out = ((co_pa_t)first) << CO_ARCH_PAGE_SHIFT;
+
+	co_os_mutex_release(kload_lock);
+	return CO_RC(OK);
+}
+
+void co_kload_window_unmap(co_pa_t pseudo, unsigned long count)
+{
+	unsigned long first = (unsigned long)(pseudo >> CO_ARCH_PAGE_SHIFT);
+	unsigned long i;
+
+	if (count == 0)
+		return;
+
+	co_os_mutex_acquire(kload_lock);
+
+	if (kload_p2m == NULL || first < kload_backed_pages ||
+	    first < kload_window_next ||
+	    count > kload_p2m_capacity - first) {
+		co_os_mutex_release(kload_lock);
+		return;
+	}
+
+	for (i = 0; i < count; i++)
+		kload_p2m[first + i] = 0;
+
+	/*
+	 * Address space comes back only when the most recent window is the one
+	 * released; anything else leaves a hole that later windows skip over.
+	 * Windows are few and long-lived, so a free list would be bookkeeping
+	 * for a case that does not arise -- and the entries are cleared either
+	 * way, which is what stops the guest from reaching the memory.
+	 */
+	if (first == kload_window_next)
+		kload_window_next += count;
+
+	co_os_mutex_release(kload_lock);
 }
 
 static co_pa_t kload_pseudo_to_machine_pa(co_pa_t pseudo)
@@ -467,6 +583,7 @@ static void kload_release_pages(co_manager_t* manager)
 	kload_m2p_alloc_pages = 0;
 	kload_p2m_capacity	= 0;
 	kload_backed_pages	= 0;
+	kload_window_next	= 0;
 	kload_m2p_slots	= 0;
 	kload_m2p_mask_value	= 0;
 	kload_ram_ready	= PFALSE;
@@ -818,6 +935,8 @@ static co_rc_t kload_translation_alloc(unsigned long capacity_pages)
 	co_memset(kload_m2p, 0,
 		  (long)(kload_m2p_alloc_pages << CO_ARCH_PAGE_SHIFT));
 	kload_p2m_capacity = capacity_pages;
+	/* Windows grow down from the top; guest RAM grows up from zero. */
+	kload_window_next = capacity_pages;
 	return CO_RC(OK);
 }
 

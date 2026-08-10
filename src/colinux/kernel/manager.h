@@ -40,6 +40,14 @@ typedef struct co_manager_kmap_slice {
 	unsigned long long bytes;
 } co_manager_kmap_slice_t;
 
+/* One host-memory window published into the guest; see KWINDOW. */
+typedef struct co_manager_window {
+	struct co_manager_window *next;
+	void		 *handle;	/* the MDL holding the pages down */
+	unsigned long	  pages;
+	unsigned long long pseudo_pa;	/* where the guest sees them */
+} co_manager_window_t;
+
 /*
  * Stamped at open, cleared immediately before the descriptor is freed.
  *
@@ -89,6 +97,17 @@ typedef struct co_manager_open_desc {
 	co_manager_kmap_slice_t *kmap_slice;
 	unsigned long		  kmap_slices;
 	bool_t			  kmap_reserved;
+
+	/*
+	 * Host memory windows published into the guest (KWINDOW), tracked for
+	 * the same reason the kmap slices above are: the guest holds page-table
+	 * entries naming these machine frames, so a process that dies without
+	 * releasing them would leave the guest -- and the GPU -- pointed at
+	 * memory Windows has re-issued to something else. Cleanup on handle
+	 * close clears the p2m entries first, then unlocks the pages.
+	 */
+	struct co_manager_window *window;
+	unsigned long		  windows;
 } *co_manager_open_desc_t;
 
 /*
@@ -148,6 +167,20 @@ extern co_rc_t co_manager_open_desc_deactive_and_close(co_manager_t *manager, co
  */
 extern void co_manager_kmap_release(co_manager_t *manager,
 				    co_manager_open_desc_t opened);
+
+/*
+ * Host-memory windows published into the guest (KWINDOW). Release clears the
+ * p2m entries before unlocking the pages, so the guest can never hold a
+ * page-table entry naming a frame Windows has taken back.
+ */
+extern void co_manager_window_track(co_manager_open_desc_t opened,
+				    void *handle,
+				    unsigned long long pseudo_pa,
+				    unsigned long pages);
+extern co_rc_t co_manager_window_release(co_manager_open_desc_t opened,
+					 unsigned long long pseudo_pa,
+					 unsigned long pages);
+extern void co_manager_window_release_all(co_manager_open_desc_t opened);
 extern co_rc_t co_manager_close(co_manager_t *manager, co_manager_open_desc_t opened);
 
 extern void co_manager_unload(co_manager_t *manager);

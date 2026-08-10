@@ -17,6 +17,7 @@
 #include <colinux/os/kernel/manager.h>
 #include <colinux/os/kernel/misc.h>
 #include <colinux/os/kernel/mutex.h>
+#include <colinux/os/kernel/user.h>	/* page locking, for KWINDOW */
 #include <colinux/os/timer.h>
 #include <colinux/arch/mmu.h>
 #include <colinux/arch/probe.h>
@@ -695,6 +696,102 @@ out:
 	return rc;
 }
 
+/*
+ * Host-memory windows published into the guest.
+ *
+ * The order in release is not arbitrary and is the whole point of tracking
+ * them: the p2m entries go first, so the guest can no longer reach the pages,
+ * and only then are the pages unlocked. Unlocking first would leave a window
+ * in which the guest's page tables name frames Windows has already taken back.
+ */
+void co_manager_window_track(co_manager_open_desc_t opened, void* handle,
+			     unsigned long long pseudo_pa, unsigned long pages)
+{
+	co_manager_window_t* node;
+
+	if (!opened)
+		return;
+
+	node = (co_manager_window_t*)co_os_malloc(sizeof(*node));
+	if (node == NULL) {
+		/*
+		 * Untracked would mean leaked on close, which is the failure
+		 * this list exists to prevent. Undo instead.
+		 */
+		co_kload_window_unmap((co_pa_t)pseudo_pa, pages);
+		co_os_user_unlock_pages(handle);
+		return;
+	}
+
+	node->handle	= handle;
+	node->pages	= pages;
+	node->pseudo_pa = pseudo_pa;
+
+	co_os_mutex_acquire(opened->lock);
+	node->next	= opened->window;
+	opened->window	= node;
+	opened->windows++;
+	co_os_mutex_release(opened->lock);
+}
+
+co_rc_t co_manager_window_release(co_manager_open_desc_t opened,
+				  unsigned long long pseudo_pa,
+				  unsigned long pages)
+{
+	co_manager_window_t* node = NULL;
+	co_manager_window_t** link;
+
+	if (!opened)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(opened->lock);
+	for (link = &opened->window; *link != NULL; link = &(*link)->next) {
+		if ((*link)->pseudo_pa == pseudo_pa && (*link)->pages == pages) {
+			node  = *link;
+			*link = node->next;
+			opened->windows--;
+			break;
+		}
+	}
+	co_os_mutex_release(opened->lock);
+
+	if (node == NULL)
+		return CO_RC(NOT_FOUND);
+
+	co_kload_window_unmap((co_pa_t)node->pseudo_pa, node->pages);
+	co_os_user_unlock_pages(node->handle);
+	co_os_free(node);
+	return CO_RC(OK);
+}
+
+void co_manager_window_release_all(co_manager_open_desc_t opened)
+{
+	co_manager_window_t* list;
+	unsigned long count = 0;
+
+	if (!opened)
+		return;
+
+	co_os_mutex_acquire(opened->lock);
+	list		= opened->window;
+	opened->window	= NULL;
+	opened->windows = 0;
+	co_os_mutex_release(opened->lock);
+
+	while (list != NULL) {
+		co_manager_window_t* next = list->next;
+
+		co_kload_window_unmap((co_pa_t)list->pseudo_pa, list->pages);
+		co_os_user_unlock_pages(list->handle);
+		co_os_free(list);
+		list = next;
+		count++;
+	}
+
+	if (count)
+		co_debug("kwindow: released %lu host window(s)", count);
+}
+
 void co_manager_kmap_release(co_manager_t* manager, co_manager_open_desc_t opened)
 {
 	co_manager_kmap_slice_t* list;
@@ -703,6 +800,8 @@ void co_manager_kmap_release(co_manager_t* manager, co_manager_open_desc_t opene
 
 	if (!opened)
 		return;
+
+	co_manager_window_release_all(opened);
 
 	co_os_mutex_acquire(opened->lock);
 	list = opened->kmap_slice;
@@ -1021,6 +1120,52 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			return CO_RC(INVALID_PARAMETER);
 
 		params->rc = co_manager_kmap_range(manager, opened, params);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	/*
+	 * KMAP's mirror: host memory published into the guest's address space,
+	 * for Venus, where the guest writes into memory the host's GPU reads.
+	 * The pages are locked here and stay locked until KUNWINDOW, because
+	 * the guest is given page-table entries naming their machine frames.
+	 */
+	case CO_MANAGER_IOCTL_KWINDOW: {
+		co_manager_ioctl_kwindow_t* params = (typeof(params))(io_buffer);
+		co_pfn_t* pfns	= NULL;
+		void*	  handle = NULL;
+		unsigned long count = 0;
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->pseudo_pa = 0;
+		params->rc = co_os_user_lock_pages((void*)(uintptr_t)params->va,
+						   (unsigned long)params->bytes,
+						   &handle, &pfns, &count);
+		if (CO_OK(params->rc)) {
+			params->rc = co_kload_window_map(pfns, count,
+							 (co_pa_t*)&params->pseudo_pa);
+			if (!CO_OK(params->rc))
+				co_os_user_unlock_pages(handle);
+			else
+				co_manager_window_track(opened, handle,
+							params->pseudo_pa, count);
+			co_os_free(pfns);
+		}
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KUNWINDOW: {
+		co_manager_ioctl_kunwindow_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_manager_window_release(opened, params->pseudo_pa,
+						       (unsigned long)(params->bytes
+							>> CO_ARCH_PAGE_SHIFT));
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}
