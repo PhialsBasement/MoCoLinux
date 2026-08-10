@@ -270,6 +270,59 @@ co_rc_t co_kload_window_map(const co_pfn_t* mfns, unsigned long count,
 	return CO_RC(OK);
 }
 
+/*
+ * A window at an address the CALLER chose. RESOURCE_MAP_BLOB works this way
+ * round: the guest's drm_mm picks the offset inside the advertised region and
+ * the host is told, not asked. So this side validates rather than allocates --
+ * the range must lie inside the arena and every slot must be vacant. The
+ * downward allocator above and the guest's bottom-up drm_mm share the arena
+ * without coordination; whoever asks for an occupied slot is refused, which
+ * both sides treat as an ordinary answer.
+ */
+co_rc_t co_kload_window_map_at(const co_pfn_t* mfns, unsigned long count,
+			       co_pa_t pseudo)
+{
+	unsigned long first = (unsigned long)(pseudo >> CO_ARCH_PAGE_SHIFT);
+	unsigned long i;
+
+	if (mfns == NULL || count == 0 ||
+	    (pseudo & (CO_ARCH_PAGE_SIZE - 1)) != 0)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(kload_lock);
+
+	if (kload_p2m == NULL) {
+		co_os_mutex_release(kload_lock);
+		return CO_RC(ERROR);
+	}
+
+	if (first < kload_backed_pages ||
+	    count > kload_p2m_capacity - first) {
+		co_os_mutex_release(kload_lock);
+		return CO_RC(INVALID_PARAMETER);
+	}
+
+	for (i = 0; i < count; i++) {
+		if (kload_p2m[first + i] != 0) {
+			co_os_mutex_release(kload_lock);
+			return CO_RC(OUT_OF_MEMORY);
+		}
+	}
+
+	for (i = 0; i < count; i++) {
+		if (mfns[i] == 0) {
+			while (i-- > 0)
+				kload_p2m[first + i] = 0;
+			co_os_mutex_release(kload_lock);
+			return CO_RC(INVALID_PARAMETER);
+		}
+		kload_p2m[first + i] = mfns[i];
+	}
+
+	co_os_mutex_release(kload_lock);
+	return CO_RC(OK);
+}
+
 void co_kload_window_unmap(co_pa_t pseudo, unsigned long count)
 {
 	unsigned long first = (unsigned long)(pseudo >> CO_ARCH_PAGE_SHIFT);
@@ -280,8 +333,13 @@ void co_kload_window_unmap(co_pa_t pseudo, unsigned long count)
 
 	co_os_mutex_acquire(kload_lock);
 
+	/*
+	 * No watermark refusal here: caller-placed windows (map_at) live below
+	 * kload_window_next by design. What userspace may free is already
+	 * gated by the per-handle exact match in co_manager_window_release;
+	 * this check is only against corrupting RAM's entries.
+	 */
 	if (kload_p2m == NULL || first < kload_backed_pages ||
-	    first < kload_window_next ||
 	    count > kload_p2m_capacity - first) {
 		co_os_mutex_release(kload_lock);
 		return;

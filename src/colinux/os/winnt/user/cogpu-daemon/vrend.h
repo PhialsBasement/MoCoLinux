@@ -79,6 +79,13 @@ int	    cogpu_vrend_resource_info(uint32_t res_id,
 					 struct cogpu_vrend_resource_info *info);
 int	    cogpu_vrend_attach_iov(uint32_t res_id, struct iovec *iov, int niov);
 void	    cogpu_vrend_detach_iov(uint32_t res_id);
+int	    cogpu_vrend_create_blob(uint32_t ctx_id, uint32_t res_id,
+				    uint32_t blob_mem, uint32_t blob_flags,
+				    uint64_t blob_id, uint64_t size,
+				    struct iovec *iov, int niov);
+int	    cogpu_vrend_resource_map(uint32_t res_id, void **va, uint64_t *size);
+int	    cogpu_vrend_resource_unmap(uint32_t res_id);
+int	    cogpu_vrend_map_info(uint32_t res_id, uint32_t *map_info);
 
 void	    cogpu_vrend_poll(void);
 uint64_t    cogpu_vrend_fences(void);

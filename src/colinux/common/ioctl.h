@@ -65,6 +65,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KVCPU_RUN,
 	CO_MANAGER_IOCTL_KWINDOW,
 	CO_MANAGER_IOCTL_KUNWINDOW,
+	CO_MANAGER_IOCTL_KWINDOW_AT,
 } co_manager_ioctl_t;
 
 /*
@@ -488,6 +489,20 @@ typedef struct {
 	unsigned long long pseudo_pa;	/* in: as returned by KWINDOW */
 	unsigned long long bytes;	/* in: the same length */
 } co_manager_ioctl_kunwindow_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_KWINDOW_AT: a window at an address the
+ * caller chose. RESOURCE_MAP_BLOB works this way round -- the guest's drm_mm
+ * picks the offset inside the advertised region -- so the driver validates
+ * (inside the arena, all slots vacant) instead of allocating. Released with
+ * KUNWINDOW like any other window.
+ */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long va;		/* in: caller's virtual address */
+	unsigned long long bytes;	/* in: length, page multiples only */
+	unsigned long long pseudo_pa;	/* in: where the guest asked for it */
+} co_manager_ioctl_kwindow_at_t;
 
 /*
  * interface for CO_MANAGER_IOCTL_VGPU: where the guest's transport structure

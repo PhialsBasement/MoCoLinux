@@ -518,6 +518,68 @@ int cogpu_vrend_attach_iov(uint32_t res_id, struct iovec *iov, int niov)
 }
 
 /*
+ * Blob resources. The GUEST kind carries mem entries exactly like
+ * ATTACH_BACKING, and the same ownership rule applies: virglrenderer keeps
+ * the iovec pointer, so the caller passes an array this function copies.
+ * HOST3D carries none.
+ */
+int cogpu_vrend_create_blob(uint32_t ctx_id, uint32_t res_id,
+			    uint32_t blob_mem, uint32_t blob_flags,
+			    uint64_t blob_id, uint64_t size,
+			    struct iovec *iov, int niov)
+{
+	struct virgl_renderer_resource_create_blob_args args;
+	struct iovec *own = NULL;
+	int rc;
+
+	if (!vrend_ready)
+		return -1;
+
+	if (niov > 0) {
+		own = malloc((size_t)niov * sizeof(*own));
+		if (!own)
+			return -1;
+		memcpy(own, iov, (size_t)niov * sizeof(*own));
+	}
+
+	memset(&args, 0, sizeof(args));
+	args.res_handle = res_id;
+	args.ctx_id	= ctx_id;
+	args.blob_mem	= blob_mem;
+	args.blob_flags = blob_flags;
+	args.blob_id	= blob_id;
+	args.size	= size;
+	args.iovecs	= own;
+	args.num_iovs	= (uint32_t)(niov > 0 ? niov : 0);
+
+	rc = virgl_renderer_resource_create_blob(&args);
+	if (rc != 0)
+		free(own);
+	return rc;
+}
+
+int cogpu_vrend_resource_map(uint32_t res_id, void **va, uint64_t *size)
+{
+	if (!vrend_ready)
+		return -1;
+	return virgl_renderer_resource_map(res_id, va, size);
+}
+
+int cogpu_vrend_resource_unmap(uint32_t res_id)
+{
+	if (!vrend_ready)
+		return -1;
+	return virgl_renderer_resource_unmap(res_id);
+}
+
+int cogpu_vrend_map_info(uint32_t res_id, uint32_t *map_info)
+{
+	if (!vrend_ready)
+		return -1;
+	return virgl_renderer_resource_get_map_info(res_id, map_info);
+}
+
+/*
  * Detach hands the array back so it can be freed. Passing NULL for both
  * out-parameters -- which this did -- discards the pointer and leaks one
  * allocation per resource for the life of the daemon.

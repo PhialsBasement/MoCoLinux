@@ -1157,6 +1157,32 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_KWINDOW_AT: {
+		co_manager_ioctl_kwindow_at_t* params = (typeof(params))(io_buffer);
+		co_pfn_t* pfns	= NULL;
+		void*	  handle = NULL;
+		unsigned long count = 0;
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_os_user_lock_pages((void*)(uintptr_t)params->va,
+						   (unsigned long)params->bytes,
+						   &handle, &pfns, &count);
+		if (CO_OK(params->rc)) {
+			params->rc = co_kload_window_map_at(pfns, count,
+							    (co_pa_t)params->pseudo_pa);
+			if (!CO_OK(params->rc))
+				co_os_user_unlock_pages(handle);
+			else
+				co_manager_window_track(opened, handle,
+							params->pseudo_pa, count);
+			co_os_free(pfns);
+		}
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_KUNWINDOW: {
 		co_manager_ioctl_kunwindow_t* params = (typeof(params))(io_buffer);
 

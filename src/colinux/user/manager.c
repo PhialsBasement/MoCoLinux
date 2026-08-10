@@ -451,6 +451,48 @@ co_rc_t co_manager_kwindow(co_manager_handle_t handle,
 	return rc;
 }
 
+co_rc_t co_manager_kwindow_at(co_manager_handle_t handle,
+			      const void* va, unsigned long long bytes,
+			      unsigned long long pseudo_pa)
+{
+	co_manager_ioctl_kwindow_at_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	params.va = (unsigned long long)va;
+	params.bytes = bytes;
+	params.pseudo_pa = pseudo_pa;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KWINDOW_AT,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+
+	return rc;
+}
+
+co_rc_t co_manager_window_bounds(co_manager_handle_t handle,
+				 unsigned long long* base,
+				 unsigned long long* top)
+{
+	co_manager_ioctl_vgpu_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_VGPU,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (CO_OK(rc)) {
+		*base = params.window_base;
+		*top  = params.window_top;
+	}
+
+	return rc;
+}
+
 co_rc_t co_manager_kunwindow(co_manager_handle_t handle,
 			     unsigned long long pseudo_pa,
 			     unsigned long long bytes)

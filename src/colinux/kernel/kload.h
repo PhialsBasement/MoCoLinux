@@ -72,6 +72,9 @@ extern co_rc_t		  co_kload_pseudo_to_machine(co_pa_t pseudo,
  * the unmap, so OUT_OF_MEMORY is an ordinary answer rather than a failure.
  * Frame zero is rejected, being indistinguishable from an unmapped page.
  */
+extern co_rc_t		  co_kload_window_map_at(const co_pfn_t* mfns,
+						 unsigned long count,
+						 co_pa_t pseudo);
 extern co_rc_t		  co_kload_window_map(const co_pfn_t* mfns,
 					      unsigned long count,
 					      co_pa_t* pseudo_out);

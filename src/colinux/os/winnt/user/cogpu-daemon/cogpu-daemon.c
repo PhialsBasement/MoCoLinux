@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdint.h>
 
 #include <colinux/common/common.h>
 #include <colinux/common/debug.h>
@@ -105,6 +106,61 @@ int cogpu_xwire_start(void);
  * from fill_rx. The handle is the daemon's, captured once at startup.
  */
 static co_manager_handle_t g_wake_handle;
+
+/*
+ * The window arena, from the driver via the VGPU ioctl at startup. MAP_BLOB
+ * turns a guest-chosen offset into guest pa = base + offset; zero top means
+ * the driver predates windows and every MAP_BLOB is refused.
+ */
+static unsigned long long g_window_base, g_window_top;
+
+/*
+ * Mapped blobs: what UNMAP_BLOB needs to give back. Slots are keyed by
+ * resource id; a zero id is a free slot, and resource id zero is invalid in
+ * the protocol so the sentinel cannot collide.
+ */
+struct cogpu_blob_map {
+	uint32_t	   res_id;
+	unsigned long long pseudo_pa;
+	unsigned long long bytes;
+};
+static struct cogpu_blob_map g_blob_map[1024];
+
+static struct cogpu_blob_map *blob_map_find(uint32_t res_id)
+{
+	unsigned int i;
+
+	if (res_id == 0)
+		return NULL;
+	for (i = 0; i < sizeof(g_blob_map) / sizeof(g_blob_map[0]); i++)
+		if (g_blob_map[i].res_id == res_id)
+			return &g_blob_map[i];
+	return NULL;
+}
+
+static int blob_map_track(uint32_t res_id, unsigned long long pseudo_pa,
+			  unsigned long long bytes)
+{
+	unsigned int i;
+
+	for (i = 0; i < sizeof(g_blob_map) / sizeof(g_blob_map[0]); i++) {
+		if (g_blob_map[i].res_id == 0) {
+			g_blob_map[i].res_id	= res_id;
+			g_blob_map[i].pseudo_pa = pseudo_pa;
+			g_blob_map[i].bytes	= bytes;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static void blob_map_forget(uint32_t res_id)
+{
+	struct cogpu_blob_map *bm = blob_map_find(res_id);
+
+	if (bm)
+		bm->res_id = 0;
+}
 
 void cogpu_ring_doorbell(void)
 {
@@ -387,6 +443,8 @@ static void *chain_gather(struct cogpu_chain *chain, int first,
 #define VIRTIO_GPU_CMD_GET_EDID			0x010a
 #define VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID	0x010b
 #define VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB	0x010c
+#define VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB	0x010d
+#define VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB	0x010e
 
 #define VIRTIO_GPU_CMD_CTX_CREATE		0x0200
 #define VIRTIO_GPU_CMD_CTX_DESTROY		0x0201
@@ -401,6 +459,7 @@ static void *chain_gather(struct cogpu_chain *chain, int first,
 #define VIRTIO_GPU_RESP_OK_DISPLAY_INFO		0x1101
 #define VIRTIO_GPU_RESP_OK_CAPSET_INFO		0x1102
 #define VIRTIO_GPU_RESP_OK_CAPSET		0x1103
+#define VIRTIO_GPU_RESP_OK_MAP_INFO		0x1105
 #define VIRTIO_GPU_RESP_ERR_UNSPEC		0x1200
 
 #define VIRTIO_GPU_FLAG_FENCE			(1 << 0)
@@ -1007,7 +1066,233 @@ static uint32_t serve(struct cogpu_chain *chain)
 		break;
 	}
 
-	case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
+	case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: {
+		struct {
+			uint32_t resource_id, blob_mem, blob_flags, nr_entries;
+			uint64_t blob_id, size;
+		} b;
+		struct { uint64_t addr; uint32_t length, pad; } ent;
+		static struct iovec iov[16384];
+		const char *p;
+		uint32_t i;
+		int bad = 0, niov = 0;
+
+		if (chain->in[0].len < sizeof(req) + sizeof(b)) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+		memcpy(&b, (char *)chain->in[0].addr + sizeof(req), sizeof(b));
+
+		if (b.nr_entries > 16384) {
+			logline("  CREATE_BLOB res %u: %u entries refused"
+				" (limit 16384)\n", b.resource_id, b.nr_entries);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
+		/* Guest pages gathered exactly as ATTACH_BACKING gathers them. */
+		if (b.nr_entries > 0) {
+			uint32_t want = b.nr_entries * (uint32_t)sizeof(ent);
+			uint32_t got = 0;
+
+			p = chain_gather(chain, 0, sizeof(req) + sizeof(b),
+					 want, &got);
+			if (!p || got < want) {
+				logline("  CREATE_BLOB res %u: %u entries need"
+					" %u bytes, chain carries %u\n",
+					b.resource_id, b.nr_entries, want, got);
+				resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+				break;
+			}
+
+			for (i = 0; i < b.nr_entries && !bad; i++) {
+				uint64_t addr;
+				uint32_t left;
+
+				memcpy(&ent, p + i * sizeof(ent), sizeof(ent));
+				addr = ent.addr;
+				left = ent.length;
+				while (left && !bad) {
+					uint32_t run = resolve_run(addr, left);
+					void *host;
+
+					if (run == 0 ||
+					    niov >= (int)(sizeof(iov) / sizeof(iov[0]))) {
+						logline("  CREATE_BLOB res %u: entry"
+							" %u (0x%llx +%u) refused\n",
+							b.resource_id, i,
+							(unsigned long long)addr, left);
+						bad = 1;
+						break;
+					}
+					host = resolve_gpa(NULL, addr, run);
+					if (!host) {
+						bad = 1;
+						break;
+					}
+					iov[niov].iov_base = host;
+					iov[niov].iov_len  = run;
+					niov++;
+					addr += run;
+					left -= run;
+				}
+			}
+			if (bad) {
+				resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+				break;
+			}
+		}
+
+		if (cogpu_vrend_create_blob(req.ctx_id, b.resource_id,
+					    b.blob_mem, b.blob_flags,
+					    b.blob_id, b.size,
+					    iov, niov) != 0) {
+			logline("  CREATE_BLOB res %u: renderer refused"
+				" (mem %u flags 0x%x id %llu size %llu,"
+				" %d iovecs)\n",
+				b.resource_id, b.blob_mem, b.blob_flags,
+				(unsigned long long)b.blob_id,
+				(unsigned long long)b.size, niov);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+		} else {
+			logline("  CREATE_BLOB res %u: mem %u flags 0x%x"
+				" size %llu, %d iovecs\n",
+				b.resource_id, b.blob_mem, b.blob_flags,
+				(unsigned long long)b.size, niov);
+			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+		}
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB: {
+		struct { uint32_t resource_id, pad; uint64_t offset; } m;
+		struct { uint32_t map_info, pad; } *mi;
+		void *va = NULL;
+		uint64_t size = 0, mapped_bytes, pseudo_pa;
+		uint32_t info = 0;
+		co_rc_t rc;
+
+		if (chain->in[0].len < sizeof(req) + sizeof(m) ||
+		    chain->out[0].len < sizeof(*resp) + sizeof(*mi)) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+		memcpy(&m, (char *)chain->in[0].addr + sizeof(req), sizeof(m));
+
+		if (blob_map_find(m.resource_id)) {
+			logline("  MAP_BLOB res %u: already mapped\n",
+				m.resource_id);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
+		if (cogpu_vrend_resource_map(m.resource_id, &va, &size) != 0 ||
+		    !va || !size) {
+			logline("  MAP_BLOB res %u: renderer would not map\n",
+				m.resource_id);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
+		/*
+		 * The window ioctl is page-granular and the guest maps pages;
+		 * a host mapping that does not start on one cannot appear at
+		 * the offset the guest chose without shifting the data by the
+		 * misalignment. Refused loudly, not worked around quietly --
+		 * if a renderer hands these out it needs its own fix.
+		 */
+		if (((uintptr_t)va & 0xfff) != 0) {
+			logline("  MAP_BLOB res %u: host va %p is not page"
+				" aligned -- refused\n", m.resource_id, va);
+			cogpu_vrend_resource_unmap(m.resource_id);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
+		mapped_bytes = (size + 0xfff) & ~0xfffULL;
+		pseudo_pa = g_window_base + m.offset;
+
+		if (g_window_top == 0 || pseudo_pa < g_window_base ||
+		    pseudo_pa + mapped_bytes > g_window_top) {
+			logline("  MAP_BLOB res %u: offset 0x%llx +%llu is"
+				" outside the arena\n", m.resource_id,
+				(unsigned long long)m.offset,
+				(unsigned long long)mapped_bytes);
+			cogpu_vrend_resource_unmap(m.resource_id);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
+		rc = co_manager_kwindow_at(g_wake_handle, va, mapped_bytes,
+					   pseudo_pa);
+		if (!CO_OK(rc)) {
+			logline("  MAP_BLOB res %u: KWINDOW_AT 0x%llx +%llu"
+				" refused, rc %08x\n", m.resource_id,
+				(unsigned long long)pseudo_pa,
+				(unsigned long long)mapped_bytes, (int)rc);
+			cogpu_vrend_resource_unmap(m.resource_id);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
+		if (blob_map_track(m.resource_id, pseudo_pa, mapped_bytes) != 0) {
+			logline("  MAP_BLOB res %u: tracking table full\n",
+				m.resource_id);
+			co_manager_kunwindow(g_wake_handle, pseudo_pa,
+					     mapped_bytes);
+			cogpu_vrend_resource_unmap(m.resource_id);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+		cogpu_vrend_map_info(m.resource_id, &info);
+
+		mi = (typeof(mi))((char *)resp + sizeof(*resp));
+		mi->map_info = info;
+		mi->pad = 0;
+		written = sizeof(*resp) + sizeof(*mi);
+		resp->type = VIRTIO_GPU_RESP_OK_MAP_INFO;
+		logline("  MAP_BLOB res %u: host %p -> guest 0x%llx +%llu,"
+			" cache %u\n", m.resource_id, va,
+			(unsigned long long)pseudo_pa,
+			(unsigned long long)mapped_bytes, info);
+		break;
+	}
+
+	case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB: {
+		struct { uint32_t resource_id, pad; } u;
+		struct cogpu_blob_map *bm;
+
+		if (chain->in[0].len < sizeof(req) + sizeof(u)) {
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+		memcpy(&u, (char *)chain->in[0].addr + sizeof(req), sizeof(u));
+
+		bm = blob_map_find(u.resource_id);
+		if (!bm) {
+			logline("  UNMAP_BLOB res %u: not mapped\n",
+				u.resource_id);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
+		/*
+		 * Window first, then renderer. The reverse order frees the
+		 * host pages while the guest can still reach them through
+		 * the p2m -- the use-after-free the KWINDOW release ordering
+		 * exists to prevent.
+		 */
+		logline("  UNMAP_BLOB res %u: guest 0x%llx +%llu released\n",
+			u.resource_id,
+			(unsigned long long)bm->pseudo_pa,
+			(unsigned long long)bm->bytes);
+		co_manager_kunwindow(g_wake_handle, bm->pseudo_pa, bm->bytes);
+		cogpu_vrend_resource_unmap(u.resource_id);
+		blob_map_forget(u.resource_id);
+		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
+		break;
+	}
+
 	case VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID:
 	case VIRTIO_GPU_CMD_GET_EDID:
 		/*
@@ -1073,7 +1358,8 @@ static int cogpu_kwindow_test(co_manager_handle_t handle)
 	enum { KWT_BYTES = 2 << 20 };
 	static const unsigned long long KWT_MAGIC = 0x600DBEEFCAFEF00Dull;
 	volatile unsigned long long *buf;
-	unsigned long long pseudo_pa = 0;
+	volatile unsigned long long *at_buf;
+	unsigned long long pseudo_pa = 0, at_base;
 	unsigned long long i, n = KWT_BYTES / 8;
 	int waited, failed = 0;
 	co_rc_t rc;
@@ -1098,6 +1384,47 @@ static int cogpu_kwindow_test(co_manager_handle_t handle)
 
 	logline("kwindow-test: %u KB of this process at guest pa 0x%llx\n",
 		KWT_BYTES >> 10, pseudo_pa);
+
+	/*
+	 * The AT variant, on the same round trip: a page placed at the arena
+	 * base -- the address MAP_BLOB uses for offset 0. Placement and
+	 * vacancy refusal are checked here; the guest writes a token through
+	 * it before the magic, verified after. New driver code, one probe.
+	 */
+	at_buf = NULL;
+	at_base = 0;
+	{
+		unsigned long long top = 0;
+
+		if (CO_OK(co_manager_window_bounds(handle, &at_base, &top)) &&
+		    top > at_base) {
+			at_buf = VirtualAlloc(NULL, 0x1000,
+					      MEM_COMMIT | MEM_RESERVE,
+					      PAGE_READWRITE);
+		}
+		if (at_buf) {
+			rc = co_manager_kwindow_at(handle, (void *)at_buf,
+						   0x1000, at_base);
+			if (!CO_OK(rc)) {
+				logline("kwindow-test: FAIL -- AT window at"
+					" arena base 0x%llx refused,"
+					" rc %08x\n", at_base, (int)rc);
+				at_buf = NULL;
+				failed = 1;
+			} else if (CO_OK(co_manager_kwindow_at(handle,
+							       (void *)at_buf,
+							       0x1000,
+							       at_base))) {
+				logline("kwindow-test: FAIL -- AT vacancy"
+					" check: occupied slot re-mapped\n");
+				failed = 1;
+			}
+		} else {
+			logline("kwindow-test: AT variant skipped (no arena"
+				" or no memory)\n");
+		}
+	}
+
 	logline("kwindow-test: from a guest shell, in this order:\n");
 	logline("  devmem 0x%llx 64                       # expect 0xc0de000000000000\n",
 		pseudo_pa);
@@ -1106,6 +1433,8 @@ static int cogpu_kwindow_test(co_manager_handle_t handle)
 	logline("  devmem 0x%llx 64 0xAA55AA55AA55AA55\n", pseudo_pa + 0x1000);
 	logline("  devmem 0x%llx 64 0x1122334455667788\n",
 		pseudo_pa + KWT_BYTES - 8);
+	if (at_buf)
+		logline("  devmem 0x%llx 64 0x5A5A5A5A5A5A5A5A\n", at_base);
 	logline("  devmem 0x%llx 64 0x600DBEEFCAFEF00D\n", pseudo_pa);
 	logline("kwindow-test: waiting up to 10 minutes for the magic...\n");
 
@@ -1120,6 +1449,19 @@ static int cogpu_kwindow_test(co_manager_handle_t handle)
 			" +0x0 still 0x%llx\n", buf[0]);
 		co_manager_kunwindow(handle, pseudo_pa, KWT_BYTES);
 		return 1;
+	}
+
+	/* The AT window's guest write must be resident by now too -- the
+	 * protocol orders it before the magic. */
+	if (at_buf) {
+		if (at_buf[0] != 0x5A5A5A5A5A5A5A5Aull) {
+			logline("kwindow-test: FAIL -- AT window still 0x%llx,"
+				" wanted 0x5a5a5a5a5a5a5a5a\n", at_buf[0]);
+			failed = 1;
+		} else {
+			logline("kwindow-test: AT window round-trip OK\n");
+		}
+		co_manager_kunwindow(handle, at_base, 0x1000);
 	}
 
 	if (buf[0x1000 / 8] != 0xAA55AA55AA55AA55ull) {
@@ -1314,6 +1656,20 @@ int main(int argc, char **argv)
 	}
 	InitializeCriticalSection(&g_slice_lock);
 	g_slice_lock_ready = 1;
+
+	/*
+	 * The window arena, asked of the driver once. Failure leaves both at
+	 * zero, and MAP_BLOB then refuses -- an old driver degrades to the
+	 * pre-blob behaviour instead of mapping things at address zero.
+	 */
+	if (CO_OK(co_manager_window_bounds(handle, &g_window_base,
+					   &g_window_top)))
+		logline("window arena: 0x%llx..0x%llx (%llu MB)\n",
+			g_window_base, g_window_top,
+			(g_window_top - g_window_base) >> 20);
+	else
+		logline("window arena unavailable (old driver?);"
+			" MAP_BLOB will refuse\n");
 
 	if (kwindow_test) {
 		int r = cogpu_kwindow_test(handle);

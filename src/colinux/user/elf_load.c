@@ -2478,29 +2478,26 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 					 * anyone would guess from the symptom.
 					 */
 /*
-					 * RESOURCE_BLOB and RESOURCE_UUID are
-					 * deliberately absent.
+					 * RESOURCE_UUID stays deliberately absent.
 					 *
-					 * A feature bit is a promise. The daemon
-					 * has no RESOURCE_CREATE_BLOB, so
+					 * A feature bit is a promise. When the
+					 * daemon had no RESOURCE_CREATE_BLOB,
 					 * advertising blobs told the guest to
 					 * allocate that way, and every such
 					 * resource then existed only in the
 					 * guest's bookkeeping: each later transfer
 					 * naming one failed, as an endless
 					 * "response 0x1200 (command 0x207)" over a
-					 * blank screen.
-					 *
-					 * Nothing in that pointed at blobs -- the
-					 * failing command was a transfer, the
-					 * context was valid and the command stream
-					 * parsed. It took decoding a rejected
-					 * stream by hand to see it named a
-					 * resource id never created on this side.
+					 * blank screen. RESOURCE_BLOB is offered
+					 * now because the daemon services
+					 * CREATE/MAP/UNMAP_BLOB against the window
+					 * arena -- the promise is kept, not
+					 * repeated.
 					 */
-					hdr.host_features = (1ULL << 32) |	/* VERSION_1    */
-							    (1ULL << 0)  |	/* VIRGL        */
-							    (1ULL << 4);	/* CONTEXT_INIT */
+					hdr.host_features = (1ULL << 32) |	/* VERSION_1     */
+							    (1ULL << 0)  |	/* VIRGL         */
+							    (1ULL << 3)  |	/* RESOURCE_BLOB */
+							    (1ULL << 4);	/* CONTEXT_INIT  */
 
 					/*
 					 * The same path every other byte of the
