@@ -29,7 +29,14 @@ regression you are about to hide in mountains of code.
   native memmove       4667.6 MiB/s   <- confirms the ceiling: guest range
                                          4439-4933 brackets it; the guest
                                          copies at native speed
-  native 2MB cache     9957.0 MiB/s   (msvcrt vs glibc differ at cache
-                                         scale; cache rows are never
-                                         bandwidth claims)
+  native 2MB cache     9957.0 MiB/s
+
+2026-08-10  952f7caa  M92p GT730 Win10  (same rambench.py, run IN GUEST)
+  guest memmove        4865.7 MiB/s   <- native 4667.6: parity, DRAM scale
+  guest 2MB cache     10081.2 MiB/s   <- native 9957.0: parity, cache scale
+  Verdict: guest == host within ~1% at BOTH scales with one instrument.
+  The 15 GiB/s guest row above used a different instrument (mmap slice
+  assignment, hotter glibc path than ctypes.memmove) -- an instrument
+  difference, not a machine one. Rule: rows are only comparable when the
+  code that produced them is the same. Second catch of the evening.
 ================================================================
