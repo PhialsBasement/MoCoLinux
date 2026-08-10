@@ -523,8 +523,16 @@ static void *chain_gather(struct cogpu_chain *chain, int first,
 #define VIRTIO_GPU_CMD_GET_EDID			0x010a
 #define VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID	0x010b
 #define VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB	0x010c
-#define VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB	0x010d
-#define VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB	0x010e
+/*
+ * MAP/UNMAP_BLOB are 3D commands, after SUBMIT_3D -- NOT 0x010d/0x010e in
+ * the 2d block, which is where a first guess put them. Wrong numbers here
+ * meant real MAP_BLOBs fell to the catch-all and were answered OK with no
+ * window and no map_info: the guest was told a mapping existed that did
+ * not, and vn's first instance died of it far away, as ERROR_OUT_OF_HOST_
+ * MEMORY from vkCreateInstance.
+ */
+#define VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB	0x0208
+#define VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB	0x0209
 
 #define VIRTIO_GPU_CMD_CTX_CREATE		0x0200
 #define VIRTIO_GPU_CMD_CTX_DESTROY		0x0201
@@ -539,7 +547,10 @@ static void *chain_gather(struct cogpu_chain *chain, int first,
 #define VIRTIO_GPU_RESP_OK_DISPLAY_INFO		0x1101
 #define VIRTIO_GPU_RESP_OK_CAPSET_INFO		0x1102
 #define VIRTIO_GPU_RESP_OK_CAPSET		0x1103
-#define VIRTIO_GPU_RESP_OK_MAP_INFO		0x1105
+/* 0x1105 is RESP_OK_RESOURCE_UUID; a first guess skipped it, the guest
+ * kernel classified the mapping as failed, and vn died 8 ms later in mmap.
+ * Enum values are transcribed from uapi headers, never counted by hand. */
+#define VIRTIO_GPU_RESP_OK_MAP_INFO		0x1106
 #define VIRTIO_GPU_RESP_ERR_UNSPEC		0x1200
 
 #define VIRTIO_GPU_FLAG_FENCE			(1 << 0)

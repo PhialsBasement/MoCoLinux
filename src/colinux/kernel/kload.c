@@ -225,6 +225,9 @@ static bool_t kload_pseudo_to_machine_pfn(co_pfn_t ppfn, co_pfn_t* mfn_out)
  * reverse entry would let a page-table walk mistake GPU memory for guest RAM.
  */
 static unsigned long kload_window_next;	/* lowest window PFN handed out */
+/* First PFN above the RAM ceiling; the arena is [this, capacity). Pinned in
+ * kload_begin -- see the comment there for why backed_pages must not be it. */
+static unsigned long kload_window_base_pages;
 
 co_rc_t co_kload_window_map(const co_pfn_t* mfns, unsigned long count,
 			    co_pa_t* pseudo_out)
@@ -243,7 +246,7 @@ co_rc_t co_kload_window_map(const co_pfn_t* mfns, unsigned long count,
 
 	/* The two allocators meet in the middle; whoever asks second loses. */
 	if (kload_window_next < count ||
-	    kload_window_next - count < kload_backed_pages) {
+	    kload_window_next - count < kload_window_base_pages) {
 		co_os_mutex_release(kload_lock);
 		return CO_RC(OUT_OF_MEMORY);
 	}
@@ -296,7 +299,7 @@ co_rc_t co_kload_window_map_at(const co_pfn_t* mfns, unsigned long count,
 		return CO_RC(ERROR);
 	}
 
-	if (first < kload_backed_pages ||
+	if (first < kload_window_base_pages ||
 	    count > kload_p2m_capacity - first) {
 		co_os_mutex_release(kload_lock);
 		return CO_RC(INVALID_PARAMETER);
@@ -339,7 +342,7 @@ void co_kload_window_unmap(co_pa_t pseudo, unsigned long count)
 	 * gated by the per-handle exact match in co_manager_window_release;
 	 * this check is only against corrupting RAM's entries.
 	 */
-	if (kload_p2m == NULL || first < kload_backed_pages ||
+	if (kload_p2m == NULL || first < kload_window_base_pages ||
 	    count > kload_p2m_capacity - first) {
 		co_os_mutex_release(kload_lock);
 		return;
@@ -655,6 +658,7 @@ static void kload_release_pages(co_manager_t* manager)
 	kload_p2m_capacity	= 0;
 	kload_backed_pages	= 0;
 	kload_window_next	= 0;
+	kload_window_base_pages = 0;
 	kload_m2p_slots	= 0;
 	kload_m2p_mask_value	= 0;
 	kload_ram_ready	= PFALSE;
@@ -1093,8 +1097,22 @@ co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 	capacity_end = ram_bytes + table_bytes;
 	if (capacity_end < kload_table_end)
 		capacity_end = kload_table_end;
-	capacity_end += CO_KLOAD_WINDOW_ARENA_BYTES;
 	capacity_end = (capacity_end + CO_ARCH_PAGE_SIZE - 1) & CO_ARCH_PAGE_MASK;
+
+	/*
+	 * The arena base, pinned NOW and never derived from kload_backed_pages:
+	 * RAM backs lazily, so backed_pages grows for the machine's whole
+	 * life. The loader read bounds at boot and the daemon read them
+	 * seconds later; they got different answers, the guest's drm_mm and
+	 * the daemon's KWINDOW_AT disagreed by the difference, and the first
+	 * real MAP_BLOB landed inside RAM's address space and was refused.
+	 * The base is the RAM CEILING -- address space RAM may someday back --
+	 * not the RAM currently backed.
+	 */
+	kload_window_base_pages =
+		(unsigned long)(capacity_end >> CO_ARCH_PAGE_SHIFT);
+
+	capacity_end += CO_KLOAD_WINDOW_ARENA_BYTES;
 
 	rc = kload_translation_alloc(
 		(unsigned long)(capacity_end >> CO_ARCH_PAGE_SHIFT));
@@ -1911,7 +1929,7 @@ unsigned long co_kload_ram_pages(void)
  */
 void co_kload_window_bounds(unsigned long long* base, unsigned long long* top)
 {
-	*base = ((unsigned long long)kload_backed_pages) << CO_ARCH_PAGE_SHIFT;
+	*base = ((unsigned long long)kload_window_base_pages) << CO_ARCH_PAGE_SHIFT;
 	*top  = ((unsigned long long)kload_p2m_capacity) << CO_ARCH_PAGE_SHIFT;
 }
 

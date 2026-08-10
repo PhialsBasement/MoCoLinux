@@ -265,9 +265,18 @@ int cogpu_vrend_init(cogpu_fence_fn fence_cb, void *fence_ctx)
 	 * vulkan-1.dll -- it loads it at runtime -- so on a machine with no
 	 * Vulkan the VENUS init fails cleanly and the retry without it is
 	 * the machine's honest capability, not an error.
+	 *
+	 * RENDER_SERVER is not optional and not a separate process here:
+	 * upstream removed in-process venus, so venus contexts exist only
+	 * behind the proxy, and the WINQ port runs that "server" as
+	 * in-process worker threads over localhost sockets. VENUS alone
+	 * initialises nothing venus at all -- it only flips vrend's buffer
+	 * layout, which is how an earlier build logged "venus: up" while
+	 * serving a zeroed capset.
 	 */
 	rc = virgl_renderer_init(&vrend_cbs,
 				 VIRGL_RENDERER_VENUS |
+				 VIRGL_RENDERER_RENDER_SERVER |
 				 VIRGL_RENDERER_ASYNC_FENCE_CB,
 				 &vrend_cbs);
 	if (rc == 0) {
