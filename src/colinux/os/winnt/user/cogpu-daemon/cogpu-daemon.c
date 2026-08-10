@@ -554,17 +554,49 @@ static void *chain_gather(struct cogpu_chain *chain, int first,
 
 static struct moco_bridge_slot {
 	uint32_t xid;
+	uint32_t ctx_id;		/* the guest context that presents here */
 	uint32_t width, height;
 	unsigned long long used;	/* for LRU eviction */
 } g_bridge[MOCO_BRIDGE_SLOTS];
 static unsigned long long g_bridge_clock;
 
 /*
+ * Release every bridge a dying guest context owned: overlay first (so the
+ * last frame leaves the screen), then the renderer resource.
+ *
+ * Without this the final frame of every Vulkan client stayed on screen
+ * forever after the client exited -- the GL path never had that problem
+ * because the guest owns its displayed resources there and unrefs them,
+ * which is what removes the overlay. Bridge resources are the daemon's, so
+ * nothing was ever unref'd and nothing ever took the picture down.
+ */
+static void moco_bridge_release_ctx(uint32_t ctx_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < MOCO_BRIDGE_SLOTS; i++) {
+		uint32_t res_id;
+
+		if (g_bridge[i].xid == 0 || g_bridge[i].ctx_id != ctx_id)
+			continue;
+
+		res_id = MOCO_BRIDGE_RES_BASE + i;
+		logline("  MOCO_PRESENT: ctx %u gone, releasing slot %u"
+			" (XID 0x%x)\n", ctx_id, i, g_bridge[i].xid);
+		cogpu_present_r1_resource_unref(res_id);
+		cogpu_present_r2_resource_unref(res_id);
+		if (g_bridge[i].width)
+			cogpu_vrend_resource_unref(res_id);
+		memset(&g_bridge[i], 0, sizeof(g_bridge[i]));
+	}
+}
+
+/*
  * The slot for this window, sized for this frame. Returns the virgl
  * resource id, or 0 if the resource could not be created.
  */
-static uint32_t moco_bridge_resource(uint32_t xid, uint32_t width,
-				     uint32_t height)
+static uint32_t moco_bridge_resource(uint32_t xid, uint32_t ctx_id,
+				     uint32_t width, uint32_t height)
 {
 	struct virgl_renderer_resource_create_args a;
 	unsigned int i, pick = 0;
@@ -592,6 +624,7 @@ static uint32_t moco_bridge_resource(uint32_t xid, uint32_t width,
 have_slot:
 	res_id = MOCO_BRIDGE_RES_BASE + pick;
 	g_bridge[pick].xid = xid;
+	g_bridge[pick].ctx_id = ctx_id;
 	g_bridge[pick].used = ++g_bridge_clock;
 
 	if (g_bridge[pick].width == width &&
@@ -821,6 +854,9 @@ static uint32_t serve(struct cogpu_chain *chain)
 	}
 
 	case VIRTIO_GPU_CMD_CTX_DESTROY:
+		/* Overlays first: a bridge outliving its context is the final
+		 * frame stuck on screen after the client is gone. */
+		moco_bridge_release_ctx(req.ctx_id);
 		cogpu_vrend_ctx_destroy(req.ctx_id);
 		if (req.ctx_id < COGPU_MAX_CTX)
 			g_ctx_capset[req.ctx_id] = 0;
@@ -1554,7 +1590,7 @@ static uint32_t serve(struct cogpu_chain *chain)
 			 */
 			{
 				uint32_t res = moco_bridge_resource(mp.xid,
-					mp.width, mp.height);
+					req.ctx_id, mp.width, mp.height);
 
 				if (!res) {
 					logline("  MOCO_PRESENT: bridge"

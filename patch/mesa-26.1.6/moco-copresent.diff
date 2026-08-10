@@ -2238,7 +2238,7 @@ diff --color -ruN '--exclude=__pycache__' '--exclude=.moco-copresent-patch-sha25
 +bool x11_dri3_is_moco(void);
  
  #endif
-diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/include/drm-uapi/virtgpu_drm.h b/include/drm-uapi/virtgpu_drm.h
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache__' a/include/drm-uapi/virtgpu_drm.h b/include/drm-uapi/virtgpu_drm.h
 --- a/include/drm-uapi/virtgpu_drm.h	2026-07-30 03:31:27.000000000 +1000
 +++ b/include/drm-uapi/virtgpu_drm.h	2026-08-11 05:51:50.444664500 +1000
 @@ -269,6 +269,22 @@
@@ -2264,7 +2264,7 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/i
  #if defined(__cplusplus)
  }
  #endif
-diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache__' a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
 --- a/src/virtio/vulkan/vn_renderer.h	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/virtio/vulkan/vn_renderer.h	2026-08-11 05:51:50.442368400 +1000
 @@ -162,6 +162,12 @@
@@ -2298,7 +2298,7 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/s
  static inline void
  vn_renderer_bo_flush(struct vn_renderer *renderer,
                       struct vn_renderer_bo *bo,
-diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/src/virtio/vulkan/vn_renderer_virtgpu.c b/src/virtio/vulkan/vn_renderer_virtgpu.c
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache__' a/src/virtio/vulkan/vn_renderer_virtgpu.c b/src/virtio/vulkan/vn_renderer_virtgpu.c
 --- a/src/virtio/vulkan/vn_renderer_virtgpu.c	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/virtio/vulkan/vn_renderer_virtgpu.c	2026-08-11 05:51:50.443602500 +1000
 @@ -1113,6 +1113,28 @@
@@ -2338,7 +2338,7 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/s
     gpu->base.bo_ops.flush = virtgpu_bo_flush;
     gpu->base.bo_ops.invalidate = virtgpu_bo_invalidate;
  
-diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache__' a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
 --- a/src/virtio/vulkan/vn_wsi.c	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/virtio/vulkan/vn_wsi.c	2026-08-11 05:51:50.455388600 +1000
 @@ -14,6 +14,7 @@
@@ -2389,7 +2389,7 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/s
     physical_dev->wsi_device.supports_scanout = false;
     physical_dev->wsi_device.supports_modifiers =
        physical_dev->base.vk.supported_extensions.EXT_image_drm_format_modifier;
-diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache__' a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
 --- a/src/vulkan/wsi/wsi_common.h	2026-07-30 03:31:27.000000000 +1000
 +++ b/src/vulkan/wsi/wsi_common.h	2026-08-11 05:51:50.440095000 +1000
 @@ -161,6 +161,18 @@
@@ -2411,9 +2411,9 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/s
     /* Set to true if the implementation is ok with linear WSI images. */
     bool wants_linear;
  
-diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
+diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=__pycache__' a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
 --- a/src/vulkan/wsi/wsi_common_x11.c	2026-07-30 03:31:27.000000000 +1000
-+++ b/src/vulkan/wsi/wsi_common_x11.c	2026-08-11 05:56:07.473806100 +1000
++++ b/src/vulkan/wsi/wsi_common_x11.c	2026-08-11 06:50:01.626370700 +1000
 @@ -343,6 +343,27 @@
     wsi_conn->is_xwayland = wsi_x11_detect_xwayland(conn, randr_reply,
                                                     xwl_reply);
@@ -2442,7 +2442,26 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/s
     wsi_conn->has_dri3_modifiers = has_dri3_v1_2 && has_present_v1_2;
     wsi_conn->has_dri3_explicit_sync = has_dri3_v1_4 && has_present_v1_4;
     wsi_conn->is_proprietary_x11 = false;
-@@ -1506,6 +1527,34 @@
+@@ -1118,6 +1139,18 @@
+ struct x11_swapchain {
+    struct wsi_swapchain                        base;
+ 
++   /*
++    * MoCoLinux: the TOP-LEVEL window this swapchain's drawable belongs to.
++    *
++    * The host matches XIDs against a property the Windows X server puts on
++    * top-level windows only, so a drawable that is a child of its top-level
++    * matches nothing -- and the host then falls back to matching by size and
++    * decorates SOME OTHER window of the right dimensions. That is exactly
++    * what the GL path's moco_dri3_present_create walks the ancestor chain to
++    * avoid; this is the same walk, cached per swapchain.
++    */
++   xcb_window_t                                 moco_toplevel;
++
+    bool                                         has_dri3_modifiers;
+    bool                                         has_mit_shm;
+    bool                                         has_async_may_tear;
+@@ -1506,6 +1539,86 @@
     assert(!chain->base.image_info.explicit_sync);
     struct x11_image *image = &chain->images[image_index];
  
@@ -2459,8 +2478,32 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/s
 +   if (chain->base.wsi->moco_present) {
 +      VkDeviceMemory frame_mem = image->base.blit.memory != VK_NULL_HANDLE
 +         ? image->base.blit.memory : image->base.memory;
++
++      /* The app's own top-level, found once: see moco_toplevel above. */
++      if (chain->moco_toplevel == XCB_NONE) {
++         xcb_window_t walk = chain->window;
++
++         chain->moco_toplevel = chain->window;
++         for (int depth = 0; depth < 32; depth++) {
++            xcb_query_tree_reply_t *tree =
++               xcb_query_tree_reply(chain->conn,
++                                    xcb_query_tree(chain->conn, walk), NULL);
++            if (!tree)
++               break;
++            if (tree->parent == XCB_NONE || tree->parent == tree->root) {
++               chain->moco_toplevel = walk;
++               free(tree);
++               break;
++            }
++            walk = tree->parent;
++            free(tree);
++         }
++         fprintf(stderr, "moco wsi: drawable 0x%x -> top-level 0x%x\n",
++                 (unsigned)chain->window, (unsigned)chain->moco_toplevel);
++      }
++
 +      VkResult mr = chain->base.wsi->moco_present(
-+         chain->base.device, frame_mem, chain->window,
++         chain->base.device, frame_mem, chain->moco_toplevel,
 +         chain->extent.width, chain->extent.height,
 +         (uint32_t)image->base.row_pitches[0]);
 +      static int moco_n;
@@ -2469,6 +2512,34 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/s
 +         fprintf(stderr, "moco wsi: present#%d -> %d (fire-and-forget)\n",
 +                 moco_n, mr);
 +      if (mr == VK_SUCCESS) {
++         /*
++          * SERVICE THE CONNECTION. Fire-and-forget means never asking X to
++          * present and never blocking on its answer -- it does not mean
++          * going deaf.
++          *
++          * Two things the put_image tail did that this path must keep doing.
++          * Flush, because the connection is still the application's: the
++          * title it set, the WM_PROTOCOLS it registered, every property and
++          * request it queued sit in libxcb's outgoing buffer until something
++          * flushes. And READ, because a reply read is what pumps incoming
++          * events into xcb's queue -- without it xcb_poll_for_event finds an
++          * empty queue for ever, and the application never sees a resize, a
++          * keystroke, or the window manager asking it to close. Measured:
++          * 14547 syscalls in four seconds and not one of them touching the X
++          * socket, while the frame's close button did nothing.
++          *
++          * The geometry answer is deliberately DISCARDED. Reading it services
++          * the connection; acting on it is what latched
++          * VK_ERROR_SURFACE_LOST_KHR into the swapchain and froze the picture
++          * after one frame. The host owns presentation, so a size mismatch is
++          * the host's business, not a reason to kill the swapchain.
++          */
++         xcb_get_geometry_cookie_t pump =
++            xcb_get_geometry(chain->conn, chain->window);
++
++         xcb_flush(chain->conn);
++         free(xcb_get_geometry_reply(chain->conn, pump, NULL));
++
 +         wsi_queue_push(&chain->acquire_queue, image_index);
 +         return VK_SUCCESS;
 +      }
@@ -2477,7 +2548,7 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/s
     /* Begin querying this before submitting the frame for improved async performance.
      * In this _sw() mode we're expecting network round-trip delay, not just UNIX socket delay. */
     xcb_get_geometry_cookie_t geom_cookie = xcb_get_geometry(chain->conn, chain->window);
-@@ -1564,6 +1613,7 @@
+@@ -1564,6 +1677,7 @@
        }
     }
  
@@ -2485,3 +2556,58 @@ diff --color -urN '--exclude=.moco-copresent-patch-sha256' '--exclude=*.pyc' a/s
     xcb_flush(chain->conn);
  
     /* We don't have queued present here.
+@@ -2664,13 +2778,33 @@
+ 
+    uint32_t present_caps = 0;
+ #ifdef HAVE_X11_DRM
+-   xcb_present_query_capabilities_cookie_t present_query_cookie;
+-   xcb_present_query_capabilities_reply_t *present_query_reply;
+-   present_query_cookie = xcb_present_query_capabilities(conn, window);
+-   present_query_reply = xcb_present_query_capabilities_reply(conn, present_query_cookie, NULL);
+-   if (present_query_reply) {
+-      present_caps = present_query_reply->capabilities;
+-      free(present_query_reply);
++   /*
++    * ONLY if the server has the Present extension.
++    *
++    * This call was ungated, and on a server without Present -- VcXsrv, which
++    * is this platform's X server -- libxcb responds to a stub call for a
++    * missing extension by SHUTTING THE CONNECTION DOWN
++    * (XCB_CONN_CLOSED_EXT_NOTSUPPORTED). Every X operation afterwards is a
++    * silent no-op with no I/O at all: the application's title never reaches
++    * the server, no event ever reaches the application, and resize, keyboard,
++    * mouse and the window manager's close request are all dead. It presented
++    * frames perfectly the whole time, which is what made it look like a
++    * presentation bug rather than a connection that had been killed during
++    * swapchain creation.
++    *
++    * Diagnosed by shimming xcb_get_extension_data: "Present present=0"
++    * immediately before conn_err 2, and by a syscall census showing 13447
++    * syscalls in four seconds without one touching the X socket.
++    */
++   if (wsi_conn->has_present) {
++      xcb_present_query_capabilities_cookie_t present_query_cookie;
++      xcb_present_query_capabilities_reply_t *present_query_reply;
++      present_query_cookie = xcb_present_query_capabilities(conn, window);
++      present_query_reply = xcb_present_query_capabilities_reply(conn, present_query_cookie, NULL);
++      if (present_query_reply) {
++         present_caps = present_query_reply->capabilities;
++         free(present_query_reply);
++      }
+    }
+ #endif
+ 
+@@ -2788,7 +2922,12 @@
+                          XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY;
+    if (!chain->base.image_info.explicit_sync)
+       event_mask |= XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY;
+-   xcb_present_select_input(chain->conn, chain->event_id, chain->window, event_mask);
++   /* Present stubs only where the server HAS Present -- see the note on
++    * xcb_present_query_capabilities above: one such call on VcXsrv kills the
++    * connection and with it every event the application needs. */
++   if (wsi_conn->has_present)
++      xcb_present_select_input(chain->conn, chain->event_id, chain->window,
++                               event_mask);
+ 
+    /* Create an XCB event queue to hold present events outside of the usual
+     * application event queue

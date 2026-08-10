@@ -152,16 +152,24 @@ for mingw behind a WGL winsys, replays the guest's GL onto the host's actual
 card: the guest reports `virgl (GeForce GT 730/PCIe/SSE2)`, GL 4.2, where
 indirect GLX gave it 1.4 in software.
 
-Presentation is CoPresent, and it ships enabled. VirtualGL and the `moco-gl`
-wrapper are gone. A matched Mesa 26.1.6 build -- `libGL`, `libEGL`,
-`libGLESv2`, Gallium and `libgbm`, for **both** the 64-bit and 32-bit ABI --
-is the system's GL driver: it uses Mesa's upstream DRI3 loader, opens
-`/dev/dri/renderD128`, and keeps its ordinary DRI images, buffer queue, buffer
-age and native fences. Only the final operation a Linux X server would perform
-is redirected. The client emits `VIRGL_CCMD_MOCO_PRESENT` inside the command
-stream it is already rendering through, and cogpu displays the texture
-virglrenderer already owns on the Windows GPU. VcXsrv remains the unmodified
-window and input control plane.
+Both APIs share one presenter, and both ship enabled. `--present-r2` on
+`cogpu-daemon.exe` carries OpenGL and Vulkan; `--no-present` silences both.
+
+![glxgears and the LunarG Vulkan cube running at the same time as native
+windows on Windows 10, beside the guest's kernel
+log](doc/img/glxvksupport.png)
+
+#### OpenGL
+
+Presentation is CoPresent. VirtualGL and the `moco-gl` wrapper are gone. A
+matched Mesa 26.1.6 build -- `libGL`, `libEGL`, `libGLESv2`, Gallium and
+`libgbm`, for **both** the 64-bit and 32-bit ABI -- is the system's GL driver:
+it uses Mesa's upstream DRI3 loader, opens `/dev/dri/renderD128`, and keeps its
+ordinary DRI images, buffer queue, buffer age and native fences. Only the final
+operation a Linux X server would perform is redirected. The client emits
+`VIRGL_CCMD_MOCO_PRESENT` inside the command stream it is already rendering
+through, and cogpu displays the texture virglrenderer already owns on the
+Windows GPU. VcXsrv remains the unmodified window and input control plane.
 
 Carrying presentation in the command stream is what makes it work for real
 applications. It travels down the render node the client already has open, so
@@ -179,14 +187,67 @@ desktop shortcut does. Steam's own log reports `MoCo DRI3: direct
 virgl/CoPresent active` for three drawables from inside its container. Firefox
 renders directly and stays interactive.
 
-Two limits are worth stating plainly. Geometry-heavy loads still run about 1.8x
-slower than the same binary natively, so this is accelerated, not native.
-And there is no Vulkan: virgl is OpenGL only, so the image ships lavapipe
-(software Vulkan, both ABIs) purely because the modern Steam client refuses to
-build its UI without a Vulkan device. The staged gates are in
+`glxgears` at its default size measures **840-855 fps**, three runs on a quiet
+box. It used to sit in a 579-721 band, and the difference is not the GL path at
+all: the guest's clockevents became oneshot and the host began honouring their
+deadlines, so every wait in the stack -- fences, presents, sleeps -- stopped
+being quantised to a millisecond. See [Timers](#timers). Against roughly 1300
+fps for the same trivial load on the host itself, that is about two thirds of
+native rather than the half this section used to report -- accelerated, still
+not native, and the gap is now dominated by geometry-heavy loads rather than by
+per-frame overhead.
+
+The staged gates are in
 [`doc/direct-presentation`](doc/direct-presentation); the checksum-pinned Mesa
 patch and exact rebuild/rollback procedure are in
 [`doc/building-copresent`](doc/building-copresent).
+
+#### Vulkan
+
+The guest has real Vulkan, on the host's real driver, through Venus. Mesa's
+`libvulkan_virtio` (both ABIs, installed as an ICD with an absolute
+`library_path`) serialises the guest's Vulkan calls; virglrenderer's `vkr`
+decoder -- cross-built for mingw with the WINQ Windows patches, its render
+server running as in-process worker threads -- replays them on the host's own
+Vulkan driver. `vulkaninfo` in the guest reports
+`Virtio-GPU Venus (NVIDIA GeForce GT 730)`, `DRIVER_ID_MESA_VENUS`, as a
+DISCRETE device.
+
+```
+  guest: Vulkan app ─► Mesa venus ICD ─► virtio rings ◄── cogpu-daemon.exe
+         /dev/dri/renderD128            + MOCO_PRESENT      │  vkr decoder
+                                          ioctl             ▼
+                                                  the host's Vulkan driver
+```
+
+Host-visible memory is the part a cooperative guest is not supposed to be able
+to do. A Vulkan allocation the application maps must be host memory appearing
+in the guest's own physical address space, and there is no BAR and no ReBAR
+here to put it in. The p2m gains a **window arena** above guest RAM -- address
+space that exists in no e820 range -- and `KWINDOW_AT` maps the host's pages
+into a caller-chosen slot in it, so `vkMapMemory` returns a pointer the guest
+writes at **4.6-4.8 GiB/s**, which is this machine's DRAM ceiling and the same
+figure a native `memcpy` measures. Nothing is copied to get there.
+
+Presentation reuses the OpenGL presenter rather than inventing a second one.
+The guest issues `DRM_IOCTL_VIRTGPU_MOCO_PRESENT` on the render node it is
+already rendering through -- so sandboxes need no configuration, exactly as
+with GL -- the daemon uploads the frame into a per-window virgl texture, and
+the same overlay draws it over the same VcXsrv window. X keeps window
+management; only pixels bypass it. A Vulkan client's context death releases its
+bridge, so the last frame leaves the screen with the application.
+
+`vkcube` runs at **368 fps** steady, and an offscreen clear-and-readback
+checks byte-exact (262144 pixels, zero wrong). GL and Vulkan coexist: gears and
+the cube together, two Vulkan clients together, one exiting while the other
+keeps presenting -- verified with zero DRM errors in every configuration, which
+is what the screenshot above is showing.
+
+Two honest limits. Presents are fire-and-forget, like the GL path's, so FIFO is
+not throttled and a Vulkan client will spin as fast as the card allows rather
+than to a refresh rate. And DXVK -- the reason this exists -- has not been run
+yet. lavapipe stays installed underneath as the software fallback for a host
+whose driver cannot serve Venus.
 
 ## Status
 

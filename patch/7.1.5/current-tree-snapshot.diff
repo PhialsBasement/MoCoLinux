@@ -6714,8 +6714,8 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
  #endif
 diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/gpu/drm/virtio/virtgpu_vq.c b/drivers/gpu/drm/virtio/virtgpu_vq.c
 --- a/drivers/gpu/drm/virtio/virtgpu_vq.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/drivers/gpu/drm/virtio/virtgpu_vq.c	2026-08-11 04:17:35.444708500 +1000
-@@ -625,6 +625,34 @@
++++ b/drivers/gpu/drm/virtio/virtgpu_vq.c	2026-08-11 06:19:59.414771200 +1000
+@@ -625,6 +625,35 @@
  	virtio_gpu_cleanup_object(bo);
  }
  
@@ -6725,8 +6725,8 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
 + * frame costs one frame. See DRM_IOCTL_VIRTGPU_MOCO_PRESENT.
 + */
 +void virtio_gpu_cmd_moco_present(struct virtio_gpu_device *vgdev,
-+				 uint32_t resource_id, uint32_t xid,
-+				 uint32_t width, uint32_t height,
++				 uint32_t ctx_id, uint32_t resource_id,
++				 uint32_t xid, uint32_t width, uint32_t height,
 +				 uint32_t stride, uint32_t flags)
 +{
 +	struct virtio_gpu_moco_present *cmd_p;
@@ -6736,6 +6736,7 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
 +	memset(cmd_p, 0, sizeof(*cmd_p));
 +
 +	cmd_p->hdr.type    = cpu_to_le32(VIRTIO_GPU_CMD_MOCO_PRESENT);
++	cmd_p->hdr.ctx_id  = cpu_to_le32(ctx_id);
 +	cmd_p->resource_id = cpu_to_le32(resource_id);
 +	cmd_p->xid	   = cpu_to_le32(xid);
 +	cmd_p->width	   = cpu_to_le32(width);
@@ -6752,7 +6753,7 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
  {
 diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
 --- a/drivers/gpu/drm/virtio/virtgpu_drv.h	2026-07-25 00:21:27.000000000 +1000
-+++ b/drivers/gpu/drm/virtio/virtgpu_drv.h	2026-08-11 04:28:20.946259200 +1000
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h	2026-08-11 06:19:59.415189800 +1000
 @@ -290,7 +290,7 @@
  };
  
@@ -6767,16 +6768,16 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
  				    struct virtio_gpu_object_array *objs,
  				    struct virtio_gpu_fence *fence);
 +void virtio_gpu_cmd_moco_present(struct virtio_gpu_device *vgdev,
-+				 uint32_t resource_id, uint32_t xid,
-+				 uint32_t width, uint32_t height,
++				 uint32_t ctx_id, uint32_t resource_id,
++				 uint32_t xid, uint32_t width, uint32_t height,
 +				 uint32_t stride, uint32_t flags);
  void virtio_gpu_cmd_unref_resource(struct virtio_gpu_device *vgdev,
  				   struct virtio_gpu_object *bo);
  int virtio_gpu_panic_cmd_transfer_to_host_2d(struct virtio_gpu_device *vgdev,
 diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/drivers/gpu/drm/virtio/virtgpu_ioctl.c b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
 --- a/drivers/gpu/drm/virtio/virtgpu_ioctl.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/drivers/gpu/drm/virtio/virtgpu_ioctl.c	2026-08-11 04:18:34.987146500 +1000
-@@ -198,6 +198,34 @@
++++ b/drivers/gpu/drm/virtio/virtgpu_ioctl.c	2026-08-11 06:19:59.414259900 +1000
+@@ -198,6 +198,38 @@
  	return 0;
  }
  
@@ -6789,6 +6790,7 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
 +					  struct drm_file *file)
 +{
 +	struct virtio_gpu_device *vgdev = dev->dev_private;
++	struct virtio_gpu_fpriv *vfpriv = file->driver_priv;
 +	struct drm_virtgpu_moco_present *mp = data;
 +	struct drm_gem_object *gobj;
 +	struct virtio_gpu_object *qobj;
@@ -6801,8 +6803,11 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
 +		return -ENOENT;
 +	qobj = gem_to_virtio_gpu_obj(gobj);
 +
-+	virtio_gpu_cmd_moco_present(vgdev, qobj->hw_res_handle, mp->xid,
-+				    mp->width, mp->height, mp->stride, 0);
++	/* Stamp the context: the host releases a window's bridge -- and takes
++	 * its last frame off the screen -- when this context is destroyed. */
++	virtio_gpu_cmd_moco_present(vgdev, vfpriv->ctx_id, qobj->hw_res_handle,
++				    mp->xid, mp->width, mp->height,
++				    mp->stride, 0);
 +
 +	drm_gem_object_put(gobj);
 +	return 0;
@@ -6811,7 +6816,7 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
  static int virtio_gpu_resource_info_ioctl(struct drm_device *dev, void *data,
  					  struct drm_file *file)
  {
-@@ -732,4 +760,7 @@
+@@ -732,4 +764,7 @@
  
  	DRM_IOCTL_DEF_DRV(VIRTGPU_CONTEXT_INIT, virtio_gpu_context_init_ioctl,
  			  DRM_RENDER_ALLOW),
