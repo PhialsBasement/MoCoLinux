@@ -1874,6 +1874,33 @@ int main(int argc, char **argv)
 		logline("window arena unavailable (old driver?);"
 			" MAP_BLOB will refuse\n");
 
+	/*
+	 * The verdict on the precise-sleep machinery, in a log file where it
+	 * can be read: zero means the idle wait is blind and every guest
+	 * sleep costs a full tick regardless of what the guest asked for.
+	 */
+	{
+		co_manager_ioctl_vgpu_t vp = {0, };
+		unsigned long returned = 0;
+
+		if (CO_OK(co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_VGPU,
+					      &vp, sizeof(vp), &vp, sizeof(vp),
+					      &returned)) && CO_OK(vp.rc))
+			logline("deadline machinery (loop truth): ptr %llx,"
+				" branch %llu, spins %llu, hires-timer %s,"
+				" hires-selftest %llu00ns | paths: tick %llu"
+				" far %llu mid %llu due %llu\n",
+				vp.timer_deadline_host,
+				vp.tdl_branch & 0xffffffffULL,
+				vp.tdl_spins & 0x7fffffffffffffffULL,
+				(vp.tdl_spins >> 63) ? "YES" : "NO",
+				(vp.tdl_branch >> 48) & 0xffffULL,
+				vp.tdl_paths_a >> 32,
+				vp.tdl_paths_a & 0xffffffffULL,
+				vp.tdl_paths_b >> 32,
+				vp.tdl_paths_b & 0xffffffffULL);
+	}
+
 	if (kwindow_test) {
 		int r = cogpu_kwindow_test(handle);
 

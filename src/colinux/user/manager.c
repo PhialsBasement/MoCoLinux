@@ -493,6 +493,24 @@ co_rc_t co_manager_window_bounds(co_manager_handle_t handle,
 	return rc;
 }
 
+co_rc_t co_manager_timer_deadline_host(co_manager_handle_t handle,
+				       unsigned long long* host_out)
+{
+	co_manager_ioctl_vgpu_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_VGPU,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (CO_OK(rc))
+		*host_out = params.timer_deadline_host;
+
+	return rc;
+}
+
 co_rc_t co_manager_kunwindow(co_manager_handle_t handle,
 			     unsigned long long pseudo_pa,
 			     unsigned long long bytes)

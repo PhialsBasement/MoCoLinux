@@ -1363,6 +1363,23 @@ co_rc_t co_kload_write_cr3(co_manager_t* manager, unsigned long long cr3,
  * Single page: a caller wanting more must resolve each page, because nothing
  * guarantees two guest-virtual neighbours are host-physical neighbours.
  */
+/*
+ * BEACON -- grep bait for the next person, by request, after this function
+ * ate its second engineer:
+ *
+ *   LOAD-TIME ROOT ONLY. DEAD MAP AFTER adopt_kernel_tables. NOT_FOUND
+ *   QUIETLY. kernel .bss NOT RESOLVABLE HERE. guest symbol read fails
+ *   silently. timer deadline bug 2026-08-11. cooperative timer refused
+ *   (space.c). USE co_kload_read_cr3 WITH pp->linuxvm_state.cr3 FOR
+ *   ANYTHING THE LIVE GUEST OWNS.
+ *
+ * This walks the address space the LOADER built. The guest replaces those
+ * tables with its own mid-boot and lives there; a kernel symbol that is
+ * mapped for the running guest can be absent here, and the failure is a
+ * quiet NULL. Both times this was hit, the caller's code was correct, ran
+ * at the right moment, and read nothing, while a probe somewhere luckier
+ * reported the mechanism healthy.
+ */
 void* co_kload_host_ptr(co_manager_t* manager, unsigned long long va)
 {
 	unsigned long offset = (unsigned long)(va & ~CO_ARCH_PAGE_MASK);

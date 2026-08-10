@@ -527,6 +527,17 @@ typedef struct {
 	 */
 	unsigned long long window_base;	/* out: guest pa, arena start */
 	unsigned long long window_top;	/* out: guest pa, arena end */
+	/*
+	 * What the guest's timer-deadline array resolves to in host space --
+	 * the same lookup the vCPU idle wait performs. Zero means the wait
+	 * is running blind at tick granularity, which is a bug to see in a
+	 * log line, not to infer from latency scatter.
+	 */
+	unsigned long long timer_deadline_host;	/* out: loop's own value */
+	unsigned long long tdl_branch;		/* out: deadline-branch runs */
+	unsigned long long tdl_spins;		/* out: tail spins entered */
+	unsigned long long tdl_paths_a;		/* out: tick<<32 | far */
+	unsigned long long tdl_paths_b;		/* out: mid<<32 | due */
 } co_manager_ioctl_vgpu_t;
 
 /*
@@ -747,6 +758,13 @@ typedef struct {
 	unsigned long long tick_entry_va;
 	unsigned long long virtual_if_va;
 	unsigned long long ipi_pending_va;
+	/*
+	 * co_colinux_timer_deadline: when each vCPU's next clock event falls
+	 * due, host monotonic 100 ns, zero for none. The idle wait is bounded
+	 * by it, which is what makes a guest nanosleep precise instead of
+	 * tick-quantized.
+	 */
+	unsigned long long timer_deadline_va;
 	int		   max_switches;
 	int		   step;
 	int		   batch;

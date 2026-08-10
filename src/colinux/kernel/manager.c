@@ -42,6 +42,19 @@
 
 co_manager_t* co_global_manager = NULL;
 
+/* The guest's timer-deadline array VA, stashed at KBOOT so the VGPU ioctl
+ * can report what it resolves to -- diagnosis surface, not a mechanism. */
+static unsigned long long manager_timer_deadline_va;
+
+/* Loop truth from the vCPU run loop -- see arch/x86_64/switch.c. */
+extern unsigned long long co_arch_tdl_loop_ptr;
+extern unsigned long long co_arch_tdl_branch_taken;
+extern unsigned long long co_arch_tdl_spins;
+extern unsigned long long co_arch_tdl_path_tick;
+extern unsigned long long co_arch_tdl_path_far;
+extern unsigned long long co_arch_tdl_path_mid;
+extern unsigned long long co_arch_tdl_path_due;
+
 static void set_hostmem_usage_limit(co_manager_t* manager)
 {
 	if (manager->hostmem_amount >= 256) {
@@ -1220,6 +1233,37 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->rc	 = CO_RC(OK);
 		co_kload_window_bounds(&params->window_base,
 				       &params->window_top);
+		/*
+		 * LOOP truth, not a fresh lookup: what the vCPU loop itself
+		 * resolved and how often each branch ran. A fresh lookup here
+		 * once succeeded while the loop's own had failed at an
+		 * earlier moment, and the healthy-looking log line cost two
+		 * blind rebuild cycles.
+		 */
+		params->timer_deadline_host = co_arch_tdl_loop_ptr;
+		/*
+		 * tdl_branch doubles as the transmission probe: high 32 bits
+		 * carry the KBOOT-time stash's low bits and the driver's own
+		 * sizeof(kboot struct), so one log line splits "value never
+		 * left userspace" from "lost between manager and the loop".
+		 */
+		{
+			unsigned long long st = co_os_idle_hires_selftest();
+
+			if (st > 0xffffULL)
+				st = 0xffffULL;
+			params->tdl_branch =
+				(co_arch_tdl_branch_taken & 0xffffffffULL)
+				| ((manager_timer_deadline_va & 0xffffULL) << 32)
+				| (st << 48);
+		}
+		params->tdl_spins  = (co_arch_tdl_spins & 0x7fffffffffffffffULL)
+			| (co_os_idle_hires_available()
+				? 0x8000000000000000ULL : 0);
+		params->tdl_paths_a = ((co_arch_tdl_path_tick & 0xffffffffULL) << 32)
+			| (co_arch_tdl_path_far & 0xffffffffULL);
+		params->tdl_paths_b = ((co_arch_tdl_path_mid & 0xffffffffULL) << 32)
+			| (co_arch_tdl_path_due & 0xffffffffULL);
 
 		/*
 		 * One guest virtual address translated, if asked. The daemon's
@@ -1505,6 +1549,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.tick_entry_va      = params->tick_entry_va;
 		in.virtual_if_va      = params->virtual_if_va;
 		in.ipi_pending_va     = params->ipi_pending_va;
+		in.timer_deadline_va  = params->timer_deadline_va;
+		manager_timer_deadline_va = params->timer_deadline_va;
 		in.step               = params->step;
 		in.batch              = params->batch;
 		in.kernel_table_count = params->kernel_table_count;

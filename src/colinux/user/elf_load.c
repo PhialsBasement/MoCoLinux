@@ -1711,8 +1711,17 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 					       */
 					      "asm_sysvec_co_timer",
 					      "co_colinux_virtual_if",
-					      "co_colinux_ipi_pending", NULL };
-		unsigned long long addr[10];
+					      "co_colinux_ipi_pending",
+					      /*
+					       * Where each vCPU's next clock
+					       * event falls due. The host
+					       * bounds its idle wait by it;
+					       * that is the whole difference
+					       * between 2 ms sleeps and
+					       * precise ones.
+					       */
+					      "co_colinux_timer_deadline", NULL };
+		unsigned long long addr[11];
 		int i;
 
 		for (i = 0; want[i]; i++) {
@@ -2261,6 +2270,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		b.tick_entry_va      = no_copic ? 0 : addr[7];
 		b.virtual_if_va      = addr[8];
 		b.ipi_pending_va     = addr[9];
+		b.timer_deadline_va  = addr[10];
 		if (no_copic)
 			co_terminal_print("    cooperative timer disabled (--no-copic):"
 					  " a running guest will not be interrupted\n");

@@ -74,3 +74,36 @@ regression you are about to hide in mountains of code.
                                          submit, fence signalled by an
                                          ERROR response, renderer never
                                          asked).
+
+2026-08-11  (timer surgery)  M92p GT730 Win10  (oneshot clockevents)
+  Guest sleep accuracy, python perf_counter, 100-200 samples:
+                        BEFORE          WINDOWS OWN     GUEST AFTER
+                        (blind tick)    (user floor)    (final)
+  sleep(50us)   p50     1937            529             567
+  sleep(1000us) p50     ~2000           1996            1580
+  sleep(5000us) p50     ~6000           5996            5687
+  The guest now sleeps AT OR BETTER than native Windows userland.
+  Constants that matter, all measured on this box:
+    Windows interrupt-wake floor: 487-586 us (user probe, hires
+    waitable timer, zero tolerance; tools/timerfloor.c reproduces).
+    Kernel ExTimer selftest: 517 us min-of-3 at driver load; the
+    driver measures it every load and reports it in the cogpu
+    verdict line.
+  Design: guest oneshot clockevent publishes per-vCPU deadlines
+  (host-mono 100ns, level-triggered -- edge-triggered froze: the
+  tick core skip-reprogram cache assumes hardware stays armed);
+  host reads them through the guest CR3 (LOAD-TIME ROOT IS A DEAD
+  MAP -- see the beacon at co_kload_host_ptr); deadlines outrank
+  the housekeeping tick; <900us deadlines get a kernel hires timer
+  aimed AT the deadline (undershoot+spin beat Windows by 470us/
+  sleep and burned a core for a flex nobody needed -- removed);
+  >=900us take the plain ms wait rounded UP (housekeeping lands
+  past its deadline, its decades-old contract; rounding down fed
+  every tick to the precise band: 80k spurious passes/30s).
+  Event hygiene: the hires timer signals its OWN event; sharing
+  the doorbell event self-amplified into a wake storm.
+  CPU: TM calm at idle; under sleep load, honest syscall cost only.
+  One host CLOCK_WATCHDOG_TIMEOUT bugcheck during bring-up -- box
+  has priors, but hires timers raise clock interrupt rates; if it
+  recurs under load, rate-limit the arms and suspect us first.
+================================================================

@@ -1,7 +1,7 @@
 diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/include/asm/cooperative.h b/arch/x86/include/asm/cooperative.h
---- a/arch/x86/include/asm/cooperative.h	1970-01-01 10:00:00.000000000 +1000
-+++ b/arch/x86/include/asm/cooperative.h	2026-08-10 22:03:34.978262900 +1000
-@@ -0,0 +1,127 @@
+--- a/arch/x86/include/asm/cooperative.h	2026-08-10 19:56:47.994454707 +1000
++++ b/arch/x86/include/asm/cooperative.h	2026-08-11 01:00:59.396424600 +1000
+@@ -0,0 +1,128 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _ASM_X86_COOPERATIVE_H
 +#define _ASM_X86_COOPERATIVE_H
@@ -16,6 +16,7 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
 +extern unsigned long co_colinux_m2p_mask;
 +extern unsigned long co_colinux_window_base;
 +extern unsigned long co_colinux_window_top;
++extern u64 co_colinux_timer_deadline[];
 +
 +#ifdef CONFIG_X86_64
 +
@@ -1148,8 +1149,8 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
  void __init cpu_init_topology(struct cpuinfo_x86 *c)
 diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/early_printk.c b/arch/x86/kernel/early_printk.c
 --- a/arch/x86/kernel/early_printk.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/early_printk.c	2026-08-10 22:03:19.432701300 +1000
-@@ -370,6 +370,210 @@
++++ b/arch/x86/kernel/early_printk.c	2026-08-11 01:00:34.241988900 +1000
+@@ -370,6 +370,221 @@
  	.index =	-1,
  };
  
@@ -1243,6 +1244,17 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
 +EXPORT_SYMBOL(co_colinux_window_base);
 +unsigned long co_colinux_window_top;
 +EXPORT_SYMBOL(co_colinux_window_top);
++
++/*
++ * When each vCPU's next clock event falls due -- host monotonic 100 ns
++ * units, the same clock the passage page carries. Written by the oneshot
++ * clockevent's set_next_event; read by the host, which bounds its idle wait
++ * by it. Zero means no event pending, and under a host that predates the
++ * symbol the guest simply keeps the 1 ms tick it always had: the periodic
++ * mode is not removed, only outgrown when both sides are current.
++ */
++u64 co_colinux_timer_deadline[CO_COLINUX_NR_VCPUS];
++EXPORT_SYMBOL(co_colinux_timer_deadline);
 +
 +/*
 + * The guest's virtual interrupt flag -- see asm/irqflags.h. Real IF stays
@@ -1360,7 +1372,7 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
  static void early_console_register(struct console *con, int keep_early)
  {
  	if (con->index != -1) {
-@@ -398,6 +602,10 @@
+@@ -398,6 +613,10 @@
  	keep = (strstr(buf, "keep") != NULL);
  
  	while (*buf != '\0') {
@@ -1770,7 +1782,7 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
   */
 diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.ko' a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
 --- a/arch/x86/kernel/process.c	2026-07-25 00:21:27.000000000 +1000
-+++ b/arch/x86/kernel/process.c	2026-08-09 00:45:41.108973700 +1000
++++ b/arch/x86/kernel/process.c	2026-08-11 01:51:30.363269700 +1000
 @@ -50,10 +50,17 @@
  #include <asm/proto.h>
  #include <asm/frame.h>
@@ -1789,7 +1801,7 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
  
  #include "process.h"
  
-@@ -773,6 +780,1104 @@
+@@ -773,6 +780,1214 @@
  
  DEFINE_STATIC_CALL_NULL(x86_idle, default_idle);
  
@@ -2464,6 +2476,69 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
 +static struct clock_event_device co_colinux_clockevent[CO_COLINUX_NR_VCPUS];
 +
 +/*
++ * The clockevent flight recorder: the last 32 events per machine, in plain
++ * guest memory, read post-mortem with KREAD. Exists because the freeze this
++ * work is debugging eats its own evidence -- printk needs the stream the
++ * wedge kills, and strided tracers are blind for 63 events at a stretch.
++ * Removed with the bring-up tracers once the oneshot path is proven.
++ */
++struct co_ce_event {
++	u32 kind;	/* 1 arm, 2 fire, 3 stop, 4 fire-skip(due future) */
++	u32 cpu;
++	u64 a, b;	/* arm: now, delta. fire: now, due. */
++};
++#define CO_CE_LOG_SZ 32
++struct co_ce_event co_colinux_ce_log[CO_CE_LOG_SZ];
++u32 co_colinux_ce_log_idx;
++EXPORT_SYMBOL(co_colinux_ce_log);
++EXPORT_SYMBOL(co_colinux_ce_log_idx);
++
++static void co_ce_log(u32 kind, u32 cpu, u64 a, u64 b)
++{
++	u32 i = (u32)(__sync_fetch_and_add(&co_colinux_ce_log_idx, 1)
++		      % CO_CE_LOG_SZ);
++
++	co_colinux_ce_log[i].kind = kind;
++	co_colinux_ce_log[i].cpu  = cpu;
++	co_colinux_ce_log[i].a	  = a;
++	co_colinux_ce_log[i].b	  = b;
++}
++
++/*
++ * Oneshot: the device's ticks are 100 ns units of the host's monotonic
++ * clock, so a delta programs an absolute deadline against the same clock
++ * the passage page stamps. The host bounds its idle wait by the published
++ * value; a host too old to look never wakes for it, which is why the
++ * device keeps offering PERIODIC -- the tick core only switches to oneshot
++ * once hres init succeeds, and a boot parameter (highres=off) restores the
++ * old world entirely if this one misbehaves.
++ */
++static int co_colinux_ce_set_next(unsigned long delta,
++				  struct clock_event_device *evt)
++{
++	const unsigned int cpu = (unsigned int)(evt - co_colinux_clockevent);
++	unsigned char *pp = (unsigned char *)co_colinux_passage_page[cpu];
++	u64 now;
++
++	if (!pp)
++		return -EIO;
++
++	now = *(volatile u64 *)(pp + CO_PP_HOST_MONO);
++	WRITE_ONCE(co_colinux_timer_deadline[cpu], now + delta);
++	co_ce_log(1, cpu, now, delta);
++	return 0;
++}
++
++static int co_colinux_ce_stop(struct clock_event_device *evt)
++{
++	const unsigned int cpu = (unsigned int)(evt - co_colinux_clockevent);
++
++	WRITE_ONCE(co_colinux_timer_deadline[cpu], 0);
++	co_ce_log(3, cpu, 0, 0);
++	return 0;
++}
++
++/*
 + * Each vCPU registers its own device, on itself -- the tick core adopts a
 + * device only for the processor registering it. CPU 0 registers first, so
 + * tick_do_timer_cpu stays 0 and only its ticks advance jiffies; a
@@ -2480,12 +2555,22 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
 +	struct clock_event_device *evt = &co_colinux_clockevent[cpu];
 +
 +	evt->name		= "cotimer";
-+	evt->features		= CLOCK_EVT_FEAT_PERIODIC;
++	evt->features		= CLOCK_EVT_FEAT_PERIODIC |
++				  CLOCK_EVT_FEAT_ONESHOT;
 +	evt->set_state_periodic	= co_colinux_ce_state_noop;
-+	evt->set_state_shutdown	= co_colinux_ce_state_noop;
++	evt->set_state_oneshot	= co_colinux_ce_state_noop;
++	evt->set_state_oneshot_stopped = co_colinux_ce_stop;
++	evt->set_state_shutdown	= co_colinux_ce_stop;
++	evt->set_next_event	= co_colinux_ce_set_next;
 +	evt->rating		= 300;
 +	evt->cpumask		= cpumask_of(cpu);
-+	clockevents_register_device(evt);
++	/*
++	 * 10 MHz: one device tick is 100 ns, the unit of the host clock the
++	 * deadlines are measured in. Min 10 ticks (1 us) because a shorter
++	 * program than the host's wake accuracy only buys a busier spin;
++	 * max 10^9 (100 s) covers every NOHZ stretch the core will ask for.
++	 */
++	clockevents_config_and_register(evt, 10000000, 10, 1000000000);
 +}
 +
 +void __init co_colinux_timer_init(void)
@@ -2548,6 +2633,43 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
 +	 * moves the boot processor's.
 +	 */
 +	now = *(volatile u64 *)(pp + CO_PP_HOST_MONO);
++
++	/*
++	 * Oneshot: one programmed deadline instead of an elapsed-time replay.
++	 * The handler is hrtimer_interrupt by way of the tick core; it reads
++	 * the clocksource itself and re-arms through set_next_event, so there
++	 * is nothing to count here -- fire once when due, never otherwise.
++	 * The deadline is cleared first because the handler's re-arm must not
++	 * be overwritten by a stale clear after it returns.
++	 */
++	if (clockevent_state_oneshot(evt)) {
++		u64 due = READ_ONCE(co_colinux_timer_deadline[cpu]);
++
++		*lm = now;	/* keep the periodic baseline current */
++		if (!due || now < due) {
++			if (due)
++				co_ce_log(4, cpu, now, due);
++			return 0;
++		}
++		/*
++		 * LEVEL-triggered, deliberately: the deadline is NOT consumed
++		 * by firing. tick_nohz_stop_tick skips reprogramming when the
++		 * next expiry equals what it believes the device carries --
++		 * correct for hardware whose timer stays loaded, fatal for a
++		 * device that forgets on fire: one skipped reprogram and this
++		 * CPU never receives another event, which is a silent
++		 * time-stops freeze (flight-recorded: a final fire followed
++		 * by neither an arm nor a stop, both CPUs). So a stale
++		 * deadline keeps firing at every boundary until the handler's
++		 * own re-arm moves it forward, and a device the core really
++		 * stopped goes quiet through set_state_oneshot_stopped, which
++		 * clears it. The healthy path costs nothing: the handler
++		 * re-arms immediately and the level drops.
++		 */
++		co_ce_log(2, cpu, now, due);
++		return 1;
++	}
++
 +	if (!*lm)
 +		*lm = now;
 +	if (now <= *lm)
@@ -2894,7 +3016,7 @@ diff --color -urN '--exclude=.*' '--exclude=*.o' '--exclude=*.cmd' '--exclude=*.
  static bool x86_idle_set(void)
  {
  	return !!static_call_query(x86_idle);
-@@ -936,6 +2041,18 @@
+@@ -936,6 +2151,18 @@
  
  void __init select_idle_routine(void)
  {

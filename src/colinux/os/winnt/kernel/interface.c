@@ -398,6 +398,9 @@ driver_unload(IN PDRIVER_OBJECT DriverObject)
 		co_manager_unload(manager);
 	}
 
+	/* The other half of DriverEntry's ExSetTimerResolution. */
+	ExSetTimerResolution(0, FALSE);
+
 	RtlInitUnicodeString(&deviceLinkUnicodeString, deviceLinkBuffer);
 
 	IoDeleteSymbolicLink(&deviceLinkUnicodeString);
@@ -437,6 +440,18 @@ DriverEntry(
 
 	manager = (co_manager_t *)deviceObject->DeviceExtension;
 	manager->state = CO_MANAGER_STATE_NOT_INITIALIZED;
+
+	/*
+	 * The idle wait's granularity, owned rather than inherited. The vCPU
+	 * loop bounds its sleep by the guest's next timer deadline, and a
+	 * KeWaitForSingleObject timeout is only as fine as the system clock
+	 * interval -- 15.6 ms by default, 1 ms only while SOMEONE has raised
+	 * it. Until now that someone was whichever process happened to call
+	 * timeBeginPeriod (the GPU daemon, via its renderer); a guest without
+	 * a GPU slept 15 ms at a time and nobody knew why. One millisecond,
+	 * held for the driver's lifetime, restored symmetrically at unload.
+	 */
+	ExSetTimerResolution(10000, TRUE);
 
 	RtlInitUnicodeString (&deviceLinkUnicodeString, deviceLinkBuffer);
 	ntStatus = IoCreateSymbolicLink (&deviceLinkUnicodeString,

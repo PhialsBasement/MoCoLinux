@@ -101,6 +101,8 @@ extern co_rc_t co_manager_kunwindow(co_manager_handle_t handle,
 extern co_rc_t co_manager_window_bounds(co_manager_handle_t handle,
 					unsigned long long* base,
 					unsigned long long* top);
+extern co_rc_t co_manager_timer_deadline_host(co_manager_handle_t handle,
+					      unsigned long long* host_out);
 extern co_rc_t co_manager_kload_enter(co_manager_handle_t handle,
 				      co_manager_ioctl_test_switch_t* out);
 extern co_rc_t co_manager_kcall(co_manager_handle_t handle,
