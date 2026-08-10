@@ -24,4 +24,12 @@ regression you are about to hide in mountains of code.
   transfer-to-host     1029.4 MiB/s   <- staged path: ~4.8x under the blob
   Lesson recorded: the first ledger row compared cache-scale to DRAM-scale
   and read as 20x. Honest gap is ~4.8x. The instrument caught its author.
+
+2026-08-10  9aa0e2a6  M92p GT730 Win10  (native control, host python)
+  native memmove       4667.6 MiB/s   <- confirms the ceiling: guest range
+                                         4439-4933 brackets it; the guest
+                                         copies at native speed
+  native 2MB cache     9957.0 MiB/s   (msvcrt vs glibc differ at cache
+                                         scale; cache rows are never
+                                         bandwidth claims)
 ================================================================
