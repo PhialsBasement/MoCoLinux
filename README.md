@@ -125,6 +125,41 @@ vendored slirp, run in a process confined to a 2 GB address space so its
 into the guest (the image runs sshd, which is a far better instrument than a
 serial console for diagnosing anything graphical).
 
+### Timers
+
+The guest has no timer hardware. It gets time from the host's clock, and for
+most of this port's life it got it as a stream of 1 kHz periodic ticks
+synthesised at cooperative boundaries -- which meant every sleep, every fence
+wait and every present in the guest was quantised to a millisecond, twice over.
+A `nanosleep(50 µs)` cost 1937 µs.
+
+The clockevent is now **oneshot**. `set_next_event` publishes the deadline, in
+the host's own monotonic 100 ns units, into a per-vCPU slot the host reads; the
+monitor bounds its idle wait by the nearest deadline and wakes on a
+high-resolution kernel timer. Guest sleeps land at **567 µs** median where they
+used to take 1937, and 1 ms and 5 ms sleeps now land *closer to their deadline
+than Windows manages for its own processes* (1580 µs against 1996, 5687 against
+5996), because the idle loop can re-aim on any early wake while a single
+user-mode wait cannot.
+
+Two properties are load-bearing and both were learned by breaking them. The
+published deadline is **level-triggered**: firing does not consume it, because
+`tick_nohz` skips reprogramming when it believes the device still carries the
+same expiry, and a device that forgets on fire then never fires again -- a
+silent freeze with no panic, because every watchdog that would report it needs
+time to advance. And the host reads that slot **through the guest's own CR3**,
+never the loader's page tables, which stop describing the guest once it adopts
+its kernel tables; the same trap cost the cooperative timer its first
+implementation and is now marked with a beacon in `co_kload_host_ptr`.
+
+The measured floor underneath all of this is Windows': a high-resolution
+waitable timer with zero coalescing tolerance, asked for 100 µs, wakes at
+**487-586 µs** on this machine. `tools/timerfloor.c` reproduces it. Nothing in
+a guest can be sharper than its host's interrupt, so the design aims at that
+floor rather than pretending past it, and the payoff shows up everywhere:
+`glxgears` went from a 579-721 band to 840-855 fps with no graphics change at
+all.
+
 ### Graphics
 
 The guest has a real GPU device: virtio-gpu, render-only, over a transport
@@ -277,9 +312,17 @@ ask for:
   command stream. Unmodified GLX and EGL programs of both ABIs load Mesa's DRI3
   provider and report direct virgl; 543 fps 64-bit and 602 fps 32-bit on
   `tools/glbench` at 1280x720 on a GT 730
+- Hardware-accelerated Vulkan on the host's card, through Venus: the guest's
+  Mesa `libvulkan_virtio` (both ABIs) serialises to virglrenderer's `vkr`
+  decoder, which runs it on the host's own Vulkan driver. `vulkaninfo` reports
+  `Virtio-GPU Venus (NVIDIA GeForce GT 730)` as a discrete device, host-visible
+  memory maps at the machine's DRAM ceiling (4.6-4.8 GiB/s) through a window
+  arena in the p2m with no BAR involved, and `vkcube` presents into its own
+  native window at 368 fps beside an OpenGL client
 - Sandboxed clients work untouched, because presentation needs only the render
-  node they already have: Firefox renders directly and stays interactive, and
-  Steam logs direct CoPresent from inside its pressure-vessel container
+  node they already have -- for both APIs: Firefox renders directly and stays
+  interactive, and Steam logs direct CoPresent from inside its pressure-vessel
+  container
 - Inbound port redirects (`-r tcp:2222:22` reaches the guest's sshd)
 - 32-bit binaries (the guest keeps its own `int $0x80` gate)
 - Landlock and user namespaces (required by pacman 7 and modern sandboxes)
@@ -300,25 +343,36 @@ ask for:
 
 Not yet:
 
-- SMP beyond two vCPUs, long-duration desktop/Steam soaking, and evaluation of
-  one-shot/NO_HZ clock events. The two-vCPU path is functional and benchmarked
+- SMP beyond two vCPUs, and long-duration desktop/Steam soaking. The two-vCPU
+  path is functional and benchmarked. One-shot clock events are no longer on
+  this list: they shipped, and [Timers](#timers) has the numbers
 - The coLinux message layer (`co_monitor_t`, queues, reactor), so upstream's
   `cocon`/`conet` consoles and devices — including `colinux-console-nt` —
   cannot attach
 - DHCP in the guest (static address only)
-- Native-speed presentation. Direct presentation is now the packaged default
-  for both ABIs, but geometry-heavy loads still cost about 1.8x the same binary
-  natively, and roughly 4-5 ms per frame goes to the synchronous present
-  round-trip. An asynchronous multi-buffered release path is the next task
-- Vulkan. virgl is OpenGL only; the image ships software lavapipe so the Steam
-  client will start, and accelerated Vulkan (and therefore Proton/DXVK) is a
-  separate project that this checkpoint does not imply
+- Native-speed presentation. Direct presentation is the packaged default for
+  both ABIs, and the oneshot clockevents took the per-frame synchronisation
+  cost from about 2.5 ms to 1.2-1.5 ms -- `glxgears` is now roughly two thirds
+  of the host's own figure rather than half. Geometry-heavy loads remain the
+  gap, and an asynchronous multi-buffered release path is still the next task
+- Vsync. Presents are fire-and-forget in both APIs, so `FIFO` is not throttled
+  and a client renders as fast as the card allows. Nothing has needed it yet;
+  a game will
+- Proton, DXVK and Wine. Accelerated Vulkan exists now (see
+  [Vulkan](#vulkan)), which removes the reason this was previously listed as a
+  separate project -- but no D3D title has been run, no Wine prefix has been
+  built on this box, and the honest state is "unblocked, untried". Zink over
+  Venus is in the same position
+- Steam's client. It launches and its helpers run, but the storefront UI is
+  still the CEF failure below, and a 5000-fish WebGL load killed its GPU
+  process on this hardware
 - Steam's own storefront UI. Its CEF helper fails to create a browser window
   against VcXsrv 1.14 — with GPU initialisation clean, a Vulkan device present
-  and CoPresent active for its other drawables. The same failure occurs with
-  this stack disabled, so it is a CEF/X-server problem rather than a graphics
-  one, and `XFree86-VidModeExtension` is likewise absent and cannot be enabled
-  on the pinned XP-compatible server
+  (an accelerated one now, not just lavapipe) and CoPresent active for its
+  other drawables. The same failure occurs with this stack disabled, so it is a
+  CEF/X-server problem rather than a graphics one, and
+  `XFree86-VidModeExtension` is likewise absent and cannot be enabled on the
+  pinned XP-compatible server
 
 ### Cooperative SMP milestone
 

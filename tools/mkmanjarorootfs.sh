@@ -153,12 +153,14 @@ PACKAGES="base manjaro-release manjaro-system pacman-mirrors \
 # 32-bit libGL/libEGL, and Steam's client is i386, so the 32-bit half of the
 # stack is not optional. It is installed below alongside the 64-bit one.
 #
-# vulkan-swrast, both ABIs, because the modern Steam client refuses to build its
-# UI without a Vulkan device: with none present it logs "BInit - Unable to
-# initialize Vulkan!" and quits. virgl offers OpenGL only, so lavapipe answers
-# the query in software while games keep rendering through accelerated GL. The
-# 32-bit copy matters for the same reason as lib32-mesa -- the client is i386,
-# and a 64-bit-only ICD leaves it failing with VK_ERROR_INCOMPATIBLE_DRIVER.
+# vulkan-swrast, both ABIs, as the FALLBACK it now is rather than the only
+# Vulkan there was. Venus is installed further down and answers with the host's
+# real card; lavapipe stays for a host whose driver or card cannot serve Venus,
+# and because the modern Steam client refuses to build its UI without any Vulkan
+# device at all -- with none present it logs "BInit - Unable to initialize
+# Vulkan!" and quits. The 32-bit copy matters for the same reason as lib32-mesa:
+# the client is i386, and a 64-bit-only ICD leaves it failing with
+# VK_ERROR_INCOMPATIBLE_DRIVER.
 #
 # mesa-utils is glxinfo and glxgears: how anyone checks whether that actually
 # happened, rather than trusting it. vulkan-tools is the same instrument for the
