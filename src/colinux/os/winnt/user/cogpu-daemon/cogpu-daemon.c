@@ -1049,6 +1049,111 @@ static uint32_t serve(struct cogpu_chain *chain)
 	return written;
 }
 
+/* ---------------------------------------------------------- kwindow test */
+
+/*
+ * The pattern round-trip that must pass before any Vulkan work is credible:
+ * this process's memory, appearing in the guest's physical address space,
+ * readable and writable from both sides at once.
+ *
+ * Protocol, driven by hand from a guest shell (busybox devmem):
+ *
+ *   devmem 0x<pa>          64                       -> 0xC0DE000000000000
+ *   devmem 0x<pa+8>        64                       -> 0xC0DE000000000001
+ *   devmem 0x<pa+0x1000>   64 0xAA55AA55AA55AA55
+ *   devmem 0x<pa+0x1FFFF8> 64 0x1122334455667788
+ *   devmem 0x<pa>          64 0x600DBEEFCAFEF00D    <- magic last
+ *
+ * The magic is written last so that when it appears here, the other two
+ * writes are already resident; three probes cover first page, an interior
+ * page, and the final eight bytes of the window.
+ */
+static int cogpu_kwindow_test(co_manager_handle_t handle)
+{
+	enum { KWT_BYTES = 2 << 20 };
+	static const unsigned long long KWT_MAGIC = 0x600DBEEFCAFEF00Dull;
+	volatile unsigned long long *buf;
+	unsigned long long pseudo_pa = 0;
+	unsigned long long i, n = KWT_BYTES / 8;
+	int waited, failed = 0;
+	co_rc_t rc;
+
+	buf = VirtualAlloc(NULL, KWT_BYTES, MEM_COMMIT | MEM_RESERVE,
+			   PAGE_READWRITE);
+	if (!buf) {
+		logline("kwindow-test: VirtualAlloc failed (%lu)\n",
+			GetLastError());
+		return 1;
+	}
+
+	for (i = 0; i < n; i++)
+		buf[i] = 0xC0DE000000000000ull | i;
+
+	rc = co_manager_kwindow(handle, (const void *)buf, KWT_BYTES,
+				&pseudo_pa);
+	if (!CO_OK(rc)) {
+		logline("kwindow-test: KWINDOW refused, rc %08x\n", (int)rc);
+		return 1;
+	}
+
+	logline("kwindow-test: %u KB of this process at guest pa 0x%llx\n",
+		KWT_BYTES >> 10, pseudo_pa);
+	logline("kwindow-test: from a guest shell, in this order:\n");
+	logline("  devmem 0x%llx 64                       # expect 0xc0de000000000000\n",
+		pseudo_pa);
+	logline("  devmem 0x%llx 64                       # expect 0xc0de000000000001\n",
+		pseudo_pa + 8);
+	logline("  devmem 0x%llx 64 0xAA55AA55AA55AA55\n", pseudo_pa + 0x1000);
+	logline("  devmem 0x%llx 64 0x1122334455667788\n",
+		pseudo_pa + KWT_BYTES - 8);
+	logline("  devmem 0x%llx 64 0x600DBEEFCAFEF00D\n", pseudo_pa);
+	logline("kwindow-test: waiting up to 10 minutes for the magic...\n");
+
+	for (waited = 0; waited < 10 * 60 * 5; waited++) {
+		if (buf[0] == KWT_MAGIC)
+			break;
+		Sleep(200);
+	}
+
+	if (buf[0] != KWT_MAGIC) {
+		logline("kwindow-test: FAIL -- magic never arrived;"
+			" +0x0 still 0x%llx\n", buf[0]);
+		co_manager_kunwindow(handle, pseudo_pa, KWT_BYTES);
+		return 1;
+	}
+
+	if (buf[0x1000 / 8] != 0xAA55AA55AA55AA55ull) {
+		logline("kwindow-test: FAIL -- +0x1000 is 0x%llx, wanted"
+			" 0xaa55aa55aa55aa55\n", buf[0x1000 / 8]);
+		failed = 1;
+	}
+	if (buf[n - 1] != 0x1122334455667788ull) {
+		logline("kwindow-test: FAIL -- last u64 is 0x%llx, wanted"
+			" 0x1122334455667788\n", buf[n - 1]);
+		failed = 1;
+	}
+	/* Slots the guest never touched must still hold the pattern. */
+	for (i = 0; i < n; i++) {
+		if (i == 0 || i == 0x1000 / 8 || i == n - 1)
+			continue;
+		if (buf[i] != (0xC0DE000000000000ull | i)) {
+			logline("kwindow-test: FAIL -- untouched +0x%llx"
+				" corrupted to 0x%llx\n", i * 8, buf[i]);
+			failed = 1;
+			break;
+		}
+	}
+
+	rc = co_manager_kunwindow(handle, pseudo_pa, KWT_BYTES);
+	if (!CO_OK(rc)) {
+		logline("kwindow-test: KUNWINDOW refused, rc %08x\n", (int)rc);
+		failed = 1;
+	}
+
+	logline("kwindow-test: %s\n", failed ? "FAIL" : "PASS");
+	return failed;
+}
+
 /* ------------------------------------------------------------------- main */
 
 int main(int argc, char **argv)
@@ -1059,6 +1164,7 @@ int main(int argc, char **argv)
 	unsigned int		last_kick[CO_VGPU_NUM_VQS] = { 0, 0 };
 	unsigned long long	vgpu_va = 0;
 	int			i, once = 0, present_probe = 0;
+	int			kwindow_test = 0;
 	int			idle = 0;
 	unsigned long long	sweeps = 0;
 
@@ -1073,11 +1179,14 @@ int main(int argc, char **argv)
 			present_r1 = 1;
 		else if (!strcmp(argv[i], "--present-r2"))
 			present_r2 = 1;
+		else if (!strcmp(argv[i], "--kwindow-test"))
+			kwindow_test = 1;
 		else if (!strcmp(argv[i], "--selftest"))
 			return cogpu_vring_selftest();
 		else {
 			logline("usage: cogpu-daemon [--verbose] [--once] [--selftest]"
-				" [--present-probe] [--present-r1] [--present-r2]\n");
+				" [--present-probe] [--present-r1] [--present-r2]"
+				" [--kwindow-test]\n");
 			return 2;
 		}
 	}
@@ -1112,17 +1221,24 @@ int main(int argc, char **argv)
 		char path[MAX_PATH];
 		char drive[8];
 		DWORD n = GetEnvironmentVariableA("SystemDrive", drive, sizeof(drive));
+		/*
+		 * A test instance runs beside the live service daemon, which
+		 * holds the real log open -- "w" here would truncate it under
+		 * the service's feet. Tests get their own file.
+		 */
+		const char *base = kwindow_test ? "cogpu-kwindow-test.log"
+						: "cogpu-daemon.log";
 
 		if (n > 0 && n < sizeof(drive))
-			_snprintf(path, sizeof(path), "%s\\MoCoLinux\\cogpu-daemon.log",
-				  drive);
+			_snprintf(path, sizeof(path), "%s\\MoCoLinux\\%s",
+				  drive, base);
 		else
-			_snprintf(path, sizeof(path), "cogpu-daemon.log");
+			_snprintf(path, sizeof(path), "%s", base);
 		path[sizeof(path) - 1] = '\0';
 
 		g_log = fopen(path, "w");
 		if (!g_log)
-			g_log = fopen("cogpu-daemon.log", "w");
+			g_log = fopen(base, "w");
 	}
 
 	/*
@@ -1135,7 +1251,7 @@ int main(int argc, char **argv)
 	 * was explaining itself into nothing while its failures were guessed
 	 * at from the guest's "response 0x1200".
 	 */
-	{
+	if (!kwindow_test) {
 		FILE *e = freopen("C:\\MoCoLinux\\cogpu-vrend.log", "w", stderr);
 
 		if (e)
@@ -1159,28 +1275,35 @@ int main(int argc, char **argv)
 	 * up there is no point servicing a ring: the guest would get OK to
 	 * everything and render nothing, which is worse than a device that
 	 * refuses honestly.
+	 *
+	 * The kwindow test is the one exception: it exercises the driver's
+	 * window path and nothing else, so a broken renderer must not be able
+	 * to block it.
 	 */
-	if (cogpu_vrend_init(NULL, NULL) != 0) {
+	if (!kwindow_test && cogpu_vrend_init(NULL, NULL) != 0) {
 		logline("virglrenderer would not initialise -- no GPU today\n");
 		return 1;
 	}
-	logline("renderer: %s\n", cogpu_vrend_renderer());
-	{
-		unsigned int v = 0, sz = 0;
+	if (!kwindow_test) {
+		logline("renderer: %s\n", cogpu_vrend_renderer());
+		{
+			unsigned int v = 0, sz = 0;
 
-		cogpu_vrend_capset(1, &v, &sz);
-		logline("virgl capset: version %u, %u bytes\n", v, sz);
-	}
-	if (present_probe)
-		return cogpu_present_probe(12000);
-	if (present_r1)
-		cogpu_present_r1_enable();
-	if (present_r2) {
-		cogpu_present_r2_enable();
-		/* Presentation requests carried in the guest's own command
-		 * stream, which is what makes sandboxed clients work with no
-		 * configuration -- see cogpu_present_stream(). */
-		cogpu_vrend_set_present_hook(cogpu_present_stream);
+			cogpu_vrend_capset(1, &v, &sz);
+			logline("virgl capset: version %u, %u bytes\n", v, sz);
+		}
+		if (present_probe)
+			return cogpu_present_probe(12000);
+		if (present_r1)
+			cogpu_present_r1_enable();
+		if (present_r2) {
+			cogpu_present_r2_enable();
+			/* Presentation requests carried in the guest's own
+			 * command stream, which is what makes sandboxed clients
+			 * work with no configuration -- see
+			 * cogpu_present_stream(). */
+			cogpu_vrend_set_present_hook(cogpu_present_stream);
+		}
 	}
 
 	handle = co_os_manager_open();
@@ -1191,6 +1314,13 @@ int main(int argc, char **argv)
 	}
 	InitializeCriticalSection(&g_slice_lock);
 	g_slice_lock_ready = 1;
+
+	if (kwindow_test) {
+		int r = cogpu_kwindow_test(handle);
+
+		co_os_manager_close(handle);
+		return r;
+	}
 
 	/*
 	 * Wait for the published transport, translate it once, then map only the

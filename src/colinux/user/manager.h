@@ -84,6 +84,17 @@ extern co_rc_t co_manager_vgpu_wake(co_manager_handle_t handle);
 extern co_rc_t co_manager_kvirt_to_phys(co_manager_handle_t handle,
 					unsigned long long va,
 					unsigned long long* pa_out);
+/*
+ * A window: this process's pages, appearing in the guest's physical address
+ * space. KMAP's mirror -- see ioctl.h. Pages stay MDL-locked until the
+ * matching kunwindow or the handle closes.
+ */
+extern co_rc_t co_manager_kwindow(co_manager_handle_t handle,
+				  const void* va, unsigned long long bytes,
+				  unsigned long long* pseudo_pa_out);
+extern co_rc_t co_manager_kunwindow(co_manager_handle_t handle,
+				    unsigned long long pseudo_pa,
+				    unsigned long long bytes);
 extern co_rc_t co_manager_kload_enter(co_manager_handle_t handle,
 				      co_manager_ioctl_test_switch_t* out);
 extern co_rc_t co_manager_kcall(co_manager_handle_t handle,

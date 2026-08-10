@@ -132,6 +132,19 @@ static bool_t		      kload_ram_ready;
 
 #define CO_KLOAD_MIN_TABLE_BYTES (4ULL << 20)
 
+/*
+ * Address space above guest RAM in which host memory windows may appear.
+ *
+ * Sizing capacity to exactly RAM + tables gave the downward window allocator
+ * zero pages to hand out: kload_window_next started level with the top of
+ * backed RAM and the first KWINDOW met the allocators-meet check immediately.
+ * The arena is address space, not memory -- its p2m slots stay zero until a
+ * window fills them, nothing appears in the guest's e820, and the only real
+ * cost is metadata: 4 GB of arena is 8 MB of p2m slots (plus the m2p hash
+ * sized from capacity, which windows deliberately never populate).
+ */
+#define CO_KLOAD_WINDOW_ARENA_BYTES (4ULL << 30)
+
 static unsigned long kload_m2p_hash(co_pfn_t mfn)
 {
 	return (unsigned long)((mfn * 11400714819323198485ULL)
@@ -1022,6 +1035,7 @@ co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 	capacity_end = ram_bytes + table_bytes;
 	if (capacity_end < kload_table_end)
 		capacity_end = kload_table_end;
+	capacity_end += CO_KLOAD_WINDOW_ARENA_BYTES;
 	capacity_end = (capacity_end + CO_ARCH_PAGE_SIZE - 1) & CO_ARCH_PAGE_MASK;
 
 	rc = kload_translation_alloc(
@@ -1831,7 +1845,15 @@ unsigned long co_kload_ram_pages(void)
 
 unsigned long co_kload_p2m_pages(void)
 {
-	return kload_backed_pages;
+	/*
+	 * Capacity, not backed RAM: this value becomes the guest's
+	 * co_colinux_p2m_pages, below which pseudo_to_machine consults the
+	 * p2m and above which it falls back to identity. Host memory windows
+	 * live between backed RAM and capacity -- report only backed pages
+	 * and a guest PTE naming a window identity-maps to a machine address
+	 * that does not exist, which reads as all-ones and swallows writes.
+	 */
+	return kload_p2m_capacity;
 }
 
 unsigned long long co_kload_m2p_mask(void)
