@@ -1,11 +1,11 @@
 # MoCoLinux
 
-Cooperative Linux for x86-64, with fragmented-RAM backing and guest memory
-configurations up to 128 GB: a modern Linux kernel running as a guest inside
-Windows XP x64, Windows 7 x64, Windows 8.1 x64 and Windows 10 x64 on real
-hardware, without a hypervisor, emulation, or virtualization extensions. It is a port of
-[coLinux](http://colinux.org/) (i386, unmaintained since ~2011) to x86-64,
-against a 2026 kernel.
+MoCoLinux is Cooperative Linux for x86-64: a modern Linux kernel running as a
+guest inside Windows XP x64, Windows 7 x64, Windows 8.1 x64 and Windows 10 x64
+on real hardware, without a hypervisor, emulation, or virtualization
+extensions. It supports fragmented-RAM backing and guest memory configurations
+up to 128 GB. It is a port of [coLinux](http://colinux.org/) (i386,
+unmaintained since ~2011) to x86-64, against a 2026 kernel.
 
 ```
 [root@mocolinux ~]# systemctl is-system-running
@@ -22,39 +22,39 @@ running
 
 ![Manjaro with KDE running as native windows on Windows XP x64](doc/img/mocolinux-desktop.png)
 
-The screenshot is one machine: KDE Plasma 6.7.3 applications and `cmd.exe`
-(Windows 5.2.3790) sharing the same desktop and taskbar. No X server runs in
-the guest — applications are X clients talking to a VcXsrv on the Windows side
+The screenshot shows one machine: KDE Plasma 6.7.3 applications and `cmd.exe`
+(Windows 5.2.3790) on the same desktop and taskbar. No X server runs in the
+guest. The applications are X clients talking to a VcXsrv on the Windows side
 in multiwindow mode (`DISPLAY=10.0.2.2:0`; slirp rewrites that address to the
 host's loopback).
 
 ![The same guest on Windows 7 x64: Dolphin, Kate and Konsole as Aero windows](doc/img/mocolinux-win7-desktop.png)
 
-The same driver, kernel and root image on Windows 7 x64 — Dolphin, Kate and
-Konsole with Aero frames and taskbar buttons, `fastfetch` reporting the
-ThinkCentre's own i5-3470.
+This is the same driver, kernel and root image on Windows 7 x64: Dolphin, Kate
+and Konsole with Aero frames and taskbar buttons, and `fastfetch` reporting
+the ThinkCentre's own i5-3470.
 
 ![The same guest again on Windows 8.1 x64, with cmd.exe reporting 6.3.9600 beside it](doc/img/mocolinux-win81-desktop.png)
 
-And the same again on Windows 8.1 x64, `cmd.exe` reporting 6.3.9600 next to
-KDE's own report of the card.
+The same again on Windows 8.1 x64, with `cmd.exe` reporting 6.3.9600 next to
+KDE's report of the graphics card.
 
 ![And on Windows 10 IoT Enterprise LTSC, with KDE, Dolphin and fastfetch reporting virgl on the GT 730](doc/img/mocolinux-win10-desktop.png)
 
 And on Windows 10 IoT Enterprise LTSC (10.0.19044), with KVA Shadow (KPTI)
-active. One binary serves all four hosts: XP ignores embedded signatures, while
+active. One binary serves all four hosts. XP ignores embedded signatures;
 Windows 7, 8.1 and 10 accept the same test-signed driver once
-`bcdedit /set testsigning on` is in force, which Setup does for you. 8.1 and 10
-ask for a little more — see [Windows 8 and 8.1](#windows-8-and-81) and
-[Windows 10](#windows-10).
+`bcdedit /set testsigning on` is in force, which Setup enables for you. 8.1
+and 10 have additional requirements; see
+[Windows 8 and 8.1](#windows-8-and-81) and [Windows 10](#windows-10).
 
 ## How it works
 
-There is no guest-physical address space, no shadow page tables, no VT-x. Both
-kernels run at ring 0 on the bare processor; a **world switch** swaps the full
-CPU context (CR0/CR2/CR3/CR4/CR8, GDT, IDT, LDT, TR, segment selectors, per-CPU
-MSRs, debug registers, FPU state) between them. The guest is trusted, like a
-driver, because it runs with kernel privilege.
+There is no guest-physical address space, no shadow page tables, and no VT-x.
+Both kernels run at ring 0 on the bare processor. A **world switch** swaps the
+full CPU context (CR0/CR2/CR3/CR4/CR8, GDT, IDT, LDT, TR, segment selectors,
+per-CPU MSRs, debug registers, FPU state) between them. The guest runs with
+kernel privilege, so it is trusted the same way a driver is.
 
 ```
   Windows XP x64                          Linux 7.1.5
@@ -69,46 +69,48 @@ driver, because it runs with kernel privilege.
                               guest kernel ──► ring 3 processes
 ```
 
-The **passage page** is a handful of pages mapped at an identical virtual
-address on both sides, holding the switch code, both saved CPU states, an IST
-stack, a TSS and the console ring — valid mid-crossing, when CR3 has changed
-but nothing else has.
+The **passage page** is a small set of pages mapped at an identical virtual
+address on both sides. It holds the switch code, both saved CPU states, an IST
+stack, a TSS and the console ring, and it remains valid in the middle of a
+crossing, after CR3 has changed but before anything else has.
 
 ### FragRAM
 
-FragRAM is shorthand here for backing the guest with whatever physical pages
-Windows can provide instead of requiring guest RAM in unbroken physical runs.
-The earlier x86-64 port treated a Linux guest page number as the corresponding
-host machine page number. That was simple, but it meant a host could have
-enough free RAM in total and still fail to boot the guest because the free
-pages were scattered after normal use or repeated guest runs.
+FragRAM means backing the guest with whatever physical pages Windows can
+provide, instead of requiring guest RAM to be physically contiguous. The
+earlier x86-64 port treated a Linux guest page number as the corresponding
+host machine page number. That was simple, but a host could have enough free
+RAM in total and still fail to boot the guest, because the free pages were
+scattered after normal use or repeated guest runs.
 
-The driver now allocates cached nonpaged-pool chunks which are contiguous in
-its kernel virtual address but may be scattered across physical RAM. It records
-the machine frame behind every 4 KB page. Linux still sees ordinary dense RAM
-starting at pseudo-physical address zero: a p2m table translates a guest page
-number before it is placed in a hardware page table, and an m2p hash translates
-it back when Linux reads that entry. The guest direct map uses 4 KB leaves
-because a huge page would incorrectly imply that the host frames are adjacent.
+The driver now allocates cached nonpaged-pool chunks that are contiguous in
+its kernel virtual address space but may be scattered across physical RAM. It
+records the machine frame behind every 4 KB page. Linux still sees ordinary
+dense RAM starting at pseudo-physical address zero: a p2m table translates a
+guest page number before it is placed in a hardware page table, and an m2p
+hash translates it back when Linux reads that entry. The guest direct map uses
+4 KB leaves, because a huge page would incorrectly imply that the host frames
+are adjacent.
 
 Supporting configurations up to 128 GB also required 64-bit memory sizes and
 block accounting, allocation and p2m/m2p metadata sized for 131072 MiB, and a
-change to how the GPU daemon sees guest memory. It no longer maps the configured
-RAM size in advance; it asks the driver for 12 MB windows around guest
-addresses as it needs them. A large `--mem` value therefore does not create
-thousands of unused user mappings before the GPU has touched a page.
+change to how the GPU daemon sees guest memory. It no longer maps the
+configured RAM size in advance; it asks the driver for 12 MB windows around
+guest addresses as it needs them. A large `--mem` value therefore does not
+create thousands of unused user mappings before the GPU has touched a page.
 
 This is not RAM overcommit or ballooning. Memory advertised to Linux still
-needs real nonpaged host backing. `--mem 131072` is therefore a supported
-ceiling, not a promise that every supported Windows machine can spare 128 GB;
-if the host supplies less than the requested target, that is reported and the
+needs real nonpaged host backing. `--mem 131072` is a supported ceiling, not a
+promise that every supported Windows machine can spare 128 GB. If the host
+supplies less than the requested target, the shortfall is reported and the
 guest e820 map describes the amount actually backed.
 
 ### Networking
 
-The guest has an ordinary ethernet device backed by two lock-free byte rings in
-its own `.bss` (one writer per word per direction). Frames are stored whole:
-32-bit length, frame, padding to a 4-byte boundary, never straddling the wrap.
+The guest has an ordinary ethernet device backed by two lock-free byte rings
+in its own `.bss` (one writer per word per direction). Frames are stored
+whole: a 32-bit length, the frame, then padding to a 4-byte boundary. A frame
+never straddles the ring wrap.
 
 ```
   guest: conet_colinux.c            host: kernel/net.c        colinux-slirp-net-daemon -R
@@ -120,55 +122,58 @@ its own `.bss` (one writer per word per direction). Frames are stored whole:
 
 The host reads the rings by walking the guest's page tables; the base address
 is retired under a lock before the address space is freed. NAT is coLinux's
-vendored slirp, run in a process confined to a 2 GB address space so its
+vendored slirp, run in a process confined to a 2 GB address space so that its
 32-bit queue links can hold pointers. `-r tcp:2222:22` redirects a host port
-into the guest (the image runs sshd, which is a far better instrument than a
-serial console for diagnosing anything graphical).
+into the guest. The image runs sshd, which is more useful than the serial
+console for diagnosing graphical problems.
 
 ### Timers
 
-The guest has no timer hardware. It gets time from the host's clock, and for
-most of this port's life it got it as a stream of 1 kHz periodic ticks
-synthesised at cooperative boundaries -- which meant every sleep, every fence
-wait and every present in the guest was quantised to a millisecond, twice over.
-A `nanosleep(50 µs)` cost 1937 µs.
+The guest has no timer hardware and takes time from the host's clock. For
+most of the port's history that was a stream of 1 kHz periodic ticks
+synthesised at cooperative boundaries, which quantised every sleep, fence
+wait and present in the guest to a millisecond, in both directions. A
+`nanosleep(50 µs)` cost 1937 µs.
 
-The clockevent is now **oneshot**. `set_next_event` publishes the deadline, in
-the host's own monotonic 100 ns units, into a per-vCPU slot the host reads; the
-monitor bounds its idle wait by the nearest deadline and wakes on a
-high-resolution kernel timer. Guest sleeps land at **567 µs** median where they
-used to take 1937, and 1 ms and 5 ms sleeps now land *closer to their deadline
-than Windows manages for its own processes* (1580 µs against 1996, 5687 against
-5996), because the idle loop can re-aim on any early wake while a single
-user-mode wait cannot.
+The clockevent is now oneshot. `set_next_event` publishes the deadline, in
+the host's own monotonic 100 ns units, into a per-vCPU slot the host reads.
+The monitor bounds its idle wait by the nearest deadline and wakes on a
+high-resolution kernel timer. Guest sleeps now land at a 567 µs median where
+they used to take 1937 µs. 1 ms and 5 ms sleeps land closer to their deadline
+than a Windows user-mode wait on the same machine (1580 µs against 1996, 5687
+against 5996), because the idle loop can re-aim on any early wake while a
+single user-mode wait cannot.
 
-Two properties are load-bearing and both were learned by breaking them. The
-published deadline is **level-triggered**: firing does not consume it, because
-`tick_nohz` skips reprogramming when it believes the device still carries the
-same expiry, and a device that forgets on fire then never fires again -- a
-silent freeze with no panic, because every watchdog that would report it needs
-time to advance. And the host reads that slot **through the guest's own CR3**,
-never the loader's page tables, which stop describing the guest once it adopts
-its kernel tables; the same trap cost the cooperative timer its first
-implementation and is now marked with a beacon in `co_kload_host_ptr`.
+Two implementation details are required for correctness, and both were
+learned from failures:
 
-The measured floor underneath all of this is Windows': a high-resolution
-waitable timer with zero coalescing tolerance, asked for 100 µs, wakes at
-**487-586 µs** on this machine. `tools/timerfloor.c` reproduces it. Nothing in
-a guest can be sharper than its host's interrupt, so the design aims at that
-floor rather than pretending past it, and the payoff shows up everywhere:
-`glxgears` went from a 579-721 band to 840-855 fps with no graphics change at
-all.
+- The published deadline is level-triggered: firing does not clear it.
+  `tick_nohz` skips reprogramming when it believes the device still carries
+  the same expiry, so a device that clears the deadline on fire never fires
+  again. The result is a silent freeze with no panic, because the watchdogs
+  that would report it also need time to advance.
+- The host reads the deadline slot through the guest's own CR3, never the
+  loader's page tables. The loader's tables stop describing the guest once it
+  adopts its own kernel tables. The same mistake broke the cooperative
+  timer's first implementation; `co_kload_host_ptr` now carries a warning
+  comment about it.
+
+The floor under all of this is Windows itself. A high-resolution waitable
+timer with zero coalescing tolerance, asked for 100 µs, wakes at 487-586 µs
+on this machine; `tools/timerfloor.c` reproduces it. Nothing in a guest can
+be more precise than its host's interrupt, so the design targets that floor.
+The improvement is visible outside timing benchmarks too: `glxgears` went
+from a 579-721 fps band to 840-855 fps with no graphics changes at all.
 
 ### Graphics
 
 The guest has a real GPU device: virtio-gpu, render-only, over a transport
-with no traps in it. MMIO transports work because a store to a fake register
-traps; nothing traps in this design, so every "register" is a plain store
+that contains no traps. MMIO transports rely on a store to a fake register
+trapping; nothing traps in this design, so every "register" is a plain store
 into a structure in guest RAM, and the kick is a counter that
-`cogpu-daemon.exe` spin-polls from another core. No ioctl and no world switch
-in the submission path — 2000 context round trips from a guest client measure
-a 3 µs median.
+`cogpu-daemon.exe` polls from another core. There is no ioctl and no world
+switch in the submission path. 2000 context round trips from a guest client
+measure a 3 µs median.
 
 ```
   guest: Mesa/virgl ─► virtio rings in guest RAM ◄── cogpu-daemon.exe
@@ -180,15 +185,15 @@ a 3 µs median.
 
 The daemon maps the whole of guest RAM into its own address space through
 persistent user-mode windows (KMAP, 8 MB slices), so it parses requests and
-writes replies in place, and a resource's backing — the guest's list of
-{guest physical address, length} — becomes iovecs pointing straight into the
-guest's pages. Zero copies on the command path. virglrenderer, cross-built
-for mingw behind a WGL winsys, replays the guest's GL onto the host's actual
-card: the guest reports `virgl (GeForce GT 730/PCIe/SSE2)`, GL 4.2, where
-indirect GLX gave it 1.4 in software.
+writes replies in place. A resource's backing, the guest's list of
+{guest physical address, length} pairs, becomes iovecs pointing directly into
+the guest's pages, so the command path copies nothing. virglrenderer,
+cross-built for mingw behind a WGL winsys, replays the guest's GL onto the
+host's actual card. The guest reports `virgl (GeForce GT 730/PCIe/SSE2)` with
+GL 4.2, where indirect GLX gave it 1.4 in software.
 
 Both APIs share one presenter, and both ship enabled. `--present-r2` on
-`cogpu-daemon.exe` carries OpenGL and Vulkan; `--no-present` silences both.
+`cogpu-daemon.exe` carries OpenGL and Vulkan; `--no-present` disables both.
 
 ![glxgears and the LunarG Vulkan cube running at the same time as native
 windows on Windows 10, beside the guest's kernel
@@ -197,53 +202,55 @@ log](doc/img/glxvksupport.png)
 #### OpenGL
 
 Presentation is CoPresent. VirtualGL and the `moco-gl` wrapper are gone. A
-matched Mesa 26.1.6 build -- `libGL`, `libEGL`, `libGLESv2`, Gallium and
-`libgbm`, for **both** the 64-bit and 32-bit ABI -- is the system's GL driver:
-it uses Mesa's upstream DRI3 loader, opens `/dev/dri/renderD128`, and keeps its
-ordinary DRI images, buffer queue, buffer age and native fences. Only the final
-operation a Linux X server would perform is redirected. The client emits
-`VIRGL_CCMD_MOCO_PRESENT` inside the command stream it is already rendering
-through, and cogpu displays the texture virglrenderer already owns on the
-Windows GPU. VcXsrv remains the unmodified window and input control plane.
+matched Mesa 26.1.6 build (`libGL`, `libEGL`, `libGLESv2`, Gallium and
+`libgbm`, for both the 64-bit and 32-bit ABI) is the system's GL driver. It
+uses Mesa's upstream DRI3 loader, opens `/dev/dri/renderD128`, and keeps its
+ordinary DRI images, buffer queue, buffer age and native fences. Only the
+final operation a Linux X server would perform is redirected: the client
+emits `VIRGL_CCMD_MOCO_PRESENT` inside the command stream it is already
+rendering through, and cogpu displays the texture virglrenderer already owns
+on the Windows GPU. VcXsrv remains the unmodified window and input control
+plane.
 
-Carrying presentation in the command stream is what makes it work for real
+Carrying presentation in the command stream is why it works for real
 applications. It travels down the render node the client already has open, so
-nothing else has to be reachable -- no socket, no extra device, no filesystem
-share -- and sandboxed clients need no configuration at all. The earlier
-revision used a broker socket under `/run`, which no sandbox can see: Firefox's
-content processes and Steam's pressure-vessel container silently fell back to
-software while unsandboxed clients worked. The broker, its pinned ring, its
-dma-buf export and its root-only pagemap requirement have all been deleted.
+nothing else has to be reachable: no socket, no extra device, no filesystem
+share. Sandboxed clients therefore need no configuration. The earlier
+revision used a broker socket under `/run`, which no sandbox can see;
+Firefox's content processes and Steam's pressure-vessel container silently
+fell back to software while unsandboxed clients worked. The broker, its
+pinned ring, its dma-buf export and its root-only pagemap requirement have
+all been deleted.
 
-Measured on the GT 730, with the broker stopped and its socket deleted to prove
-it is out of the path: **543 fps 64-bit and 602 fps 32-bit** on the project's
-own `glbench` at 1280x720, and 550 fps booting with no flags at all, as the
-desktop shortcut does. Steam's own log reports `MoCo DRI3: direct
-virgl/CoPresent active` for three drawables from inside its container. Firefox
-renders directly and stays interactive.
+Measured on the GT 730, with the broker stopped and its socket deleted to
+confirm it is out of the path: 543 fps 64-bit and 602 fps 32-bit on the
+project's own `glbench` at 1280x720, and 550 fps booting with no flags at
+all, as the desktop shortcut does. Steam's log reports `MoCo DRI3: direct
+virgl/CoPresent active` for three drawables from inside its container.
+Firefox renders directly and stays interactive.
 
-`glxgears` at its default size measures **840-855 fps**, three runs on a quiet
-box. It used to sit in a 579-721 band, and the difference is not the GL path at
-all: the guest's clockevents became oneshot and the host began honouring their
-deadlines, so every wait in the stack -- fences, presents, sleeps -- stopped
-being quantised to a millisecond. See [Timers](#timers). Against roughly 1300
-fps for the same trivial load on the host itself, that is about two thirds of
-native rather than the half this section used to report -- accelerated, still
-not native, and the gap is now dominated by geometry-heavy loads rather than by
-per-frame overhead.
+`glxgears` at its default size measures 840-855 fps over three runs on a
+quiet box. It used to sit in a 579-721 band, and the difference is not the GL
+path: the guest's clockevents became oneshot and the host began honouring
+their deadlines, so fence waits, presents and sleeps stopped being quantised
+to a millisecond. See [Timers](#timers). The host measures roughly 1300 fps
+for the same trivial load, so the guest now runs at about two thirds of
+native rather than the half this section used to report. It is accelerated
+but not native, and the gap is now dominated by geometry-heavy loads rather
+than per-frame overhead.
 
 The staged gates are in
-[`doc/direct-presentation`](doc/direct-presentation); the checksum-pinned Mesa
-patch and exact rebuild/rollback procedure are in
+[`doc/direct-presentation`](doc/direct-presentation); the checksum-pinned
+Mesa patch and exact rebuild/rollback procedure are in
 [`doc/building-copresent`](doc/building-copresent).
 
 #### Vulkan
 
-The guest has real Vulkan, on the host's real driver, through Venus. Mesa's
+The guest has real Vulkan on the host's real driver, through Venus. Mesa's
 `libvulkan_virtio` (both ABIs, installed as an ICD with an absolute
-`library_path`) serialises the guest's Vulkan calls; virglrenderer's `vkr`
-decoder -- cross-built for mingw with the WINQ Windows patches, its render
-server running as in-process worker threads -- replays them on the host's own
+`library_path`) serialises the guest's Vulkan calls. virglrenderer's `vkr`
+decoder, cross-built for mingw with the WINQ Windows patches and running its
+render server as in-process worker threads, replays them on the host's own
 Vulkan driver. `vulkaninfo` in the guest reports
 `Virtio-GPU Venus (NVIDIA GeForce GT 730)`, `DRIVER_ID_MESA_VENUS`, as a
 DISCRETE device.
@@ -255,75 +262,76 @@ DISCRETE device.
                                                   the host's Vulkan driver
 ```
 
-Host-visible memory is the part a cooperative guest is not supposed to be able
-to do. A Vulkan allocation the application maps must be host memory appearing
-in the guest's own physical address space, and there is no BAR and no ReBAR
-here to put it in. The p2m gains a **window arena** above guest RAM -- address
-space that exists in no e820 range -- and `KWINDOW_AT` maps the host's pages
-into a caller-chosen slot in it, so `vkMapMemory` returns a pointer the guest
-writes at **4.6-4.8 GiB/s**, which is this machine's DRAM ceiling and the same
-figure a native `memcpy` measures. Nothing is copied to get there.
+Host-visible memory is the part a cooperative guest normally cannot provide.
+A Vulkan allocation the application maps must be host memory appearing in the
+guest's own physical address space, and there is no BAR and no ReBAR here to
+put it in. The p2m gains a **window arena** above guest RAM, address space
+that exists in no e820 range, and `KWINDOW_AT` maps the host's pages into a
+caller-chosen slot in it. `vkMapMemory` then returns a pointer the guest
+writes at 4.6-4.8 GiB/s, which is this machine's DRAM ceiling and the same
+figure a native `memcpy` measures. Nothing is copied.
 
-Presentation reuses the OpenGL presenter rather than inventing a second one.
-The guest issues `DRM_IOCTL_VIRTGPU_MOCO_PRESENT` on the render node it is
-already rendering through -- so sandboxes need no configuration, exactly as
-with GL -- the daemon uploads the frame into a per-window virgl texture, and
+Presentation reuses the OpenGL presenter rather than adding a second one. The
+guest issues `DRM_IOCTL_VIRTGPU_MOCO_PRESENT` on the render node it is
+already rendering through, so sandboxes need no configuration, exactly as
+with GL. The daemon uploads the frame into a per-window virgl texture, and
 the same overlay draws it over the same VcXsrv window. X keeps window
-management; only pixels bypass it. A Vulkan client's context death releases its
-bridge, so the last frame leaves the screen with the application.
+management; only pixels bypass it. A Vulkan client's context death releases
+its bridge, so the last frame leaves the screen when the application exits.
 
-`vkcube` runs at **368 fps** steady, and an offscreen clear-and-readback
-checks byte-exact (262144 pixels, zero wrong). GL and Vulkan coexist: gears and
-the cube together, two Vulkan clients together, one exiting while the other
-keeps presenting -- verified with zero DRM errors in every configuration, which
-is what the screenshot above is showing.
+`vkcube` runs at a steady 368 fps, and an offscreen clear-and-readback checks
+byte-exact (262144 pixels, zero wrong). GL and Vulkan coexist: gears and the
+cube together, two Vulkan clients together, and one client exiting while the
+other keeps presenting were all verified with zero DRM errors. That is what
+the screenshot above shows.
 
 #### Direct3D, through Wine and DXVK
 
-The reason the Vulkan work exists. Wine 11.14 with DXVK runs Direct3D 11 in the
-guest: the application's D3D calls become Vulkan, Venus carries them to the
-host's own driver, and the frames come back through the same presenter as
+This is why the Vulkan work exists. Wine 11.14 with DXVK runs Direct3D 11 in
+the guest: the application's D3D calls become Vulkan, Venus carries them to
+the host's own driver, and the frames come back through the same presenter as
 everything else.
 
 ![Unigine Heaven 4.0 rendering in Direct3D 11 as a native Windows window, with
 the guest's kernel log beside it](doc/img/uniginedxvkwine.png)
 
-That is Unigine Heaven 4.0 -- a 2013 D3D11 benchmark, not a synthetic test --
-at **26 fps**, 1024x768, low quality, tessellation off. A project D3D11 frame
-loop (`tools/d3dbench.c`, clear and present, no geometry) measures **304 fps**
-through the same stack, which is the path's own cost rather than the card's.
+That is Unigine Heaven 4.0, a 2013 D3D11 benchmark rather than a synthetic
+test, at 26 fps (1024x768, low quality, tessellation off). A project D3D11
+frame loop (`tools/d3dbench.c`, clear and present, no geometry) measures 304
+fps through the same stack, which is the path's own cost rather than the
+card's.
 
-Three version facts decide whether this works at all, and each cost a
-diagnosis:
+Three version choices are required, and each one was found by diagnosing a
+failure:
 
 - **DXVK 1.10.3, not 2.x or 3.x.** NVIDIA caps Kepler at Vulkan 1.2, Venus
-  reports exactly that, and DXVK 2.0 and later require Vulkan 1.3 -- newer
-  releases enumerate the GT 730, skip it as unsupported, and then fail with no
-  adapters at all
+  reports exactly that, and DXVK 2.0 and later require Vulkan 1.3. Newer
+  releases enumerate the GT 730, skip it as unsupported, and then fail with
+  no adapters at all.
 - **`d3dcompiler_42`** from `winetricks`. Heaven imports that exact DLL, and
   Wine's builtin HLSL compiler rejects its 2013-era `half` types with 2396
-  `E5017: not yet implemented` errors -- which renders as a black scene with a
-  working HUD, because only the simple shaders survive
-- **Every Present-extension call gated.** VcXsrv has no Present, and libxcb
-  closes the connection on a stub call for a missing extension. Three such
-  calls existed; the last was `xcb_register_for_special_xge`, which does not
-  match a search for `xcb_present_*` and killed each client one frame after
-  its swapchain came up
+  `E5017: not yet implemented` errors. That renders as a black scene with a
+  working HUD, because only the simple shaders survive.
+- **Every Present-extension call gated.** VcXsrv has no Present extension,
+  and libxcb closes the connection on a stub call for a missing extension.
+  Three such calls existed; the last was `xcb_register_for_special_xge`,
+  which does not match a search for `xcb_present_*` and killed each client
+  one frame after its swapchain came up.
 
-Two honest limits remain. Presents are fire-and-forget, like the GL path's, so
-FIFO is not throttled and a client renders as fast as the card allows rather
-than to a refresh rate. And 26 fps has no native reference beside it yet: the
-same binary through `wined3d` (D3D11 to OpenGL to virgl) and a host-side run
-are what would say how much of that is the GT 730 and how much is us. lavapipe
-stays installed underneath as the software fallback for a host whose driver
-cannot serve Venus.
+Two limits remain. Presents are fire-and-forget, like the GL path's, so FIFO
+is not throttled and a client renders as fast as the card allows rather than
+at a refresh rate. And the 26 fps figure has no native reference beside it
+yet: running the same binary through `wined3d` (D3D11 to OpenGL to virgl) and
+on the host directly would show how much of the cost is the GT 730 and how
+much is this stack. lavapipe stays installed underneath as the software
+fallback for a host whose driver cannot serve Venus.
 
 ## Status
 
-Working, verified on hardware (Lenovo ThinkCentre M92p, i5-3470) under Windows
-XP x64, Windows 7 x64, Windows 8.1 x64 and Windows 10 x64 — see [Windows 8
-and 8.1](#windows-8-and-81) and [Windows 10](#windows-10) for what those hosts
-ask for:
+Working, verified on hardware (Lenovo ThinkCentre M92p, i5-3470) under
+Windows XP x64, Windows 7 x64, Windows 8.1 x64 and Windows 10 x64. See
+[Windows 8 and 8.1](#windows-8-and-81) and [Windows 10](#windows-10) for what
+those hosts require.
 
 - Boots Manjaro with systemd to multi-user target, no failed units, from an
   image the tree builds (`tools/mkmanjarorootfs.sh`)
@@ -331,35 +339,35 @@ ask for:
 - Interactive terminal over TCP (hvc console, `/dev/hvc0`)
 - KDE applications as native Windows windows, rootless, over a host-side X
   server
-- Preemption: the host interrupts a busy-looping task; time advances at real
-  speed
-- Cooperative SMP: the installed launcher requests `--cpus 2`; two Linux
+- Preemption: the host interrupts a busy-looping task and time advances at
+  real speed
+- Cooperative SMP: the installed launcher requests `--cpus 2`. Two Linux
   processors run concurrently on distinct host logical processors with
-  per-vCPU switch state, passage pages, timers and posted-IPI delivery. Linux
-  receives their real physical-core/SMT relationship
+  per-vCPU switch state, passage pages, timers and posted-IPI delivery.
+  Linux receives their real physical-core/SMT relationship
 - Networking: guest ethernet device, host NAT, static address via
-  `systemd-networkd`; pacman installs a 791-package desktop over HTTPS at
+  `systemd-networkd`. pacman installs a 791-package desktop over HTTPS at
   16 MB/s
 - Hardware-accelerated OpenGL on the host's card, enabled by default and with
-  no wrapper: virtio-gpu in the guest, virglrenderer on the host, and CoPresent
-  carrying resource identity — not finished frames — in the guest's own virgl
-  command stream. Unmodified GLX and EGL programs of both ABIs load Mesa's DRI3
-  provider and report direct virgl; 543 fps 64-bit and 602 fps 32-bit on
-  `tools/glbench` at 1280x720 on a GT 730
+  no wrapper: virtio-gpu in the guest, virglrenderer on the host, and
+  CoPresent carrying resource identity (not finished frames) in the guest's
+  own virgl command stream. Unmodified GLX and EGL programs of both ABIs load
+  Mesa's DRI3 provider and report direct virgl; 543 fps 64-bit and 602 fps
+  32-bit on `tools/glbench` at 1280x720 on a GT 730
 - Hardware-accelerated Vulkan on the host's card, through Venus: the guest's
   Mesa `libvulkan_virtio` (both ABIs) serialises to virglrenderer's `vkr`
-  decoder, which runs it on the host's own Vulkan driver. `vulkaninfo` reports
-  `Virtio-GPU Venus (NVIDIA GeForce GT 730)` as a discrete device, host-visible
-  memory maps at the machine's DRAM ceiling (4.6-4.8 GiB/s) through a window
-  arena in the p2m with no BAR involved, and `vkcube` presents into its own
-  native window at 368 fps beside an OpenGL client
+  decoder, which runs it on the host's own Vulkan driver. `vulkaninfo`
+  reports `Virtio-GPU Venus (NVIDIA GeForce GT 730)` as a discrete device,
+  host-visible memory maps at the machine's DRAM ceiling (4.6-4.8 GiB/s)
+  through a window arena in the p2m with no BAR involved, and `vkcube`
+  presents into its own native window at 368 fps beside an OpenGL client
 - Direct3D 11, through Wine 11.14 and DXVK 1.10.3 on top of that Vulkan:
   Unigine Heaven 4.0 renders at 26 fps (1024x768, low, no tessellation) as a
   native window, and `tools/d3dbench.c` measures 304 fps for the path itself
-- Sandboxed clients work untouched, because presentation needs only the render
-  node they already have -- for both APIs: Firefox renders directly and stays
-  interactive, and Steam logs direct CoPresent from inside its pressure-vessel
-  container
+- Sandboxed clients work without configuration for both APIs, because
+  presentation needs only the render node they already have: Firefox renders
+  directly and stays interactive, and Steam logs direct CoPresent from inside
+  its pressure-vessel container
 - Inbound port redirects (`-r tcp:2222:22` reaches the guest's sshd)
 - 32-bit binaries (the guest keeps its own `int $0x80` gate)
 - Landlock and user namespaces (required by pacman 7 and modern sandboxes)
@@ -378,38 +386,38 @@ ask for:
   It is regenerated against the released tarball and checked by applying and
   reverse-applying it with zero fuzz and an exact tree comparison
 
-Not yet:
+Not yet done:
 
-- SMP beyond two vCPUs, and long-duration desktop/Steam soaking. The two-vCPU
-  path is functional and benchmarked. One-shot clock events are no longer on
-  this list: they shipped, and [Timers](#timers) has the numbers
-- The coLinux message layer (`co_monitor_t`, queues, reactor), so upstream's
-  `cocon`/`conet` consoles and devices — including `colinux-console-nt` —
+- SMP beyond two vCPUs, and long-duration desktop/Steam soaking. The
+  two-vCPU path is functional and benchmarked. Oneshot clock events are no
+  longer on this list: they shipped, and [Timers](#timers) has the numbers
+- The coLinux message layer (`co_monitor_t`, queues, reactor). Upstream's
+  `cocon`/`conet` consoles and devices, including `colinux-console-nt`,
   cannot attach
 - DHCP in the guest (static address only)
 - Native-speed presentation. Direct presentation is the packaged default for
   both ABIs, and the oneshot clockevents took the per-frame synchronisation
-  cost from about 2.5 ms to 1.2-1.5 ms -- `glxgears` is now roughly two thirds
+  cost from about 2.5 ms to 1.2-1.5 ms; `glxgears` is now roughly two thirds
   of the host's own figure rather than half. Geometry-heavy loads remain the
-  gap, and an asynchronous multi-buffered release path is still the next task
-- Vsync. Presents are fire-and-forget in both APIs, so `FIFO` is not throttled
-  and a client renders as fast as the card allows. Nothing has needed it yet;
-  a game will
+  gap, and an asynchronous multi-buffered release path is the next task
+- Vsync. Presents are fire-and-forget in both APIs, so `FIFO` is not
+  throttled and a client renders as fast as the card allows. Nothing has
+  needed it yet; a game will
 - Proton, and games. Wine and DXVK are no longer on this list: Direct3D 11
-  runs on the host's card and Unigine Heaven renders through it, so see
-  [Direct3D, through Wine and DXVK](#direct3d-through-wine-and-dxvk). What has
-  not been done is a *game*: no title has been launched, Proton has never been
-  installed here (GE-Proton standalone plus `umu-launcher` is the route that
-  needs no Steam), and D3D9 and D3D12 are both untested -- only D3D11 has run.
-  Zink over Venus is likewise still untried
-- Steam's client. It launches and its helpers run, but the storefront UI is
-  still the CEF failure below, and a 5000-fish WebGL load killed its GPU
-  process on this hardware
-- Steam's own storefront UI. Its CEF helper fails to create a browser window
-  against VcXsrv 1.14 — with GPU initialisation clean, a Vulkan device present
-  (an accelerated one now, not just lavapipe) and CoPresent active for its
-  other drawables. The same failure occurs with this stack disabled, so it is a
-  CEF/X-server problem rather than a graphics one, and
+  runs on the host's card and Unigine Heaven renders through it (see
+  [Direct3D, through Wine and DXVK](#direct3d-through-wine-and-dxvk)). But no
+  actual game has been launched, Proton has never been installed here
+  (GE-Proton standalone plus `umu-launcher` is the route that needs no
+  Steam), and D3D9 and D3D12 are untested; only D3D11 has run. Zink over
+  Venus is also untried
+- Steam's client. It launches and its helpers run, but the storefront UI
+  fails as described below, and a 5000-fish WebGL load killed its GPU process
+  on this hardware
+- Steam's storefront UI. Its CEF helper fails to create a browser window
+  against VcXsrv 1.14, even with GPU initialisation clean, a Vulkan device
+  present (an accelerated one now, not just lavapipe) and CoPresent active
+  for its other drawables. The same failure occurs with this stack disabled,
+  so it is a CEF/X-server problem rather than a graphics one.
   `XFree86-VidModeExtension` is likewise absent and cannot be enabled on the
   pinned XP-compatible server
 
@@ -417,16 +425,16 @@ Not yet:
 
 To the project's knowledge, MoCoLinux is the first coLinux-style cooperative
 kernel to run a working SMP Linux guest on Windows 10. This is guest SMP, not
-merely a uniprocessor guest running on an SMP host: Linux reports CPUs 0 and 1
-online and schedules useful work on both simultaneously. Upstream coLinux
+merely a uniprocessor guest running on an SMP host: Linux reports CPUs 0 and
+1 online and schedules useful work on both simultaneously. Upstream coLinux
 [documented that its guest could use only one CPU](https://colinux.fandom.com/wiki/FAQ#Q39._Does_coLinux_take_advantage_of_dual_core_processors?)
 and its changelog records that the daemon was
 [pinned to the first processor while SMP remained unresolved](https://colinux.sourceforge.net/?section=changelog).
 
-The first validated two-vCPU run was recorded on 2026-08-09 on the ThinkCentre
-M92p (Core i5-3470, four physical cores, no SMT), Windows 10 IoT Enterprise
-LTSC 21H2 build 19044, and Linux 7.1.5. Each result compares the same running
-guest with one worker against two; higher is better:
+The first validated two-vCPU run was recorded on 2026-08-09 on the
+ThinkCentre M92p (Core i5-3470, four physical cores, no SMT), Windows 10 IoT
+Enterprise LTSC 21H2 build 19044, and Linux 7.1.5. Each result compares the
+same running guest with one worker against two; higher is better:
 
 | Workload | 1 vCPU | 2 vCPUs | Gain |
 | --- | ---: | ---: | ---: |
@@ -435,38 +443,40 @@ guest with one worker against two; higher is better:
 | `sysbench memory` sequential write, 1 MiB blocks | 17,631.70 MiB/s | 35,828.47 MiB/s | **2.032x** |
 | `sysbench memory` sequential read, 1 MiB blocks | 21,729.63 MiB/s | 42,494.90 MiB/s | **1.956x** |
 
-The memory figures are a hot-buffer/cache-path scaling test, not a claim about
-the M92p's raw DRAM bandwidth. Stability and scheduling checks completed too:
+The memory figures are a hot-buffer/cache-path scaling test, not a claim
+about the M92p's raw DRAM bandwidth. Stability and scheduling checks also
+passed:
 
 - A 20-second two-worker `stress-ng` matrix run accumulated 39.65 CPU-seconds
-  and passed both workers, showing that both vCPUs stayed busy for the full run.
-- Four oversubscribed context-switch workers completed 3,275,146 operations in
-  10.02 seconds (327,349/s), with no failed or untrustworthy metrics.
-- A lock/yield-heavy two-thread sysbench run completed 35,432 events in exactly
-  10 seconds, with 0.56 ms average latency and balanced workers.
+  and passed both workers, showing that both vCPUs stayed busy for the full
+  run.
+- Four oversubscribed context-switch workers completed 3,275,146 operations
+  in 10.02 seconds (327,349/s), with no failed or untrustworthy metrics.
+- A lock/yield-heavy two-thread sysbench run completed 35,432 events in
+  exactly 10 seconds, with 0.56 ms average latency and balanced workers.
 - Firefox, the workload that previously drove both processors into a hard
   deadlock, loaded pages normally after the posted-IPI polling fix. The guest
   remained reachable over SSH after every test, and a post-stress two-second
   sleep measured 2.023 seconds.
 
-The mechanism follows the useful parts of Xen PV's shape without pretending an
-APIC exists. A posted per-vCPU bitmap is the message; a targeted Windows DPC is
-the doorbell that interrupts a running target core. A separate targeted 100 Hz
-deadline guarantees that a userspace-bound vCPU crosses to the monitor, where a
-guarded cooperative interrupt entry batches the guest's 1 ms clock events.
-Kernel spin waits poll posted vectors without allowing re-entry from NMI,
-hardirq or virtual-interrupt-off regions. CPU scaling is therefore solved for
-two vCPUs; presentation frame rate remains limited by the separate GPU-to-X
-transport described above.
+The mechanism follows the useful parts of Xen PV's design without pretending
+an APIC exists. A posted per-vCPU bitmap is the message; a targeted Windows
+DPC is the doorbell that interrupts a running target core. A separate
+targeted 100 Hz deadline guarantees that a userspace-bound vCPU crosses to
+the monitor, where a guarded cooperative interrupt entry batches the guest's
+1 ms clock events. Kernel spin waits poll posted vectors without allowing
+re-entry from NMI, hardirq or virtual-interrupt-off regions. CPU scaling is
+solved for two vCPUs; presentation frame rate remains limited by the separate
+GPU-to-X transport described above.
 
-Guest APIC routing IDs remain synthetic because no APIC hardware is addressed.
-Package, core and SMT topology instead comes from CPUID on each pinned host
-logical processor, so Linux's sibling masks describe the placement Windows
-actually supplied.
+Guest APIC routing IDs remain synthetic because no APIC hardware is
+addressed. Package, core and SMT topology instead comes from CPUID on each
+pinned host logical processor, so Linux's sibling masks describe the
+placement Windows actually supplied.
 
-The same tested build uses the [FragRAM](#fragram) path described above. A real
-2048 MiB guest boot has been verified; 128 GB is the supported configuration
-ceiling, not a claim that a 128 GB host has already been tested.
+The same tested build uses the [FragRAM](#fragram) path described above. A
+real 2048 MiB guest boot has been verified; 128 GB is the supported
+configuration ceiling, not a claim that a 128 GB host has been tested.
 
 ## Layout
 
@@ -476,8 +486,8 @@ ceiling, not a claim that a 128 GB host has already been tested.
 | `src/colinux/kernel/kload.c` | loads vmlinux into host memory, builds the guest's tables |
 | `src/colinux/kernel/cobd.c` | cooperative block device, host half |
 | `src/colinux/kernel/console.c` | terminal rings, host half |
-| `src/colinux/kernel/net.c` | network rings, host half — read, consume, inject |
-| `src/colinux/kernel/vgpu.c` | virtio-gpu transport, host half — publish, retire, idle gate |
+| `src/colinux/kernel/net.c` | network rings, host half: read, consume, inject |
+| `src/colinux/kernel/vgpu.c` | virtio-gpu transport, host half: publish, retire, idle gate |
 | `src/colinux/os/winnt/user/cogpu-daemon/` | the GPU device: vring service, virglrenderer, the WGL winsys |
 | `src/colinux/user/copresent/` | the standalone fenced producer used to test presentation without a GL application |
 | `src/colinux/user/conet_ring.c` | the ring format and its decoder, shared by both readers |
@@ -496,26 +506,26 @@ ceiling, not a claim that a 128 GB host has already been tested.
 | `doc/porting-x86_64` | design notes for the port |
 | `doc/direct-presentation` | staged plan and acceptance gates for the presentation path |
 | `doc/building-copresent` | exact host and dual-ABI DRI3 Mesa build; isolated test, system selection and rollback |
-| `doc/building-release` | **end to end: every product, the order, the traps, cutting a release** |
+| `doc/building-release` | end to end: every product, the order, the traps, cutting a release |
 | `doc/building-modern` | the Windows driver and daemons in detail |
 
 ## Building
 
-**[`doc/building-release`](doc/building-release) is the end-to-end recipe** —
-what each of the six products is, which script builds it, the order their
+[`doc/building-release`](doc/building-release) is the end-to-end recipe: what
+each of the six products is, which script builds it, the order their
 dependencies force, and the traps in each step. Start there.
 
-Requires a cross toolchain (`mingw-w64-gcc`, `binutils`), `osslsigncode` for
-the driver signature, and two kernel trees: the Windows side builds against
-2.6.33 headers (the passage-page ABI is a header inside the guest kernel
-tree), while the guest kernel is 7.1.5. The 2.6.33 tree is used for headers
-only — nothing in it is built or run.
+Building requires a cross toolchain (`mingw-w64-gcc`, `binutils`),
+`osslsigncode` for the driver signature, and two kernel trees. The Windows
+side builds against 2.6.33 headers (the passage-page ABI is a header inside
+the guest kernel tree), while the guest kernel is 7.1.5. The 2.6.33 tree is
+used for headers only; nothing in it is built or run.
 
 The host and guest halves are one matched interface and should be built from
-the same commit. `linux.sys` and the host daemons come from `src/colinux/`; the
-matching `vmlinux` comes from applying
-`patch/7.1.5/current-tree-snapshot.diff` to pristine Linux 7.1.5. Keeping both
-source halves is what makes a tested driver/kernel pair reproducible.
+the same commit. `linux.sys` and the host daemons come from `src/colinux/`;
+the matching `vmlinux` comes from applying
+`patch/7.1.5/current-tree-snapshot.diff` to pristine Linux 7.1.5. Keeping
+both source halves is what makes a tested driver/kernel pair reproducible.
 
 The Windows side, driver through release, is one script:
 
@@ -525,44 +535,44 @@ tools/build.sh --release 0.5.0    # ...and assemble release/MoCoLinux-0.5.0/
 ```
 
 `build.sh` compiles the driver and daemons, builds the installer, signs the
-driver with the test cert (NT 6 and later refuse the unsigned image the linker
-emits), and stages a set it checks for completeness — the binaries, the
+driver with the test cert (NT 6 and later refuse the unsigned image the
+linker emits), and stages a set it checks for completeness: the binaries, the
 `virglrenderer`/`libepoxy` DLLs the GPU daemon loads, the launchers, and the
 guest-side `coxwire` shim. `--release` then assembles a directory whose
-manifest is read out of the installer's own payload list, refusing to finish
-if anything is missing, links the Universal CRT (it will not start on XP), or
-depends on a DLL the release does not carry.
+manifest is read out of the installer's own payload list. It refuses to
+finish if anything is missing, links the Universal CRT (which will not start
+on XP), or depends on a DLL the release does not carry.
 
-It finds the 2.6.33 header tree and the `download/prefix-mingw` cross prefix by
-their default locations; `COLINUX_TARGET_KERNEL_SOURCE` and
-`COLINUX_VIRGL_PREFIX` override. It does **not** build `vmlinux` or
-`root-arch.img` — both are slow and change rarely — and reports whether the
-staged copies are present.
+It finds the 2.6.33 header tree and the `download/prefix-mingw` cross prefix
+by their default locations; `COLINUX_TARGET_KERNEL_SOURCE` and
+`COLINUX_VIRGL_PREFIX` override them. It does not build `vmlinux` or
+`root-arch.img`, because both are slow and change rarely, but it reports
+whether the staged copies are present.
 
-CoPresent adds separately built Linux Mesa pieces; `build.sh` cannot silently
-manufacture those as part of a Windows build. Run
-`tools/build-mesa-copresent.sh` for the matched patched GL stack, which builds
-both the 64-bit and 32-bit ABI, and `tools/build-copresent-guest.sh` for the
-standalone test producer.
-The latter verifies the official Mesa 26.1.6 SHA-256 and applies the complete
+CoPresent adds separately built Linux Mesa pieces, which `build.sh` cannot
+produce as part of a Windows build. Run `tools/build-mesa-copresent.sh` for
+the matched patched GL stack, which builds both the 64-bit and 32-bit ABI,
+and `tools/build-copresent-guest.sh` for the standalone test producer. The
+latter verifies the official Mesa 26.1.6 SHA-256 and applies the complete
 repository patch with zero fuzz. See
 [`doc/building-copresent`](doc/building-copresent) before enabling the
 development stack system-wide; it also contains the non-destructive rollback.
 
 To drive `comake` directly, or for the underlying recipe and every
-environment variable, see `doc/building-modern`. The guest kernel is separate:
-apply `patch/7.1.5/current-tree-snapshot.diff` to a 7.1.5 tree and build
-`vmlinux` normally. The patch defaults `CONFIG_VIRTIO_COLINUX` on; verify that
-it is built in, not a module. `CONFIG_KASAN` must be off — the host's allocation
-lands in PML4 slot 501, inside Linux's KASAN shadow region.
+environment variable, see `doc/building-modern`. The guest kernel is
+separate: apply `patch/7.1.5/current-tree-snapshot.diff` to a 7.1.5 tree and
+build `vmlinux` normally. The patch defaults `CONFIG_VIRTIO_COLINUX` on;
+verify that it is built in, not a module. `CONFIG_KASAN` must be off, because
+the host's allocation lands in PML4 slot 501, inside Linux's KASAN shadow
+region.
 
 ## Running
 
 The short way, on the target machine: run `mocolinux-setup.exe`. It installs
 the driver, daemons, kernel, VcXsrv and launchers, creates desktop shortcuts
 and a logon entry, then boots Linux and builds a Manjaro system on a fresh
-disk image over the network (~15 minutes, ~2.5 GB of downloads — the release
-carries no built desktop, only the seed).
+disk image over the network (~15 minutes, ~2.5 GB of downloads; the release
+carries no built desktop, only the seed image).
 
 ![The installer's desktop shortcuts, and four Linux applications started from them](doc/img/moco-desktop.png)
 
@@ -588,49 +598,51 @@ colinux-daemon.exe --run konsole           (start one app in a running guest)
   processor, and the driver reserves capacity for Windows and the GPU daemon
   instead of placing two guest processors on the same one.
 - The image ships `10-eth0.network` with slirp's fixed layout and
-  `systemd-networkd` enabled, so the guest configures its own network at boot.
+  `systemd-networkd` enabled, so the guest configures its own network at
+  boot.
 - For a desktop, start an X server on the Windows side in multiwindow mode
   (`vcxsrv :0 -multiwindow -ac`, or `dist-x64/xstart.bat`) and run X clients
   in the guest. `DISPLAY=10.0.2.2:0` is already in the image's environment.
-  GL applications need no wrapper: CoPresent is the system's GL driver, so
-  `glxinfo | grep renderer` reporting `virgl` is how to check the card is
-  actually being used rather than trusting it.
+  GL applications need no wrapper, because CoPresent is the system's GL
+  driver. To confirm the card is actually being used, check that
+  `glxinfo | grep renderer` reports `virgl`.
 - `tools/mkrootfs.sh` builds the minimal BusyBox image (`--init /bin/sh`);
   `tools/mkmanjarorootfs.sh` builds the Manjaro desktop image (needs a Linux
   host with `pacman` and `e2fsprogs`; handles the alpm skeleton, package
   install, keyring, `ldconfig`, network unit, fonts and `lib32` packages).
-- The daemon processes are separate on purpose: the one running the guest sits
-  inside a single ioctl for the guest's lifetime and cannot also service a
-  socket. End a session with `colinux-daemon.exe --stop`, a `poweroff` in the
-  guest, or by unloading the driver.
+- The daemon processes are separate on purpose: the one running the guest
+  sits inside a single ioctl for the guest's lifetime and cannot also
+  service a socket. End a session with `colinux-daemon.exe --stop`, a
+  `poweroff` in the guest, or by unloading the driver.
 - `--net-dump` prints the guest's network rings and decodes their frames
   read-only; `--net-take` does the same and consumes them.
 
 ## Windows 8 and 8.1
 
-Supported and verified on hardware, with everything the XP and 7 hosts do —
+Supported and verified on hardware, with everything the XP and 7 hosts do,
 including hardware-accelerated OpenGL on the host's card (screenshot above).
 
-Two of the following apply to Windows 7 as well, which is NT 6.1: it wants
-testsigning and it has UAC. The other two are what 8.1 adds. The installer
-handles all four and refuses to continue rather than half-install if it cannot:
+Two of the following also apply to Windows 7 (NT 6.1): it wants testsigning
+and it has UAC. The other two are new in 8.1. The installer handles all four
+and refuses to continue rather than half-install if it cannot:
 
-- **Secure Boot must be off** *(8.1)*. A test-signed driver cannot load with it
-  on, and nothing later in the install can work around that, so the suitability
-  check stops there with the firmware steps spelled out.
+- **Secure Boot must be off** *(8.1)*. A test-signed driver cannot load with
+  it on, and nothing later in the install can work around that, so the
+  suitability check stops there with the firmware steps spelled out.
 - **Test signing must be on** *(7 and 8.1)*. The installer enables it and
-  reboots; the driver *service* is created after that reboot, not before,
-  because creating it while signing is still enforced leaves a service that can
-  never start.
-- **No hypervisor** *(8.1)*. Hyper-V, VBS/HVCI or a running VM means the guest
-  is not at ring 0 on real hardware. Checked via CPUID leaf 1 ECX bit 31.
+  reboots. The driver service is created after that reboot, not before,
+  because creating it while signing is still enforced leaves a service that
+  can never start.
+- **No hypervisor** *(8.1)*. Hyper-V, VBS/HVCI or a running VM means the
+  guest is not at ring 0 on real hardware. Checked via CPUID leaf 1 ECX
+  bit 31.
 - **Elevation** *(7 and 8.1)*. `mocolinux-setup.exe` carries a
-  `requireAdministrator`
-  manifest. The logon entry cannot: UAC runs Startup-folder shortcuts with the
-  filtered token, so `moco-boot.vbs` re-launches itself through the `runas`
-  verb on NT 6 and later. Without that the X server came up, the desktop looked
-  like a working install, `sc start CoLinuxDriver` was silently refused, and
-  only the Linux half was missing.
+  `requireAdministrator` manifest. The logon entry cannot: UAC runs
+  Startup-folder shortcuts with the filtered token, so `moco-boot.vbs`
+  re-launches itself through the `runas` verb on NT 6 and later. Without
+  that, the X server came up, the desktop looked like a working install,
+  `sc start CoLinuxDriver` was silently refused, and only the Linux half was
+  missing.
 
 Two smaller differences from XP:
 
@@ -639,11 +651,12 @@ Two smaller differences from XP:
   which offers to enable it and otherwise says which box to tick.
 - **User-space mappings land above 4 GB.** XP and 7 place the driver's MDL
   mappings of guest RAM low; 8.1 does not. `co_manager_kmap` reported those
-  addresses through an `unsigned long`, which is 32 bits under LLP64, so every
-  slice above 4 GB lost its top half and the GPU daemon dereferenced half a
-  pointer. Fixed; noted here because it is the one place where the host version
-  changed behaviour rather than policy, and because the same truncation class
-  has bitten `vm_ptr_t`, the host ISR address and `snprintf %p` in this tree.
+  addresses through an `unsigned long`, which is 32 bits under LLP64, so
+  every slice above 4 GB lost its top half and the GPU daemon dereferenced
+  half a pointer. This is fixed. It is noted here because it is the one place
+  where the host version changed behaviour rather than policy, and because
+  the same truncation class has also bitten `vm_ptr_t`, the host ISR address
+  and `snprintf %p` in this tree.
 
 Windows 8 (6.2) shares all of the above and is expected to work, but has not
 been run on hardware.
@@ -652,46 +665,50 @@ been run on hardware.
 
 Supported and verified on hardware (Windows 10 IoT Enterprise LTSC 21H2,
 build 19044) with GPU acceleration and a two-vCPU SMP guest. Everything the
-earlier hosts do, plus two world-switch fixes that only this version needs:
+earlier hosts do works, plus two world-switch fixes that only this version
+needs:
 
 - **CR4 before CR3 at the crossing.** Windows 10 with KVA Shadow sets
   `CR4.PCIDE`, which makes bits 11:0 of CR3 a PCID and bit 63 the NOFLUSH
-  flag. The guest clears PCIDE (`nopcid`). Writing the host's PCID-encoded CR3
-  while PCIDE is still off writes reserved bits: `#GP` in the passage page with
-  IF clear, triple fault, instant machine freeze. The crossing now loads the
-  entering side's CR4 (with PGE cleared for the TLB flush) before writing CR3.
+  flag. The guest clears PCIDE (`nopcid`). Writing the host's PCID-encoded
+  CR3 while PCIDE is still off writes reserved bits: `#GP` in the passage
+  page with IF clear, triple fault, instant machine freeze. The crossing now
+  loads the entering side's CR4 (with PGE cleared for the TLB flush) before
+  writing CR3.
 - **`MSR_TSC_AUX` (0xC0000103) saved and restored per crossing.** Windows 10
-  stores the logical processor number here for `RDTSCP`. PatchGuard verifies it
-  has not been modified. The guest's `cpu_init()` overwrites it; without the
-  save/restore, PatchGuard trips with bugcheck `0x109`
+  stores the logical processor number here for `RDTSCP`, and PatchGuard
+  verifies it has not been modified. The guest's `cpu_init()` overwrites it.
+  Without the save/restore, PatchGuard trips with bugcheck `0x109`
   (`CRITICAL_STRUCTURE_CORRUPTION`, arg4 = 0x7, arg3 = 0xC0000103) on its
-  randomized timer, minutes after boot. Confirmed from a minidump. Saved into
-  the existing `temp_cr3` slot to avoid growing the shared state struct.
+  randomized timer, minutes after boot. Confirmed from a minidump. The value
+  is saved into the existing `temp_cr3` slot to avoid growing the shared
+  state struct.
 
-Neither fix has any effect on XP, 7 or 8.1 — PCIDE is not set and TSC_AUX is
-not checked on those hosts — so the same binary runs on all four.
+Neither fix has any effect on XP, 7 or 8.1, where PCIDE is not set and
+TSC_AUX is not checked, so the same binary runs on all four hosts.
 
-Requirements are the same as 8.1 (test signing, no hypervisor, elevation) with
-no additions. Windows 10 enables KVA Shadow by default on affected hardware,
-which the switch now handles; it does **not** need to be disabled.
+Requirements are the same as 8.1 (test signing, no hypervisor, elevation)
+with no additions. Windows 10 enables KVA Shadow by default on affected
+hardware, which the switch now handles; it does not need to be disabled.
 
 ## Porting notes
 
-Constraints that shaped the port, recorded in full in `doc/porting-x86_64`
-and the commit history:
+These constraints shaped the port. They are recorded in full in
+`doc/porting-x86_64` and the commit history:
 
-- A free-running guest keeps real IF **enabled**: hardware interrupts vector
+- A free-running guest keeps real IF enabled: hardware interrupts vector
   through the guest's IDT into a stub, world-switch back, and are replayed
-  into Windows' live IDT. Relying on voluntary yields deafens the core to its
-  clock and to TLB-shootdown IPIs.
-- Real IF must be **clear across the crossing** itself: between the CR3 write
+  into Windows' live IDT. Relying on voluntary yields leaves the core unable
+  to receive its clock or TLB-shootdown IPIs.
+- Real IF must be clear across the crossing itself: between the CR3 write
   and the IDTR load, a stale IDTR points into an unmapped table and any
   interrupt triple-faults with no dump.
 - Anything the switch restores per crossing it must also save per crossing,
   including `GS_BASE` (Windows' KPCR moves with its scheduler).
-- PatchGuard (new in XP x64) checksums the host's GDT/IDT/TSS on a randomized
-  timer; any standing modification bugchecks `0x109` minutes later with
-  nothing of yours on the stack. Host structures are restored exactly.
+- PatchGuard (new in XP x64) checksums the host's GDT/IDT/TSS on a
+  randomized timer; any standing modification bugchecks `0x109` minutes
+  later with none of this driver's code on the stack. Host structures are
+  restored exactly.
 - Vector `0x80` is carved out of the host-owned 32–255 range: it is Linux's
   32-bit syscall gate (DPL 3), not a machine interrupt.
 - The guest's IF is virtual; interrupt gates and `SYSCALL` clear the real
@@ -700,15 +717,15 @@ and the commit history:
   the vmalloc region (with `CONFIG_VMAP_STACK`, most task stacks) exist only
   in the guest's tables. Host-side reads must walk the guest's live PML4.
 - Ticks must be injected even when the guest never enters its kernel;
-  otherwise a busy userspace loop owns the CPU forever and every watchdog
-  that would report it runs on the tick that stopped.
-- slirp's wire-overlay structs require `-mno-ms-bitfields` (else `struct ip`
-  is 24 bytes and nothing parses); its `errno` is `WSAGetLastError()`, so
-  would-block checks must compare against `WSAEWOULDBLOCK`. Six
-  `_Static_assert`s pin the structure sizes.
+  otherwise a busy userspace loop owns the CPU forever, and every watchdog
+  that would report it depends on the tick that stopped.
+- slirp's wire-overlay structs require `-mno-ms-bitfields` (otherwise
+  `struct ip` is 24 bytes and nothing parses). Its `errno` is
+  `WSAGetLastError()`, so would-block checks must compare against
+  `WSAEWOULDBLOCK`. Six `_Static_assert`s pin the structure sizes.
 - NTFS zero-fills sparse tails synchronously inside a write;
-  `FileValidDataLengthInformation` removes minutes-long first writes on large
-  images.
+  `FileValidDataLengthInformation` removes minutes-long first writes on
+  large images.
 - The host's pointer into a guest's rings is retired under a lock inside
   `co_kload_free`, where no caller can forget it; pended IRPs are read and
   cleared under the cancel spin lock.
