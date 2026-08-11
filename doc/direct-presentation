@@ -9,9 +9,11 @@ texture virglrenderer has already created on the Windows GPU. Applications must
 open ordinary GLX/EGL contexts through Mesa: no vglrun wrapper, LD_PRELOAD,
 faker library, application patch, frame readback, or XPutImage presentation.
 
-VcXsrv 1.14.2.1 is immutable. Its build is an installer input that cannot be
-reconstructed as part of the normal MoCoLinux build, so no rung may depend on a
-patched X server. VcXsrv remains responsible for the things it already does
+VcXsrv 1.14.2.1 cannot be rebuilt. Its build is an installer input and no rung
+here may depend on recompiling it. That is a bar on rebuilding, not on editing:
+tools/vcxsrv-fakemonitor patches the shipped binary in place, which is how the
+server came to report a monitor at all. Anything that would need a source
+change stays out of reach. VcXsrv remains responsible for the things it already does
 well: X protocol semantics, outer HWND lifetime, input, focus, stacking,
 clipboard, titles, icons, menus, shapes, and ordinary CPU-rendered X drawing.
 

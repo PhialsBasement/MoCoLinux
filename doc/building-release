@@ -30,7 +30,13 @@ appear on the test box.
     the release directory       tools/mkrelease.sh VERSION   release/MoCoLinux-VERSION
 
 The X server is not built. VcXsrv 1.14.2.1 ships as its stock installer and is
-deliberately never patched or rebuilt.
+never rebuilt -- the 2013 MSVC toolchain it needs is not something we have.
+
+Its binary is patched after installation, once, by
+tools/vcxsrv-fakemonitor/patch-vcxsrv.py: stock VcXsrv reports no monitor at
+all, and clients that enumerate displays before opening a window fail on that.
+The patch refuses to touch anything but the exact 1.14.2.1 build it was written
+against, so a reinstall silently reverts it and it has to be reapplied.
 
 
 1. Build host prerequisites
