@@ -121,6 +121,24 @@ done
 [ "$OUT/mocolinux-setup.exe" -nt "$HERE/installer/setup.c" ] ||
 	die "mocolinux-setup.exe is older than setup.c -- rebuild it first"
 
+# The kernel has to be one these daemons can drive.
+#
+# dist-x64/vmlinux is not built by this tree -- it is copied in by hand from
+# whichever build/linux-* directory was last used -- so it goes stale silently
+# while everything beside it is rebuilt. 0.7.0 was assembled that way, with an
+# Aug 9 kernel and Aug 11 daemons, and nothing noticed until the install had
+# copied 35 GB, restarted the machine, loaded the driver and then stopped at
+#
+#   co_colinux_timer_deadline not found -- is the kernel patched?
+#
+# with the guest exiting 0 and Setup able to report only that the guest had
+# gone. The symbol the daemon looks up by name is the cheapest honest test of
+# the pair, and it is the exact one the daemon fails on.
+grep -qa co_colinux_timer_deadline "$OUT/vmlinux" ||
+	die "vmlinux has no co_colinux_timer_deadline -- it predates the timer
+       work and these daemons will refuse it at boot. Copy the kernel from
+       the build/linux-* directory you actually built into dist-x64/vmlinux."
+
 # The driver carries a signature, and it is a signature of THIS driver.
 #
 # Not "Signature verification: ok" and not osslsigncode's exit status: both
