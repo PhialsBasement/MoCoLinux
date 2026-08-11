@@ -1,0 +1,64 @@
+From 5d5b12e8bcd2cfc34ea2dbc80bca91193bc99b70 Mon Sep 17 00:00:00 2001
+From: Yiwei Zhang <zzyiwei@chromium.org>
+Date: Tue, 10 Mar 2026 21:11:14 -0700
+Subject: [PATCH] proxy/server: SOCK_CLOEXEC and MSG_CMSG_CLOEXEC are optional
+
+Using SOCK_CLOEXEC and MSG_CMSG_CLOEXEC are good practice for socket
+communication, but venus client/server model doesn't involve any racy
+exec on parallel threads.
+
+Meanwhile, the ad-hoc server forked from the proxy client is after
+socket pair, and we manually close up corresponding fds on both client
+and server side.
+
+As for passing resource fds via socket, there's no requirement to set
+FD_CLOEXEC both internally and towards the virgl resource side.
+
+Just to ease MacOS adoption.
+
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1603>
+---
+ server/render_socket.c   | 9 +++++++++
+ src/proxy/proxy_socket.c | 6 ++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/server/render_socket.c b/server/render_socket.c
+index 58edcf46..9891010a 100644
+--- a/server/render_socket.c
++++ b/server/render_socket.c
+@@ -10,6 +10,15 @@
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
++#ifdef __APPLE__
++#ifndef SOCK_CLOEXEC
++#define SOCK_CLOEXEC 0
++#endif /* SOCK_CLOEXEC */
++#ifndef MSG_CMSG_CLOEXEC
++#define MSG_CMSG_CLOEXEC 0
++#endif /* MSG_CMSG_CLOEXEC */
++#endif /* __APPLE__ */
++
+ #define RENDER_SOCKET_MAX_FD_COUNT 8
+ 
+ /* The socket pair between the server process and the client process is set up
+diff --git a/src/proxy/proxy_socket.c b/src/proxy/proxy_socket.c
+index 51223c6c..146f0650 100644
+--- a/src/proxy/proxy_socket.c
++++ b/src/proxy/proxy_socket.c
+@@ -13,6 +13,12 @@
+ 
+ #define PROXY_SOCKET_MAX_FD_COUNT 8
+ 
++#ifdef __APPLE__
++#ifndef MSG_CMSG_CLOEXEC
++#define MSG_CMSG_CLOEXEC 0
++#endif /* MSG_CMSG_CLOEXEC */
++#endif /* __APPLE__ */
++
+ /* this is only used when the render server is started on demand */
+ bool
+ proxy_socket_pair(int out_fds[static 2])
+-- 
+2.55.0
+

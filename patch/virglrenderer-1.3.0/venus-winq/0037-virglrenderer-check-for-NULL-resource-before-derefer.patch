@@ -1,0 +1,45 @@
+From 0f5c62e3421e6c636edf4a0d3c65ca516baa0252 Mon Sep 17 00:00:00 2001
+From: Adam Ford <adam.ford@anodize.com>
+Date: Tue, 21 Apr 2026 10:25:53 -0500
+Subject: [PATCH] virglrenderer: check for NULL resource before dereferencing
+ it
+
+virgl_renderer_resource_map_fixed() was reading res->fd_type and res->fd
+into local variables before checking whether virgl_resource_lookup()
+had returned NULL, so a stale or invalid res_handle from a guest would
+crash the renderer before the -EINVAL early-return could fire.
+
+Move the initialisations below the NULL check so the lookup failure
+returns cleanly.
+
+Signed-off-by: Adam Ford <adam.ford@anodize.com>
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1614>
+---
+ src/virglrenderer.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 20c09e6e..d2f928e3 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -1321,13 +1321,14 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
+    void *map = NULL;
+    struct virgl_context *ctx = NULL;
+    struct virgl_resource *res = virgl_resource_lookup(res_handle);
+-   enum virgl_resource_fd_type fd_type = res->fd_type;
+-   enum virgl_resource_fd_type export_fd_type = res->fd_type;
+-   int fd = res->fd;
+ 
+    if (!res)
+       return -EINVAL;
+ 
++   enum virgl_resource_fd_type fd_type = res->fd_type;
++   enum virgl_resource_fd_type export_fd_type = res->fd_type;
++   int fd = res->fd;
++
+    if (fd_type == VIRGL_RESOURCE_OPAQUE_HANDLE) {
+       ctx = virgl_context_lookup(res->opaque_handle_context_id);
+       if (!ctx)
+-- 
+2.55.0
+

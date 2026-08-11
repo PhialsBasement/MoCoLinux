@@ -1,0 +1,104 @@
+From e6206488f5960882362354fb90193bab86badfdb Mon Sep 17 00:00:00 2001
+From: cmspam <cmspam@localhost>
+Date: Sun, 12 Apr 2026 10:19:29 +0900
+Subject: [PATCH] Remove debug logging and temp file creation
+
+- Remove venus-server.log and venus-thread.log file creation
+- Silence debug logger callback (no longer writes to stderr or files)
+- Remove noisy "installed for device" and "flushing deferred" info messages
+- Keep error-level messages (OOM, too many devices, unexpected type)
+---
+ src/proxy/proxy_server.c   | 35 +++--------------------------------
+ src/venus/vkr_win32_shim.c |  9 ---------
+ 2 files changed, 3 insertions(+), 41 deletions(-)
+
+diff --git a/src/proxy/proxy_server.c b/src/proxy/proxy_server.c
+index ecb34432..c97d8cbf 100644
+--- a/src/proxy/proxy_server.c
++++ b/src/proxy/proxy_server.c
+@@ -220,17 +220,7 @@ server_cb_debug_logger(UNUSED enum virgl_log_level_flags log_level,
+                        const char *message,
+                        UNUSED void *user_data)
+ {
+-   fputs("vkr: ", stderr);
+-   fputs(message, stderr);
+-   fflush(stderr);
+-
+-   FILE *f = fopen("venus-server.log",
+-                   "a");
+-   if (f) {
+-      fputs("vkr: ", f);
+-      fputs(message, f);
+-      fclose(f);
+-   }
++   (void)message;
+ }
+ 
+ static const struct vkr_renderer_callbacks server_vkr_cbs = {
+@@ -241,17 +231,8 @@ static const struct vkr_renderer_callbacks server_vkr_cbs = {
+ static FILE *
+ server_dbgf(const char *fmt, ...)
+ {
+-   static FILE *f = NULL;
+-   if (!f)
+-      f = fopen("venus-server.log", "a");
+-   if (f) {
+-      va_list ap;
+-      va_start(ap, fmt);
+-      vfprintf(f, fmt, ap);
+-      va_end(ap);
+-      fflush(f);
+-   }
+-   return f;
++   (void)fmt;
++   return NULL;
+ }
+ 
+ static bool
+@@ -529,16 +510,6 @@ server_main_thread(void *arg)
+ {
+    struct server_thread_state *state = arg;
+ 
+-   {
+-      /* Debug: write directly to a file to confirm thread started */
+-      FILE *tf = fopen("venus-thread.log", "w");
+-      if (tf) {
+-         fprintf(tf, "server_main_thread STARTED fd=%d\n", state->socket_fd);
+-         fflush(tf);
+-         fclose(tf);
+-      }
+-   }
+-
+    while (true) {
+       struct render_client_op_header hdr;
+       if (!server_recv_all(state->socket_fd, &hdr, sizeof(hdr))) {
+diff --git a/src/venus/vkr_win32_shim.c b/src/venus/vkr_win32_shim.c
+index 77b10616..1d21f589 100644
+--- a/src/venus/vkr_win32_shim.c
++++ b/src/venus/vkr_win32_shim.c
+@@ -595,12 +595,6 @@ vkr_win32_device_install_shim(struct vkr_device *dev)
+    vk->DestroyEvent = vkr_win32_DestroyEvent;
+    vk->DestroyQueryPool = vkr_win32_DestroyQueryPool;
+ 
+-   vkr_log("win32 shim: installed for device %p (mem=%d fence=%d sem=%d, "
+-           "deferred-destroy=metadata)",
+-           (void *)entry->handle,
+-           !!dev->GetMemoryWin32HandleKHR,
+-           !!dev->GetFenceWin32HandleKHR,
+-           !!dev->GetSemaphoreWin32HandleKHR);
+ }
+ 
+ void
+@@ -632,9 +626,6 @@ vkr_win32_flush_deferred_destroys(struct vkr_device *dev)
+       return;
+    }
+ 
+-   vkr_log("win32 shim: flushing %u deferred object destructions",
+-           dev->deferred_destroy_count);
+-
+    /* At this point the proc table has been restored to real driver
+     * functions (by vkr_win32_device_remove_shim) and DeviceWaitIdle
+     * has completed, so it is safe to destroy these objects.
+-- 
+2.55.0
+

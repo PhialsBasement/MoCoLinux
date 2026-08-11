@@ -1,0 +1,61 @@
+From b85edd0a8dace9a44a78d063ccc5a094930cf0a2 Mon Sep 17 00:00:00 2001
+From: cmspam <cmspam@users.noreply.github.com>
+Date: Mon, 27 Apr 2026 14:06:00 +0900
+Subject: [PATCH] vkr: defer destruction of VkAccelerationStructureKHR on
+ Windows
+
+The Intel ICD handle-recycle workaround in vkr_win32_shim.c covers 14
+non-dispatchable object types but not VkAccelerationStructureKHR.
+Ray-tracing applications (Quake II RTX, Portal RTX, vkd3d-proton games)
+destroy and recreate AS handles every frame as TLAS rebuilds, so the
+same stale-cache crash class applies if Intel's driver behaves the same
+way for AS handles.
+
+The DestroyAccelerationStructureKHR proc table entry is only present
+when VK_KHR_acceleration_structure is enabled, so guard the install and
+flush paths against a NULL function pointer.
+---
+ src/venus/vkr_win32_shim.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/venus/vkr_win32_shim.c b/src/venus/vkr_win32_shim.c
+index 1017890b..4c655afb 100644
+--- a/src/venus/vkr_win32_shim.c
++++ b/src/venus/vkr_win32_shim.c
+@@ -556,6 +556,12 @@ VKR_WIN32_DEFERRED_DESTROY_SHIM(VkSamplerYcbcrConversion, SamplerYcbcrConversion
+ VKR_WIN32_DEFERRED_DESTROY_SHIM(VkPipelineCache, PipelineCache, VK_OBJECT_TYPE_PIPELINE_CACHE)
+ VKR_WIN32_DEFERRED_DESTROY_SHIM(VkEvent, Event, VK_OBJECT_TYPE_EVENT)
+ VKR_WIN32_DEFERRED_DESTROY_SHIM(VkQueryPool, QueryPool, VK_OBJECT_TYPE_QUERY_POOL)
++/* Ray-tracing apps (Quake II RTX, Portal RTX, vkd3d-proton games) destroy
++ * and recreate VkAccelerationStructureKHR every frame as TLAS rebuilds.
++ * Fall under the same Intel handle-recycle bug class as the lightweight
++ * metadata types above, so defer them too.
++ */
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkAccelerationStructureKHR, AccelerationStructureKHR, VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR)
+ 
+ /* ------------------------------------------------------------------ */
+ /* Install / remove                                                    */
+@@ -628,6 +634,8 @@ vkr_win32_device_install_shim(struct vkr_device *dev)
+    vk->DestroyPipelineCache = vkr_win32_DestroyPipelineCache;
+    vk->DestroyEvent = vkr_win32_DestroyEvent;
+    vk->DestroyQueryPool = vkr_win32_DestroyQueryPool;
++   if (vk->DestroyAccelerationStructureKHR)
++      vk->DestroyAccelerationStructureKHR = vkr_win32_DestroyAccelerationStructureKHR;
+ 
+ }
+ 
+@@ -712,6 +720,11 @@ vkr_win32_flush_deferred_destroys(struct vkr_device *dev)
+       case VK_OBJECT_TYPE_QUERY_POOL:
+          vk->DestroyQueryPool(device, (VkQueryPool)h->handle, NULL);
+          break;
++      case VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR:
++         if (vk->DestroyAccelerationStructureKHR)
++            vk->DestroyAccelerationStructureKHR(device,
++               (VkAccelerationStructureKHR)h->handle, NULL);
++         break;
+       default:
+          vkr_log("win32 shim: unexpected deferred type %u", (uint32_t)h->type);
+          break;
+-- 
+2.55.0
+

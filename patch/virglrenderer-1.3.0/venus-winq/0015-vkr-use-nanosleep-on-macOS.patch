@@ -1,0 +1,33 @@
+From 9b3a54e02d25d3934a6448a243ccd31e1a62dd3e Mon Sep 17 00:00:00 2001
+From: osy <osy@turing.llc>
+Date: Fri, 28 Nov 2025 16:43:25 -0800
+Subject: [PATCH] vkr: use nanosleep() on macOS
+
+macOS does not have clock_nanosleep()
+
+Co-authored-by: Lucas Amaral <lucaaamaral@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1600>
+---
+ src/venus/vkr_ring.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index 0e46df87..775ec280 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -204,7 +204,12 @@ vkr_ring_relax(uint32_t *iter)
+       .tv_sec = us / 1000000,
+       .tv_nsec = (us % 1000000) * 1000,
+    };
++#ifdef __APPLE__
++   /* macOS does not implement clock_nanosleep; a unified path is TBD */
++   nanosleep(&ts, NULL);
++#else
+    clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
++#endif
+ }
+ 
+ static bool
+-- 
+2.55.0
+

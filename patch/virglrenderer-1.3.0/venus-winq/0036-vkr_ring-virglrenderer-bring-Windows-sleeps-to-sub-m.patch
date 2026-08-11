@@ -1,0 +1,149 @@
+From 5be70432af2f6432c48e10f69142cd7a3e8a7f2e Mon Sep 17 00:00:00 2001
+From: cmspam <cmspam@localhost>
+Date: Sun, 26 Apr 2026 13:12:30 +0900
+Subject: [PATCH] vkr_ring,virglrenderer: bring Windows sleeps to
+ sub-millisecond
+
+Two related sources of frame hitches in Vulkan workloads:
+
+1. virgl_renderer_init now calls timeBeginPeriod(1) on Windows. The
+   default system timer tick is 15.625ms (64Hz), so cnd_timedwait,
+   nanosleep, Sleep, and clock_nanosleep all round up to that. The
+   ring monitor's cnd_timedwait and the ring relax sleeps are sized
+   in microseconds; without an elevated timer rate they become 16ms
+   naps that drop a whole frame's worth of guest commands on the
+   floor. timeBeginPeriod(1) drops that to 1ms.
+
+2. vkr_ring_relax now uses CreateWaitableTimerEx with the
+   CREATE_WAITABLE_TIMER_HIGH_RESOLUTION flag and 100-ns relative
+   delays via SetWaitableTimer. That gets actual ~50us resolution on
+   modern Windows, which keeps the early steps of the exponential
+   backoff (10us, 20us, 40us, ...) from oversleeping into the next
+   frame. Falls back to Sleep(ms) if the high-resolution timer can't
+   be created, which preserves the pre-fix millisecond behavior.
+
+Together these target the specific hitch pattern where the dispatcher
+goes to sleep on a microsecond-scale request, the OS rounds up to the
+timer tick, and the guest sees a multi-frame stall every time a burst
+of commands is followed by a brief lull.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/meson.build      |  2 ++
+ src/venus/vkr_ring.c | 42 ++++++++++++++++++++++++++++++++++++++++--
+ src/virglrenderer.c  | 20 ++++++++++++++++++++
+ 3 files changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/src/meson.build b/src/meson.build
+index 10fa66b5..ecb99c9e 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -265,6 +265,8 @@ endif
+ if with_host_windows
+   virgl_sources += ['mman_win32.c']
+   virgl_depends += [meson.get_compiler('c').find_library('ws2_32')]
++  # winmm for timeBeginPeriod (system timer resolution control)
++  virgl_depends += [meson.get_compiler('c').find_library('winmm')]
+ endif
+ 
+ libvirgl = static_library(
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index b2690c28..e03e51b4 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -204,14 +204,52 @@ vkr_ring_relax(uint32_t *iter)
+ 
+    const uint32_t shift = util_last_bit(*iter) - busy_wait_order - 1;
+    const uint32_t us = base_sleep_us << shift;
++
++#ifdef _WIN32
++   /* Use a high-resolution waitable timer so sub-millisecond requests are
++    * actually honored. Plain Sleep / clock_nanosleep round to the system
++    * timer tick, which is 15.625ms by default and 1ms with timeBeginPeriod
++    * (set in virgl_renderer_init). Even 1ms is too coarse for the early
++    * exponential backoff steps (10us, 20us, 40us, ...). A waitable timer
++    * with SetWaitableTimerEx + 100ns relative delays gets ~50us actual
++    * resolution on modern Windows, which keeps the ring monitor responsive
++    * to short bursts of guest activity instead of oversleeping into the
++    * next frame.
++    *
++    * Falling back to Sleep((us+999)/1000) when the timer can't be created
++    * just preserves the previous millisecond-granularity behavior. */
++   static _Thread_local HANDLE relax_timer = NULL;
++   if (!relax_timer) {
++      relax_timer = CreateWaitableTimerExW(
++         NULL, NULL,
++         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION | CREATE_WAITABLE_TIMER_MANUAL_RESET,
++         TIMER_ALL_ACCESS);
++      if (!relax_timer) {
++         /* Older Windows: fall back to default-resolution timer. */
++         relax_timer = CreateWaitableTimerW(NULL, TRUE, NULL);
++      }
++   }
++   if (relax_timer) {
++      LARGE_INTEGER due;
++      due.QuadPart = -(LONGLONG)us * 10; /* 100ns units, negative = relative */
++      if (SetWaitableTimer(relax_timer, &due, 0, NULL, NULL, FALSE)) {
++         WaitForSingleObject(relax_timer, INFINITE);
++         return;
++      }
++   }
++   Sleep((us + 999) / 1000);
++#elif defined(__APPLE__)
++   /* macOS does not implement clock_nanosleep; a unified path is TBD */
+    const struct timespec ts = {
+       .tv_sec = us / 1000000,
+       .tv_nsec = (us % 1000000) * 1000,
+    };
+-#ifdef __APPLE__
+-   /* macOS does not implement clock_nanosleep; a unified path is TBD */
+    nanosleep(&ts, NULL);
+ #else
++   const struct timespec ts = {
++      .tv_sec = us / 1000000,
++      .tv_nsec = (us % 1000000) * 1000,
++   };
+    clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+ #endif
+ }
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index caf3aa34..20c09e6e 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -35,6 +35,8 @@
+ #include <sys/mman.h>
+ #else
+ #include "mman_win32.h"
++#include <windows.h>
++#include <timeapi.h>
+ #endif
+ 
+ #include "pipe/p_state.h"
+@@ -802,6 +804,24 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
+ 
+    int ret;
+ 
++#ifdef _WIN32
++   /* Drop Windows system timer to 1ms granularity. By default the timer
++    * tick is 15.625ms (64Hz), which means clock_nanosleep / Sleep / cnd_*
++    * timed waits all round up to 15.625ms even when the requested wait
++    * is microseconds. The vkr ring relax path requests sub-millisecond
++    * sleeps that turn into ~16ms naps in practice, producing visible
++    * frame hitches in Vulkan workloads -- the host dispatcher misses an
++    * entire frame's worth of guest commands while it's asleep. With
++    * timeBeginPeriod(1), the same sleeps are honored at ~1ms or better.
++    *
++    * The cost is a small system-wide CPU bump (timer fires more often).
++    * On modern CPUs this is well under 1% and it's the standard fix every
++    * Windows audio/video application applies. We never call timeEndPeriod;
++    * that's intentional -- the runtime owns the elevated rate for as long
++    * as virglrenderer is loaded, which is the entire QEMU session. */
++   timeBeginPeriod(1);
++#endif
++
+    /* VIRGL_RENDERER_THREAD_SYNC is a hint and can be silently ignored */
+    if (!has_eventfd() || getenv("VIRGL_DISABLE_MT"))
+       flags &= ~VIRGL_RENDERER_THREAD_SYNC;
+-- 
+2.55.0
+

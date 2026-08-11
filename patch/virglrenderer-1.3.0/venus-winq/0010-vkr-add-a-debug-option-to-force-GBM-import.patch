@@ -1,0 +1,102 @@
+From 59238fb8ae461b84724c3740cd27e8920a61d6a9 Mon Sep 17 00:00:00 2001
+From: Yiwei Zhang <zzyiwei@chromium.org>
+Date: Wed, 11 Mar 2026 15:00:31 -0700
+Subject: [PATCH] vkr: add a debug option to force GBM import
+
+The UDMABUF option takes precedence over the GBM option.
+
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1604>
+---
+ src/venus/vkr_common.c          |  1 +
+ src/venus/vkr_common.h          |  1 +
+ src/venus/vkr_device_memory.c   |  3 ++-
+ src/venus/vkr_physical_device.c | 17 ++++++++++++-----
+ 4 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/src/venus/vkr_common.c b/src/venus/vkr_common.c
+index e7660920..8ff62c77 100644
+--- a/src/venus/vkr_common.c
++++ b/src/venus/vkr_common.c
+@@ -216,6 +216,7 @@ static const struct vn_info_extension_table vkr_extension_table = {
+ static const struct debug_named_value vkr_debug_options[] = {
+    { "validate", VKR_DEBUG_VALIDATE, "Force enabling the validation layer" },
+    { "udmabuf", VKR_DEBUG_UDMABUF, "Force udmabuf for host visible memory" },
++   { "gbm", VKR_DEBUG_GBM, "Force gbm for host visible memory" },
+    DEBUG_NAMED_VALUE_END
+ };
+ 
+diff --git a/src/venus/vkr_common.h b/src/venus/vkr_common.h
+index e24a16fb..7a0df1d1 100644
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
+@@ -116,6 +116,7 @@ typedef uint64_t vkr_object_id;
+ enum vkr_debug_flags {
+    VKR_DEBUG_VALIDATE = 1 << 0,
+    VKR_DEBUG_UDMABUF = 1 << 1,
++   VKR_DEBUG_GBM = 1 << 2,
+ };
+ 
+ /* base class for all objects */
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 200a3774..d0f29419 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -306,8 +306,9 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+       const bool no_dma_buf_export =
+          !export_info ||
+          !(export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
++      const bool force_gbm_import = !!physical_dev->gbm_device;
+       const bool force_udmabuf_import = physical_dev->udmabuf_dev_fd >= 0;
+-      if (!force_udmabuf_import &&
++      if (!(force_gbm_import || force_udmabuf_import) &&
+           (physical_dev->is_dma_buf_fd_export_supported ||
+            (physical_dev->is_opaque_fd_export_supported && no_dma_buf_export))) {
+          const VkExternalMemoryHandleTypeFlagBits handle_type =
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index da41c9b1..043d5845 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -48,21 +48,23 @@ vkr_physical_device_get_udmabuf_dev_fd(void)
+ #ifdef MINIGBM
+ #include <minigbm/minigbm_helpers.h>
+ #else
+-#define minigbm_create_default_device(out_fd) NULL
++#include "../vrend/vrend_winsys_gbm.h"
+ #endif /* MINIGBM */
+ 
+-/* TODO remove minigbm allocation fallback after requiring exporting from raw mappable
+- * device memory via a new Vulkan extension
+- */
+ static struct gbm_device *vkr_gbm_dev;
+ 
+ static void
+ vkr_gbm_device_init_once(void)
+ {
++#ifdef MINIGBM
+    UNUSED int gbm_fd;
+    vkr_gbm_dev = minigbm_create_default_device(&gbm_fd);
++#else
++   struct virgl_gbm *gbm = virgl_gbm_init(-1);
++   vkr_gbm_dev = gbm->device;
++#endif /* MINIGBM */
+    if (!vkr_gbm_dev) {
+-      vkr_log("minigbm_create_default_device failed");
++      vkr_log("vkr_gbm_device_init_once failed");
+       exit(-1);
+    }
+ }
+@@ -239,6 +241,11 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
+          physical_dev->udmabuf_dev_fd = vkr_physical_device_get_udmabuf_dev_fd();
+       else
+          vkr_log("missing VK_EXT_external_memory_dma_buf for udmabuf import!");
++   } else if (VKR_DEBUG(GBM)) {
++      if (physical_dev->EXT_external_memory_dma_buf)
++         physical_dev->gbm_device = vkr_physical_device_get_gbm_device();
++      else
++         vkr_log("missing VK_EXT_external_memory_dma_buf for gbm import!");
+    }
+ }
+ 
+-- 
+2.55.0
+

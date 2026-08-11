@@ -1,0 +1,107 @@
+From 274c16f8dd76c90438cdf1e796a48df834430132 Mon Sep 17 00:00:00 2001
+From: cmspam <cmspam@localhost>
+Date: Sun, 26 Apr 2026 12:57:33 +0900
+Subject: [PATCH] vkr: register ring + queue threads with MMCSS on Windows
+
+The ring monitor thread (decode + dispatch guest commands to host
+Vulkan) and the per-queue sync thread (retire GPU fences and signal
+guest) are both latency-sensitive: their wake-to-process latency is
+on the per-frame critical path of every guest Vulkan workload.
+
+Register them with the Windows Multimedia Class Scheduler Service
+under "Pro Audio" so the scheduler treats them like low-latency audio
+workers: longer time slices, less likely to be preempted by background
+work, raised base priority during the registered period. Failure is
+benign (returns NULL handle) so this is safe to apply unconditionally.
+
+Loaded dynamically via LoadLibrary("avrt.dll") to avoid hard-linking
+against avrt -- this keeps the binary loadable on minimal Windows
+images that strip the multimedia stack.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/venus/vkr_queue.c | 26 ++++++++++++++++++++++++++
+ src/venus/vkr_ring.c  | 23 +++++++++++++++++++++++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index 42367292..e1118811 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -5,6 +5,10 @@
+ 
+ #include "vkr_queue.h"
+ 
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
+ #include "venus-protocol/vn_protocol_renderer_queue.h"
+ 
+ #include "util/os_file.h"
+@@ -216,6 +220,28 @@ vkr_queue_thread(void *arg)
+    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-queue-%d", ctx->ctx_id);
+    u_thread_setname(thread_name);
+ 
++#ifdef _WIN32
++   /* Same MMCSS treatment as the ring thread: this thread retires GPU
++    * fences via WaitForFences and signals the guest, so its scheduling
++    * latency directly affects per-frame submit/retire turnaround. */
++   {
++      typedef HANDLE (WINAPI *PFN_AvSetMmThreadCharacteristicsW)(LPCWSTR, LPDWORD);
++      static PFN_AvSetMmThreadCharacteristicsW pAvSet = NULL;
++      static int avrt_tried = 0;
++      if (!avrt_tried) {
++         avrt_tried = 1;
++         HMODULE h = LoadLibraryW(L"avrt.dll");
++         if (h)
++            pAvSet = (PFN_AvSetMmThreadCharacteristicsW)
++               GetProcAddress(h, "AvSetMmThreadCharacteristicsW");
++      }
++      if (pAvSet) {
++         DWORD task_index = 0;
++         (void)pAvSet(L"Pro Audio", &task_index);
++      }
++   }
++#endif
++
+    mtx_lock(&queue->sync_thread.mutex);
+    while (true) {
+       while (list_is_empty(&queue->sync_thread.syncs) && !queue->sync_thread.join)
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index cb4be950..b2690c28 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -259,6 +259,29 @@ vkr_ring_thread(void *arg)
+    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ring-%d", ctx->ctx_id);
+    u_thread_setname(thread_name);
+ #ifdef _WIN32
++   /* Register with Multimedia Class Scheduler Service so Windows treats
++    * this thread like a low-latency audio/graphics worker: longer time
++    * slices, less likely to be preempted by background work, gets a
++    * higher base priority class. Costs nothing and reduces frame jitter
++    * for guest Vulkan submission, which is exactly what this thread does. */
++   {
++      typedef HANDLE (WINAPI *PFN_AvSetMmThreadCharacteristicsW)(LPCWSTR, LPDWORD);
++      static PFN_AvSetMmThreadCharacteristicsW pAvSet = NULL;
++      static int avrt_tried = 0;
++      if (!avrt_tried) {
++         avrt_tried = 1;
++         HMODULE h = LoadLibraryW(L"avrt.dll");
++         if (h)
++            pAvSet = (PFN_AvSetMmThreadCharacteristicsW)
++               GetProcAddress(h, "AvSetMmThreadCharacteristicsW");
++      }
++      if (pAvSet) {
++         DWORD task_index = 0;
++         /* "Pro Audio" gives the strongest scheduling guarantees. "Games"
++          * works on most systems too. Either is fine; failure is benign. */
++         (void)pAvSet(L"Pro Audio", &task_index);
++      }
++   }
+    if (ring->prio_valid && !SetThreadPriority(GetCurrentThread(),
+          ring->prio <= -10 ? THREAD_PRIORITY_HIGHEST :
+          ring->prio <= 0   ? THREAD_PRIORITY_ABOVE_NORMAL :
+-- 
+2.55.0
+

@@ -1,0 +1,49 @@
+From 1207422c2fddfe612b4d40ef0476ff7e48b61dd0 Mon Sep 17 00:00:00 2001
+From: Collabora's Gfx CI Team
+ <gfx-ci-bot-collabora@contact.daniels.if.required.fdo.invalid>
+Date: Wed, 25 Feb 2026 00:04:29 +0000
+Subject: [PATCH] Uprev Mesa to 7fc6af99ea4ef86e96b098dcd29a52d33fdd915f
+
+https://gitlab.freedesktop.org/mesa/mesa/-/compare/2fa85edd75a4dac145ca9fee78dbe56207aa6870...7fc6af99ea4ef86e96b098dcd29a52d33fdd915f
+
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1598>
+---
+ .gitlab-ci.yml                               | 4 ++--
+ .gitlab-ci/expectations/virt/venus-fails.txt | 1 +
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+index 2b378927..bc4e69b0 100644
+--- a/.gitlab-ci.yml
++++ b/.gitlab-ci.yml
+@@ -17,7 +17,7 @@ variables:
+   #
+   # Pick a pipeline on https://gitlab.freedesktop.org/mesa/mesa/-/pipelines/
+   #
+-  MESA_PIPELINE_ID: 1610924
++  MESA_PIPELINE_ID: 1622883
+ 
+   MESA_PROJECT_PATH: mesa/mesa
+   S3_JWT_FILE: /s3_jwt
+@@ -59,7 +59,7 @@ include:
+     # IMPORTANT: Use a recent Mesa Git revision
+     # The commit ref must be in sync with the pipeline picked above
+     # It can be found on the pipeline page below the commit message
+-    ref: 2fa85edd75a4dac145ca9fee78dbe56207aa6870
++    ref: 7fc6af99ea4ef86e96b098dcd29a52d33fdd915f
+     file:
+       - '/.gitlab-ci/image-tags.yml'
+ 
+diff --git a/.gitlab-ci/expectations/virt/venus-fails.txt b/.gitlab-ci/expectations/virt/venus-fails.txt
+index e32d0e76..04bf7297 100644
+--- a/.gitlab-ci/expectations/virt/venus-fails.txt
++++ b/.gitlab-ci/expectations/virt/venus-fails.txt
+@@ -11,4 +11,5 @@ dEQP-VK.draw.dynamic_rendering.partial_secondary_cmd_buff.multiple_interpolation
+ 
+ # uprev Mesa in Virglrenderer
+ dEQP-VK.sparse_resources.image_block_shapes.2d.g8b8g8r8_422_unorm.samples_1,Fail
++dEQP-VK.wsi.direct_drm.swapchain.private_data.image_usage,Crash
+ 
+-- 
+2.55.0
+

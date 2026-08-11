@@ -1,0 +1,262 @@
+--- a/src/virgl_protocol.h	2026-02-11 00:43:59.000000000 +1100
++++ b/src/virgl_protocol.h	2026-08-10 01:41:58.367112500 +1000
+@@ -145,6 +145,11 @@
+    VIRGL_CCMD_CLEAR_SURFACE,
+    VIRGL_CCMD_GET_PIPE_RESOURCE_LAYOUT,
+ 
++   /* MoCoLinux CoPresent. Keep this value identical to the guest Mesa copy
++    * in src/virtio/virtio-gpu/virgl_protocol.h. Numbered explicitly and far
++    * above the upstream range so neither side's enum length can shift it. */
++   VIRGL_CCMD_MOCO_PRESENT = 200,
++
+    VIRGL_MAX_COMMANDS
+ };
+ 
+@@ -790,4 +795,15 @@
+ #define VIRGL_RESOURCE_LAYOUT_HANDLE_OUT     1
+ #define VIRGL_RESOURCE_LAYOUT_HANDLE_TARGET  2
+ 
++/* VIRGL_CCMD_MOCO_PRESENT -- keep identical to the guest Mesa copy. */
++#define VIRGL_MOCO_PRESENT_SIZE              8
++#define VIRGL_MOCO_PRESENT_RES_HANDLE        1
++#define VIRGL_MOCO_PRESENT_XID               2
++#define VIRGL_MOCO_PRESENT_WIDTH             3
++#define VIRGL_MOCO_PRESENT_HEIGHT            4
++#define VIRGL_MOCO_PRESENT_DAMAGE_X          5
++#define VIRGL_MOCO_PRESENT_DAMAGE_Y          6
++#define VIRGL_MOCO_PRESENT_DAMAGE_WIDTH      7
++#define VIRGL_MOCO_PRESENT_DAMAGE_HEIGHT     8
++
+ #endif
+--- a/src/virglrenderer.h	2026-02-11 00:43:59.000000000 +1100
++++ b/src/virglrenderer.h	2026-08-10 01:58:05.504973400 +1000
+@@ -48,7 +48,8 @@
+    int compat_ctx;
+ };
+ 
+-#define VIRGL_RENDERER_CALLBACKS_VERSION 4
++/* 5 adds MoCoLinux's moco_present callback below. */
++#define VIRGL_RENDERER_CALLBACKS_VERSION 5
+ 
+ struct virgl_renderer_callbacks {
+    int version;
+@@ -104,6 +105,25 @@
+     * destroy_gl_context, make_current to be implemented by caller.
+     */
+    void *(*get_egl_display)(void *cookie);
++
++   /*
++    * v5 (MoCoLinux): the guest asked for a resource to be shown in one of
++    * its X windows, via VIRGL_CCMD_MOCO_PRESENT in the command stream.
++    *
++    * Presentation rides the command stream precisely so that it needs
++    * nothing a sandboxed client does not already have: the render node it
++    * renders through carries the request, so no socket, extra device or
++    * filesystem share is involved and containers such as Steam's
++    * pressure-vessel work untouched.
++    *
++    * res_handle is the ordinary virgl resource, already validated to belong
++    * to the calling context. xid is the client's top-level X window. No
++    * pixels cross this interface -- the host already holds the texture.
++    */
++   void (*moco_present)(void *cookie, uint32_t res_handle, uint32_t xid,
++                        uint32_t width, uint32_t height,
++                        uint32_t damage_x, uint32_t damage_y,
++                        uint32_t damage_width, uint32_t damage_height);
+ };
+ 
+ /* virtio-gpu compatible interface */
+--- a/src/virglrenderer.c	2026-02-11 00:43:59.000000000 +1100
++++ b/src/virglrenderer.c	2026-08-10 01:43:13.272785200 +1000
+@@ -697,6 +697,17 @@
+    return -1;
+ }
+ 
++static void moco_present(uint32_t res_handle, uint32_t xid,
++                         uint32_t width, uint32_t height,
++                         uint32_t damage_x, uint32_t damage_y,
++                         uint32_t damage_width, uint32_t damage_height)
++{
++   if (state.cbs && state.cbs->version >= 5 && state.cbs->moco_present)
++      state.cbs->moco_present(state.cookie, res_handle, xid, width, height,
++                              damage_x, damage_y, damage_width,
++                              damage_height);
++}
++
+ static const struct vrend_if_cbs vrend_cbs = {
+    ctx0_fence_retire,
+    create_gl_context,
+@@ -706,6 +717,7 @@
+    create_gl_context_surfaceless,
+    destroy_gl_context_surfaceless,
+    make_current_surfaceless,
++   moco_present,
+ };
+ 
+ static int
+--- a/src/vrend/vrend_renderer.h	2026-02-11 00:43:59.000000000 +1100
++++ b/src/vrend/vrend_renderer.h	2026-08-10 01:43:04.991931900 +1000
+@@ -188,6 +188,13 @@
+    virgl_gl_context (*create_gl_context_surfaceless)(int scanout, struct virgl_gl_ctx_param *params);
+    void (*destroy_gl_context_surfaceless)(virgl_gl_context ctx);
+    int (*make_current_surfaceless)(virgl_gl_context ctx);
++
++   /* MoCoLinux: VIRGL_CCMD_MOCO_PRESENT reached the decoder and named a
++    * resource this context legitimately owns. May be NULL. */
++   void (*moco_present)(uint32_t res_handle, uint32_t xid,
++                        uint32_t width, uint32_t height,
++                        uint32_t damage_x, uint32_t damage_y,
++                        uint32_t damage_width, uint32_t damage_height);
+ };
+ 
+ #define VREND_USE_THREAD_SYNC (1 << 0)
+--- a/src/vrend/vrend_renderer.c	2026-02-11 00:43:59.000000000 +1100
++++ b/src/vrend/vrend_renderer.c	2026-08-10 00:25:11.949741200 +1000
+@@ -4260,6 +4260,12 @@
+ {
+    enum pipe_shader_type type = sel->type;
+ 
++   /* The key unions fs/vs/gs state; only touch fs fields for fragment
++    * shaders. Zero (link time, no framebuffer yet) keeps the conservative
++    * all-cbufs emission. */
++   if (type == PIPE_SHADER_FRAGMENT)
++      key->fs.nr_cbufs = sub_ctx->nr_cbufs;
++
+    if (vrend_state.use_core_profile) {
+       bool add_alpha_test = true;
+ 
+@@ -8346,8 +8352,22 @@
+       gr->storage_bits |= VREND_STORAGE_GL_IMMUTABLE;
+       gr->buffer_storage_flags = buffer_storage_flags;
+       gr->size = width;
+-   } else
+-      glBufferData(gr->target, width, NULL, GL_STREAM_DRAW);
++   } else {
++      /* The usage hint decides where the driver places the buffer.
++       * GL_STREAM_DRAW invites system/GART placement, and then the GPU
++       * fetches every vertex and index across the bus on every draw --
++       * measured as a uniform ~2.2x geometry-throughput loss against
++       * native on a GT 730, insensitive to draw count, resolution and
++       * shader cost.  Vertex and index buffers are written rarely and
++       * read every frame: hint them static so they live in VRAM.  The
++       * guest's usage hint does not survive the virgl protocol, so the
++       * bind flags are the best signal available. */
++      GLenum usage = (gr->base.bind & (VIRGL_BIND_VERTEX_BUFFER |
++                                       VIRGL_BIND_INDEX_BUFFER))
++                     ? GL_STATIC_DRAW : GL_STREAM_DRAW;
++
++      glBufferData(gr->target, width, NULL, usage);
++   }
+ 
+    glBindBufferARB(gr->target, 0);
+ }
+--- a/src/vrend/vrend_decode.c	2026-02-11 00:43:59.000000000 +1100
++++ b/src/vrend/vrend_decode.c	2026-08-10 01:44:01.703927000 +1000
+@@ -1575,6 +1575,46 @@
+    }
+ }
+ 
++/* MoCoLinux CoPresent: show a resource in one of the guest's X windows.
++ *
++ * The whole point of carrying this in the command stream is that a client
++ * needs nothing beyond the render node it is already rendering through, so
++ * sandboxes and containers require no configuration. Ordering is implicit:
++ * the command follows the draws it presents in the same buffer.
++ */
++static int vrend_decode_moco_present(struct vrend_context *ctx,
++                                     const uint32_t *buf, uint32_t length)
++{
++   uint32_t res_handle;
++   struct vrend_resource *res;
++
++   if (length != VIRGL_MOCO_PRESENT_SIZE)
++      return EINVAL;
++
++   res_handle = get_buf_entry(buf, VIRGL_MOCO_PRESENT_RES_HANDLE);
++
++   /* A context may only present what it owns. */
++   res = vrend_renderer_ctx_res_lookup(ctx, res_handle);
++   if (!res) {
++      vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE,
++                                 res_handle);
++      return EINVAL;
++   }
++
++   if (!vrend_clicbs->moco_present)
++      return 0;      /* host does not implement presentation; harmless */
++
++   vrend_clicbs->moco_present(res_handle,
++                              get_buf_entry(buf, VIRGL_MOCO_PRESENT_XID),
++                              get_buf_entry(buf, VIRGL_MOCO_PRESENT_WIDTH),
++                              get_buf_entry(buf, VIRGL_MOCO_PRESENT_HEIGHT),
++                              get_buf_entry(buf, VIRGL_MOCO_PRESENT_DAMAGE_X),
++                              get_buf_entry(buf, VIRGL_MOCO_PRESENT_DAMAGE_Y),
++                              get_buf_entry(buf, VIRGL_MOCO_PRESENT_DAMAGE_WIDTH),
++                              get_buf_entry(buf, VIRGL_MOCO_PRESENT_DAMAGE_HEIGHT));
++   return 0;
++}
++
+ static int vrend_decode_pipe_resource_create(struct vrend_context *ctx, const uint32_t *buf, uint32_t length)
+ {
+    struct vrend_renderer_resource_create_args args = { 0 };
+@@ -2031,6 +2071,7 @@
+    [VIRGL_CCMD_END_FRAME] = vrend_unsupported,
+ #endif
+    [VIRGL_CCMD_GET_PIPE_RESOURCE_LAYOUT] = vrend_decode_get_pipe_resource_layout,
++   [VIRGL_CCMD_MOCO_PRESENT] = vrend_decode_moco_present,
+ };
+ 
+ static void dump_command_stream_to_file(const void *buffer, size_t size)
+--- a/src/vrend/vrend_shader.h	2026-02-11 00:43:59.000000000 +1100
++++ b/src/vrend/vrend_shader.h	2026-08-09 23:58:27.238385000 +1000
+@@ -203,6 +203,13 @@
+          uint32_t prim_is_points : 1;
+          uint32_t lower_left_origin : 1;
+          uint32_t available_color_in_bits : 4;
++         /* Bound colorbuffer count at draw time, so a color0-broadcast
++          * fragment shader (compat gl_FragColor) emits that many outputs
++          * instead of max_draw_buffers. Zero means unknown: keep the old
++          * write-everything behaviour. Eight fragment exports per shaded
++          * pixel where one buffer is bound is pure export-path waste on
++          * every fixed-function-era application. */
++         uint32_t nr_cbufs : 4;
+       } fs;
+ 
+       struct {
+--- a/src/vrend/vrend_shader.c	2026-02-11 00:43:59.000000000 +1100
++++ b/src/vrend/vrend_shader.c	2026-08-09 23:59:00.041792400 +1000
+@@ -2174,12 +2174,24 @@
+    }
+ }
+ 
++static int write_all_cbuf_count(const struct dump_ctx *ctx)
++{
++   /* Broadcast semantics only owe a write to every *bound* colorbuffer.
++    * The key carries that count from draw time; zero means it is unknown
++    * and the conservative every-buffer emission stands. */
++   if (ctx->key->fs.nr_cbufs &&
++       (int)ctx->key->fs.nr_cbufs < ctx->cfg->max_draw_buffers)
++      return (int)ctx->key->fs.nr_cbufs;
++   return ctx->cfg->max_draw_buffers;
++}
++
+ static void emit_cbuf_writes(const struct dump_ctx *ctx,
+                              struct vrend_glsl_strbufs *glsl_strbufs)
+ {
++   int limit = write_all_cbuf_count(ctx);
+    int i;
+ 
+-   for (i = ctx->num_outputs; i < ctx->cfg->max_draw_buffers; i++) {
++   for (i = ctx->num_outputs; i < limit; i++) {
+       emit_buff(glsl_strbufs, "fsout_c%d = fsout_c0;\n", i);
+    }
+ }
+@@ -7323,7 +7335,7 @@
+       else if (ctx->key->fs.cbufs_signed_int_bitmask)
+          type = "ivec4";
+ 
+-      for (i = 0; i < (uint32_t)ctx->cfg->max_draw_buffers; i++) {
++      for (i = 0; i < (uint32_t)write_all_cbuf_count(ctx); i++) {
+          if (ctx->cfg->use_gles) {
+             if (ctx->key->fs.logicop_enabled)
+                emit_hdrf(glsl_strbufs, "%s fsout_tmp_c%d;\n", type, i);

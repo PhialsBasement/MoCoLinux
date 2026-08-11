@@ -68,7 +68,11 @@ Build these first: `cogpu-daemon` includes `<virgl/virglrenderer.h>` and
 them.
 
 virglrenderer is the pristine 1.3.0 release tarball plus the patches in
-`download/virgl-patches/`, applied in order:
+`patch/virglrenderer-1.3.0/`, applied in order. They used to live only in
+`download/virgl-patches/`, which is outside this repository -- so every
+virglrenderer fix this project has ever made existed on exactly one disk and
+in no history. `download/virgl-patches/` is now a working copy of the
+tracked directory; change the tracked one.
 
     01-drm-h-windows-no-ioccom.patch   supplies the fixed-width types and
                                        collapses the ioctl encoders, because
@@ -78,6 +82,13 @@ virglrenderer is the pristine 1.3.0 release tarball plus the patches in
                                        VIRGL_CCMD_MOCO_PRESENT command and its
                                        decoder, the v5 present callback, and
                                        two shader-emission fixes
+    03-moco-ctx-lifetime.patch         forces ctx0 when any context is
+                                       destroyed, so tearing down a Venus
+                                       context cannot leave vrend believing a
+                                       freed GL context is still current; and
+                                       gives the renderer its own log file,
+                                       because neither the daemon's stderr nor
+                                       the log callback ever reached us
 
 Then, from `download/virglrenderer-1.3.0`:
 

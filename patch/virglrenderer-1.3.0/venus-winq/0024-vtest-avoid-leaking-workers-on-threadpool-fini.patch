@@ -1,0 +1,26 @@
+From f12b8b482942f1b95d3fcda72ca75bbec2f271c1 Mon Sep 17 00:00:00 2001
+From: Yiwei Zhang <zzyiwei@chromium.org>
+Date: Wed, 25 Mar 2026 20:45:54 -0700
+Subject: [PATCH] vtest: avoid leaking workers on threadpool fini
+
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1610>
+---
+ vtest/threadpool.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vtest/threadpool.c b/vtest/threadpool.c
+index dbe3baa8..412a3c42 100644
+--- a/vtest/threadpool.c
++++ b/vtest/threadpool.c
+@@ -123,7 +123,7 @@ threadpool_fini(struct threadpool *tp)
+ {
+    mtx_lock(&tp->lock);
+ 
+-   while (!list_is_empty(&tp->idle_workers) &&
++   while (!list_is_empty(&tp->idle_workers) ||
+           !list_is_empty(&tp->busy_workers)) {
+       struct threadpool_worker *w;
+       int ret;
+-- 
+2.55.0
+

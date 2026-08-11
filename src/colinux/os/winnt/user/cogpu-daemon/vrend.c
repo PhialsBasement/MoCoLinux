@@ -244,12 +244,46 @@ static struct virgl_renderer_callbacks vrend_cbs = {
 	.moco_present	   = vrend_moco_present,
 };
 
+/*
+ * virglrenderer's own voice, brought into our log.
+ *
+ * The renderer explains every refusal it makes -- the decoder prints
+ * "context N failed to dispatch <COMMAND>: <err>" naming the exact command,
+ * which is the one fact a rejected command stream does not otherwise carry.
+ * That message goes to virgl_error(), and until now nothing was listening.
+ *
+ * cogpu-daemon.c freopen()s its own stderr to cogpu-vrend.log, and that
+ * quietly does not work: virglrenderer lives in libvirglrenderer-1.dll with
+ * its own C runtime, so the DLL's stderr is a different stream from the
+ * exe's. The file has been 0 bytes through every failure it was meant to
+ * explain, which is worse than having no log at all -- an empty one reads as
+ * "the renderer had nothing to say".
+ *
+ * This is the library's documented way in, and it crosses the DLL boundary as
+ * a function pointer rather than a FILE*, so the runtime split cannot break
+ * it.
+ */
+void logline(const char *fmt, ...);
+
+static void vrend_log_cb(enum virgl_log_level_flags level, const char *message,
+			 void *user_data)
+{
+	(void)level;
+	(void)user_data;
+
+	/* Messages arrive with their own newline. */
+	logline("vrend: %s", message ? message : "(null)\n");
+}
+
 int cogpu_vrend_init(cogpu_fence_fn fence_cb, void *fence_ctx)
 {
 	int rc;
 
 	vrend_fence_cb	= fence_cb;
 	vrend_fence_ctx	= fence_ctx;
+
+	/* Before init, so anything the bring-up itself reports is captured. */
+	virgl_set_log_callback(vrend_log_cb, NULL, NULL);
 
 	if (wgl_winsys_init() != 0)
 		return -1;

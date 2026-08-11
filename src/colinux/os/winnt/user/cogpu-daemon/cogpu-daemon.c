@@ -222,6 +222,35 @@ static int ctx_is_venus(uint32_t ctx_id)
 }
 
 /*
+ * The capset the guest ASKED for, kept even when the creation failed.
+ *
+ * g_ctx_capset above records what exists; this records what was wanted, which
+ * is what a rebuild needs.
+ */
+static uint8_t g_ctx_wanted[COGPU_MAX_CTX];
+
+/*
+ * A refusal that repeats is worth seeing once, not a hundred thousand times.
+ *
+ * One black Steam client wrote 27 MB of identical lines in twenty minutes,
+ * pushing the history that explained it out of reach and filling the disk it
+ * was on. The first few, then powers of two, keeps the onset, the fact that it
+ * is continuing, and the total -- which is all any of them ever told us.
+ */
+static int refusal_worth_logging(unsigned long long *seen)
+{
+	unsigned long long n = ++*seen;
+
+	if (n <= 8)
+		return 1;
+	return (n & (n - 1)) == 0;
+}
+
+static unsigned long long g_submit_refusals;
+static unsigned long long g_transfer_refusals;
+static unsigned long long g_refusals;
+
+/*
  * Requests whose completion is a fence that has not signalled yet. The chain
  * is already answered (response header written), but the used-ring element
  * is withheld until vkr says the fence retired -- that withholding IS the
@@ -874,20 +903,75 @@ static uint32_t serve(struct cogpu_chain *chain)
 			       (chain->in[0].len - sizeof(req)) < sizeof(c)
 			       ? chain->in[0].len - sizeof(req) : sizeof(c));
 
+		/* Capset 0 means the legacy default, VIRGL2 -- the same rule
+		 * vrend.c applies when creating it. Recorded before the
+		 * attempt, because a failed attempt is exactly when the wanted
+		 * capset has to survive: the guest will not ask twice. */
+		if (req.ctx_id < COGPU_MAX_CTX)
+			g_ctx_wanted[req.ctx_id] =
+				(c.ctx_init & 0xff) ? (c.ctx_init & 0xff) : 2;
+
+		/*
+		 * Whatever used to hold this id is finished. Say so before
+		 * making the new one.
+		 *
+		 * virtio-gpu recycles context ids aggressively -- the guest
+		 * frees the id as soon as it QUEUES the destroy -- so the same
+		 * number comes back for an unrelated client moments later, and
+		 * on this box it comes back with a different capset: ctx 3 was
+		 * a Venus (capset 4) context, was destroyed, and was recreated
+		 * as GL (capset 2) three lines later. That is the id Steam's
+		 * renderer then submitted into for 66,000 refusals.
+		 *
+		 * virglrenderer will not remake an id it still knows:
+		 * virgl_renderer_context_create_with_flags() looks it up first
+		 * and, finding one, either returns success having created
+		 * nothing or refuses outright on a capset mismatch. Either way
+		 * the guest ends up submitting a GL stream at whatever the id
+		 * used to be, and the failure is silent -- the refusal happens
+		 * before the decoder, so the renderer never prints the one
+		 * message that would have explained it.
+		 *
+		 * Destroying first makes CTX_CREATE mean what the guest means
+		 * by it. It is a no-op for an id the renderer does not hold.
+		 */
+		cogpu_vrend_ctx_destroy(req.ctx_id);
+
 		if (cogpu_vrend_ctx_create(req.ctx_id, c.name,
 					   c.namelen > 63 ? 63 : c.namelen,
 					   c.ctx_init) == 0) {
-			/* Capset 0 means the legacy default, VIRGL2 -- the
-			 * same rule vrend.c applies when creating it. */
 			if (req.ctx_id < COGPU_MAX_CTX)
 				g_ctx_capset[req.ctx_id] =
-					(c.ctx_init & 0xff) ? (c.ctx_init & 0xff)
-							    : 2;
+					g_ctx_wanted[req.ctx_id];
 			resp->type = VIRTIO_GPU_RESP_OK_NODATA;
-			if (verbose)
-				logline("  ctx %u created, capset %u\n",
-					req.ctx_id, c.ctx_init & 0xff);
+			/*
+			 * Always, not behind --verbose. Contexts are a handful
+			 * per run, so this costs nothing, and without it the
+			 * question "did this context ever exist, and when did
+			 * it stop" has no answer anywhere -- which is the
+			 * question every one of these failures turns into.
+			 */
+			logline("  ctx %u created, capset %u\n", req.ctx_id,
+				req.ctx_id < COGPU_MAX_CTX
+					? g_ctx_wanted[req.ctx_id]
+					: (c.ctx_init & 0xff));
 		} else {
+			/*
+			 * Loud, and always -- not behind --verbose.
+			 *
+			 * This is the failure the guest cannot see: CTX_CREATE
+			 * is fire-and-forget, so ERR_UNSPEC goes into a response
+			 * nobody reads and the next symptom is thousands of
+			 * refusals a long way from here. There is no repairing
+			 * it later either -- a GL context cannot be recreated
+			 * behind a client that already holds objects in it --
+			 * so this line is the only warning that exists.
+			 */
+			logline("  ctx %u REFUSED at create (capset %u); the"
+				" guest will not be told\n",
+				req.ctx_id,
+				req.ctx_id < COGPU_MAX_CTX
+					? g_ctx_wanted[req.ctx_id] : 0);
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
 		}
 		break;
@@ -900,6 +984,9 @@ static uint32_t serve(struct cogpu_chain *chain)
 		cogpu_vrend_ctx_destroy(req.ctx_id);
 		if (req.ctx_id < COGPU_MAX_CTX)
 			g_ctx_capset[req.ctx_id] = 0;
+		/* The other half of the lifetime, and the one that answers
+		 * "was it destroyed under us". */
+		logline("  ctx %u destroyed\n", req.ctx_id);
 		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 		break;
 
@@ -992,8 +1079,11 @@ static uint32_t serve(struct cogpu_chain *chain)
 				}
 			} else {
 				resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
-				logline("  SUBMIT_3D ctx %u, %u bytes, refused (%d)\n",
-					req.ctx_id, sub.size, rc2);
+				if (refusal_worth_logging(&g_submit_refusals))
+					logline("  SUBMIT_3D ctx %u, %u bytes,"
+						" refused (%d) [%llu total]\n",
+						req.ctx_id, sub.size, rc2,
+						g_submit_refusals);
 			}
 		}
 		break;
@@ -1312,7 +1402,13 @@ static uint32_t serve(struct cogpu_chain *chain)
 			g_stats.transfers++;
 		} else {
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
-			logline("  TRANSFER res %u refused (%d)\n", t.resource_id, rc2);
+			/* ctx, not just res: virglrenderer checks the context
+			 * first, so this line named an innocent resource for
+			 * 66,000 lines while the context was the problem. */
+			if (refusal_worth_logging(&g_transfer_refusals))
+				logline("  TRANSFER res %u ctx %u refused (%d)"
+					" [%llu total]\n", t.resource_id,
+					req.ctx_id, rc2, g_transfer_refusals);
 		}
 		break;
 	}
@@ -1715,6 +1811,21 @@ static uint32_t serve(struct cogpu_chain *chain)
 		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 		break;
 	}
+
+	/*
+	 * Every refusal, named, in one place.
+	 *
+	 * There are forty places above that can answer ERR_UNSPEC and most of
+	 * them say nothing, so the guest logged thousands of
+	 * "response 0x1200 (command 0x206)" while this log stayed completely
+	 * silent -- the two halves of the same failure, neither of which could
+	 * be matched to the other. Whatever refuses, it is visible here with
+	 * the command that was refused and the context it was refused for.
+	 */
+	if (resp->type == VIRTIO_GPU_RESP_ERR_UNSPEC &&
+	    refusal_worth_logging(&g_refusals))
+		logline("  REFUSED cmd 0x%04x ctx %u [%llu total]\n",
+			type, req.ctx_id, g_refusals);
 
 	if (req.flags & VIRTIO_GPU_FLAG_FENCE) {
 		resp->flags    = req.flags &

@@ -1,0 +1,38 @@
+From 8cdae03075f9bb2c94d76070b64f7deb083fe764 Mon Sep 17 00:00:00 2001
+From: Yiwei Zhang <zzyiwei@chromium.org>
+Date: Fri, 24 Apr 2026 09:10:11 -0700
+Subject: [PATCH] vkr: assign vkr_allocator.instance when instance creation
+ succeeds
+
+When vkCreateInstance fails, the passed VkInstance handle might become
+non-NULL, which is allowed by the spec. Passing an invalid non-NULL
+handle to vkDestroyInstance violates the spec, whereas NULL is allowed.
+
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1616>
+---
+ src/venus/vkr_allocator.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/venus/vkr_allocator.c b/src/venus/vkr_allocator.c
+index dc0e7b8c..cb29dc0d 100644
+--- a/src/venus/vkr_allocator.c
++++ b/src/venus/vkr_allocator.c
+@@ -284,12 +284,14 @@ vkr_allocator_init(void)
+       .pApplicationInfo = &app_info,
+    };
+ 
++   VkInstance inst_handle;
+    vk->CreateInstance =
+       (PFN_vkCreateInstance)get_proc_addr(VK_NULL_HANDLE, "vkCreateInstance");
+-   res = vk->CreateInstance(&inst_info, NULL, &vkr_allocator.instance);
++   res = vk->CreateInstance(&inst_info, NULL, &inst_handle);
+    if (res != VK_SUCCESS)
+       goto fail;
+ 
++   vkr_allocator.instance = inst_handle;
+    vkr_allocator_inst_proc_table_init(vkr_allocator.instance, get_proc_addr, vk);
+ 
+    vkr_allocator.device_count = VKR_ALLOCATOR_MAX_DEVICE_COUNT;
+-- 
+2.55.0
+
