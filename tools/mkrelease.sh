@@ -139,6 +139,58 @@ grep -qa co_colinux_timer_deadline "$OUT/vmlinux" ||
        work and these daemons will refuse it at boot. Copy the kernel from
        the build/linux-* directory you actually built into dist-x64/vmlinux."
 
+# The builder inside the image, replaced with this tree's copy.
+#
+# The image carries the script that builds the real root filesystem, and until
+# now it carried whatever was baked in whenever the image was last made. That
+# is the one payload nothing here checked, and it is the payload that decides
+# what the installed system IS.
+#
+# 0.7.0 was assembled with an image holding TWO builders: /root/mk.sh from
+# Aug 7 and /usr/local/bin/mkmanjarorootfs.sh from Aug 10. setup.c prefers the
+# first that exists, which is /root/mk.sh -- and that one predates CoPresent,
+# Venus and Vulkan entirely. An install would have run for twenty minutes and
+# produced a Manjaro on stock Mesa: software GL, no Vulkan, none of the GPU
+# stack this project exists for, with nothing anywhere saying so.
+#
+# Both paths are written, because setup.c will take either and a release
+# should not depend on which. The image is the copy in $OUT, so dist-x64's
+# stays as it was.
+mk=$HERE/tools/mkmanjarorootfs.sh
+[ -f "$mk" ] || die "tools/mkmanjarorootfs.sh is missing"
+
+for t in debugfs e2fsck; do
+	command -v $t >/dev/null 2>&1 ||
+		die "$t (e2fsprogs) is needed to put the builder into $image"
+done
+
+debugfs -w -f - "$OUT/$image" >/dev/null 2>&1 <<EOF
+cd /root
+rm mk.sh
+write $mk mk.sh
+cd /usr/local/bin
+rm mkmanjarorootfs.sh
+write $mk mkmanjarorootfs.sh
+EOF
+
+# debugfs unlinks without tidying up after itself; 0 is clean and 1 is
+# "errors corrected", which is the normal outcome here. 4 and above is damage.
+e2fsck -fy "$OUT/$image" >/dev/null 2>&1
+[ $? -lt 4 ] || die "$image did not survive having the builder written into it"
+
+# Read both back and compare, rather than trusting that the write landed --
+# debugfs reports a failed write on stdout and still exits 0.
+check=$(mktemp -d)
+for p in /root/mk.sh /usr/local/bin/mkmanjarorootfs.sh; do
+	debugfs -R "dump $p $check/got" "$OUT/$image" >/dev/null 2>&1
+	cmp -s "$check/got" "$mk" || {
+		rm -rf "$check"
+		die "$p in $image is not tools/mkmanjarorootfs.sh"
+	}
+done
+rm -rf "$check"
+say "  builder written into $image at both paths setup.c looks in"
+
 # The driver carries a signature, and it is a signature of THIS driver.
 #
 # Not "Signature verification: ok" and not osslsigncode's exit status: both
