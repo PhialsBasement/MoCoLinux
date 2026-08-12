@@ -113,7 +113,9 @@ co_rc_t co_manager_save_state(co_manager_handle_t handle,
 
 co_rc_t co_manager_kload_begin(co_manager_handle_t handle,
 			       unsigned long long min_va, unsigned long long max_va,
-			       unsigned long long ram_bytes)
+			       unsigned long long ram_bytes,
+			       unsigned long long ram_user_va,
+			       unsigned long long ram_user_bytes)
 {
 	co_manager_ioctl_kload_begin_t params = {0, };
 	unsigned long returned = 0;
@@ -122,6 +124,8 @@ co_rc_t co_manager_kload_begin(co_manager_handle_t handle,
 	params.min_va = min_va;
 	params.max_va = max_va;
 	params.ram_bytes = ram_bytes;
+	params.ram_user_va = ram_user_va;
+	params.ram_user_bytes = ram_user_bytes;
 
 	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KLOAD_BEGIN,
 				 &params, sizeof(params), &params, sizeof(params), &returned);
@@ -351,6 +355,22 @@ co_rc_t co_manager_kmap_range(co_manager_handle_t handle,
 		*range_out = params.range;
 	if (CO_OK(rc) && reused_out)
 		*reused_out = params.reused ? 1 : 0;
+	return rc;
+}
+
+/* Release one slice by its exact base pa; the eviction half of KMAP_RANGE. */
+co_rc_t co_manager_kunmap_range(co_manager_handle_t handle, unsigned long long pa)
+{
+	co_manager_ioctl_kmap_unmap_range_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	params.pa = pa;
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KMAP_UNMAP_RANGE,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
 	return rc;
 }
 

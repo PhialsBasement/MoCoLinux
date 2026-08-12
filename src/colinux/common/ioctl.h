@@ -66,6 +66,7 @@ typedef enum {
 	CO_MANAGER_IOCTL_KWINDOW,
 	CO_MANAGER_IOCTL_KUNWINDOW,
 	CO_MANAGER_IOCTL_KWINDOW_AT,
+	CO_MANAGER_IOCTL_KMAP_UNMAP_RANGE,
 } co_manager_ioctl_t;
 
 /*
@@ -380,6 +381,17 @@ typedef struct {
 	unsigned long long min_va;
 	unsigned long long max_va;
 	unsigned long long ram_bytes;	/* p2m capacity needed by a boot */
+	/*
+	 * Section-backed guest RAM. ram_user_va is the caller's view of the
+	 * shared section guest RAM lives in; ram_user_bytes its committed
+	 * size. The driver locks blocks of it and builds the p2m from their
+	 * frames, mapping each block once at KERNEL mode for its own use --
+	 * a call that returns NULL on failure instead of raising, which is
+	 * the property the whole arrangement exists for. Zero keeps the
+	 * legacy nonpaged-pool backing.
+	 */
+	unsigned long long ram_user_va;
+	unsigned long long ram_user_bytes;
 } co_manager_ioctl_kload_begin_t;
 
 typedef struct {
@@ -429,6 +441,15 @@ typedef struct {
  * may be called repeatedly on the same handle. The driver keeps every returned
  * address alive until KUNMAP/handle cleanup, so callers can cache pointers and
  * the amount passed to --mem never determines their mapping footprint.
+ *
+ * CO_MANAGER_IOCTL_KMAP_UNMAP_RANGE releases ONE slice by its exact base pa,
+ * so a long-running caller can bound its concurrent mappings by evicting cold
+ * slices and re-requesting them on demand. The caller owns the hard part of
+ * that contract: nothing in its process may still dereference the slice's
+ * user_va after this returns. It exists because the mapping path has no
+ * working exception guard -- a mapping request past the host's limit is a
+ * bugcheck, not an error, so the only safe policy is to stay far below the
+ * limit, and that requires being able to let go of one slice at a time.
  */
 #define CO_KMAP_SLICE_BYTES	(12ULL << 20)
 #define CO_KMAP_MAX_RANGES	256
@@ -458,6 +479,13 @@ typedef struct {
 	co_rc_t		   rc;
 	unsigned long	   released;	/* out: slices unmapped */
 } co_manager_ioctl_kunmap_t;
+
+/* interface for CO_MANAGER_IOCTL_KMAP_UNMAP_RANGE: */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long pa;		/* in: the slice's exact base pa */
+	unsigned long long bytes;	/* out: what the slice covered */
+} co_manager_ioctl_kmap_unmap_range_t;
 
 /*
  * KMAP's mirror: host memory made visible to the GUEST.

@@ -557,6 +557,12 @@ static co_rc_t co_manager_kmap(co_manager_t* manager,
 		slice_bytes = CO_KMAP_SLICE_BYTES;
 	slice_bytes &= CO_ARCH_PAGE_MASK;
 
+	/* Section-backed blocks are kernel mappings of user pages, not pool;
+	 * MmBuildMdlForNonPagedPool over them is a lie the memory manager
+	 * acts on. Consumers reach section-backed RAM through the section. */
+	if (co_kload_user_backed())
+		return CO_RC(ERROR);
+
 	co_os_mutex_acquire(opened->lock);
 	if (opened->kmap_reserved || opened->kmap_slices != 0) {
 		co_os_mutex_release(opened->lock);
@@ -653,6 +659,10 @@ static co_rc_t co_manager_kmap_range(co_manager_t* manager,
 	co_memset(&params->range, 0, sizeof(params->range));
 	if (!opened)
 		return CO_RC(INVALID_PARAMETER);
+	/* See the guard in co_manager_kmap: pool MDLs cannot describe
+	 * section-backed blocks. The section is the access path. */
+	if (co_kload_user_backed())
+		return CO_RC(ERROR);
 
 	co_os_mutex_acquire(opened->lock);
 	if (!opened->kmap_reserved) {
@@ -707,6 +717,50 @@ out:
 	}
 	co_os_mutex_release(opened->lock);
 	return rc;
+}
+
+/*
+ * Release ONE slice by its exact base pa -- the eviction half of KMAP_RANGE.
+ *
+ * The caller promises nothing in its process still dereferences the slice's
+ * user_va; the driver's half is to unlink under the lock and unmap in the
+ * caller's process context, which an ioctl already is. The kmap reservation is
+ * deliberately NOT dropped even if this was the last slice: the reservation
+ * stands for the handle's intent to keep mapping guest RAM, and an eviction is
+ * the opposite of letting go of that intent.
+ */
+static co_rc_t co_manager_kmap_unmap_range(co_manager_open_desc_t opened,
+					   co_manager_ioctl_kmap_unmap_range_t* params)
+{
+	co_manager_kmap_slice_t*  slice = NULL;
+	co_manager_kmap_slice_t** link;
+
+	params->bytes = 0;
+	if (!opened)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(opened->lock);
+	for (link = &opened->kmap_slice; *link != NULL; link = &(*link)->next) {
+		if ((*link)->pa == params->pa) {
+			slice = *link;
+			*link = slice->next;
+			opened->kmap_slices--;
+			break;
+		}
+	}
+	co_os_mutex_release(opened->lock);
+
+	if (slice == NULL)
+		return CO_RC(NOT_FOUND);
+
+	params->bytes = slice->bytes;
+	if (slice->handle)
+		co_os_userspace_unmap(slice->user_va, slice->handle,
+				      slice->pages);
+	co_os_free(slice);
+	co_debug("kmap-unmap: pa 0x%llx, %llu KB released",
+		 params->pa, params->bytes >> 10);
+	return CO_RC(OK);
 }
 
 /*
@@ -1058,7 +1112,9 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		}
 
 		params->rc = co_kload_begin(manager, params->min_va, params->max_va,
-					    params->ram_bytes);
+					    params->ram_bytes,
+					    params->ram_user_va,
+					    params->ram_user_bytes);
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}
@@ -1133,6 +1189,18 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 			return CO_RC(INVALID_PARAMETER);
 
 		params->rc = co_manager_kmap_range(manager, opened, params);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KMAP_UNMAP_RANGE: {
+		co_manager_ioctl_kmap_unmap_range_t* params =
+			(typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_manager_kmap_unmap_range(opened, params);
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}

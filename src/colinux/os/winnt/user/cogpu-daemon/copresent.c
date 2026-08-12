@@ -23,12 +23,17 @@
 #include "vrend.h"
 
 void *resolve_gpa(void *ctx, uint64_t gpa, uint32_t len);
+/* The pointers below outlive the accept that resolved them, so the pages are
+ * held with the pinned resolve against the daemon's slice eviction. */
+void *cogpu_resolve_gpa_pinned(uint64_t gpa, uint32_t len, void **token);
+void cogpu_unpin(void *token);
 void logline(const char *fmt, ...);
 void cogpu_ring_doorbell(void);
 
 struct copresent_channel {
 	SOCKET ctl;
 	unsigned char *page[COPRESENT_REGION_PAGES];
+	void *pin[COPRESENT_REGION_PAGES];
 	struct copresent_region *header;
 	uint32_t generation;
 };
@@ -68,6 +73,8 @@ static void *region_at(struct copresent_channel *c, size_t offset,
 
 static void channel_free(struct copresent_channel *c)
 {
+	unsigned int i;
+
 	if (!c)
 		return;
 	if (c->header)
@@ -75,6 +82,9 @@ static void channel_free(struct copresent_channel *c)
 	MemoryBarrier();
 	if (c->ctl != INVALID_SOCKET)
 		closesocket(c->ctl);
+	for (i = 0; i < COPRESENT_REGION_PAGES; i++)
+		if (c->pin[i])
+			cogpu_unpin(c->pin[i]);
 	free(c);
 }
 
@@ -108,8 +118,8 @@ static struct copresent_channel *accept_channel(SOCKET ctl)
 	c->ctl = ctl;
 	c->generation = open_record.generation;
 	for (i = 0; i < COPRESENT_REGION_PAGES; i++) {
-		c->page[i] = (unsigned char *)resolve_gpa(NULL, gpa[i],
-			COPRESENT_PAGE_BYTES);
+		c->page[i] = (unsigned char *)cogpu_resolve_gpa_pinned(gpa[i],
+			COPRESENT_PAGE_BYTES, &c->pin[i]);
 		if (!c->page[i]) {
 			logline("CoPresent: page %u at 0x%llx is outside guest RAM\n",
 				i, (unsigned long long)gpa[i]);

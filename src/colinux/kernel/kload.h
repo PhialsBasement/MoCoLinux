@@ -121,7 +121,12 @@ extern co_rc_t co_kload_adopt_kernel_tables(co_manager_t* manager,
 
 extern co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 			      unsigned long long max_va,
-			      unsigned long long ram_bytes);
+			      unsigned long long ram_bytes,
+			      unsigned long long ram_user_va,
+			      unsigned long long ram_user_bytes);
+/* Whether guest RAM is carved from a caller's section view. KMAP's pool-MDL
+ * paths are invalid over such blocks and refuse; consumers use the section. */
+extern bool_t  co_kload_user_backed(void);
 extern co_rc_t co_kload_chunk(co_manager_t* manager, unsigned long long va,
 			      const unsigned char* data, unsigned long size, bool_t zero);
 extern co_rc_t co_kload_verify(co_manager_t* manager, unsigned long long va,

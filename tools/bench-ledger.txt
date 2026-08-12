@@ -246,3 +246,20 @@ regression you are about to hide in mountains of code.
   exit 0, ZERO DRM errors. A capacity bug that only a real workload was
   ever going to find.
 ================================================================
+
+2026-08-12  (section-backed guest RAM)  M92p GT730 Win10  --mem 2048
+  Guest RAM moved from nonpaged pool to a shared section; cogpu reaches
+  all of it through one view (pseudo-pa == offset, resolve is one add).
+  MmMapLockedPages(UserMode) is gone from the GPU path; its raise was the
+  whole 0x1E family (three bugchecks this day alone) and the SEH guard
+  never worked (bound mingw's user-mode __C_specific_handler).
+    anon-write/read        3605 / 4083 MiB/s   (concurrent with vkcube)
+    blob-write/read        4162 / 4047 MiB/s   (~= anon: still zero-copy)
+    transfer-to-host        770 MiB/s
+    glxgears                954 fps            (baseline 840-855)
+    vkcube                  420 fps            (baseline 368)
+  Steam soak: 88028 requests, 4842 ATTACH_BACKING -- every one exactly
+  1 iovec (the view is linear in guest-physical) -- zero kmap traffic,
+  zero refusals, zero evictions, no bugcheck. Guest allocated and touched
+  1800 MB in one process mid-soak; free(1) total 1973 MB as always.
+================================================================

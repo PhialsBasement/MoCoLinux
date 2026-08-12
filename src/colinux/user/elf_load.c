@@ -1454,7 +1454,31 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		return CO_RC(ERROR_MONITOR_NOT_LOADED);
 	}
 
-	rc = co_manager_kload_begin(handle, lo, hi, ram_bytes);
+	/*
+	 * The shared section guest RAM will live in, created before the
+	 * driver is asked to back anything. Sized for RAM plus the reserved
+	 * page-table region with slack; the driver stops carving at whatever
+	 * it actually needs. If the section cannot be made the driver falls
+	 * back to the legacy pool backing and the GPU daemon to its windows
+	 * -- slower, never wrong.
+	 */
+	{
+		unsigned long long section_bytes = ram_bytes + (256ULL << 20);
+		void* view = co_os_guest_ram_section_create(section_bytes);
+
+		if (view != NULL)
+			co_terminal_print("  guest RAM section: %llu MB shared,"
+					  " view %p\n", section_bytes >> 20, view);
+		else {
+			co_terminal_print("  guest RAM section unavailable;"
+					  " using the legacy pool backing\n");
+			section_bytes = 0;
+		}
+
+		rc = co_manager_kload_begin(handle, lo, hi, ram_bytes,
+					    (unsigned long long)(size_t)view,
+					    view ? section_bytes : 0);
+	}
 	if (!CO_OK(rc)) {
 		co_terminal_print("kload begin failed (rc %x)\n", (int)rc);
 		goto out;

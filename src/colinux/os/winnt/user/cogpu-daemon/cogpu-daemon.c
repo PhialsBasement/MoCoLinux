@@ -37,6 +37,7 @@
 #include <colinux/common/debug.h>
 #include <colinux/user/manager.h>
 #include <colinux/os/user/manager.h>
+#include <colinux/os/user/misc.h>
 #include <colinux/os/alloc.h>
 
 #include "vring.h"
@@ -113,6 +114,21 @@ static co_manager_handle_t g_wake_handle;
  * the driver predates windows and every MAP_BLOB is refused.
  */
 static unsigned long long g_window_base, g_window_top;
+
+/*
+ * The whole of guest RAM, as one shared-section view.
+ *
+ * The boot daemon creates the section and the driver carves guest RAM from
+ * it sequentially, so a guest pseudo-physical address IS an offset into this
+ * view: resolve is one add, valid for every byte below the RAM ceiling, from
+ * any thread, with no lock, no slice, no pin and no driver call. This is
+ * what finally makes "the guest has 2 GB" mean 2 GB to the GPU path -- there
+ * is no mapping step left to ration, refuse, or bugcheck on. The KMAP slice
+ * machinery below survives only as the fallback for a legacy driver or a
+ * failed section open.
+ */
+static unsigned char	 *g_ram_view;
+static unsigned long long g_ram_view_bytes;
 
 /*
  * Mapped blobs: what UNMAP_BLOB needs to give back. Slots are keyed by
@@ -344,14 +360,37 @@ void logline(const char *fmt, ...)
 struct mapped_slice {
 	co_kmap_range_t	      range;
 	struct mapped_slice *next;
+	/* Both guarded by g_slice_lock. pins holds the slice against eviction;
+	 * last_use is the LRU clock stamped on lookup (approximate on the
+	 * lock-free main-thread path, which is all an LRU needs). */
+	long		      pins;
+	unsigned long long    last_use;
 };
 
 /*
- * Immutable after publication. Hits take no lock; a miss is serialized so the
- * GPU thread and an X-wire thread cannot ask the driver for the same slice at
- * once. Nodes are never removed while the daemon is live because virglrenderer
- * retains iovec pointers until RESOURCE_DETACH_BACKING. KUNMAP at shutdown
- * retires the driver side in one operation.
+ * The working-set cache, and the rules that keep it bounded.
+ *
+ * This list used to be append-only for the daemon's life, and that was the
+ * direct conflict with FragRAM: the guest's buddy allocator walks all of its
+ * RAM over time, so an append-only cache converges on mapping ALL of guest
+ * RAM -- the same map-everything volume that raises inside
+ * MmMapLockedPagesSpecifyCache near 2 GB. The SEH guard around that raise
+ * does not work, so crossing the limit is a host bugcheck, not an error.
+ * Bounding this cache is therefore the safety line, not a tuning knob.
+ *
+ * The rules:
+ *   - Anything that holds a pointer into a slice past the current serve pass
+ *     PINS it: virgl iovecs (per resource, ATTACH_BACKING/CREATE_BLOB), the
+ *     X-wire and CoPresent channel pages, the vrings and the transport page.
+ *   - Eviction runs ONLY from the top of the main loop, with no chain in
+ *     flight, so pointers used within one serve pass need no pin.
+ *   - The main thread's lookups stay lock-free; that is safe because eviction
+ *     is main-thread-only. Every other thread takes g_slice_lock for any
+ *     lookup, and may only obtain pointers through the pinned resolve, so a
+ *     slice another thread can see is a slice eviction will not touch.
+ *   - Above the hard ceiling the daemon REFUSES to map. A refused request is
+ *     a broken command; a mapping attempt past the host's limit is a dead
+ *     machine. The ceiling stays far below where the raise has been observed.
  */
 static struct mapped_slice *volatile g_slices;
 static struct mapped_slice *volatile g_last_hit;
@@ -359,6 +398,27 @@ static CRITICAL_SECTION		  g_slice_lock;
 static int			  g_slice_lock_ready;
 static volatile LONG		  g_slice_count;
 static unsigned long long	  g_slice_bytes;
+/*
+ * The mapping budget, in BYTES -- the unit the working-set quota is actually
+ * charged in. Slice counts were the first draft and they mislead: a slice is
+ * 12 or 8 MB depending on where it falls in a 32 MB block, and can be smaller
+ * under host fragmentation. Finalised in main() once the RAM ceiling and the
+ * working-set raise are known; the defaults here only cover the window
+ * between startup and that. The hard value sits above the cap so a burst
+ * inside one sweep is absorbed rather than refused.
+ */
+static unsigned long long	  g_kmap_cap_bytes = 768ULL << 20;
+static unsigned long long	  g_kmap_hard_bytes = 1152ULL << 20;
+/* The RAM ceiling the budget is chasing, what the working-set raise has
+ * achieved so far, and whether --kmap-cap pinned the cap by hand. The ratchet
+ * in slices_evict() grows the budget toward the ceiling at runtime. */
+static unsigned long long	  g_kmap_ram_ceiling;
+static unsigned long long	  g_kmap_ws_budget;
+static int			  g_kmap_cap_given;
+/* Defined beside main(); declared here for the ratchet. */
+static int raise_ws_once(unsigned long long bytes);
+static unsigned long long	  g_slice_clock;	/* main-loop sweeps */
+static DWORD			  g_main_tid;
 
 static struct mapped_slice *slice_head(void)
 {
@@ -377,20 +437,24 @@ static struct mapped_slice *find_slice(uint64_t gpa, uint32_t len)
 	slice = (struct mapped_slice *)InterlockedCompareExchangePointer(
 		(PVOID volatile *)&g_last_hit, NULL, NULL);
 	if (slice && gpa >= slice->range.pa &&
-	    end <= slice->range.pa + slice->range.bytes)
+	    end <= slice->range.pa + slice->range.bytes) {
+		slice->last_use = g_slice_clock;
 		return slice;
+	}
 
 	for (slice = slice_head(); slice; slice = slice->next) {
 		if (gpa >= slice->range.pa &&
 		    end <= slice->range.pa + slice->range.bytes) {
 			InterlockedExchangePointer((PVOID volatile *)&g_last_hit, slice);
+			slice->last_use = g_slice_clock;
 			return slice;
 		}
 	}
 	return NULL;
 }
 
-static struct mapped_slice *map_slice(uint64_t gpa)
+/* The mapping core; g_slice_lock is held by the caller. */
+static struct mapped_slice *slice_map_locked(uint64_t gpa)
 {
 	struct mapped_slice *slice;
 	co_kmap_range_t range;
@@ -398,21 +462,48 @@ static struct mapped_slice *map_slice(uint64_t gpa)
 	int reused = 0;
 
 	slice = find_slice(gpa, 1);
-	if (slice || !g_wake_handle || !g_slice_lock_ready)
+	if (slice)
 		return slice;
 
-	EnterCriticalSection(&g_slice_lock);
-	slice = find_slice(gpa, 1);
-	if (slice)
-		goto out;
+	/*
+	 * The hard ceiling, and it is not negotiable at this layer.
+	 *
+	 * There is no working exception guard around the driver's mapping
+	 * call: a request the host cannot satisfy is bugcheck 0x1E, not an
+	 * error return. Eviction at the sweep top keeps the count near the
+	 * cap; this line is what stands if eviction cannot (everything
+	 * pinned, or a burst inside one sweep). A refused map fails one
+	 * command loudly; the alternative fails the machine.
+	 */
+	if (g_slice_bytes + CO_KMAP_SLICE_BYTES > g_kmap_hard_bytes) {
+		static unsigned long long refused;
+
+		if (refusal_worth_logging(&refused))
+			logline("kmap: REFUSED pa 0x%llx at the hard ceiling"
+				" (%llu MB mapped, ceiling %llu MB)"
+				" [%llu total]\n", (unsigned long long)gpa,
+				g_slice_bytes >> 20, g_kmap_hard_bytes >> 20,
+				refused);
+		return NULL;
+	}
 
 	slice = calloc(1, sizeof(*slice));
 	if (!slice)
-		goto out;
+		return NULL;
+	/*
+	 * The address, BEFORE the driver is asked for it.
+	 *
+	 * MmMapLockedPagesSpecifyCache raises rather than returns when it
+	 * cannot make a UserMode mapping, and the SEH guard around it does
+	 * not work -- so a host that bugchecks 0x1E inside this ioctl leaves
+	 * no record of WHICH request did it: everything below this line,
+	 * including the "mapped working-set slice" record, runs only on
+	 * success. This makes the last line of the log name it.
+	 */
+	logline("kmap request pa 0x%llx\n", (unsigned long long)gpa);
 	if (!CO_OK(co_manager_kmap_range(g_wake_handle, gpa, &range, &reused))) {
 		free(slice);
-		slice = NULL;
-		goto out;
+		return NULL;
 	}
 
 	/* Refuse a mismatched driver/daemon ABI before following its pointer. */
@@ -422,8 +513,7 @@ static struct mapped_slice *map_slice(uint64_t gpa)
 			" pa 0x%llx bytes 0x%llx\n",
 			(unsigned long long)gpa, range.pa, range.bytes);
 		free(slice);
-		slice = NULL;
-		goto out;
+		return NULL;
 	}
 
 	ZeroMemory(&mbi, sizeof(mbi));
@@ -442,11 +532,11 @@ static struct mapped_slice *map_slice(uint64_t gpa)
 			range.pa, range.user_va, (unsigned long)mbi.State,
 			(unsigned long)mbi.Protect);
 		free(slice);
-		slice = NULL;
-		goto out;
+		return NULL;
 	}
 
 	slice->range = range;
+	slice->last_use = g_slice_clock;
 	slice->next = slice_head();
 	InterlockedExchangePointer((PVOID volatile *)&g_slices, slice);
 	InterlockedExchangePointer((PVOID volatile *)&g_last_hit, slice);
@@ -455,8 +545,19 @@ static struct mapped_slice *map_slice(uint64_t gpa)
 	logline("mapped working-set slice %ld: pa 0x%llx, %llu KB at"
 		" 0x%llx%s\n", (long)g_slice_count, range.pa,
 		range.bytes >> 10, range.user_va, reused ? " (driver reused)" : "");
+	return slice;
+}
 
-out:
+static struct mapped_slice *map_slice(uint64_t gpa)
+{
+	struct mapped_slice *slice;
+
+	slice = find_slice(gpa, 1);
+	if (slice || !g_wake_handle || !g_slice_lock_ready)
+		return slice;
+
+	EnterCriticalSection(&g_slice_lock);
+	slice = slice_map_locked(gpa);
 	LeaveCriticalSection(&g_slice_lock);
 	return slice;
 }
@@ -475,11 +576,29 @@ out:
  * Returning the reachable prefix lets the caller split the entry into as many
  * iovecs as it spans -- which is what an iovec list is for.
  */
+/* Guest RAM below the ceiling resolves through the section view: one add,
+ * any thread, no lock. Above it (the window arena) nothing resolves here. */
+static inline unsigned char *ram_view_ptr(uint64_t gpa, uint64_t len)
+{
+	if (g_ram_view == NULL || len == 0 || gpa + len < gpa)
+		return NULL;
+	if (gpa + len > g_window_base || gpa + len > g_ram_view_bytes)
+		return NULL;
+	return g_ram_view + gpa;
+}
+
 static uint32_t resolve_run(uint64_t gpa, uint32_t len)
 {
-	struct mapped_slice *slice = find_slice(gpa, 1);
+	struct mapped_slice *slice;
 	uint64_t avail;
 
+	if (ram_view_ptr(gpa, 1)) {
+		uint64_t left = g_window_base - gpa;
+
+		return (left < len) ? (uint32_t)left : len;
+	}
+
+	slice = find_slice(gpa, 1);
 	if (!slice)
 		slice = map_slice(gpa);
 	if (!slice)
@@ -493,6 +612,35 @@ void *resolve_gpa(void *ctx, uint64_t gpa, uint32_t len)
 	struct mapped_slice *slice;
 
 	(void)ctx;
+
+	{
+		unsigned char *p = ram_view_ptr(gpa, len);
+
+		if (p)
+			return p;
+	}
+
+	/*
+	 * Off the main thread, the lock-free walk is not safe against the
+	 * main thread's eviction unlinking a node mid-traversal. Every
+	 * off-main caller is supposed to use the pinned resolve below; this
+	 * path exists so a future caller that forgets corrupts nothing --
+	 * though the pointer it gets is still evictable, which is its bug
+	 * to own.
+	 */
+	if (g_slice_lock_ready && GetCurrentThreadId() != g_main_tid) {
+		void *p = NULL;
+
+		EnterCriticalSection(&g_slice_lock);
+		slice = slice_map_locked(gpa);
+		if (slice && gpa + len >= gpa &&
+		    gpa + len <= slice->range.pa + slice->range.bytes)
+			p = (void *)(size_t)(slice->range.user_va +
+					     (gpa - slice->range.pa));
+		LeaveCriticalSection(&g_slice_lock);
+		return p;
+	}
+
 	slice = find_slice(gpa, len);
 	if (!slice) {
 		slice = map_slice(gpa);
@@ -502,6 +650,310 @@ void *resolve_gpa(void *ctx, uint64_t gpa, uint32_t len)
 	}
 	return (void *)(size_t)(slice->range.user_va +
 				       (gpa - slice->range.pa));
+}
+
+/* --------------------------------------------- slice pinning and eviction */
+
+/*
+ * Resolve AND hold: the pointer stays valid until the matching cogpu_unpin,
+ * because a pinned slice is never evicted. This is the only resolve an
+ * off-main-thread caller may keep a pointer from (the X wire and CoPresent
+ * channels), and the lookup, the length check and the pin are one locked
+ * operation so eviction cannot slip between them.
+ */
+void *cogpu_resolve_gpa_pinned(uint64_t gpa, uint32_t len, void **token_out)
+{
+	struct mapped_slice *slice;
+	void *p = NULL;
+
+	if (token_out)
+		*token_out = NULL;
+	if (!token_out || len == 0 || gpa + len < gpa)
+		return NULL;
+
+	/* Through the view there is nothing to pin: the section lives as
+	 * long as the daemon. A NULL token is a no-op to cogpu_unpin. */
+	{
+		unsigned char *p = ram_view_ptr(gpa, len);
+
+		if (p)
+			return p;
+	}
+
+	if (!g_slice_lock_ready)
+		return NULL;
+
+	EnterCriticalSection(&g_slice_lock);
+	slice = slice_map_locked(gpa);
+	if (slice && gpa + len <= slice->range.pa + slice->range.bytes) {
+		slice->pins++;
+		slice->last_use = g_slice_clock;
+		*token_out = slice;
+		p = (void *)(size_t)(slice->range.user_va +
+				     (gpa - slice->range.pa));
+	}
+	LeaveCriticalSection(&g_slice_lock);
+	return p;
+}
+
+void cogpu_unpin(void *token)
+{
+	struct mapped_slice *slice = token;
+
+	if (!slice || !g_slice_lock_ready)
+		return;
+	EnterCriticalSection(&g_slice_lock);
+	if (slice->pins > 0)
+		slice->pins--;
+	else
+		logline("kmap pin: UNDERFLOW on slice pa 0x%llx -- an unpin"
+			" without its pin\n", slice->range.pa);
+	LeaveCriticalSection(&g_slice_lock);
+}
+
+/*
+ * Evict cold slices down below the cap. MAIN LOOP TOP ONLY: this is the one
+ * place slices are unlinked, and its safety argument is that no chain is in
+ * flight (so unpinned pointers held inside one serve pass cannot dangle) and
+ * that main-thread lookups are on this same thread (so the lock-free walk
+ * cannot race the unlink). Off-main lookups hold g_slice_lock, which this
+ * holds throughout.
+ *
+ * The driver unmap happens INSIDE the lock, deliberately: after the unlink,
+ * a concurrent pinned lookup for the same pa would miss the cache, re-request
+ * the slice, and be handed the very driver mapping this is an instant from
+ * destroying -- a fresh node wrapping a dead va. Atomic with respect to
+ * lookups, or not at all.
+ */
+#define KMAP_EVICT_HEADROOM_BYTES (96ULL << 20)
+
+static void slices_evict(void)
+{
+	unsigned long long target;
+
+	if (!g_slice_lock_ready)
+		return;
+
+	/*
+	 * Ratchet before evicting. Mapping pool pages consumes no NEW
+	 * physical memory -- the frames are already resident, the mapping is
+	 * a second view of them -- but the working-set raise is checked
+	 * against currently AVAILABLE pages, so asking for all of guest RAM
+	 * in one request is refused (error 1450) on a host whose free memory
+	 * is smaller than the guest. Available does not shrink as the mapped
+	 * set grows, so the same total is reachable in steps: whenever the
+	 * mapped set closes on the budget, ask for another 512 MB. A refusal
+	 * costs one syscall every two seconds and eviction stands; success
+	 * moves the cap until the whole guest fits and eviction goes idle.
+	 */
+	if (g_kmap_ws_budget && g_kmap_ws_budget < g_kmap_ram_ceiling &&
+	    g_slice_bytes + (128ULL << 20) > g_kmap_cap_bytes) {
+		static DWORD last_try;
+		DWORD now = GetTickCount();
+
+		if (now - last_try >= 2000) {
+			unsigned long long next =
+				g_kmap_ws_budget + (512ULL << 20);
+
+			last_try = now;
+			if (next > g_kmap_ram_ceiling)
+				next = g_kmap_ram_ceiling;
+			if (raise_ws_once(next)) {
+				g_kmap_ws_budget = next;
+				if (!g_kmap_cap_given) {
+					g_kmap_cap_bytes = next;
+					g_kmap_hard_bytes =
+						next + (64ULL << 20);
+				}
+				logline("working set ratcheted to %llu of"
+					" %llu MB; kmap cap %llu MB\n",
+					next >> 20, g_kmap_ram_ceiling >> 20,
+					g_kmap_cap_bytes >> 20);
+			}
+		}
+	}
+
+	if (g_slice_bytes < g_kmap_cap_bytes)
+		return;
+	target = g_kmap_cap_bytes - KMAP_EVICT_HEADROOM_BYTES;
+
+	EnterCriticalSection(&g_slice_lock);
+	while (g_slice_bytes > target) {
+		struct mapped_slice **link, **victim_link = NULL, *victim;
+
+		for (link = (struct mapped_slice **)&g_slices; *link != NULL;
+		     link = &(*link)->next) {
+			if ((*link)->pins != 0)
+				continue;
+			if (victim_link == NULL ||
+			    (*link)->last_use < (*victim_link)->last_use)
+				victim_link = link;
+		}
+		if (victim_link == NULL) {
+			/* Everything live is pinned: the cap is smaller than
+			 * the genuinely held working set. Name it -- this is
+			 * the line that says "raise --kmap-cap", and it is
+			 * the signal, not the failure. */
+			static unsigned long long stuck;
+
+			if (refusal_worth_logging(&stuck))
+				logline("kmap evict: %llu MB live and all"
+					" pinned (cap %llu MB) -- raise"
+					" --kmap-cap [%llu total]\n",
+					g_slice_bytes >> 20,
+					g_kmap_cap_bytes >> 20, stuck);
+			break;
+		}
+
+		victim = *victim_link;
+		*victim_link = victim->next;
+		if (g_last_hit == victim)
+			InterlockedExchangePointer((PVOID volatile *)&g_last_hit,
+						   NULL);
+		InterlockedDecrement(&g_slice_count);
+		g_slice_bytes -= victim->range.bytes;
+
+		{
+			co_rc_t rc = co_manager_kunmap_range(g_wake_handle,
+							     victim->range.pa);
+
+			if (!CO_OK(rc))
+				/* The daemon and driver disagree about what
+				 * is mapped; that is never fine quietly. */
+				logline("kmap evict: driver REFUSED unmap of"
+					" pa 0x%llx (rc %08x)\n",
+					victim->range.pa, (int)rc);
+			else
+				logline("kmap evict: pa 0x%llx (%llu KB)"
+					" released; %ld slices, %llu MB"
+					" resident\n", victim->range.pa,
+					victim->range.bytes >> 10,
+					(long)g_slice_count,
+					g_slice_bytes >> 20);
+		}
+		free(victim);
+	}
+	LeaveCriticalSection(&g_slice_lock);
+}
+
+/*
+ * Which slices a guest-backed resource's iovecs point into.
+ *
+ * virglrenderer keeps the iovec pointers from ATTACH_BACKING/CREATE_BLOB
+ * until detach, so the slices underneath must not be evicted for exactly
+ * that long. The daemon builds every iovec itself, so it knows the slices;
+ * this table remembers them per resource, pins on attach, unpins on
+ * DETACH_BACKING/UNREF. Slot layout follows g_blob_map: res_id 0 is free,
+ * and resource id 0 is invalid in the protocol.
+ */
+struct cogpu_res_pin {
+	uint32_t	      res_id;
+	int		      nslices;
+	struct mapped_slice **slices;
+};
+static struct cogpu_res_pin *g_res_pins;
+static unsigned int	     g_res_pin_slots;
+
+/* Distinct slices touched while building one request's iovecs. Bounded by
+ * the slice hard ceiling, so the array cannot overflow in practice; if it
+ * somehow does, the request is refused rather than left evictable. */
+struct pin_collect {
+	struct mapped_slice *s[256];
+	int n;
+	int overflow;
+};
+
+static void pin_collect_add(struct pin_collect *pc, uint64_t gpa)
+{
+	struct mapped_slice *slice = find_slice(gpa, 1);
+	int i;
+
+	if (!slice)
+		return;		/* resolve just succeeded; cannot happen */
+	for (i = 0; i < pc->n; i++)
+		if (pc->s[i] == slice)
+			return;
+	if (pc->n >= (int)(sizeof(pc->s) / sizeof(pc->s[0]))) {
+		pc->overflow = 1;
+		return;
+	}
+	pc->s[pc->n++] = slice;
+}
+
+static void res_pins_drop(uint32_t res_id)
+{
+	unsigned int i;
+	int k;
+
+	if (res_id == 0)
+		return;
+	for (i = 0; i < g_res_pin_slots; i++) {
+		if (g_res_pins[i].res_id != res_id)
+			continue;
+		EnterCriticalSection(&g_slice_lock);
+		for (k = 0; k < g_res_pins[i].nslices; k++) {
+			if (g_res_pins[i].slices[k]->pins > 0)
+				g_res_pins[i].slices[k]->pins--;
+		}
+		LeaveCriticalSection(&g_slice_lock);
+		free(g_res_pins[i].slices);
+		g_res_pins[i].res_id  = 0;
+		g_res_pins[i].nslices = 0;
+		g_res_pins[i].slices  = NULL;
+		return;
+	}
+}
+
+/* Pin the collected slices for a resource. 0 on success; on failure nothing
+ * is pinned and the caller must refuse the attach, because iovecs into
+ * unpinned slices are a use-after-unmap waiting for the first eviction. */
+static int res_pins_commit(uint32_t res_id, struct pin_collect *pc)
+{
+	struct mapped_slice **own;
+	unsigned int i;
+	int k;
+
+	if (res_id == 0 || pc->overflow)
+		return -1;
+
+	res_pins_drop(res_id);	/* a re-attach replaces the old pin set */
+	if (pc->n == 0)
+		return 0;
+
+	own = malloc((size_t)pc->n * sizeof(*own));
+	if (!own)
+		return -1;
+	memcpy(own, pc->s, (size_t)pc->n * sizeof(*own));
+
+	for (i = 0; i < g_res_pin_slots; i++) {
+		if (g_res_pins[i].res_id == 0)
+			goto have_slot;
+	}
+	{
+		unsigned int want = g_res_pin_slots ? g_res_pin_slots * 2 : 1024;
+		struct cogpu_res_pin *bigger =
+			realloc(g_res_pins, want * sizeof(*bigger));
+
+		if (!bigger) {
+			free(own);
+			return -1;
+		}
+		memset(bigger + g_res_pin_slots, 0,
+		       (want - g_res_pin_slots) * sizeof(*bigger));
+		i = g_res_pin_slots;
+		g_res_pins = bigger;
+		g_res_pin_slots = want;
+	}
+
+have_slot:
+	EnterCriticalSection(&g_slice_lock);
+	for (k = 0; k < pc->n; k++)
+		own[k]->pins++;
+	LeaveCriticalSection(&g_slice_lock);
+	g_res_pins[i].res_id  = res_id;
+	g_res_pins[i].nslices = pc->n;
+	g_res_pins[i].slices  = own;
+	return 0;
 }
 
 /*
@@ -1168,9 +1620,13 @@ static uint32_t serve(struct cogpu_chain *chain)
 		 * silent again.
 		 */
 		static struct iovec iov[16384];
+		struct pin_collect pins;
 		const char *p;
 		uint32_t i;
 		int bad = 0, niov = 0;
+
+		pins.n = 0;
+		pins.overflow = 0;
 
 		if (chain->in[0].len < sizeof(req) + sizeof(a)) {
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
@@ -1256,6 +1712,7 @@ static uint32_t serve(struct cogpu_chain *chain)
 				iov[niov].iov_len  = run;
 				niov++;
 
+				pin_collect_add(&pins, addr);
 				g_stats.backing_bytes += run;
 				addr += run;
 				left -= run;
@@ -1264,9 +1721,20 @@ static uint32_t serve(struct cogpu_chain *chain)
 
 		if (bad) {
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+		} else if (res_pins_commit(a.resource_id, &pins) != 0) {
+			/*
+			 * Pins BEFORE the attach: iovecs into unpinned slices
+			 * are a use-after-unmap on the first eviction, so a
+			 * resource whose slices cannot be held does not get
+			 * attached at all.
+			 */
+			logline("  ATTACH_BACKING res %u: cannot pin %d backing"
+				" slice(s) -- refused\n", a.resource_id, pins.n);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
 		} else if (cogpu_vrend_attach_iov(a.resource_id, iov, niov) != 0) {
 			logline("  ATTACH_BACKING res %u: renderer refused"
 				" %d iovecs\n", a.resource_id, niov);
+			res_pins_drop(a.resource_id);
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
 		} else {
 			uint64_t total = 0;
@@ -1296,6 +1764,9 @@ static uint32_t serve(struct cogpu_chain *chain)
 		if (chain->in[0].len >= sizeof(req) + sizeof(d)) {
 			memcpy(&d, (char *)chain->in[0].addr + sizeof(req), sizeof(d));
 			cogpu_vrend_detach_iov(d.resource_id);
+			/* The renderer let go of the iovecs; the slices they
+			 * pointed into may be evicted again. */
+			res_pins_drop(d.resource_id);
 		}
 		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 		break;
@@ -1334,6 +1805,7 @@ static uint32_t serve(struct cogpu_chain *chain)
 		cogpu_present_r2_resource_unref(d.resource_id);
 		cogpu_vrend_detach_iov(d.resource_id);
 		cogpu_vrend_resource_unref(d.resource_id);
+		res_pins_drop(d.resource_id);
 
 		resp->type = VIRTIO_GPU_RESP_OK_NODATA;
 		break;
@@ -1465,9 +1937,13 @@ static uint32_t serve(struct cogpu_chain *chain)
 		} b;
 		struct { uint64_t addr; uint32_t length, pad; } ent;
 		static struct iovec iov[16384];
+		struct pin_collect pins;
 		const char *p;
 		uint32_t i;
 		int bad = 0, niov = 0;
+
+		pins.n = 0;
+		pins.overflow = 0;
 
 		if (chain->in[0].len < sizeof(req) + sizeof(b)) {
 			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
@@ -1525,6 +2001,7 @@ static uint32_t serve(struct cogpu_chain *chain)
 					iov[niov].iov_base = host;
 					iov[niov].iov_len  = run;
 					niov++;
+					pin_collect_add(&pins, addr);
 					addr += run;
 					left -= run;
 				}
@@ -1535,10 +2012,22 @@ static uint32_t serve(struct cogpu_chain *chain)
 			}
 		}
 
+		/* Same rule as ATTACH_BACKING: the renderer keeps guest-page
+		 * iovecs for the blob's life, so their slices are pinned first
+		 * and a blob whose slices cannot be held is refused. */
+		if (niov > 0 && res_pins_commit(b.resource_id, &pins) != 0) {
+			logline("  CREATE_BLOB res %u: cannot pin %d backing"
+				" slice(s) -- refused\n", b.resource_id, pins.n);
+			resp->type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+			break;
+		}
+
 		if (cogpu_vrend_create_blob(req.ctx_id, b.resource_id,
 					    b.blob_mem, b.blob_flags,
 					    b.blob_id, b.size,
 					    iov, niov) != 0) {
+			if (niov > 0)
+				res_pins_drop(b.resource_id);
 			logline("  CREATE_BLOB res %u: renderer refused"
 				" (mem %u flags 0x%x id %llu size %llu,"
 				" %d iovecs)\n",
@@ -2042,6 +2531,107 @@ static int cogpu_kwindow_test(co_manager_handle_t handle)
 
 /* ------------------------------------------------------------------- main */
 
+#ifndef QUOTA_LIMITS_HARDWS_MIN_ENABLE
+#define QUOTA_LIMITS_HARDWS_MIN_ENABLE	0x1
+#define QUOTA_LIMITS_HARDWS_MIN_DISABLE	0x2
+#define QUOTA_LIMITS_HARDWS_MAX_ENABLE	0x4
+#define QUOTA_LIMITS_HARDWS_MAX_DISABLE	0x8
+#endif
+
+/*
+ * Lift the working-set quota that WAS the mapping ceiling.
+ *
+ * MmMapLockedPagesSpecifyCache(UserMode) charges every mapped page against
+ * this process's working set, and the default working-set maximum is a few
+ * hundred MB regardless of the machine's RAM. That quota is what the
+ * project's "~1.5-2 GB of mappings kills the host" folklore was: the raise
+ * arrives with the SEH guard broken, so it presented as bugcheck 0x1E and
+ * read as a hardware wall. It is a per-process default, and raising it is
+ * what lets this daemon map ALL of the guest's RAM instead of rationing a
+ * budget below it.
+ *
+ * Ex with a hard minimum first, soft as the middle rung, plain
+ * SetProcessWorkingSetSize for XP where Ex does not exist. Returns the
+ * requested minimum on success, 0 when every form was refused -- and the
+ * caller then falls back to the conservative cap, because mapping past an
+ * unlifted quota is the bugcheck this whole path exists to avoid.
+ */
+/*
+ * The privilege the working-set call needs, ENABLED, not merely held.
+ *
+ * SeIncreaseWorkingSetPrivilege is granted to every interactive user and
+ * arrives DISABLED in the token; SetProcessWorkingSetSizeEx does not enable
+ * it on the caller's behalf, it just fails. An elevated token changes
+ * nothing about that. This is why the first deployment logged
+ * "working-set raise REFUSED" on a box where the raise is perfectly legal.
+ */
+static void enable_privilege(const char *name)
+{
+	HANDLE token;
+	TOKEN_PRIVILEGES tp;
+
+	if (!OpenProcessToken(GetCurrentProcess(),
+			      TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+		return;
+	tp.PrivilegeCount = 1;
+	tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+	if (LookupPrivilegeValueA(NULL, name, &tp.Privileges[0].Luid))
+		AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL);
+	CloseHandle(token);
+}
+
+/*
+ * Returns the mapping budget achieved, in bytes -- the accepted minimum
+ * minus the reserve held back for the process's own residency -- or 0 when
+ * nothing could be raised at all. Halves on refusal rather than giving up:
+ * a partial grant is a partial ceiling lift, and every refusal logs its
+ * GetLastError, because a silent refusal here already cost one deployment.
+ */
+#define WS_RESERVE_BYTES (256ULL << 20)
+
+/*
+ * One attempt at one size. SOFT limits only, deliberately: a hard minimum
+ * (QUOTA_LIMITS_HARDWS_MIN_ENABLE) RESERVES that many pages system-wide, and
+ * the first deployment proved it -- the daemon's 1283 MB hard grant left the
+ * rest of the machine unable to grant anything at all. The mapped pool pages
+ * are permanently resident regardless, so a guarantee buys nothing here.
+ * Privileges must already be enabled; raise_ws_for does that once.
+ */
+static int raise_ws_once(unsigned long long want)
+{
+	typedef BOOL (WINAPI *setws_ex_t)(HANDLE, SIZE_T, SIZE_T, DWORD);
+	setws_ex_t setws_ex = (setws_ex_t)GetProcAddress(
+		GetModuleHandleA("kernel32.dll"), "SetProcessWorkingSetSizeEx");
+	SIZE_T want_min = (SIZE_T)(want + WS_RESERVE_BYTES);
+	SIZE_T want_max = want_min + (256ULL << 20);
+
+	if (setws_ex &&
+	    setws_ex(GetCurrentProcess(), want_min, want_max,
+		     QUOTA_LIMITS_HARDWS_MIN_DISABLE |
+		     QUOTA_LIMITS_HARDWS_MAX_DISABLE))
+		return 1;
+	if (SetProcessWorkingSetSize(GetCurrentProcess(), want_min, want_max))
+		return 1;
+	return 0;
+}
+
+static unsigned long long raise_ws_for(unsigned long long bytes)
+{
+	unsigned long long want = bytes;
+
+	enable_privilege("SeIncreaseWorkingSetPrivilege");
+	enable_privilege("SeIncreaseQuotaPrivilege");
+
+	while (want >= (512ULL << 20)) {
+		if (raise_ws_once(want))
+			return want;
+		logline("working set: %llu MB refused (%lu); halving\n",
+			want >> 20, (unsigned long)GetLastError());
+		want >>= 1;
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	co_manager_handle_t	handle;
@@ -2053,6 +2643,8 @@ int main(int argc, char **argv)
 	int			kwindow_test = 0;
 	int			idle = 0;
 	unsigned long long	sweeps = 0;
+
+	g_main_tid = GetCurrentThreadId();
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--verbose"))
@@ -2067,15 +2659,25 @@ int main(int argc, char **argv)
 			present_r2 = 1;
 		else if (!strcmp(argv[i], "--kwindow-test"))
 			kwindow_test = 1;
+		else if (!strcmp(argv[i], "--kmap-cap") && i + 1 < argc) {
+			g_kmap_cap_bytes =
+				(unsigned long long)atoi(argv[++i]) << 20;
+			g_kmap_cap_given = 1;
+		}
 		else if (!strcmp(argv[i], "--selftest"))
 			return cogpu_vring_selftest();
 		else {
 			logline("usage: cogpu-daemon [--verbose] [--once] [--selftest]"
 				" [--present-probe] [--present-r1] [--present-r2]"
-				" [--kwindow-test]\n");
+				" [--kwindow-test] [--kmap-cap MB]\n");
 			return 2;
 		}
 	}
+
+	/* The real cap is decided after the working-set raise, where the RAM
+	 * ceiling is known; only an explicit flag's floor is enforced here. */
+	if (g_kmap_cap_given && g_kmap_cap_bytes < (192ULL << 20))
+		g_kmap_cap_bytes = 192ULL << 20;
 	if (present_r1 && present_r2) {
 		logline("--present-r1 and --present-r2 are mutually exclusive\n");
 		return 2;
@@ -2262,6 +2864,51 @@ int main(int argc, char **argv)
 			" MAP_BLOB will refuse\n");
 
 	/*
+	 * Lift the working-set quota, then size the cap so ALL of guest RAM
+	 * fits. The guest's 2 GB is 2 GB; the daemon maps every byte of it
+	 * that goes hot and refuses none of it. The only clamp left is the
+	 * host's physical memory, which is a fact rather than a policy: a
+	 * guest bigger than the machine (--mem 131072 on a 4 GB host) maps
+	 * as much as physically exists and eviction cycles the remainder --
+	 * the case that machinery was built for. If the quota raise is
+	 * refused outright, the old conservative budget stands, loudly.
+	 */
+	{
+		unsigned long long ram_ceiling = g_window_base
+			? g_window_base : (2ULL << 30);
+		unsigned long long got;
+		MEMORYSTATUSEX ms;
+
+		ms.dwLength = sizeof(ms);
+		if (GlobalMemoryStatusEx(&ms) &&
+		    ms.ullTotalPhys > (1ULL << 30) &&
+		    ram_ceiling > ms.ullTotalPhys - (512ULL << 20))
+			ram_ceiling = ms.ullTotalPhys - (512ULL << 20);
+
+		/*
+		 * The cap is a physical fact, not a policy: all of guest RAM,
+		 * clamped only by what the machine actually has. The SEH
+		 * guard in the driver is real now (it dispatches through
+		 * ntoskrnl's __C_specific_handler), so a mapping the host
+		 * cannot make is a refusal the daemon retries or lives
+		 * without -- not a bugcheck to be rationed against. The
+		 * working-set raise is best-effort grease, nothing derives
+		 * from it.
+		 */
+		got = raise_ws_for(ram_ceiling);
+		g_kmap_ram_ceiling = ram_ceiling;
+		g_kmap_ws_budget   = got ? got : ram_ceiling;
+		if (!g_kmap_cap_given)
+			g_kmap_cap_bytes = ram_ceiling + (64ULL << 20);
+		g_kmap_hard_bytes = g_kmap_cap_bytes + (64ULL << 20);
+		logline("kmap budget: %llu MB (all of guest RAM%s), hard"
+			" ceiling %llu MB; working-set grease %llu MB\n",
+			g_kmap_cap_bytes >> 20,
+			ram_ceiling < g_window_base ? ", host-clamped" : "",
+			g_kmap_hard_bytes >> 20, got >> 20);
+	}
+
+	/*
 	 * The verdict on the precise-sleep machinery, in a log file where it
 	 * can be read: zero means the idle wait is blind and every guest
 	 * sleep costs a full tick regardless of what the guest asked for.
@@ -2312,6 +2959,12 @@ int main(int argc, char **argv)
 
 		for (tries = 0; tries < 120; tries++) {
 			MEMORY_BASIC_INFORMATION mbi;
+			/* The section appears when the boot daemon begins its
+			 * load, which can be after this daemon starts. */
+			if (!g_ram_view)
+				g_ram_view = (unsigned char *)
+					co_os_guest_ram_section_open(
+						&g_ram_view_bytes);
 			if (!vgpu_va)
 				co_manager_vgpu_address(handle, &vgpu_va);
 			if (vgpu_va && !gpa_valid &&
@@ -2356,10 +3009,67 @@ int main(int argc, char **argv)
 		logline("transport mapped on demand at guest pa 0x%llx;"
 			" %ld slice(s), %llu MB resident in cogpu\n",
 			gpa, (long)g_slice_count, g_slice_bytes >> 20);
+
+		/* io is dereferenced on every sweep for the daemon's life;
+		 * its slice is pinned permanently, never unpinned. */
+		{
+			static void *transport_pin;
+
+			if (!cogpu_resolve_gpa_pinned(gpa, sizeof(*io),
+						      &transport_pin))
+				logline("WARNING: could not pin the transport"
+					" slice\n");
+		}
 	}
 
 	logline("transport at guest va 0x%llx, status 0x%x\n\n",
 	       vgpu_va, io->status);
+
+	/*
+	 * ALL of guest RAM, mapped NOW -- while the host's free memory is at
+	 * its boot-time high -- and held for the daemon's life. On-demand
+	 * mapping was the design that rationed: it deferred each mapping to
+	 * the moment a workload was already squeezing the host, which is
+	 * exactly when the insert can fail. Mapped eagerly there is nothing
+	 * left to refuse later: every ATTACH_BACKING resolves into a mapping
+	 * that already exists, pins become bookkeeping, and eviction stays
+	 * idle unless --mem exceeds the machine itself. A slice the host
+	 * genuinely cannot map is retried briefly and then conceded to the
+	 * on-demand path -- a partial eager map is a head start, not a fault.
+	 */
+	if (g_ram_view) {
+		logline("guest RAM: shared section view, %llu MB, every byte"
+			" of the guest reachable at zero cost -- no mappings,"
+			" no pins, no ceiling\n",
+			(g_window_base < g_ram_view_bytes
+				? g_window_base : g_ram_view_bytes) >> 20);
+	} else if (g_window_base) {
+		/* Legacy driver or failed section open: the slice fallback,
+		 * warmed while boot-time availability is at its best. */
+		unsigned long long pa = 0;
+		int stalls = 0;
+
+		while (pa < g_window_base &&
+		       g_slice_bytes + CO_KMAP_SLICE_BYTES <= g_kmap_hard_bytes) {
+			struct mapped_slice *slice = map_slice(pa);
+
+			if (!slice) {
+				if (++stalls > 5) {
+					logline("eager map: gave up at pa"
+						" 0x%llx with %llu MB mapped;"
+						" the rest maps on demand\n",
+						pa, g_slice_bytes >> 20);
+					break;
+				}
+				Sleep(200);
+				continue;
+			}
+			stalls = 0;
+			pa = slice->range.pa + slice->range.bytes;
+		}
+		logline("eager map: %llu MB of guest RAM resident in %ld"
+			" slices\n", g_slice_bytes >> 20, (long)g_slice_count);
+	}
 
 	/*
 	 * The X wire, if it can be had.
@@ -2393,6 +3103,14 @@ int main(int argc, char **argv)
 		int did = 0;
 		int present_poll_rc;
 		int copresent_poll_rc;
+
+		/*
+		 * The LRU tick, and the ONLY place eviction may run: no chain
+		 * is in flight here, which is the safety argument for every
+		 * unpinned pointer used inside one serve pass below.
+		 */
+		g_slice_clock++;
+		slices_evict();
 
 		present_poll_rc = present_r1 ? cogpu_present_r1_poll() :
 			(present_r2 ? cogpu_present_r2_poll() : 0);
@@ -2471,6 +3189,28 @@ int main(int argc, char **argv)
 				 */
 				vq[i].last_avail = vq[i].used->idx;
 				vq[i].used_idx	 = vq[i].used->idx;
+
+				/* The three ring pointers are dereferenced
+				 * on every sweep; their slices are pinned
+				 * for the daemon's life. */
+				{
+					void *t;
+
+					if (!cogpu_resolve_gpa_pinned(
+						io->vq[i].desc_gpa,
+						sizeof(struct vring_desc) *
+							vq[i].num, &t) ||
+					    !cogpu_resolve_gpa_pinned(
+						io->vq[i].avail_gpa,
+						4 + 2 * vq[i].num, &t) ||
+					    !cogpu_resolve_gpa_pinned(
+						io->vq[i].used_gpa,
+						4 + 8 * vq[i].num, &t))
+						logline("WARNING: queue %d ring"
+							" not fully pinned;"
+							" eviction may unmap"
+							" it\n", i);
+				}
 
 				logline("queue %d: %u descriptors,"
 					" joining at used %u\n",

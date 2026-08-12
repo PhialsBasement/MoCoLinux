@@ -34,4 +34,16 @@ co_rc_t co_os_user_lock_pages(void *user_address, unsigned long size,
 			      unsigned long *count_out);
 void	co_os_user_unlock_pages(void *handle);
 
+/*
+ * Lock a block of a caller's section view AND map it at kernel mode, so the
+ * driver can reach it from any process context. The kernel mapping is what
+ * makes section-backed guest RAM equivalent to the old pool blocks for every
+ * in-driver reader; the KernelMode map returns NULL on failure rather than
+ * raising, which is the property the section design rests on. Size is capped
+ * by what one MDL can describe (just under 16 MB).
+ */
+co_rc_t co_os_user_block_map(void *user_address, unsigned long size,
+			     void **kernel_va_out, void **handle_out);
+void	co_os_user_block_unmap(void *kernel_va, void *handle);
+
 #endif

@@ -27,6 +27,7 @@
 #include <colinux/os/kernel/alloc.h>
 #include <colinux/os/kernel/misc.h>
 #include <colinux/os/kernel/mutex.h>
+#include <colinux/os/kernel/user.h>	/* block lock+map, for section-backed RAM */
 #include <colinux/os/timer.h>		/* co_os_msleep, for the deferred-free wait */
 #include <colinux/arch/mmu.h>
 #include <colinux/arch/space.h>
@@ -63,11 +64,28 @@ typedef struct {
 	void*		   va;
 	unsigned long long pseudo_base;
 	unsigned long long bytes;
+	/* Non-NULL for a section-backed block: the MDL holding the caller's
+	 * pages locked, whose kernel mapping is `va`. NULL for pool blocks. */
+	void*		   mdl;
 } co_kload_block_t;
 
 static co_kload_block_t	      kload_block[CO_KLOAD_MAX_BLOCKS];
 static int		      kload_block_count;
 static int		      kload_last_hit;
+
+/*
+ * Section-backed guest RAM. When the boot daemon passes a view of the shared
+ * section at KLOAD_BEGIN, blocks are carved from it sequentially -- so a
+ * block's pseudo base IS its section offset, which is what lets the GPU
+ * daemon compute a pointer from a pseudo address with one add. Blocks are
+ * locked with MmProbeAndLockPages and kernel-mapped for the driver's own
+ * readers; the UserMode mapping path, whose failure is a raise no guard in
+ * this tree has ever caught, is not involved anywhere.
+ */
+static unsigned long long     kload_user_ram_va;
+static unsigned long long     kload_user_ram_bytes;
+/* One MDL describes at most 4089 pages; 8 MB divides guest RAM evenly. */
+#define CO_KLOAD_USER_BLOCK_BYTES (8ULL << 20)
 
 static co_pfn_t*	      kload_p2m;
 static unsigned int*	      kload_m2p;
@@ -491,19 +509,38 @@ static co_kload_block_t* kload_block_alloc(unsigned long long bytes)
 {
 	co_kload_block_t* b;
 	void* va;
+	void* mdl = NULL;
 	unsigned long pages, i;
 	unsigned long first;
 
 	if (kload_block_count >= CO_KLOAD_MAX_BLOCKS)
 		return NULL;
 
+	if (kload_user_ram_va && bytes > CO_KLOAD_USER_BLOCK_BYTES)
+		bytes = CO_KLOAD_USER_BLOCK_BYTES;
+
 	pages = (unsigned long)(bytes >> CO_ARCH_PAGE_SHIFT);
 	if (pages == 0 || pages > kload_p2m_capacity - kload_backed_pages)
 		return NULL;
 
-	va = co_os_alloc_cached_pages((unsigned int)pages);
-	if (va == NULL)
-		return NULL;
+	if (kload_user_ram_va) {
+		/* The section offset of this block is exactly the pseudo
+		 * base it will get -- both advance in lockstep from zero. */
+		unsigned long long offset =
+			((unsigned long long)kload_backed_pages)
+			<< CO_ARCH_PAGE_SHIFT;
+
+		if (offset + bytes > kload_user_ram_bytes)
+			return NULL;
+		if (!CO_OK(co_os_user_block_map(
+				(void*)(size_t)(kload_user_ram_va + offset),
+				(unsigned long)bytes, &va, &mdl)))
+			return NULL;
+	} else {
+		va = co_os_alloc_cached_pages((unsigned int)pages);
+		if (va == NULL)
+			return NULL;
+	}
 
 	co_memset(va, 0, (long)(pages << CO_ARCH_PAGE_SHIFT));
 	first = kload_backed_pages;
@@ -523,9 +560,15 @@ static co_kload_block_t* kload_block_alloc(unsigned long long bytes)
 	b->va		= va;
 	b->pseudo_base = ((unsigned long long)first) << CO_ARCH_PAGE_SHIFT;
 	b->bytes	= ((unsigned long long)pages) << CO_ARCH_PAGE_SHIFT;
+	b->mdl		= mdl;
 	kload_backed_pages += pages;
 
 	return b;
+}
+
+bool_t co_kload_user_backed(void)
+{
+	return kload_user_ram_va != 0 ? PTRUE : PFALSE;
 }
 
 static bool_t kload_grow_to(unsigned long long end)
@@ -627,6 +670,7 @@ static void kload_release_pages(co_manager_t* manager)
 
 	for (i = 0; i < count; i++) {
 		void*		   va    = kload_block[i].va;
+		void*		   mdl   = kload_block[i].mdl;
 		unsigned long long bytes = kload_block[i].bytes;
 
 		if (va == NULL)
@@ -641,8 +685,12 @@ static void kload_release_pages(co_manager_t* manager)
 		kload_block[i].va	  = NULL;
 		kload_block[i].pseudo_base = 0;
 		kload_block[i].bytes	  = 0;
+		kload_block[i].mdl	  = NULL;
 
-		co_os_free_cached_pages(va,
+		if (mdl != NULL)
+			co_os_user_block_unmap(va, mdl);
+		else
+			co_os_free_cached_pages(va,
 					(unsigned int)(bytes >> CO_ARCH_PAGE_SHIFT));
 	}
 
@@ -667,6 +715,8 @@ static void kload_release_pages(co_manager_t* manager)
 	kload_table_start = 0;
 	kload_table_end   = 0;
 	kload_table_top	  = 0;
+	kload_user_ram_va    = 0;
+	kload_user_ram_bytes = 0;
 }
 
 void co_kload_free(co_manager_t* manager)
@@ -1045,7 +1095,9 @@ static co_rc_t kload_map_translation_pages(co_manager_t* manager)
 }
 
 co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
-		       unsigned long long max_va, unsigned long long ram_bytes)
+		       unsigned long long max_va, unsigned long long ram_bytes,
+		       unsigned long long ram_user_va,
+		       unsigned long long ram_user_bytes)
 {
 	unsigned long long image_hi, table_bytes, capacity_end, sizing_bytes;
 	co_rc_t rc;
@@ -1060,6 +1112,16 @@ co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 	 */
 	if (!kload_wait_for_deferred_free())
 		return CO_RC(ERROR);
+
+	/* Section-backed RAM, if the caller offered a view. Page alignment is
+	 * the MDL's requirement; a misaligned offer degrades to pool. */
+	if (ram_user_va && ram_user_bytes &&
+	    (ram_user_va & ~CO_ARCH_PAGE_MASK) == 0) {
+		kload_user_ram_va    = ram_user_va;
+		kload_user_ram_bytes = ram_user_bytes & CO_ARCH_PAGE_MASK;
+		co_debug("kload: guest RAM is section-backed: view 0x%llx,"
+			 " %llu MB", ram_user_va, kload_user_ram_bytes >> 20);
+	}
 
 	if (min_va >= max_va || !CO_ARCH_VA_CANONICAL(min_va) || !CO_ARCH_VA_CANONICAL(max_va - 1))
 		return CO_RC(INVALID_PARAMETER);

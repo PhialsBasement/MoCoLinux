@@ -94,10 +94,17 @@ are adjacent.
 
 Supporting sizes up to 128 GB also required 64-bit memory sizes and block
 accounting, allocation and p2m/m2p metadata sized for 131072 MiB, and a
-change to how the GPU daemon accesses guest memory. It no longer maps the
-configured RAM size in advance; it asks the driver for 12 MB windows around
-guest addresses as it needs them. A large `--mem` value therefore does not
-create thousands of unused user mappings before the GPU has touched a page.
+change to where guest RAM physically lives. It is no longer nonpaged pool:
+the boot daemon creates a named shared section (`Global\MoCoLinuxGuestRAM`)
+sized for the configured RAM, and the driver locks and kernel-maps 8 MB
+blocks of it, building the p2m from their frames exactly as before. Because
+blocks are carved sequentially, a guest pseudo-physical address is an offset
+into that section -- so the GPU daemon opens the same section and reaches
+EVERY byte of guest RAM through one ordinary view, with no per-window
+mappings, no working-set locking, and none of the kernel calls whose failure
+mode is a bugcheck rather than an error. The old on-demand 12 MB windows
+(with LRU eviction, `--kmap-cap MB`) survive only as the fallback for a
+legacy driver.
 
 This is not overcommit or ballooning. Memory advertised to Linux still needs
 real nonpaged host backing. `--mem 131072` is the supported maximum, not a
@@ -180,9 +187,12 @@ client measure a 3 µs median.
                                             virglrenderer ─► WGL ─► the card
 ```
 
-The daemon maps all of guest RAM into its own address space through
-persistent user-mode windows (KMAP, 8 MB slices), so it parses requests and
-writes replies in place. A resource's backing list of {guest physical
+The daemon reaches guest RAM through its view of the shared section that
+backs it: a guest physical address is an offset, resolution is one add, and
+every byte of the guest is reachable from any thread at zero cost -- so it
+parses requests and writes replies in place, and a resource's whole backing
+arrives as a single iovec because the view is linear in guest-physical
+space. A resource's backing list of {guest physical
 address, length} pairs becomes iovecs pointing into the guest's pages, so the
 command path performs no copies. virglrenderer, cross-built for mingw with a
 WGL winsys, replays the guest's GL on the host card. The guest reports

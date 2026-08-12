@@ -42,7 +42,9 @@ extern co_rc_t co_manager_save_state(co_manager_handle_t handle,
 
 extern co_rc_t co_manager_kload_begin(co_manager_handle_t handle,
 				      unsigned long long min_va, unsigned long long max_va,
-				      unsigned long long ram_bytes);
+				      unsigned long long ram_bytes,
+				      unsigned long long ram_user_va,
+				      unsigned long long ram_user_bytes);
 extern co_rc_t co_manager_kload_chunk(co_manager_handle_t handle, unsigned long long va,
 				      const void* data, unsigned long size, int zero);
 extern co_rc_t co_manager_kload_verify(co_manager_handle_t handle,
@@ -78,6 +80,13 @@ extern co_rc_t co_manager_kmap_range(co_manager_handle_t handle,
 				     int* reused_out);
 extern co_rc_t co_manager_kunmap(co_manager_handle_t handle,
 				 unsigned long* released_out);
+/*
+ * Release one slice by its exact base pa (as returned in co_kmap_range_t.pa).
+ * The caller certifies nothing in this process still uses the slice's
+ * user_va; see the eviction contract in ioctl.h.
+ */
+extern co_rc_t co_manager_kunmap_range(co_manager_handle_t handle,
+				       unsigned long long pa);
 extern co_rc_t co_manager_vgpu_address(co_manager_handle_t handle,
 				       unsigned long long* va_out);
 extern co_rc_t co_manager_vgpu_wake(co_manager_handle_t handle);

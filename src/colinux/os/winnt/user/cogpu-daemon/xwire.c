@@ -34,6 +34,14 @@
 /* Provided by cogpu-daemon.c: guest-physical to a pointer we can use, and how
  * much of a run is reachable as one. */
 extern void *resolve_gpa(void *ctx, uint64_t gpa, uint32_t len);
+/*
+ * The pinned variant, which is the only resolve this file may keep a pointer
+ * from: the daemon evicts cold guest-RAM mappings now, and an unpinned
+ * pointer is valid only within the sweep that resolved it. A pin holds the
+ * slice until the matching unpin at channel teardown.
+ */
+extern void *cogpu_resolve_gpa_pinned(uint64_t gpa, uint32_t len, void **token);
+extern void cogpu_unpin(void *token);
 extern void logline(const char *fmt, ...);
 
 /*
@@ -72,6 +80,7 @@ struct xchan {
 	struct coxwire_hdr  *hdr;
 	unsigned char	   **page;	/* host pointer per guest page	*/
 	uint32_t	    *runlen;	/* contiguous bytes from each page */
+	void		   **pin;	/* slice pin token per guest page  */
 	uint32_t	     npages;
 	uint32_t	     id;
 	int		     tx_stalled;	/* socket full, waiting on VcXsrv */
@@ -129,6 +138,8 @@ static unsigned char *at(struct xchan *c, uint32_t off, uint32_t *run)
 
 static void chan_free(struct xchan *c)
 {
+	uint32_t i;
+
 	if (!c)
 		return;
 	if (c->hdr)
@@ -137,6 +148,14 @@ static void chan_free(struct xchan *c)
 		closesocket(c->x);
 	if (c->ctl != INVALID_SOCKET)
 		closesocket(c->ctl);
+	/* Nothing in this channel touches the rings after this point, so the
+	 * slices may go back into the daemon's eviction pool. */
+	if (c->pin) {
+		for (i = 0; i < c->npages; i++)
+			if (c->pin[i])
+				cogpu_unpin(c->pin[i]);
+	}
+	free(c->pin);
 	free(c->runlen);
 	free(c->page);
 	free(c);
@@ -372,13 +391,18 @@ static struct xchan *accept_chan(SOCKET ctl)
 
 	c->page = calloc(op.npages, sizeof(*c->page));
 	c->runlen = calloc(op.npages, sizeof(*c->runlen));
-	if (!c->page || !c->runlen)
+	c->pin = calloc(op.npages, sizeof(*c->pin));
+	if (!c->page || !c->runlen || !c->pin)
 		goto fail;
 	c->npages = op.npages;
 	c->id = op.chan;
 
 	for (i = 0; i < op.npages; i++) {
-		void *h = resolve_gpa(NULL, gpa[i], COXWIRE_PAGE);
+		/* Pinned: this thread and the channel thread keep these
+		 * pointers for the channel's whole life, so each page's slice
+		 * is held against eviction until chan_free lets go. */
+		void *h = cogpu_resolve_gpa_pinned(gpa[i], COXWIRE_PAGE,
+						   &c->pin[i]);
 
 		if (!h) {
 			logline("xwire: channel %u: page %u at 0x%llx is"

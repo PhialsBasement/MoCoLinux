@@ -120,6 +120,62 @@ void co_os_user_unlock_pages(void *handle)
 	IoFreeMdl(user_mdl);
 }
 
+/*
+ * Lock a section-view block and give the driver a kernel mapping of it.
+ *
+ * Runs in the boot daemon's ioctl context, which is what makes the user VA
+ * meaningful to MmProbeAndLockPages. The KernelMode map afterwards is the
+ * load-bearing choice: unlike the UserMode form it RETURNS NULL on failure,
+ * so the one call in this driver that historically raised through a guard
+ * that could not catch it is simply absent from this path.
+ */
+co_rc_t co_os_user_block_map(void *user_address, unsigned long size,
+			     void **kernel_va_out, void **handle_out)
+{
+	PMDL mdl;
+	void *kva;
+
+	if (kernel_va_out == NULL || handle_out == NULL)
+		return CO_RC(INVALID_PARAMETER);
+	*kernel_va_out = NULL;
+	*handle_out = NULL;
+
+	if (user_address == NULL || size == 0 ||
+	    ((uintptr_t)user_address & (CO_ARCH_PAGE_SIZE - 1)) != 0 ||
+	    (size & (CO_ARCH_PAGE_SIZE - 1)) != 0)
+		return CO_RC(INVALID_PARAMETER);
+
+	mdl = IoAllocateMdl(user_address, size, FALSE, FALSE, NULL);
+	if (mdl == NULL)
+		return CO_RC(OUT_OF_MEMORY);
+
+	MmProbeAndLockPages(mdl, KernelMode, IoModifyAccess);
+
+	kva = MmMapLockedPagesSpecifyCache(mdl, KernelMode, MmCached, NULL,
+					   FALSE, HighPagePriority);
+	if (kva == NULL) {
+		MmUnlockPages(mdl);
+		IoFreeMdl(mdl);
+		return CO_RC(OUT_OF_MEMORY);
+	}
+
+	*kernel_va_out = kva;
+	*handle_out = mdl;
+	return CO_RC(OK);
+}
+
+void co_os_user_block_unmap(void *kernel_va, void *handle)
+{
+	PMDL mdl = (PMDL)handle;
+
+	if (mdl == NULL)
+		return;
+	if (kernel_va != NULL)
+		MmUnmapLockedPages(kernel_va, mdl);
+	MmUnlockPages(mdl);
+	IoFreeMdl(mdl);
+}
+
 co_rc_t co_copy_from_user(char *user_address, char *kernel_address, unsigned long size)
 {
 	PMDL user_mdl;
