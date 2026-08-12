@@ -191,6 +191,39 @@ done
 rm -rf "$check"
 say "  builder written into $image at both paths setup.c looks in"
 
+# The X server with a monitor in it, built here rather than carried.
+#
+# Stock VcXsrv 1.14 answers RandR with no outputs at all, and a client that
+# asks about monitors before opening a window does not degrade -- Steam's
+# client refuses to start. Every install before this one shipped that way: the
+# NSIS installer laid down a stock server and nothing patched it, so the fault
+# reached every user who installed the release rather than only the box it was
+# developed on.
+#
+# Built from the stock binary at assembly time so it cannot drift from the
+# patcher, and the patcher verifies six byte signatures before it writes -- a
+# different VcXsrv build fails here rather than shipping a corrupt server.
+patched=$(sed -n 's/^#define XSERVER_PATCHED[[:space:]]*"\(.*\)"$/\1/p' \
+		"$HERE/installer/setup.c")
+[ -n "$patched" ] || die "could not read XSERVER_PATCHED out of setup.c"
+
+stock=$DIST/vcxsrv-stock.exe
+[ -f "$stock" ] ||
+	die "dist-x64/vcxsrv-stock.exe is missing -- it is the unmodified
+       vcxsrv.exe from the shipped installer, and $patched is built from it"
+
+command -v python3 >/dev/null 2>&1 ||
+	die "python3 is needed to build $patched"
+
+"$HERE/tools/vcxsrv-fakemonitor/patch-vcxsrv.py" "$stock" "$OUT/$patched" \
+	>/dev/null || die "could not build $patched from vcxsrv-stock.exe"
+
+# The patch lands in a section of its own; if it is not there, nothing was done.
+objdump -h "$OUT/$patched" 2>/dev/null | grep -q '\.moco' ||
+	die "$patched has no .moco section -- the monitor patch did not apply"
+
+say "  $patched built from the stock server"
+
 # The driver carries a signature, and it is a signature of THIS driver.
 #
 # Not "Signature verification: ok" and not osslsigncode's exit status: both
