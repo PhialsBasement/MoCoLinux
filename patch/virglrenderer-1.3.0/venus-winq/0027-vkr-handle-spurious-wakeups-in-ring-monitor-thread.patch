@@ -1,0 +1,65 @@
+From 1c8782fa3756a4b4e6a62741ec58095fa136df0f Mon Sep 17 00:00:00 2001
+From: Yiwei Zhang <zzyiwei@chromium.org>
+Date: Thu, 26 Mar 2026 08:54:08 -0700
+Subject: [PATCH] vkr: handle spurious wakeups in ring monitor thread
+
+The absolute wait target should be update only when real timeout occurs
+but not spurious wakeups. The bug pattern would be driver side unable to
+detect heartbeat, ending up with a false-positive ring alive status
+expiration. The chance to hit this is really low though.
+
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1610>
+---
+ src/venus/vkr_context.c | 25 ++++++++++++++-----------
+ 1 file changed, 14 insertions(+), 11 deletions(-)
+
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index 7c82e7c7..2704bfd8 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -528,7 +528,7 @@ vkr_context_ring_monitor_thread(void *arg)
+    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ringmon-%d", ctx->ctx_id);
+    u_thread_setname(thread_name);
+ 
+-   struct timespec ts;
++   struct timespec abs_ts;
+    int ret = thrd_busy;
+    assert(ctx->ring_monitor.started);
+    while (ctx->ring_monitor.started) {
+@@ -540,20 +540,23 @@ vkr_context_ring_monitor_thread(void *arg)
+                vkr_ring_set_status_bits(ring, VK_RING_STATUS_ALIVE_BIT_MESA);
+          }
+          mtx_unlock(&ctx->ring_mutex);
+-         ret = 0;
++
++         ret = clock_gettime(CLOCK_REALTIME, &abs_ts);
++         if (ret)
++            break;
++
++         const uint32_t period_us = ctx->ring_monitor.report_period_us;
++         const struct timespec rel_ts = {
++            .tv_sec = period_us / 1000000,
++            .tv_nsec = (period_us % 1000000) * 1000,
++         };
++         abs_ts = timespec_add(abs_ts, rel_ts);
+       } else if (ret)
+          break;
+ 
++      /* abs_ts is immutable for spurious wakeups */
+       mtx_lock(&ctx->ring_monitor.mutex);
+-      if ((ret = clock_gettime(CLOCK_REALTIME, &ts))) {
+-         mtx_unlock(&ctx->ring_monitor.mutex);
+-         break;
+-      }
+-
+-      const uint32_t period_us = ctx->ring_monitor.report_period_us;
+-      ts = timespec_add(
+-         ts, (struct timespec){ period_us / 1000000, (period_us % 1000000) * 1000 });
+-      ret = cnd_timedwait(&ctx->ring_monitor.cond, &ctx->ring_monitor.mutex, &ts);
++      ret = cnd_timedwait(&ctx->ring_monitor.cond, &ctx->ring_monitor.mutex, &abs_ts);
+       mtx_unlock(&ctx->ring_monitor.mutex);
+    }
+ 
+-- 
+2.55.0
+

@@ -141,6 +141,15 @@ typedef struct {
 	unsigned long long tick_entry_va;
 	unsigned long long virtual_if_va;
 	unsigned long long ipi_pending_va;
+	/* Per-vCPU next-clock-event deadlines, host monotonic 100 ns. */
+	unsigned long long timer_deadline_va;
+	/*
+	 * Loop truth, exported: what the vCPU loop ACTUALLY resolved and how
+	 * often each branch ran. Two rewrites of the wait measured identical
+	 * latencies because the branch never executed and every probe of the
+	 * resolution was made from a luckier moment than the loop's own.
+	 * Diagnosis surface; reported by the VGPU ioctl into a log file.
+	 */
 	int		   async_cobd;
 	unsigned long long cobd_io_va;
 	/*
@@ -4164,6 +4173,17 @@ static void co_vcpu_release(co_vcpu_t* vcpu)
  * supposed to do. The core map is small and read while a run is starting,
  * which is not a hot path, so a linear scan is the whole mechanism.
  */
+/* Loop truth for the deadline machinery -- see the note in the ctl struct. */
+unsigned long long co_arch_tdl_loop_ptr;
+unsigned long long co_arch_tdl_branch_taken;
+unsigned long long co_arch_tdl_spins;
+/* Wait-path census: which branch each idle pass takes. The median sleep
+ * latency is a mixture over these; the census names the slow component. */
+unsigned long long co_arch_tdl_path_tick;	/* no deadline: tick wait */
+unsigned long long co_arch_tdl_path_far;	/* deadline, undershoot wait */
+unsigned long long co_arch_tdl_path_mid;	/* deadline inside one floor */
+unsigned long long co_arch_tdl_path_due;	/* deadline already passed */
+
 int co_arch_vcpu_core_taken(unsigned long cpu)
 {
 	int i;
@@ -6256,23 +6276,406 @@ static co_rc_t co_arch_vcpu_run(co_manager_t* manager, co_vcpu_t* vcpu,
 					{
 						unsigned long long now =
 							co_os_monotonic_100ns();
-						unsigned int wait_ms;
+						unsigned long long bound, gd = 0;
 
 						if (tick_due <= now)
 							tick_due = now +
 								CO_GUEST_TICK_100NS;
+						bound = tick_due;
 
-						/* round up: never a zero wait */
-						wait_ms = (unsigned int)
-							((tick_due - now + 9999ULL)
-							 / 10000ULL);
-						if (wait_ms == 0)
-							wait_ms = 1;
+						/*
+						 * The guest's own next clock
+						 * event, read through the
+						 * guest's LIVE page tables
+						 * (its saved CR3), never the
+						 * load-time root: the guest
+						 * adopts its own tables mid-
+						 * boot and .bss lives only in
+						 * those. co_kload_host_ptr
+						 * walked the dead map here
+						 * for five debugging cycles,
+						 * failing quietly on every
+						 * pass -- the exact trap the
+						 * injector above documents
+						 * and the beacon at
+						 * co_kload_host_ptr now
+						 * names. One 8-byte CR3 walk
+						 * per idle pass, at idle.
+						 *
+						 * A valid deadline OUTRANKS
+						 * the tick, always: the tick
+						 * exists to synthesise time
+						 * for a guest that cannot
+						 * name its next event, and
+						 * this guest just did.
+						 * Letting them race by phase
+						 * cost every second sleep a
+						 * coarse millisecond in
+						 * line behind housekeeping.
+						 */
+						if (ctl->timer_deadline_va &&
+						    pp->linuxvm_state.cr3 &&
+						    CO_OK(co_kload_read_cr3(
+							manager,
+							pp->linuxvm_state.cr3,
+							ctl->timer_deadline_va +
+							  (unsigned long long)
+							  vcpu->index * 8,
+							(unsigned char *)&gd,
+							sizeof(gd)))) {
+							co_arch_tdl_loop_ptr = gd;
+							if (gd && gd > now)
+								bound = gd;
+							else if (gd && gd <= now) {
+								bound = 0;
+								co_arch_tdl_path_due++;
+							}
+						} else {
+							gd = 0;
+						}
+						if (!gd)
+							co_arch_tdl_path_tick++;
 
-						idle_run++;
-						if (!co_os_idle_wait(vcpu->index,
-								     wait_ms))
-							pp->params[48] += 1;
+						if (bound) {
+							/*
+							 * When the bound is the
+							 * guest's deadline the
+							 * wait lands SHORT and
+							 * a bounded spin does
+							 * the approach -- but
+							 * the spin budget is
+							 * 200 us, HARD. The
+							 * first cut skipped the
+							 * wait for any sub-ms
+							 * deadline and spun the
+							 * whole gap, which at
+							 * the guest's ordinary
+							 * 1 ms tick cadence
+							 * burned a full host
+							 * core per vCPU doing
+							 * nothing but waiting
+							 * precisely. A 200 us
+							 * tail costs at most a
+							 * fifth of that in the
+							 * worst 1 kHz case and
+							 * nothing when idle is
+							 * deep. Inside the
+							 * budget: pure spin.
+							 * Beyond it: sleep at
+							 * least 1 ms even when
+							 * the floor rounds to
+							 * zero -- an overshoot
+							 * of half a tick beats
+							 * a burned core. The
+							 * tick keeps its
+							 * round-up: an early
+							 * wake there only burns
+							 * a pass.
+							 */
+							/*
+							 * ONE precise wait for
+							 * whichever bound is
+							 * nearer. The first
+							 * version gave only
+							 * gd-bounds the hires
+							 * wait and left the
+							 * tick on the coarse
+							 * one -- so a deadline
+							 * landing just behind
+							 * tick_due ate a full
+							 * coarse tick first,
+							 * which measured as a
+							 * bimodal distribution:
+							 * a quarter of sleeps
+							 * at 55-115 us (the
+							 * design working), the
+							 * rest at ~1 ms (the
+							 * tick standing in the
+							 * doorway). The tick
+							 * wake needs no
+							 * precision, but it
+							 * costs nothing to give
+							 * it some, and it must
+							 * never queue in front
+							 * of a deadline. The
+							 * 100 us undershoot is
+							 * only applied for gd:
+							 * the spin below covers
+							 * that tail; a tick
+							 * woken a hair early
+							 * just burns a pass.
+							 */
+							/*
+							 * The tick takes the
+							 * PLAIN ms wait; only
+							 * a guest deadline
+							 * takes the precise
+							 * one. Unifying them
+							 * was tried: it put
+							 * ~2000 timer arm+
+							 * cancel syscalls per
+							 * second per vCPU on
+							 * the box and made
+							 * every wake sloppier,
+							 * because the "high
+							 * resolution" timer's
+							 * delivery is itself
+							 * in question (see the
+							 * hires bit in the
+							 * verdict line). The
+							 * tick does not need
+							 * precision; it needs
+							 * to be cheap.
+							 */
+							if (bound == gd &&
+							    bound - now >= 9000ULL) {
+								/*
+								 * A far
+								 * deadline is
+								 * housekeeping
+								 * until proven
+								 * otherwise:
+								 * the shallow-
+								 * idle tick
+								 * publishes one
+								 * every guest
+								 * millisecond,
+								 * and giving
+								 * each the
+								 * precise
+								 * treatment --
+								 * two arms and
+								 * a spin per
+								 * millisecond
+								 * per vCPU --
+								 * ate a core
+								 * doing nothing
+								 * anyone could
+								 * feel. The
+								 * approved
+								 * accuracy
+								 * table (the
+								 * host's own
+								 * floor probe)
+								 * lands 1 ms+
+								 * requests one
+								 * tick late;
+								 * the plain
+								 * wait does
+								 * exactly that
+								 * for free. A
+								 * deadline that
+								 * starts inside
+								 * 900 us is a
+								 * real short
+								 * timer and
+								 * takes the
+								 * precise path
+								 * below.
+								 */
+								/*
+								 * ROUND UP:
+								 * housekeeping
+								 * must land
+								 * PAST its
+								 * deadline --
+								 * that is its
+								 * decades-old
+								 * contract.
+								 * Rounding
+								 * down woke
+								 * just short
+								 * of it half
+								 * the time and
+								 * handed every
+								 * such tick to
+								 * the precise
+								 * band for a
+								 * pointless
+								 * dance: 80k
+								 * spurious
+								 * passes per
+								 * 30 idle
+								 * seconds.
+								 */
+								unsigned int wait_ms =
+									(unsigned int)
+									((bound - now
+									  + 9999ULL)
+									 / 10000ULL);
+
+								if (wait_ms == 0)
+									wait_ms = 1;
+								idle_run++;
+								if (!co_os_idle_wait(
+									vcpu->index,
+									wait_ms))
+									pp->params[48] += 1;
+								gd = 0;	/* no spin */
+							} else if (bound == gd) {
+								/*
+								 * Aim the wake
+								 * one MEASURED
+								 * floor plus
+								 * one spin
+								 * budget short
+								 * of the
+								 * deadline.
+								 * The floor is
+								 * self-tested
+								 * at driver
+								 * load (517 us
+								 * on the box
+								 * that taught
+								 * us this; the
+								 * user-mode
+								 * probe read
+								 * 487-586); an
+								 * undershoot
+								 * SMALLER than
+								 * the floor
+								 * lands the
+								 * wake past
+								 * the deadline
+								 * and the spin
+								 * never runs,
+								 * which was
+								 * worth ~450 us
+								 * of pure loss
+								 * on every
+								 * sleep. Waking
+								 * inside
+								 * [gd-250us,
+								 * gd-150us]
+								 * lets the
+								 * spin finish
+								 * to micro-
+								 * seconds at a
+								 * hard 250 us
+								 * budget.
+								 */
+								/*
+								 * Aim AT the
+								 * deadline and
+								 * take the
+								 * floor's
+								 * landing --
+								 * the same deal
+								 * Windows gives
+								 * its own
+								 * processes
+								 * (min and p50
+								 * are near-
+								 * equal on the
+								 * host's own
+								 * probe). An
+								 * earlier build
+								 * undershot by
+								 * a measured
+								 * floor and
+								 * spun the
+								 * tail; it beat
+								 * the host OS
+								 * by 470 us per
+								 * sleep and
+								 * paid for the
+								 * flex in
+								 * visible CPU.
+								 * Nobody needs
+								 * a guest that
+								 * sleeps more
+								 * precisely
+								 * than its
+								 * host.
+								 */
+								/*
+								 * Aim AT the
+								 * deadline; the
+								 * floor is the
+								 * ARM-TO-WAKE
+								 * LATENCY, so
+								 * it is charged
+								 * automatically
+								 * on top of any
+								 * due time.
+								 * Clamping the
+								 * due time to
+								 * now+floor was
+								 * tried and
+								 * charged it
+								 * TWICE: p50
+								 * moved right
+								 * by one full
+								 * floor and the
+								 * minimum it
+								 * meant to slow
+								 * never came
+								 * from this
+								 * path at all.
+								 */
+								co_arch_tdl_path_mid++;
+								co_arch_tdl_branch_taken++;
+								idle_run++;
+								if (!co_os_idle_wait_until(
+									vcpu->index, bound))
+									pp->params[48] += 1;
+							} else {
+								unsigned int wait_ms =
+									(unsigned int)
+									((bound - now + 9999ULL)
+									 / 10000ULL);
+
+								if (wait_ms == 0)
+									wait_ms = 1;
+								idle_run++;
+								if (!co_os_idle_wait(
+									vcpu->index,
+									wait_ms))
+									pp->params[48] += 1;
+							}
+						}
+
+						/*
+						 * The sub-millisecond tail a
+						 * timed wait cannot reach:
+						 * spin it, on the CACHED
+						 * deadline -- the guest is
+						 * not running during this
+						 * wait, so the value cannot
+						 * move, and a CR3 walk per
+						 * spin iteration would be a
+						 * page-table walk per pause.
+						 * The 200 us budget is
+						 * enforced by the window
+						 * check: a wait that woke
+						 * early never buys a longer
+						 * spin.
+						 */
+						/*
+						 * Spin ONLY when the wait was
+						 * for the deadline: a doorbell
+						 * wake on a tick-bounded pass
+						 * that happens to land near
+						 * somebody's deadline must
+						 * not buy a spin -- at the
+						 * guest's 1 kHz shallow-idle
+						 * cadence those spins summed
+						 * to a visibly hot core for
+						 * no precision anyone asked
+						 * for.
+						 */
+						if (gd && bound == gd) {
+							now = co_os_monotonic_100ns();
+							if (now < gd &&
+							    gd - now < 2500ULL)
+								co_arch_tdl_spins++;
+							while (now < gd &&
+							       gd - now < 2500ULL &&
+							       !vcpu_abort_all) {
+								asm volatile("pause");
+								now = co_os_monotonic_100ns();
+							}
+						}
 					}
 
 					/*
@@ -6997,6 +7400,7 @@ co_rc_t co_arch_boot_loaded(co_manager_t* manager, co_arch_guest_space_t* space,
 	vcpu_ctl.tick_entry_va = in->tick_entry_va;
 	vcpu_ctl.virtual_if_va = in->virtual_if_va;
 	vcpu_ctl.ipi_pending_va = in->ipi_pending_va;
+	vcpu_ctl.timer_deadline_va = in->timer_deadline_va;
 	vcpu_ctl.async_cobd    = in->async_cobd;
 	vcpu_ctl.cobd_io_va    = in->cobd_io_va;
 	/*

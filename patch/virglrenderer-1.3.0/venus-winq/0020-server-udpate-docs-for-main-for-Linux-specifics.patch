@@ -1,0 +1,35 @@
+From ff8ba8f5e1f49179e241df70343102c9745a1c0a Mon Sep 17 00:00:00 2001
+From: Yiwei Zhang <zzyiwei@chromium.org>
+Date: Thu, 19 Mar 2026 13:10:48 -0700
+Subject: [PATCH] server: udpate docs for main for Linux specifics
+
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1607>
+---
+ server/main.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/server/main.c b/server/main.c
+index 90c6c624..83f22bc7 100644
+--- a/server/main.c
++++ b/server/main.c
+@@ -16,13 +16,13 @@
+  * up a socket pair, with one end owned by the worker and the other end sent
+  * to and owned by the client process.
+  *
+- * A worker can be a subprocess forked from the server process, or a thread
+- * created by the server process.  When a worker is a subprocess, the
+- * subprocess returns from render_server_main and enters render_context_main.
+- *
+  * When a worker is a thread, the thread enters render_context_main directly
+  * from its start function.  In this case, render_context_main must be
+  * thread-safe.
++ *
++ * When a worker is a process,
++ * - On Linux, it's a subprocess forked from the server process. It returns
++ *   from render_server_main and enters render_context_main.
+  */
+ int
+ main(int argc, char **argv)
+-- 
+2.55.0
+

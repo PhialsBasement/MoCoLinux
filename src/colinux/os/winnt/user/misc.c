@@ -351,3 +351,82 @@ unsigned int co_os_terminate_process_by_name(const char* image_name)
 	CloseHandle(snapshot);
 	return killed;
 }
+
+/*
+ * Guest RAM as a named shared section. See the contract in os/user/misc.h.
+ *
+ * Global\ so a service-session daemon and a console-session daemon find the
+ * same object; both run elevated, which carries SeCreateGlobalPrivilege. The
+ * section is pagefile-backed and committed up front -- the commit charge is
+ * the honest statement that this memory exists -- and both handles are
+ * deliberately leaked so the object's lifetime is exactly the union of the
+ * processes using it.
+ */
+#define CO_OS_GUEST_RAM_SECTION "Global\\MoCoLinuxGuestRAM"
+
+void* co_os_guest_ram_section_create(unsigned long long bytes,
+				     unsigned long long* actual_out)
+{
+	HANDLE section;
+	void* view;
+	MEMORY_BASIC_INFORMATION mbi;
+
+	if (actual_out)
+		*actual_out = 0;
+
+	section = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
+				     PAGE_READWRITE | SEC_COMMIT,
+				     (DWORD)(bytes >> 32),
+				     (DWORD)(bytes & 0xffffffffu),
+				     CO_OS_GUEST_RAM_SECTION);
+	if (section == NULL)
+		return NULL;
+
+	view = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+	if (view == NULL) {
+		CloseHandle(section);
+		return NULL;
+	}
+
+	/*
+	 * The size the OBJECT actually has, not the size that was asked for.
+	 *
+	 * CreateFileMapping on an existing name returns the existing object
+	 * "with its current size, not the specified size" (MSDN) -- and a
+	 * stale GPU daemon from a crashed run can be holding last boot's
+	 * object. If --mem grew between the runs, reporting the requested
+	 * size would send the driver probing past the view's real end, and
+	 * MmProbeAndLockPages answers that with a raise, not an error. The
+	 * driver is told what VirtualQuery can prove instead.
+	 */
+	memset(&mbi, 0, sizeof(mbi));
+	if (VirtualQuery(view, &mbi, sizeof(mbi)) == sizeof(mbi) && actual_out)
+		*actual_out = (unsigned long long)mbi.RegionSize;
+	return view;
+}
+
+void* co_os_guest_ram_section_open(unsigned long long* bytes_out)
+{
+	HANDLE section;
+	void* view;
+	MEMORY_BASIC_INFORMATION mbi;
+
+	if (bytes_out)
+		*bytes_out = 0;
+
+	section = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE,
+				   CO_OS_GUEST_RAM_SECTION);
+	if (section == NULL)
+		return NULL;
+
+	view = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+	if (view == NULL) {
+		CloseHandle(section);
+		return NULL;
+	}
+
+	memset(&mbi, 0, sizeof(mbi));
+	if (VirtualQuery(view, &mbi, sizeof(mbi)) == sizeof(mbi) && bytes_out)
+		*bytes_out = (unsigned long long)mbi.RegionSize;
+	return view;
+}

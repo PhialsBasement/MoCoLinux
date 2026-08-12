@@ -1,0 +1,4612 @@
+From 0e84243be47ec7e64c6c6fb1d32c9fa2833b264e Mon Sep 17 00:00:00 2001
+From: cmspam <cmspam@localhost>
+Date: Thu, 9 Apr 2026 03:41:39 +0900
+Subject: [PATCH] WINQ-EMU Alpha 1: Windows Venus port
+
+Complete Windows port of the Venus Vulkan forwarding protocol:
+- Win32 external memory translation shim (fd -> Win32 handles)
+- Push descriptor layout compatibility fix
+- Deferred object destruction for driver stability
+- GL error handling for Windows GL drivers
+- Queue creation lifetime fix
+- Proxy/server Windows socket and threading support
+---
+ README.md                                     |  67 ++
+ meson.build                                   |   7 +-
+ src/drm/drm-uapi/drm.h                        |  35 +
+ src/mesa/meson.build                          |   4 +-
+ src/mesa/util/anon_file.c                     |  60 ++
+ src/mesa/util/os_file.c                       | 141 ++++
+ src/mesa/util/os_file.h                       |  18 +
+ src/meson.build                               |   2 +
+ src/mman_win32.c                              |  29 +-
+ src/proxy/proxy_context.c                     |  86 ++-
+ src/proxy/proxy_server.c                      | 698 ++++++++++++++++-
+ src/proxy/proxy_server.h                      |   8 +
+ src/proxy/proxy_socket.c                      | 205 +++++
+ .../vn_protocol_renderer_info.h               |   6 +-
+ src/venus/vkr_allocator.c                     |  48 +-
+ src/venus/vkr_buffer.c                        |  62 ++
+ src/venus/vkr_context.c                       |  32 +-
+ src/venus/vkr_device.c                        | 379 +++++++++-
+ src/venus/vkr_device.h                        |  69 ++
+ src/venus/vkr_device_memory.c                 | 196 +++--
+ src/venus/vkr_library.c                       |  30 +-
+ src/venus/vkr_physical_device.c               | 188 ++++-
+ src/venus/vkr_physical_device.h               |   4 +
+ src/venus/vkr_queue.c                         |  92 ++-
+ src/venus/vkr_ring.c                          |  17 +-
+ src/venus/vkr_win32_shim.c                    | 702 ++++++++++++++++++
+ src/venus/vkr_win32_shim.h                    |  61 ++
+ src/virgl_resource.c                          |   4 +-
+ src/virgl_util.c                              |  31 +-
+ src/virglrenderer.c                           |  11 +-
+ src/vrend/vrend_formats.c                     |   6 +-
+ src/vrend/vrend_renderer.c                    |  25 +-
+ 32 files changed, 3169 insertions(+), 154 deletions(-)
+ create mode 100644 README.md
+ create mode 100644 src/venus/vkr_win32_shim.c
+ create mode 100644 src/venus/vkr_win32_shim.h
+
+diff --git a/README.md b/README.md
+new file mode 100644
+index 00000000..e1db9212
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,67 @@
++# WINQ-EMU virglrenderer
++
++**[Project Page](https://cmspam.github.io/winq-emu/)** | **[Download](https://github.com/cmspam/winq-emu/releases)**
++
++A fork of [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer) with a complete Windows port of the **Venus Vulkan forwarding protocol**, enabling Linux VMs to access the host GPU for hardware-accelerated Vulkan rendering via virtio-gpu.
++
++## What's Changed
++
++All changes are in the `winq-emu-alpha1` branch, applied as a single commit on top of upstream `main`.
++
++### Windows Venus Port
++- **Win32 external memory shim**: Translates POSIX fd-based memory/fence/semaphore operations to Win32 handle equivalents (`OPAQUE_FD` -> `OPAQUE_WIN32`)
++- **Buffer and image creation**: Remaps external memory handle types in creation info chains for Windows compatibility
++- **Proxy server threading**: Replaces Unix fork-based server with Windows in-process threading model using Win32 synchronization primitives
++- **Ring monitor**: Windows-compatible futex emulation using `WaitOnAddress`/`WakeByAddressSingle`
++
++### Stability Fixes
++- **Push descriptor layout fix**: Strips `VkDescriptorSetLayoutBindingFlagsCreateInfo` from push descriptor DSLs to prevent driver crashes on Windows
++- **Deferred object destruction**: Delays destruction of lightweight Vulkan objects (descriptor set layouts, pipelines, render passes, etc.) until device teardown to prevent handle reuse issues
++- **GL error drain**: Handles `GL_INVALID_ENUM` from `GL_SMOOTH_POINT_SIZE_RANGE`/`GL_SMOOTH_LINE_WIDTH_RANGE` on Windows GL drivers (via ANGLE)
++- **Queue creation fix**: Corrected use-after-free in queue info allocation
++
++## Building
++
++### Requirements (MSYS2 UCRT64)
++
++```bash
++pacman -S mingw-w64-ucrt64-x86_64-meson mingw-w64-ucrt64-x86_64-ninja \
++          mingw-w64-ucrt64-x86_64-gcc mingw-w64-ucrt64-x86_64-pkg-config \
++          mingw-w64-ucrt64-x86_64-libepoxy mingw-w64-ucrt64-x86_64-vulkan-headers \
++          mingw-w64-ucrt64-x86_64-vulkan-loader mingw-w64-ucrt64-x86_64-angleproject
++```
++
++### Build
++
++```bash
++meson setup builddir --prefix=/ucrt64
++ninja -C builddir
++```
++
++The output is `builddir/src/libvirglrenderer-1.dll`.
++
++## Syncing with Upstream
++
++This fork tracks [virglrenderer upstream](https://gitlab.freedesktop.org/virgl/virglrenderer). To sync:
++
++```bash
++git remote add upstream https://gitlab.freedesktop.org/virgl/virglrenderer.git
++git fetch upstream
++git checkout main
++git merge upstream/main
++git checkout winq-emu-alpha1
++git rebase main
++```
++
++## Related Projects
++
++- [winq-emu-qemu](https://github.com/cmspam/winq-emu-qemu) - QEMU fork with WHPX and Venus support
++- [winq-emu](https://github.com/cmspam/winq-emu) - Installer, launcher, and project page
++
++## License
++
++MIT License (same as upstream virglrenderer)
++
++## Contributing
++
++This is an alpha release. Anyone is welcome to look at, modify, and/or merge these changes into upstream projects.
+diff --git a/meson.build b/meson.build
+index 8e1c0767..a727d6f8 100644
+--- a/meson.build
++++ b/meson.build
+@@ -388,7 +388,10 @@ if with_venus
+       conf_data.set('ENABLE_VULKAN_PRELOAD', 1)
+    endif
+ 
+-   if with_render_server_worker == 'process'
++   if with_host_windows
++      # Windows always uses thread workers (in-process render server)
++      conf_data.set('ENABLE_RENDER_SERVER_WORKER_THREAD', 1)
++   elif with_render_server_worker == 'process'
+       conf_data.set('ENABLE_RENDER_SERVER_WORKER_PROCESS', 1)
+    elif with_render_server_worker == 'thread'
+       if not has_attribute_cleanup
+@@ -440,7 +443,7 @@ if not with_host_windows
+    subdir('vtest')
+ endif
+ 
+-if with_render_server
++if with_render_server and not with_host_windows
+ subdir('server')
+ endif
+ 
+diff --git a/src/drm/drm-uapi/drm.h b/src/drm/drm-uapi/drm.h
+index c5bd3e9a..88502c7d 100644
+--- a/src/drm/drm-uapi/drm.h
++++ b/src/drm/drm-uapi/drm.h
+@@ -41,6 +41,41 @@
+ #include <asm/ioctl.h>
+ typedef unsigned int drm_handle_t;
+ 
++#elif defined(_WIN32)
++
++#include <stdint.h>
++typedef int8_t   __s8;
++typedef uint8_t  __u8;
++typedef int16_t  __s16;
++typedef uint16_t __u16;
++typedef int32_t  __s32;
++typedef uint32_t __u32;
++typedef int64_t  __s64;
++typedef uint64_t __u64;
++typedef size_t   __kernel_size_t;
++typedef unsigned int drm_handle_t;
++
++/* ioctl direction and size macros (not used on Windows, but needed for
++ * virtgpu_drm.h struct definitions that reference DRM_IOWR etc.) */
++#define _IOC_NRBITS    8
++#define _IOC_TYPEBITS  8
++#define _IOC_SIZEBITS  14
++#define _IOC_DIRBITS   2
++#define _IOC_NRSHIFT   0
++#define _IOC_TYPESHIFT  (_IOC_NRSHIFT + _IOC_NRBITS)
++#define _IOC_SIZESHIFT  (_IOC_TYPESHIFT + _IOC_TYPEBITS)
++#define _IOC_DIRSHIFT   (_IOC_SIZESHIFT + _IOC_SIZEBITS)
++#define _IOC_NONE  0U
++#define _IOC_WRITE 1U
++#define _IOC_READ  2U
++#define _IOC(dir,type,nr,size) \
++   (((dir) << _IOC_DIRSHIFT) | ((type) << _IOC_TYPESHIFT) | \
++    ((nr) << _IOC_NRSHIFT) | ((size) << _IOC_SIZESHIFT))
++#define _IO(type,nr)        _IOC(_IOC_NONE,(type),(nr),0)
++#define _IOR(type,nr,size)  _IOC(_IOC_READ,(type),(nr),sizeof(size))
++#define _IOW(type,nr,size)  _IOC(_IOC_WRITE,(type),(nr),sizeof(size))
++#define _IOWR(type,nr,size) _IOC(_IOC_READ|_IOC_WRITE,(type),(nr),sizeof(size))
++
+ #else /* One of the BSDs */
+ 
+ #include <stdint.h>
+diff --git a/src/mesa/meson.build b/src/mesa/meson.build
+index cab8553a..2b4be54c 100644
+--- a/src/mesa/meson.build
++++ b/src/mesa/meson.build
+@@ -14,9 +14,7 @@ files_mesa = files(
+   'util/u_math.c',
+ )
+ 
+-if not with_host_windows
+-   files_mesa += files('util/anon_file.c')
+-endif
++files_mesa += files('util/anon_file.c')
+ 
+ deps_mesa = [
+   m_dep,
+diff --git a/src/mesa/util/anon_file.c b/src/mesa/util/anon_file.c
+index 4f8a5fb1..2370f27e 100644
+--- a/src/mesa/util/anon_file.c
++++ b/src/mesa/util/anon_file.c
+@@ -29,6 +29,13 @@
+ 
+ #include "anon_file.h"
+ 
++#ifdef _WIN32
++#include <windows.h>
++#include <io.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <stdint.h>
++#else
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include <errno.h>
+@@ -42,7 +49,9 @@
+ #else
+ #include <stdio.h>
+ #endif
++#endif /* _WIN32 */
+ 
++#ifndef _WIN32
+ #if !(defined(__FreeBSD__) || defined(HAVE_MEMFD_CREATE) || defined(HAVE_MKOSTEMP) || defined(__ANDROID__))
+ static int
+ set_cloexec_or_close(int fd)
+@@ -110,6 +119,56 @@ create_tmpfile_cloexec(char *tmpname)
+  * transmitting the file descriptor over Unix sockets using the
+  * SCM_RIGHTS methods.
+  */
++#endif /* !_WIN32 - close guard around helper functions */
++
++#ifdef _WIN32
++int
++os_create_anonymous_file(off_t size, const char *debug_name)
++{
++   char temp_path[MAX_PATH];
++   char temp_file[MAX_PATH];
++
++   DWORD path_len = GetTempPathA(MAX_PATH, temp_path);
++   if (!path_len || path_len >= MAX_PATH)
++      return -1;
++
++   UINT name_ret = GetTempFileNameA(temp_path,
++                                    (debug_name && debug_name[0]) ? debug_name : "vrg",
++                                    0, temp_file);
++   if (!name_ret)
++      return -1;
++
++   HANDLE file = CreateFileA(temp_file,
++                             GENERIC_READ | GENERIC_WRITE,
++                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                             NULL,
++                             CREATE_ALWAYS,
++                             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
++                             NULL);
++   if (file == INVALID_HANDLE_VALUE) {
++      DeleteFileA(temp_file);
++      return -1;
++   }
++
++   LARGE_INTEGER file_size;
++   file_size.QuadPart = size;
++   if (!SetFilePointerEx(file, file_size, NULL, FILE_BEGIN) ||
++       !SetEndOfFile(file)) {
++      CloseHandle(file);
++      DeleteFileA(temp_file);
++      return -1;
++   }
++
++   int fd = _open_osfhandle((intptr_t)file, _O_BINARY);
++   if (fd < 0) {
++      CloseHandle(file);
++      DeleteFileA(temp_file);
++      return -1;
++   }
++
++   return fd;
++}
++#else /* !_WIN32 */
+ int
+ os_create_anonymous_file(off_t size, const char *debug_name)
+ {
+@@ -160,3 +219,4 @@ os_create_anonymous_file(off_t size, const char *debug_name)
+ 
+    return fd;
+ }
++#endif /* !_WIN32 */
+diff --git a/src/mesa/util/os_file.c b/src/mesa/util/os_file.c
+index 5f79284e..f35b516b 100644
+--- a/src/mesa/util/os_file.c
++++ b/src/mesa/util/os_file.c
+@@ -12,6 +12,7 @@
+ #include <sys/stat.h>
+ 
+ #if DETECT_OS_WINDOWS
++#include <windows.h>
+ #include <io.h>
+ #define open _open
+ #define fdopen _fdopen
+@@ -25,6 +26,134 @@
+ #endif
+ #endif
+ 
++#if DETECT_OS_WINDOWS
++struct os_win32_handle_entry {
++   int token;
++   HANDLE handle;
++};
++
++static CRITICAL_SECTION os_win32_handle_mutex;
++static INIT_ONCE os_win32_handle_once = INIT_ONCE_STATIC_INIT;
++static struct os_win32_handle_entry *os_win32_handles;
++static size_t os_win32_handle_count;
++static size_t os_win32_handle_capacity;
++static LONG os_win32_next_token = 0x40000000;
++
++static BOOL CALLBACK
++os_win32_handle_init_once(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context)
++{
++   (void)InitOnce;
++   (void)Parameter;
++   (void)Context;
++   InitializeCriticalSection(&os_win32_handle_mutex);
++   return TRUE;
++}
++
++static void
++os_win32_handle_ensure_init(void)
++{
++   InitOnceExecuteOnce(&os_win32_handle_once, os_win32_handle_init_once, NULL, NULL);
++}
++
++static ptrdiff_t
++os_win32_handle_find_index_locked(int token)
++{
++   for (size_t i = 0; i < os_win32_handle_count; i++) {
++      if (os_win32_handles[i].token == token)
++         return (ptrdiff_t)i;
++   }
++
++   return -1;
++}
++
++static int
++os_win32_handle_insert(HANDLE handle)
++{
++   os_win32_handle_ensure_init();
++   EnterCriticalSection(&os_win32_handle_mutex);
++
++   if (os_win32_handle_count == os_win32_handle_capacity) {
++      size_t new_cap = os_win32_handle_capacity ? os_win32_handle_capacity * 2 : 16;
++      struct os_win32_handle_entry *new_entries =
++         realloc(os_win32_handles, new_cap * sizeof(*new_entries));
++      if (!new_entries) {
++         LeaveCriticalSection(&os_win32_handle_mutex);
++         return -1;
++      }
++
++      os_win32_handles = new_entries;
++      os_win32_handle_capacity = new_cap;
++   }
++
++   int token = InterlockedIncrement(&os_win32_next_token);
++   os_win32_handles[os_win32_handle_count++] = (struct os_win32_handle_entry){
++      .token = token,
++      .handle = handle,
++   };
++
++   LeaveCriticalSection(&os_win32_handle_mutex);
++   return token;
++}
++
++bool
++os_fd_is_handle_token(int fd)
++{
++   os_win32_handle_ensure_init();
++   EnterCriticalSection(&os_win32_handle_mutex);
++   const bool found = os_win32_handle_find_index_locked(fd) >= 0;
++   LeaveCriticalSection(&os_win32_handle_mutex);
++   return found;
++}
++
++HANDLE
++os_get_win32_handle_from_fd(int fd)
++{
++   intptr_t crt_handle = _get_osfhandle(fd);
++   if (crt_handle != -1)
++      return (HANDLE)crt_handle;
++
++   os_win32_handle_ensure_init();
++   EnterCriticalSection(&os_win32_handle_mutex);
++   const ptrdiff_t idx = os_win32_handle_find_index_locked(fd);
++   HANDLE handle = idx >= 0 ? os_win32_handles[idx].handle : INVALID_HANDLE_VALUE;
++   LeaveCriticalSection(&os_win32_handle_mutex);
++   return handle;
++}
++
++int
++os_wrap_win32_handle(HANDLE handle)
++{
++   if (!handle || handle == INVALID_HANDLE_VALUE)
++      return -1;
++
++   return os_win32_handle_insert(handle);
++}
++
++int
++os_close_fd(int fd)
++{
++   os_win32_handle_ensure_init();
++   EnterCriticalSection(&os_win32_handle_mutex);
++   const ptrdiff_t idx = os_win32_handle_find_index_locked(fd);
++   if (idx >= 0) {
++      HANDLE handle = os_win32_handles[idx].handle;
++      os_win32_handles[idx] = os_win32_handles[os_win32_handle_count - 1];
++      os_win32_handle_count--;
++      LeaveCriticalSection(&os_win32_handle_mutex);
++      return CloseHandle(handle) ? 0 : -1;
++   }
++   LeaveCriticalSection(&os_win32_handle_mutex);
++
++   return _close(fd);
++}
++#else
++int
++os_close_fd(int fd)
++{
++   return close(fd);
++}
++#endif
++
+ 
+ FILE *
+ os_file_create_unique(const char *filename, int filemode)
+@@ -40,6 +169,18 @@ os_file_create_unique(const char *filename, int filemode)
+ int
+ os_dupfd_cloexec(int fd)
+ {
++   if (os_fd_is_handle_token(fd)) {
++      HANDLE handle = os_get_win32_handle_from_fd(fd);
++      HANDLE dup_handle = NULL;
++      if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup_handle,
++                           0, FALSE, DUPLICATE_SAME_ACCESS)) {
++         errno = EBADF;
++         return -1;
++      }
++
++      return os_wrap_win32_handle(dup_handle);
++   }
++
+    /*
+     * On Windows child processes don't inherit handles by default:
+     * https://devblogs.microsoft.com/oldnewthing/20111216-00/?p=8873
+diff --git a/src/mesa/util/os_file.h b/src/mesa/util/os_file.h
+index 0c69eeaa..f73f286b 100644
+--- a/src/mesa/util/os_file.h
++++ b/src/mesa/util/os_file.h
+@@ -11,6 +11,10 @@
+ #include <stdbool.h>
+ #include <stdio.h>
+ 
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
+ #ifdef  __cplusplus
+ extern "C" {
+ #endif
+@@ -30,6 +34,20 @@ os_file_create_unique(const char *filename, int filemode);
+ int
+ os_dupfd_cloexec(int fd);
+ 
++int
++os_close_fd(int fd);
++
++#ifdef _WIN32
++bool
++os_fd_is_handle_token(int fd);
++
++HANDLE
++os_get_win32_handle_from_fd(int fd);
++
++int
++os_wrap_win32_handle(HANDLE handle);
++#endif
++
+ /*
+  * Read a file.
+  * Returns a char* that the caller must free(), or NULL and sets errno.
+diff --git a/src/meson.build b/src/meson.build
+index ed677f38..1f317647 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -84,6 +84,7 @@ venus_sources = [
+    'venus/vkr_renderer.c',
+    'venus/vkr_ring.c',
+    'venus/vkr_transport.c',
++   'venus/vkr_win32_shim.c',
+ ]
+ 
+ venus_codegen = custom_target(
+@@ -238,6 +239,7 @@ endif
+ 
+ if with_host_windows
+   virgl_sources += ['mman_win32.c']
++  virgl_depends += [meson.get_compiler('c').find_library('ws2_32')]
+ endif
+ 
+ libvirgl = static_library(
+diff --git a/src/mman_win32.c b/src/mman_win32.c
+index 9f3eab4e..9462cef1 100644
+--- a/src/mman_win32.c
++++ b/src/mman_win32.c
+@@ -113,16 +113,29 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fildes, intptr_t off
+       return MAP_FAILED;
+    }
+ 
+-   h = ((flags & MAP_ANONYMOUS) == 0) ?
+-      (HANDLE)_get_osfhandle(fildes) : INVALID_HANDLE_VALUE;
+-
+-   if ((flags & MAP_ANONYMOUS) == 0 && h == INVALID_HANDLE_VALUE) {
+-      errno = EBADF;
+-      return MAP_FAILED;
++   if ((flags & MAP_ANONYMOUS) != 0) {
++      h = INVALID_HANDLE_VALUE;
++   } else {
++      h = (HANDLE)_get_osfhandle(fildes);
++      if (h == INVALID_HANDLE_VALUE) {
++         /* fildes may be a raw HANDLE (e.g. from CreateFileMapping passed as int
++          * through the Venus proxy protocol). Try using it directly.
++          */
++         h = (HANDLE)(intptr_t)fildes;
++      }
+    }
+ 
+    fm = CreateFileMappingW(h, NULL, protect, dwMaxSizeHigh, dwMaxSizeLow, NULL);
+ 
++   if (fm == NULL && (flags & MAP_ANONYMOUS) == 0) {
++      /* h may already be a file mapping handle (e.g. from os_create_anonymous_file
++       * which wraps CreateFileMapping + _open_osfhandle). CreateFileMapping fails
++       * when given a mapping handle instead of a file handle. Try using h directly.
++       */
++      fm = h;
++      h = NULL; /* signal that we're borrowing, not owning fm */
++   }
++
+    if (fm == NULL) {
+       errno = __map_mman_error(GetLastError(), EPERM);
+       return MAP_FAILED;
+@@ -134,7 +147,9 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fildes, intptr_t off
+       map = MapViewOfFileEx(fm, desiredAccess, dwFileOffsetHigh, dwFileOffsetLow, len, addr);
+    }
+ 
+-   CloseHandle(fm);
++   /* Only close fm if we created it (h != NULL means we own fm) */
++   if (h != NULL)
++      CloseHandle(fm);
+ 
+    if (map == NULL) {
+       errno = __map_mman_error(GetLastError(), EPERM);
+diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
+index dc23ef58..c6b6d819 100644
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -6,13 +6,21 @@
+ #include "proxy_context.h"
+ 
+ #include <fcntl.h>
++#ifdef _WIN32
++#include <windows.h>
++#include <io.h>
++#include <winsock2.h>
++#include "mman_win32.h"
++#else
+ #include <poll.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
++#endif
+ 
+ #include "server/render_protocol.h"
+ #include "util/anon_file.h"
+ #include "util/bitscan.h"
++#include "util/os_file.h"
+ 
+ #include "proxy_client.h"
+ 
+@@ -165,19 +173,27 @@ static int
+ proxy_context_sync_thread(void *arg)
+ {
+    struct proxy_context *ctx = arg;
+-   struct pollfd poll_fds[2] = {
+-      [0] = {
+-         .fd = ctx->sync_thread.fence_eventfd,
+-         .events = POLLIN,
+-      },
+-      [1] = {
+-         .fd = ctx->socket.fd,
+-      },
+-   };
+ 
+    assert(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB);
+ 
+    while (!ctx->sync_thread.stop) {
++#ifdef _WIN32
++      HANDLE event = (HANDLE)_get_osfhandle(ctx->sync_thread.fence_eventfd);
++      DWORD wait_ret = WaitForSingleObject(event, 100); /* 100ms timeout */
++      if (wait_ret == WAIT_FAILED) {
++         proxy_log("failed to wait on fence event");
++         break;
++      }
++#else
++      struct pollfd poll_fds[2] = {
++         [0] = {
++            .fd = ctx->sync_thread.fence_eventfd,
++            .events = POLLIN,
++         },
++         [1] = {
++            .fd = ctx->socket.fd,
++         },
++      };
+       const int ret = poll(poll_fds, ARRAY_SIZE(poll_fds), -1);
+       if (ret <= 0) {
+          if (ret < 0 && (errno == EINTR || errno == EAGAIN))
+@@ -186,6 +202,7 @@ proxy_context_sync_thread(void *arg)
+          proxy_log("failed to poll fence eventfd");
+          break;
+       }
++#endif
+ 
+       proxy_context_retire_fences_internal(ctx);
+    }
+@@ -346,14 +363,14 @@ proxy_context_get_blob(struct virgl_context *base,
+     */
+    struct proxy_context *ctx = (struct proxy_context *)base;
+ 
+-   const struct render_context_op_create_resource_request req = {
+-      .header.op = RENDER_CONTEXT_OP_CREATE_RESOURCE,
+-      .res_id = res_id,
+-      .blob_id = blob_id,
+-      .blob_size = blob_size,
+-      .blob_flags = blob_flags,
++   const struct render_context_op_header hdr = {
++      .op = RENDER_CONTEXT_OP_CREATE_RESOURCE,
+    };
+-   if (!proxy_socket_send_request(&ctx->socket, &req, sizeof(req))) {
++   if (!proxy_socket_send_request(&ctx->socket, &hdr, sizeof(hdr)) ||
++       !proxy_socket_send_request(&ctx->socket, &res_id, sizeof(res_id)) ||
++       !proxy_socket_send_request(&ctx->socket, &blob_id, sizeof(blob_id)) ||
++       !proxy_socket_send_request(&ctx->socket, &blob_size, sizeof(blob_size)) ||
++       !proxy_socket_send_request(&ctx->socket, &blob_flags, sizeof(blob_flags))) {
+       proxy_log("failed to get blob %" PRIu64, blob_id);
+       return -1;
+    }
+@@ -383,16 +400,23 @@ proxy_context_get_blob(struct virgl_context *base,
+       reply_fd_valid = true;
+       break;
+    case VIRGL_RESOURCE_FD_SHM:
++#ifdef _WIN32
++      /* On Windows, the fd is a raw HANDLE from CreateFileMapping.
++       * File seals and lseek validation don't apply.
++       */
++      reply_fd_valid = true;
++#else
+       /* validate the seals and size here */
+       reply_fd_valid = !add_required_seals_to_fd(reply_fd) &&
+                        validate_resource_fd_shm(reply_fd, blob_size);
++#endif
+       break;
+    default:
+       break;
+    }
+    if (!reply_fd_valid) {
+       proxy_log("invalid fd type %d for blob %" PRIu64, reply.fd_type, blob_id);
+-      close(reply_fd);
++      os_close_fd(reply_fd);
+       return -1;
+    }
+ 
+@@ -471,7 +495,7 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource
+       if (res_fd_type != VIRGL_RESOURCE_FD_DMABUF) {
+          /* close fd for unexpected fd type from succeeded export */
+          if (res_fd_type != VIRGL_RESOURCE_FD_INVALID)
+-            close(res_fd);
++            os_close_fd(res_fd);
+          proxy_log("exported res %d to unexpected fd_type %d", res_id, res_fd_type);
+          return;
+       }
+@@ -496,7 +520,7 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource
+       proxy_log("failed to attach res %d", res_id);
+ 
+    if (res_fd >= 0 && close_res_fd)
+-      close(res_fd);
++      os_close_fd(res_fd);
+ 
+    proxy_context_resource_add(ctx, res_id);
+ }
+@@ -517,13 +541,13 @@ proxy_context_destroy(struct virgl_context *base)
+          thrd_join(ctx->sync_thread.thread, NULL);
+       }
+ 
+-      close(ctx->sync_thread.fence_eventfd);
++      os_close_fd(ctx->sync_thread.fence_eventfd);
+    }
+ 
+    if (ctx->shmem.ptr)
+       munmap(ctx->shmem.ptr, ctx->shmem.size);
+    if (ctx->shmem.fd >= 0)
+-      close(ctx->shmem.fd);
++      os_close_fd(ctx->shmem.fd);
+ 
+    if (ctx->timeline_seqnos) {
+       for (uint32_t i = 0; i < PROXY_CONTEXT_TIMELINE_COUNT; i++) {
+@@ -632,7 +656,7 @@ alloc_memfd(const char *name, size_t size, void **out_ptr)
+    return fd;
+ 
+ fail:
+-   close(fd);
++   os_close_fd(fd);
+    return -1;
+ }
+ 
+@@ -652,11 +676,17 @@ proxy_context_init_shmem(struct proxy_context *ctx)
+ static bool
+ proxy_context_init(struct proxy_context *ctx, uint32_t ctx_flags)
+ {
+-   if (!proxy_context_init_shmem(ctx) || !proxy_context_init_timelines(ctx) ||
+-       !proxy_context_init_fencing(ctx) || !proxy_context_resource_table_init(ctx)) {
+-      proxy_log("failed to pre-initialize context");
+-      return false;
+-   }
++   bool shmem_ok = proxy_context_init_shmem(ctx);
++   if (!shmem_ok) { proxy_log("failed shmem"); return false; }
++
++   bool timelines_ok = proxy_context_init_timelines(ctx);
++   if (!timelines_ok) { proxy_log("failed timelines"); return false; }
++
++   bool fencing_ok = proxy_context_init_fencing(ctx);
++   if (!fencing_ok) { proxy_log("failed fencing"); return false; }
++
++   bool table_ok = proxy_context_resource_table_init(ctx);
++   if (!table_ok) { proxy_log("failed table"); return false; }
+ 
+    const struct render_context_op_init_request req = {
+       .header.op = RENDER_CONTEXT_OP_INIT,
+@@ -691,7 +721,7 @@ proxy_context_create(uint32_t ctx_id,
+ 
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+-      close(ctx_fd);
++      os_close_fd(ctx_fd);
+       return NULL;
+    }
+ 
+diff --git a/src/proxy/proxy_server.c b/src/proxy/proxy_server.c
+index c643f74d..ecb34432 100644
+--- a/src/proxy/proxy_server.c
++++ b/src/proxy/proxy_server.c
+@@ -5,9 +5,16 @@
+ 
+ #include "proxy_server.h"
+ 
++#ifdef _WIN32
++#include <windows.h>
++#include <errno.h>
++#include <io.h>
++#include "mman_win32.h"
++#else
+ #include <signal.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
++#endif
+ 
+ #include "server/render_protocol.h"
+ 
+@@ -23,19 +30,687 @@ proxy_server_connect(struct proxy_server *srv)
+ void
+ proxy_server_destroy(struct proxy_server *srv)
+ {
++#ifdef _WIN32
++   /* The server thread will exit when the socket is closed */
++#else
+    if (srv->pid >= 0) {
+       kill(srv->pid, SIGKILL);
+ 
+       siginfo_t siginfo = { 0 };
+       waitid(P_PID, srv->pid, &siginfo, WEXITED);
+    }
++#endif
+ 
+-   if (srv->client_fd >= 0)
++   if (srv->client_fd >= 0) {
++#ifdef _WIN32
++      closesocket((SOCKET)srv->client_fd);
++#else
+       close(srv->client_fd);
++#endif
++   }
+ 
+    free(srv);
+ }
+ 
++#ifdef _WIN32
++/*
++ * Windows in-process render server
++ *
++ * On Unix, the render server runs as a separate process spawned via fork+exec.
++ * On Windows, we run it as an in-process thread. Each Venus context gets its
++ * own worker thread that calls vkr_renderer_* functions directly.
++ *
++ * Communication uses the same protocol (render_protocol.h) over TCP localhost
++ * sockets. Since all threads share the process handle table, file
++ * descriptors/handles can be passed as inline integers.
++ */
++
++#include "c11/threads.h"
++#include "vkr_renderer.h"
++#include "virgl_util.h"
++
++/* matches PROXY_CONTEXT_TIMELINE_COUNT in proxy_context.h */
++#define SERVER_TIMELINE_COUNT 64
++
++struct server_context_worker {
++   uint32_t ctx_id;
++   char name[32];
++   uint32_t name_len;
++   int socket_fd;
++
++   /* shared memory for timeline seqnos (mapped by proxy_context) */
++   void *shmem_ptr;
++   size_t shmem_size;
++   int shmem_fd;
++   atomic_uint *timeline_seqnos;
++   int timeline_count;
++   int fence_eventfd;
++
++   thrd_t thread;
++   struct list_head head;
++};
++
++struct server_thread_state {
++   int socket_fd;
++   uint32_t init_flags;
++
++   mtx_t renderer_mutex;
++   bool vkr_initialized;
++
++   mtx_t workers_mutex;
++   struct list_head workers;
++};
++
++/* global state for the retire_fence callback */
++static struct server_thread_state *g_server_state;
++
++static bool
++server_recv_all(int fd, void *data, size_t len)
++{
++   char *p = data;
++   while (len > 0) {
++      int got = recv((SOCKET)fd, p, (int)len, 0);
++      if (got <= 0)
++         return false;
++      p += got;
++      len -= got;
++   }
++   return true;
++}
++
++static bool
++server_send_all(int fd, const void *data, size_t len)
++{
++   const char *p = data;
++   while (len > 0) {
++      int sent = send((SOCKET)fd, p, (int)len, 0);
++      if (sent <= 0)
++         return false;
++      p += sent;
++      len -= sent;
++   }
++   return true;
++}
++
++static bool
++server_recv_with_fds(int fd, void *data, size_t size,
++                     int *fds, int max_fds, int *out_fd_count)
++{
++   if (!server_recv_all(fd, data, size))
++      return false;
++
++   uint32_t fd_count = 0;
++   if (!server_recv_all(fd, &fd_count, sizeof(fd_count)))
++      return false;
++
++   if ((int)fd_count > max_fds) {
++      proxy_log("server: too many fds: %u", fd_count);
++      return false;
++   }
++
++   if (fd_count > 0) {
++      if (!server_recv_all(fd, fds, sizeof(int) * fd_count))
++         return false;
++   }
++
++   *out_fd_count = (int)fd_count;
++   return true;
++}
++
++static bool
++server_send_reply(int fd, const void *data, size_t size)
++{
++   return server_send_all(fd, data, size);
++}
++
++static bool
++server_send_reply_with_fds(int fd, const void *data, size_t size,
++                           const int *fds, int fd_count)
++{
++   if (!server_send_all(fd, data, size))
++      return false;
++
++   uint32_t count = (uint32_t)fd_count;
++   if (!server_send_all(fd, &count, sizeof(count)))
++      return false;
++
++   if (fd_count > 0) {
++      if (!server_send_all(fd, fds, sizeof(int) * fd_count))
++         return false;
++   }
++   return true;
++}
++
++static struct server_context_worker *
++server_find_worker(struct server_thread_state *state, uint32_t ctx_id)
++{
++   list_for_each_entry(struct server_context_worker, w, &state->workers, head) {
++      if (w->ctx_id == ctx_id)
++         return w;
++   }
++   return NULL;
++}
++
++/*
++ * VKR fence retirement callback.
++ *
++ * Called from VKR sync threads when a fence signals. Updates the shared
++ * memory timeline seqno and optionally signals the eventfd.
++ */
++static void
++server_retire_fence_cb(uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id)
++{
++   struct server_thread_state *state = g_server_state;
++   if (!state)
++      return;
++
++   mtx_lock(&state->workers_mutex);
++   struct server_context_worker *w = server_find_worker(state, ctx_id);
++   if (w && w->timeline_seqnos && (int)ring_idx < w->timeline_count) {
++      uint32_t seqno = (uint32_t)fence_id;
++      atomic_store(&w->timeline_seqnos[ring_idx], seqno);
++      if (w->fence_eventfd >= 0)
++         write_eventfd(w->fence_eventfd, 1);
++   }
++   mtx_unlock(&state->workers_mutex);
++}
++
++static void
++server_cb_debug_logger(UNUSED enum virgl_log_level_flags log_level,
++                       const char *message,
++                       UNUSED void *user_data)
++{
++   fputs("vkr: ", stderr);
++   fputs(message, stderr);
++   fflush(stderr);
++
++   FILE *f = fopen("venus-server.log",
++                   "a");
++   if (f) {
++      fputs("vkr: ", f);
++      fputs(message, f);
++      fclose(f);
++   }
++}
++
++static const struct vkr_renderer_callbacks server_vkr_cbs = {
++   .debug_logger = server_cb_debug_logger,
++   .retire_fence = server_retire_fence_cb,
++};
++
++static FILE *
++server_dbgf(const char *fmt, ...)
++{
++   static FILE *f = NULL;
++   if (!f)
++      f = fopen("venus-server.log", "a");
++   if (f) {
++      va_list ap;
++      va_start(ap, fmt);
++      vfprintf(f, fmt, ap);
++      va_end(ap);
++      fflush(f);
++   }
++   return f;
++}
++
++static bool
++server_ensure_vkr_init(struct server_thread_state *state)
++{
++   mtx_lock(&state->renderer_mutex);
++   if (!state->vkr_initialized) {
++      static const uint32_t vkr_flags =
++         VKR_RENDERER_THREAD_SYNC | VKR_RENDERER_ASYNC_FENCE_CB;
++      server_dbgf("vkr_renderer_init flags=0x%x\n", vkr_flags);
++      if (!vkr_renderer_init(vkr_flags, &server_vkr_cbs)) {
++         mtx_unlock(&state->renderer_mutex);
++         server_dbgf("vkr_renderer_init FAILED\n");
++         proxy_log("server: failed to init vkr renderer");
++         return false;
++      }
++      state->vkr_initialized = true;
++      server_dbgf("vkr_renderer_init OK\n");
++   }
++   mtx_unlock(&state->renderer_mutex);
++   return true;
++}
++
++/*
++ * Context worker thread — handles per-context operations.
++ *
++ * Each Venus context gets its own worker thread that processes commands
++ * from the proxy_context on the QEMU side.
++ */
++static int
++server_context_worker_thread(void *arg)
++{
++   struct server_context_worker *w = arg;
++   struct server_thread_state *state = g_server_state;
++   bool ctx_created = false;
++
++   while (true) {
++      struct render_context_op_header hdr;
++      if (!server_recv_all(w->socket_fd, &hdr, sizeof(hdr))) {
++         break;
++      }
++
++      switch (hdr.op) {
++      case RENDER_CONTEXT_OP_INIT: {
++         /* Read remaining fields after header.
++          * Must read fields individually to avoid struct padding issues
++          * (uint32_t followed by size_t gets 4 bytes of padding on 64-bit).
++          */
++         uint32_t init_flags;
++         size_t init_shmem_size;
++         if (!server_recv_all(w->socket_fd, &init_flags, sizeof(init_flags)))
++            goto done;
++         if (!server_recv_all(w->socket_fd, &init_shmem_size, sizeof(init_shmem_size)))
++            goto done;
++
++         int fds[2];
++         uint32_t fd_count = 0;
++         if (!server_recv_all(w->socket_fd, &fd_count, sizeof(fd_count)))
++            goto done;
++         if (fd_count < 1 || fd_count > 2) {
++            proxy_log("server worker: bad fd count %u for INIT", fd_count);
++            goto done;
++         }
++         if (!server_recv_all(w->socket_fd, fds, sizeof(int) * fd_count))
++            goto done;
++
++         w->shmem_fd = fds[0];
++         w->fence_eventfd = (fd_count >= 2) ? fds[1] : -1;
++         w->shmem_size = init_shmem_size;
++         w->timeline_count = (int)(init_shmem_size / sizeof(atomic_uint));
++
++         /* Map shared memory through mmap so both CRT fds and any Windows
++          * handle-backed fd variants follow the same path.
++          */
++         w->shmem_ptr = mmap(NULL, w->shmem_size, PROT_READ | PROT_WRITE,
++                             MAP_SHARED, w->shmem_fd, 0);
++         if (w->shmem_ptr == MAP_FAILED) {
++            goto done;
++         }
++         w->timeline_seqnos = (atomic_uint *)w->shmem_ptr;
++
++         for (int i = 0; i < w->timeline_count; i++)
++            atomic_store(&w->timeline_seqnos[i], 0);
++
++         /* Initialize VKR renderer if needed */
++         if (!server_ensure_vkr_init(state)) {
++            goto done;
++         }
++
++         /* Create the VKR context */
++         mtx_lock(&state->renderer_mutex);
++         bool ok = vkr_renderer_create_context(w->ctx_id, init_flags,
++                                               w->name_len, w->name);
++         mtx_unlock(&state->renderer_mutex);
++         if (!ok) {
++            proxy_log("server worker: failed to create vkr context %u", w->ctx_id);
++            goto done;
++         }
++         ctx_created = true;
++         break;
++      }
++
++      case RENDER_CONTEXT_OP_SUBMIT_CMD: {
++         struct {
++            uint32_t size;
++            char cmd[256];
++         } cmd_body;
++         if (!server_recv_all(w->socket_fd, &cmd_body,
++                              sizeof(cmd_body.size) + sizeof(cmd_body.cmd)))
++            goto done;
++
++         void *cmd = cmd_body.cmd;
++         void *large_cmd = NULL;
++         if (cmd_body.size > sizeof(cmd_body.cmd)) {
++            large_cmd = malloc(cmd_body.size);
++            if (!large_cmd)
++               goto done;
++            memcpy(large_cmd, cmd_body.cmd, sizeof(cmd_body.cmd));
++            size_t remain = cmd_body.size - sizeof(cmd_body.cmd);
++            if (!server_recv_all(w->socket_fd,
++                                 (char *)large_cmd + sizeof(cmd_body.cmd),
++                                 remain)) {
++               free(large_cmd);
++               goto done;
++            }
++            cmd = large_cmd;
++         }
++
++         mtx_lock(&state->renderer_mutex);
++         bool cmd_ok = vkr_renderer_submit_cmd(w->ctx_id, cmd, cmd_body.size);
++         mtx_unlock(&state->renderer_mutex);
++         (void)cmd_ok;
++
++         free(large_cmd);
++         break;
++      }
++
++      case RENDER_CONTEXT_OP_SUBMIT_FENCE: {
++         struct {
++            uint32_t flags;
++            uint32_t ring_index;
++            uint32_t seqno;
++         } fence_body;
++         if (!server_recv_all(w->socket_fd, &fence_body, sizeof(fence_body)))
++            goto done;
++
++         mtx_lock(&state->renderer_mutex);
++         vkr_renderer_submit_fence(w->ctx_id,
++                                   VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
++                                   fence_body.ring_index,
++                                   fence_body.seqno);
++         mtx_unlock(&state->renderer_mutex);
++         break;
++      }
++
++      case RENDER_CONTEXT_OP_CREATE_RESOURCE: {
++         /* Read fields individually to avoid struct padding between
++          * uint32_t res_id and uint64_t blob_id (4 bytes padding on 64-bit).
++          */
++         uint32_t res_id;
++         uint64_t blob_id;
++         uint64_t blob_size;
++         uint32_t blob_flags;
++         if (!server_recv_all(w->socket_fd, &res_id, sizeof(res_id)) ||
++             !server_recv_all(w->socket_fd, &blob_id, sizeof(blob_id)) ||
++             !server_recv_all(w->socket_fd, &blob_size, sizeof(blob_size)) ||
++             !server_recv_all(w->socket_fd, &blob_flags, sizeof(blob_flags)))
++            goto done;
++
++         struct render_context_op_create_resource_reply reply = {
++            .fd_type = VIRGL_RESOURCE_FD_INVALID,
++         };
++         int res_fd = -1;
++
++         mtx_lock(&state->renderer_mutex);
++         bool ok = vkr_renderer_create_resource(
++            w->ctx_id, res_id, blob_id,
++            blob_size, blob_flags,
++            &reply.fd_type, &res_fd, &reply.map_info,
++            &reply.vulkan_info);
++         mtx_unlock(&state->renderer_mutex);
++
++         if (!ok || res_fd < 0) {
++            reply.fd_type = VIRGL_RESOURCE_FD_INVALID;
++            server_send_reply(w->socket_fd, &reply, sizeof(reply));
++         } else {
++            server_send_reply_with_fds(w->socket_fd, &reply, sizeof(reply),
++                                       &res_fd, 1);
++         }
++         break;
++      }
++
++      case RENDER_CONTEXT_OP_IMPORT_RESOURCE: {
++         struct {
++            uint32_t res_id;
++            enum virgl_resource_fd_type fd_type;
++            uint64_t size;
++         } imp_body;
++
++         int fds[1];
++         int fd_count;
++         if (!server_recv_with_fds(w->socket_fd, &imp_body, sizeof(imp_body),
++                                   fds, 1, &fd_count))
++            goto done;
++
++         if (fd_count != 1) {
++            proxy_log("server worker: import resource missing fd");
++            break;
++         }
++
++         mtx_lock(&state->renderer_mutex);
++         vkr_renderer_import_resource(w->ctx_id, imp_body.res_id,
++                                      imp_body.fd_type, fds[0], imp_body.size);
++         mtx_unlock(&state->renderer_mutex);
++         break;
++      }
++
++      case RENDER_CONTEXT_OP_DESTROY_RESOURCE: {
++         struct {
++            uint32_t res_id;
++         } destroy_body;
++         if (!server_recv_all(w->socket_fd, &destroy_body, sizeof(destroy_body)))
++            goto done;
++
++         mtx_lock(&state->renderer_mutex);
++         vkr_renderer_destroy_resource(w->ctx_id, destroy_body.res_id);
++         mtx_unlock(&state->renderer_mutex);
++         break;
++      }
++
++      case RENDER_CONTEXT_OP_NOP:
++         break;
++
++      default:
++         proxy_log("server worker: unknown op %d", hdr.op);
++         goto done;
++      }
++   }
++
++done:
++   proxy_log("server worker: exiting ctx %u", w->ctx_id);
++
++   if (ctx_created) {
++      mtx_lock(&state->renderer_mutex);
++      vkr_renderer_destroy_context(w->ctx_id);
++      mtx_unlock(&state->renderer_mutex);
++   }
++
++   if (w->shmem_ptr)
++      UnmapViewOfFile(w->shmem_ptr);
++
++   closesocket((SOCKET)w->socket_fd);
++   return 0;
++}
++
++static void
++server_destroy_worker(struct server_thread_state *state,
++                      struct server_context_worker *w)
++{
++   /* Close our end; worker thread will exit when recv fails */
++   closesocket((SOCKET)w->socket_fd);
++   thrd_join(w->thread, NULL);
++
++   list_del(&w->head);
++   free(w);
++}
++
++/*
++ * Server main thread — handles client protocol messages.
++ *
++ * This is the Windows replacement for the forked render_server process.
++ */
++static int
++server_main_thread(void *arg)
++{
++   struct server_thread_state *state = arg;
++
++   {
++      /* Debug: write directly to a file to confirm thread started */
++      FILE *tf = fopen("venus-thread.log", "w");
++      if (tf) {
++         fprintf(tf, "server_main_thread STARTED fd=%d\n", state->socket_fd);
++         fflush(tf);
++         fclose(tf);
++      }
++   }
++
++   while (true) {
++      struct render_client_op_header hdr;
++      if (!server_recv_all(state->socket_fd, &hdr, sizeof(hdr))) {
++         break;
++      }
++
++      switch (hdr.op) {
++      case RENDER_CLIENT_OP_INIT: {
++         uint32_t flags;
++         if (!server_recv_all(state->socket_fd, &flags, sizeof(flags)))
++            goto done;
++         state->init_flags = flags;
++         break;
++      }
++
++      case RENDER_CLIENT_OP_CREATE_CONTEXT: {
++         struct {
++            uint32_t ctx_id;
++            char ctx_name[32];
++         } ctx_body;
++         if (!server_recv_all(state->socket_fd, &ctx_body, sizeof(ctx_body)))
++            goto done;
++
++         /* Create socketpair for worker <-> proxy_context */
++         int socket_fds[2];
++         if (!proxy_socket_pair(socket_fds)) {
++            struct render_client_op_create_context_reply reply = { .ok = false };
++            server_send_reply_with_fds(state->socket_fd, &reply, sizeof(reply),
++                                       NULL, 0);
++            break;
++         }
++
++         struct server_context_worker *w = calloc(1, sizeof(*w));
++         if (!w) {
++            closesocket((SOCKET)socket_fds[0]);
++            closesocket((SOCKET)socket_fds[1]);
++            struct render_client_op_create_context_reply reply = { .ok = false };
++            server_send_reply_with_fds(state->socket_fd, &reply, sizeof(reply),
++                                       NULL, 0);
++            break;
++         }
++
++         w->ctx_id = ctx_body.ctx_id;
++         w->name_len = (uint32_t)strnlen(ctx_body.ctx_name,
++                                         sizeof(ctx_body.ctx_name) - 1);
++         memcpy(w->name, ctx_body.ctx_name, w->name_len);
++         w->name[w->name_len] = '\0';
++         w->socket_fd = socket_fds[0];
++         w->shmem_fd = -1;
++         w->fence_eventfd = -1;
++
++         int ret = thrd_create(&w->thread, server_context_worker_thread, w);
++         if (ret != thrd_success) {
++            proxy_log("server thread: failed to create worker thread");
++            closesocket((SOCKET)socket_fds[0]);
++            closesocket((SOCKET)socket_fds[1]);
++            free(w);
++            struct render_client_op_create_context_reply reply = { .ok = false };
++            server_send_reply_with_fds(state->socket_fd, &reply, sizeof(reply),
++                                       NULL, 0);
++            break;
++         }
++
++         mtx_lock(&state->workers_mutex);
++         list_addtail(&w->head, &state->workers);
++         mtx_unlock(&state->workers_mutex);
++
++         /* Send back the other end of the socketpair */
++         int remote_fd = socket_fds[1];
++         struct render_client_op_create_context_reply reply = { .ok = true };
++         server_send_reply_with_fds(state->socket_fd, &reply, sizeof(reply),
++                                    &remote_fd, 1);
++         break;
++      }
++
++      case RENDER_CLIENT_OP_DESTROY_CONTEXT: {
++         uint32_t ctx_id;
++         if (!server_recv_all(state->socket_fd, &ctx_id, sizeof(ctx_id)))
++            goto done;
++
++         mtx_lock(&state->workers_mutex);
++         struct server_context_worker *w = server_find_worker(state, ctx_id);
++         if (w)
++            server_destroy_worker(state, w);
++         mtx_unlock(&state->workers_mutex);
++         break;
++      }
++
++      case RENDER_CLIENT_OP_RESET: {
++         mtx_lock(&state->workers_mutex);
++         list_for_each_entry_safe(struct server_context_worker, w,
++                                  &state->workers, head)
++            server_destroy_worker(state, w);
++         mtx_unlock(&state->workers_mutex);
++         break;
++      }
++
++      case RENDER_CLIENT_OP_NOP:
++         break;
++
++      default:
++         proxy_log("server thread: unknown op %d", hdr.op);
++         goto done;
++      }
++   }
++
++done:
++   proxy_log("server thread: exiting");
++
++   /* Clean up remaining workers */
++   mtx_lock(&state->workers_mutex);
++   list_for_each_entry_safe(struct server_context_worker, w,
++                            &state->workers, head)
++      server_destroy_worker(state, w);
++   mtx_unlock(&state->workers_mutex);
++
++   if (state->vkr_initialized)
++      vkr_renderer_fini();
++
++   closesocket((SOCKET)state->socket_fd);
++   mtx_destroy(&state->renderer_mutex);
++   mtx_destroy(&state->workers_mutex);
++   free(state);
++   return 0;
++}
++
++static bool
++proxy_server_create_thread(struct proxy_server *srv)
++{
++   server_dbgf("proxy_server_create_thread: entered\n");
++
++   int socket_fds[2];
++   if (!proxy_socket_pair(socket_fds)) {
++      server_dbgf("proxy_server_create_thread: socket_pair failed\n");
++      return false;
++   }
++   server_dbgf("proxy_server_create_thread: socket_pair OK fds=%d,%d\n",
++               socket_fds[0], socket_fds[1]);
++
++   struct server_thread_state *state = calloc(1, sizeof(*state));
++   if (!state) {
++      closesocket((SOCKET)socket_fds[0]);
++      closesocket((SOCKET)socket_fds[1]);
++      return false;
++   }
++
++   state->socket_fd = socket_fds[1];
++   mtx_init(&state->renderer_mutex, mtx_plain);
++   mtx_init(&state->workers_mutex, mtx_plain);
++   list_inithead(&state->workers);
++
++   g_server_state = state;
++
++   thrd_t thread;
++   if (thrd_create(&thread, server_main_thread, state) != thrd_success) {
++      proxy_log("failed to create server thread");
++      closesocket((SOCKET)socket_fds[0]);
++      closesocket((SOCKET)socket_fds[1]);
++      mtx_destroy(&state->renderer_mutex);
++      mtx_destroy(&state->workers_mutex);
++      free(state);
++      return false;
++   }
++   thrd_detach(thread);
++
++   srv->client_fd = socket_fds[0];
++   srv->thread_data = state;
++   return true;
++}
++
++#else /* !_WIN32 */
++
+ static bool
+ proxy_server_fork(struct proxy_server *srv)
+ {
+@@ -84,6 +759,8 @@ proxy_server_fork(struct proxy_server *srv)
+    return true;
+ }
+ 
++#endif /* !_WIN32 */
++
+ static bool
+ proxy_server_init_fd(struct proxy_server *srv)
+ {
+@@ -98,13 +775,23 @@ proxy_server_init_fd(struct proxy_server *srv)
+ struct proxy_server *
+ proxy_server_create(void)
+ {
++   server_dbgf("proxy_server_create called\n");
+    struct proxy_server *srv = calloc(1, sizeof(*srv));
+    if (!srv)
+       return NULL;
+ 
++#ifndef _WIN32
+    srv->pid = -1;
++#endif
+ 
+    if (!proxy_server_init_fd(srv)) {
++#ifdef _WIN32
++      /* Start an in-process render server thread */
++      if (!proxy_server_create_thread(srv)) {
++         free(srv);
++         return NULL;
++      }
++#else
+       /* start the render server on demand when the client does not provide a
+        * server fd
+        */
+@@ -112,16 +799,25 @@ proxy_server_create(void)
+          free(srv);
+          return NULL;
+       }
++#endif
+    }
+ 
+    if (!proxy_socket_is_valid(srv->client_fd)) {
+       proxy_log("invalid client fd type");
++#ifdef _WIN32
++      closesocket((SOCKET)srv->client_fd);
++#else
+       close(srv->client_fd);
++#endif
+       free(srv);
+       return NULL;
+    }
+ 
++#ifndef _WIN32
+    proxy_log("proxy server with pid %d", srv->pid);
++#else
++   proxy_log("proxy server running as in-process thread");
++#endif
+ 
+    return srv;
+ }
+diff --git a/src/proxy/proxy_server.h b/src/proxy/proxy_server.h
+index 1b5ca02b..b70da2bf 100644
+--- a/src/proxy/proxy_server.h
++++ b/src/proxy/proxy_server.h
+@@ -8,11 +8,19 @@
+ 
+ #include "proxy_common.h"
+ 
++#ifndef _WIN32
+ #include <sys/types.h>
++#endif
+ 
+ struct proxy_server {
++#ifndef _WIN32
+    pid_t pid;
++#endif
+    int client_fd;
++#ifdef _WIN32
++   /* opaque pointer to win32 server thread state */
++   void *thread_data;
++#endif
+ };
+ 
+ struct proxy_server *
+diff --git a/src/proxy/proxy_socket.c b/src/proxy/proxy_socket.c
+index dd30b112..63c50829 100644
+--- a/src/proxy/proxy_socket.c
++++ b/src/proxy/proxy_socket.c
+@@ -6,6 +6,209 @@
+ #include "proxy_socket.h"
+ #include "server/render_protocol.h"
+ 
++#ifdef _WIN32
++#include <windows.h>
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#include <io.h>
++
++#define close closesocket
++#define PROXY_SOCKET_MAX_FD_COUNT 8
++
++/*
++ * Windows implementation of proxy socket using TCP localhost.
++ *
++ * On Windows, Unix domain sockets and SCM_RIGHTS are not available.
++ * Since we only use thread worker mode (in-process), file descriptors
++ * are shared across threads and can be passed as inline data.
++ *
++ * Protocol for messages with fds:
++ *   [uint32_t data_len][data bytes][uint32_t fd_count][int fds...]
++ */
++
++bool
++proxy_socket_pair(int out_fds[static 2])
++{
++   WSADATA wsa;
++   WSAStartup(MAKEWORD(2, 2), &wsa);
++
++   SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++   if (listener == INVALID_SOCKET)
++      return false;
++
++   struct sockaddr_in addr = {
++      .sin_family = AF_INET,
++      .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
++      .sin_port = 0,
++   };
++
++   if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) ||
++       listen(listener, 1)) {
++      closesocket(listener);
++      return false;
++   }
++
++   int addrlen = sizeof(addr);
++   getsockname(listener, (struct sockaddr *)&addr, &addrlen);
++
++   SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++   if (client == INVALID_SOCKET) {
++      closesocket(listener);
++      return false;
++   }
++
++   if (connect(client, (struct sockaddr *)&addr, sizeof(addr))) {
++      closesocket(client);
++      closesocket(listener);
++      return false;
++   }
++
++   SOCKET server = accept(listener, NULL, NULL);
++   closesocket(listener);
++
++   if (server == INVALID_SOCKET) {
++      closesocket(client);
++      return false;
++   }
++
++   out_fds[0] = (int)client;
++   out_fds[1] = (int)server;
++   return true;
++}
++
++bool
++proxy_socket_is_valid(int fd)
++{
++   /* On Windows with TCP sockets, just check it's a valid socket */
++   int type;
++   int len = sizeof(type);
++   return getsockopt((SOCKET)fd, SOL_SOCKET, SO_TYPE, (char *)&type, &len) == 0;
++}
++
++void
++proxy_socket_init(struct proxy_socket *socket, int fd)
++{
++   assert(fd >= 0);
++   *socket = (struct proxy_socket){
++      .fd = fd,
++   };
++}
++
++void
++proxy_socket_fini(struct proxy_socket *socket)
++{
++   closesocket((SOCKET)socket->fd);
++}
++
++bool
++proxy_socket_is_connected(const struct proxy_socket *socket)
++{
++   /* Quick poll to check if socket is still open */
++   fd_set readfds;
++   struct timeval tv = { 0, 0 };
++   FD_ZERO(&readfds);
++   FD_SET((SOCKET)socket->fd, &readfds);
++   int ret = select(0, &readfds, NULL, NULL, &tv);
++   return ret >= 0;
++}
++
++static bool
++send_all(SOCKET s, const void *data, size_t len)
++{
++   const char *p = data;
++   while (len > 0) {
++      int sent = send(s, p, (int)len, 0);
++      if (sent <= 0)
++         return false;
++      p += sent;
++      len -= sent;
++   }
++   return true;
++}
++
++static bool
++recv_all(SOCKET s, void *data, size_t len)
++{
++   char *p = data;
++   while (len > 0) {
++      int got = recv(s, p, (int)len, 0);
++      if (got <= 0)
++         return false;
++      p += got;
++      len -= got;
++   }
++   return true;
++}
++
++bool
++proxy_socket_receive_reply(struct proxy_socket *socket, void *data, size_t size)
++{
++   return recv_all((SOCKET)socket->fd, data, size);
++}
++
++bool
++proxy_socket_receive_reply_with_fds(struct proxy_socket *socket,
++                                    void *data,
++                                    size_t size,
++                                    int *fds,
++                                    int max_fd_count,
++                                    int *out_fd_count)
++{
++   if (!recv_all((SOCKET)socket->fd, data, size))
++      return false;
++
++   /* Receive inline fd count and fds (thread-local, no SCM_RIGHTS needed) */
++   uint32_t fd_count = 0;
++   if (!recv_all((SOCKET)socket->fd, &fd_count, sizeof(fd_count)))
++      return false;
++
++   if (fd_count > (uint32_t)max_fd_count) {
++      proxy_log("too many fds: %u > %d", fd_count, max_fd_count);
++      return false;
++   }
++
++   if (fd_count > 0) {
++      if (!recv_all((SOCKET)socket->fd, fds, sizeof(int) * fd_count))
++         return false;
++   }
++
++   if (out_fd_count)
++      *out_fd_count = (int)fd_count;
++
++   return true;
++}
++
++bool
++proxy_socket_send_request(struct proxy_socket *socket, const void *data, size_t size)
++{
++   return send_all((SOCKET)socket->fd, data, size);
++}
++
++bool
++proxy_socket_send_request_with_fds(struct proxy_socket *socket,
++                                   const void *data,
++                                   size_t size,
++                                   const int *fds,
++                                   int fd_count)
++{
++   if (!send_all((SOCKET)socket->fd, data, size))
++      return false;
++
++   /* Send fds inline (threads share fd table, no SCM_RIGHTS needed) */
++   uint32_t count = (uint32_t)fd_count;
++   if (!send_all((SOCKET)socket->fd, &count, sizeof(count)))
++      return false;
++
++   if (fd_count > 0) {
++      if (!send_all((SOCKET)socket->fd, fds, sizeof(int) * fd_count))
++         return false;
++   }
++
++   return true;
++}
++
++#else /* !_WIN32 */
++
+ #include <poll.h>
+ #include <sys/socket.h>
+ #include <sys/types.h>
+@@ -406,3 +609,5 @@ proxy_socket_send_request_with_fds(struct proxy_socket *socket,
+ {
+    return proxy_socket_send_request_internal(socket, data, size, fds, fd_count);
+ }
++
++#endif /* _WIN32 */
+diff --git a/src/venus/venus-protocol/vn_protocol_renderer_info.h b/src/venus/venus-protocol/vn_protocol_renderer_info.h
+index b32f2e90..8a5d00c5 100644
+--- a/src/venus/venus-protocol/vn_protocol_renderer_info.h
++++ b/src/venus/venus-protocol/vn_protocol_renderer_info.h
+@@ -190,6 +190,7 @@ struct vn_info_extension_table {
+          bool KHR_shader_untyped_pointers;
+          bool KHR_spirv_1_4;
+          bool KHR_storage_buffer_storage_class;
++         bool KHR_swapchain;
+          bool KHR_synchronization2;
+          bool KHR_timeline_semaphore;
+          bool KHR_uniform_buffer_standard_layout;
+@@ -214,8 +215,8 @@ struct vn_info_extension {
+ };
+ 
+ /* sorted by extension names for bsearch */
+-static const uint32_t _vn_info_extension_count = 187;
+-static const struct vn_info_extension _vn_info_extensions[187] = {
++static const uint32_t _vn_info_extension_count = 188;
++static const struct vn_info_extension _vn_info_extensions[188] = {
+    { "VK_ARM_rasterization_order_attachment_access", 343, 1 },
+    { "VK_EXT_4444_formats", 341, 1 },
+    { "VK_EXT_attachment_feedback_loop_dynamic_state", 525, 1 },
+@@ -392,6 +393,7 @@ static const struct vn_info_extension _vn_info_extensions[187] = {
+    { "VK_KHR_shader_untyped_pointers", 388, 1 },
+    { "VK_KHR_spirv_1_4", 237, 1 },
+    { "VK_KHR_storage_buffer_storage_class", 132, 1 },
++   { "VK_KHR_swapchain", 2, 70 },
+    { "VK_KHR_synchronization2", 315, 1 },
+    { "VK_KHR_timeline_semaphore", 208, 2 },
+    { "VK_KHR_uniform_buffer_standard_layout", 254, 1 },
+diff --git a/src/venus/vkr_allocator.c b/src/venus/vkr_allocator.c
+index ed250833..dc0e7b8c 100644
+--- a/src/venus/vkr_allocator.c
++++ b/src/venus/vkr_allocator.c
+@@ -27,10 +27,17 @@
+ #include <errno.h>
+ #include <stdlib.h>
+ #include <string.h>
++#ifdef _WIN32
++#include <windows.h>
++#include <vulkan/vulkan.h>
++#include <vulkan/vulkan_win32.h>
++#else
+ #include <unistd.h>
++#endif
+ 
+ #include "util/list.h"
+ #include "util/macros.h"
++#include "util/os_file.h"
+ #include "venus-protocol/vulkan.h"
+ #include "virgl_resource.h"
+ 
+@@ -125,10 +132,33 @@ vkr_allocator_allocate_memory(struct virgl_resource *res)
+    int fd = -1;
+    if (virgl_resource_export_fd(res, &fd) != VIRGL_RESOURCE_FD_OPAQUE) {
+       if (fd >= 0)
+-         close(fd);
++         os_close_fd(fd);
+       return NULL;
+    }
+ 
++#ifdef _WIN32
++   HANDLE import_handle = os_get_win32_handle_from_fd(fd);
++   HANDLE dup_handle = NULL;
++   if (import_handle == INVALID_HANDLE_VALUE ||
++       !DuplicateHandle(GetCurrentProcess(), import_handle, GetCurrentProcess(), &dup_handle,
++                        0, FALSE, DUPLICATE_SAME_ACCESS)) {
++      os_close_fd(fd);
++      return NULL;
++   }
++
++   VkMemoryAllocateInfo alloc_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext =
++         &(VkImportMemoryWin32HandleInfoKHR){
++            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
++            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++            .handle = dup_handle,
++            .name = NULL,
++         },
++      .allocationSize = res->vulkan_info.allocation_size,
++      .memoryTypeIndex = res->vulkan_info.memory_type_index
++   };
++#else
+    VkMemoryAllocateInfo alloc_info = {
+       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+       .pNext =
+@@ -139,13 +169,19 @@ vkr_allocator_allocate_memory(struct virgl_resource *res)
+       .allocationSize = res->vulkan_info.allocation_size,
+       .memoryTypeIndex = res->vulkan_info.memory_type_index
+    };
++#endif
+ 
+    VkDeviceMemory mem_handle;
+    if (vk->AllocateMemory(dev_handle, &alloc_info, NULL, &mem_handle) != VK_SUCCESS) {
+-      close(fd);
++#ifdef _WIN32
++      CloseHandle(dup_handle);
++#endif
++      os_close_fd(fd);
+       return NULL;
+    }
+ 
++   os_close_fd(fd);
++
+    struct vkr_opaque_fd_mem_info *mem_info = calloc(1, sizeof(*mem_info));
+    if (!mem_info) {
+       vk->FreeMemory(dev_handle, mem_handle, NULL);
+@@ -211,16 +247,22 @@ vkr_allocator_dev_proc_table_init(VkDevice dev_handle,
+    vk->AllocateMemory = VN_GDPA(vkAllocateMemory);
+    vk->FreeMemory = VN_GDPA(vkFreeMemory);
+    vk->MapMemory = VN_GDPA(vkMapMemory);
+-   vk->UnmapMemory = VN_GDPA(vkUnmapMemory);
++    vk->UnmapMemory = VN_GDPA(vkUnmapMemory);
+ #undef VN_GDPA
+ }
+ 
+ int
+ vkr_allocator_init(void)
+ {
++#ifdef _WIN32
++   static const char *required_extensions[] = {
++      "VK_KHR_external_memory_win32",
++   };
++#else
+    static const char *required_extensions[] = {
+       "VK_KHR_external_memory_fd",
+    };
++#endif
+    struct vkr_inst_proc_table *vk = &vkr_allocator.proc_table;
+    VkResult res;
+ 
+diff --git a/src/venus/vkr_buffer.c b/src/venus/vkr_buffer.c
+index 9e466f83..2d12eba2 100644
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -8,6 +8,59 @@
+ #include "vkr_buffer_gen.h"
+ #include "vkr_physical_device.h"
+ 
++static VkExternalMemoryHandleTypeFlags
++vkr_buffer_get_host_external_handle_types(struct vkr_device *dev)
++{
++#ifdef _WIN32
++   if (dev->physical_device->host_external_memory_win32)
++      return VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++#endif
++   if (dev->physical_device->KHR_external_memory_fd)
++      return VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++
++   return 0;
++}
++
++static void
++vkr_buffer_prepare_external_create_info(struct vkr_device *dev,
++                                        const VkBufferCreateInfo **in_out_create_info,
++                                        VkBufferCreateInfo *create_info_storage,
++                                        VkExternalMemoryBufferCreateInfo *external_info_storage)
++{
++   const VkExternalMemoryHandleTypeFlags host_handle_types =
++      vkr_buffer_get_host_external_handle_types(dev);
++   if (!host_handle_types)
++      return;
++
++   VkBufferCreateInfo *create_info = create_info_storage;
++   *create_info = **in_out_create_info;
++
++   for (VkBaseOutStructure *iter = (VkBaseOutStructure *)create_info->pNext; iter;
++        iter = iter->pNext) {
++      if (iter->sType != VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO)
++         continue;
++
++      VkExternalMemoryBufferCreateInfo *external_info =
++         (VkExternalMemoryBufferCreateInfo *)iter;
++#ifdef _WIN32
++      if (external_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
++         external_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++         external_info->handleTypes |= host_handle_types;
++      }
++#endif
++      *in_out_create_info = create_info;
++      return;
++   }
++
++   *external_info_storage = (VkExternalMemoryBufferCreateInfo){
++      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
++      .pNext = (void *)create_info->pNext,
++      .handleTypes = host_handle_types,
++   };
++   create_info->pNext = (void *)external_info_storage;
++   *in_out_create_info = create_info;
++}
++
+ static void
+ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+                             struct vn_command_vkCreateBuffer *args)
+@@ -37,6 +90,15 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+     * vkr_physical_device_init_memory_properties as well.
+     */
+ 
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   VkBufferCreateInfo create_info_storage;
++   VkExternalMemoryBufferCreateInfo external_info_storage;
++   const VkBufferCreateInfo *create_info = args->pCreateInfo;
++
++   vkr_buffer_prepare_external_create_info(dev, &create_info, &create_info_storage,
++                                           &external_info_storage);
++   ((struct vn_command_vkCreateBuffer *)args)->pCreateInfo = create_info;
++
+    vkr_buffer_create_and_add(dispatch->data, args);
+ }
+ 
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index 2704bfd8..a79fe2f1 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -5,11 +5,18 @@
+ 
+ #include "vkr_context.h"
+ 
++#ifdef _WIN32
++#include <windows.h>
++#include <io.h>
++#include "mman_win32.h"
++#else
+ #include <sys/mman.h>
+ #include <sys/types.h>
+ #include <unistd.h>
++#endif
+ 
+ #include "util/anon_file.h"
++#include "util/os_file.h"
+ #include "venus-protocol/vn_protocol_renderer_dispatches.h"
+ 
+ #define XXH_INLINE_ALL
+@@ -192,7 +199,7 @@ vkr_context_free_resource(struct hash_entry *entry)
+    if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
+       munmap(res->u.data, res->size);
+    else if (res->u.fd >= 0)
+-      close(res->u.fd);
++      os_close_fd(res->u.fd);
+    free(res);
+ }
+ 
+@@ -288,14 +295,14 @@ vkr_context_create_resource_from_shm(struct vkr_context *ctx,
+ 
+    void *mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+    if (mmap_ptr == MAP_FAILED) {
+-      close(fd);
++      os_close_fd(fd);
+       return false;
+    }
+ 
+    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size,
+                                              VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr)) {
+       munmap(mmap_ptr, blob_size);
+-      close(fd);
++      os_close_fd(fd);
+       return false;
+    }
+ 
+@@ -318,13 +325,18 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+ {
+    assert(!vkr_context_get_resource(ctx, res_id));
+ 
+-   struct vkr_device_memory *mem = vkr_context_get_object(ctx, blob_id);
+-   if (!mem || mem->base.type != VK_OBJECT_TYPE_DEVICE_MEMORY)
++   mtx_lock(&ctx->object_mutex);
++   const struct hash_entry *mem_entry = _mesa_hash_table_search(ctx->object_table, &blob_id);
++   struct vkr_device_memory *mem = likely(mem_entry) ? mem_entry->data : NULL;
++   mtx_unlock(&ctx->object_mutex);
++   if (!mem || mem->base.type != VK_OBJECT_TYPE_DEVICE_MEMORY) {
+       return false;
++   }
+ 
+    struct virgl_context_blob blob;
+-   if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
++   if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob)) {
+       return false;
++   }
+ 
+    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
+     * - vkAllocateMemory for dma_buf import
+@@ -334,16 +346,16 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+    if (mem->might_export) {
+       res_fd = os_dupfd_cloexec(blob.u.fd);
+       if (res_fd < 0) {
+-         close(blob.u.fd);
++         os_close_fd(blob.u.fd);
+          return false;
+       }
+    }
+ 
+    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size, blob.type, res_fd,
+-                                             NULL)) {
++                                              NULL)) {
+       if (res_fd >= 0)
+-         close(res_fd);
+-      close(blob.u.fd);
++         os_close_fd(res_fd);
++      os_close_fd(blob.u.fd);
+       return false;
+    }
+ 
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 91441804..a774703b 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -7,12 +7,45 @@
+ 
+ #include "venus-protocol/vn_protocol_renderer_device.h"
+ 
++#include "util/os_file.h"
++
+ #include "vkr_command_buffer.h"
+ #include "vkr_context.h"
+ #include "vkr_descriptor_set.h"
+ #include "vkr_device_memory.h"
+ #include "vkr_physical_device.h"
+ #include "vkr_queue.h"
++#include "vkr_win32_shim.h"
++
++static bool
++vkr_device_has_extension(const char *const *exts, uint32_t count, const char *name)
++{
++   for (uint32_t i = 0; i < count; i++) {
++      if (!strcmp(exts[i], name))
++         return true;
++   }
++
++   return false;
++}
++
++static const char *
++vkr_device_map_guest_ext_to_host(const struct vkr_physical_device *physical_dev,
++                                 const char *name)
++{
++#ifdef _WIN32
++   if (!strcmp(name, "VK_KHR_external_memory_fd") &&
++       physical_dev->host_external_memory_win32)
++      return "VK_KHR_external_memory_win32";
++   if (!strcmp(name, "VK_KHR_external_fence_fd") &&
++       physical_dev->host_external_fence_win32)
++      return "VK_KHR_external_fence_win32";
++   if (!strcmp(name, "VK_KHR_external_semaphore_fd") &&
++       physical_dev->host_external_semaphore_win32)
++      return "VK_KHR_external_semaphore_win32";
++#endif
++
++   return name;
++}
+ 
+ static VkResult
+ vkr_device_create_queues(struct vkr_context *ctx,
+@@ -75,6 +108,201 @@ vkr_device_init_proc_table(struct vkr_device *dev,
+ 
+    vn_util_init_device_proc_table(dev->base.handle.device, vk->GetDeviceProcAddr,
+                                   api_version, &ext_table, &dev->proc_table);
++
++#ifdef _WIN32
++   if (dev->physical_device->host_external_memory_win32) {
++      dev->GetMemoryWin32HandleKHR =
++         (PFN_vkGetMemoryWin32HandleKHR)vk->GetDeviceProcAddr(dev->base.handle.device,
++                                                              "vkGetMemoryWin32HandleKHR");
++      dev->GetMemoryWin32HandlePropertiesKHR =
++         (PFN_vkGetMemoryWin32HandlePropertiesKHR)vk->GetDeviceProcAddr(
++            dev->base.handle.device, "vkGetMemoryWin32HandlePropertiesKHR");
++   }
++
++   if (dev->physical_device->host_external_fence_win32) {
++      dev->GetFenceWin32HandleKHR =
++         (PFN_vkGetFenceWin32HandleKHR)vk->GetDeviceProcAddr(dev->base.handle.device,
++                                                             "vkGetFenceWin32HandleKHR");
++      dev->ImportFenceWin32HandleKHR =
++         (PFN_vkImportFenceWin32HandleKHR)vk->GetDeviceProcAddr(
++            dev->base.handle.device, "vkImportFenceWin32HandleKHR");
++   }
++
++   if (dev->physical_device->host_external_semaphore_win32) {
++      dev->GetSemaphoreWin32HandleKHR =
++         (PFN_vkGetSemaphoreWin32HandleKHR)vk->GetDeviceProcAddr(
++            dev->base.handle.device, "vkGetSemaphoreWin32HandleKHR");
++      dev->ImportSemaphoreWin32HandleKHR =
++         (PFN_vkImportSemaphoreWin32HandleKHR)vk->GetDeviceProcAddr(
++            dev->base.handle.device, "vkImportSemaphoreWin32HandleKHR");
++   }
++#endif
++}
++
++VkResult
++vkr_device_get_fence_fd(struct vkr_device *dev,
++                        VkFence fence,
++                        VkExternalFenceHandleTypeFlagBits handle_type,
++                        int *out_fd)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++#ifdef _WIN32
++   if (handle_type == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT &&
++       dev->physical_device->host_external_fence_win32 && dev->GetFenceWin32HandleKHR) {
++      HANDLE handle = INVALID_HANDLE_VALUE;
++      const VkFenceGetWin32HandleInfoKHR info = {
++         .sType = VK_STRUCTURE_TYPE_FENCE_GET_WIN32_HANDLE_INFO_KHR,
++         .fence = fence,
++         .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++      };
++      VkResult result =
++         dev->GetFenceWin32HandleKHR(dev->base.handle.device, &info, &handle);
++      if (result != VK_SUCCESS)
++         return result;
++
++      const int fd = os_wrap_win32_handle(handle);
++      if (fd < 0) {
++         CloseHandle(handle);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++
++      *out_fd = fd;
++      return VK_SUCCESS;
++   }
++#endif
++
++   const VkFenceGetFdInfoKHR info = {
++      .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
++      .fence = fence,
++      .handleType = handle_type,
++   };
++   return vk->GetFenceFdKHR(dev->base.handle.device, &info, out_fd);
++}
++
++VkResult
++vkr_device_get_semaphore_fd(struct vkr_device *dev,
++                            VkSemaphore semaphore,
++                            VkExternalSemaphoreHandleTypeFlagBits handle_type,
++                            int *out_fd)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++#ifdef _WIN32
++   if (handle_type == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT &&
++       dev->physical_device->host_external_semaphore_win32 &&
++       dev->GetSemaphoreWin32HandleKHR) {
++      HANDLE handle = INVALID_HANDLE_VALUE;
++      const VkSemaphoreGetWin32HandleInfoKHR info = {
++         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR,
++         .semaphore = semaphore,
++         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++      };
++      VkResult result =
++         dev->GetSemaphoreWin32HandleKHR(dev->base.handle.device, &info, &handle);
++      if (result != VK_SUCCESS)
++         return result;
++
++      const int fd = os_wrap_win32_handle(handle);
++      if (fd < 0) {
++         CloseHandle(handle);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++
++      *out_fd = fd;
++      return VK_SUCCESS;
++   }
++#endif
++
++   const VkSemaphoreGetFdInfoKHR info = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
++      .semaphore = semaphore,
++      .handleType = handle_type,
++   };
++   return vk->GetSemaphoreFdKHR(dev->base.handle.device, &info, out_fd);
++}
++
++VkResult
++vkr_device_import_fence_fd(struct vkr_device *dev,
++                           const VkImportFenceFdInfoKHR *import_info)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++#ifdef _WIN32
++   if (import_info->handleType == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT &&
++       dev->physical_device->host_external_fence_win32 && dev->ImportFenceWin32HandleKHR) {
++      HANDLE import_handle = INVALID_HANDLE_VALUE;
++      HANDLE dup_handle = INVALID_HANDLE_VALUE;
++
++      if (import_info->fd >= 0) {
++         import_handle = os_get_win32_handle_from_fd(import_info->fd);
++         if (import_handle == INVALID_HANDLE_VALUE)
++            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++
++         if (!DuplicateHandle(GetCurrentProcess(), import_handle, GetCurrentProcess(),
++                              &dup_handle, 0, FALSE, DUPLICATE_SAME_ACCESS))
++            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++      }
++
++      const VkImportFenceWin32HandleInfoKHR win32_info = {
++         .sType = VK_STRUCTURE_TYPE_IMPORT_FENCE_WIN32_HANDLE_INFO_KHR,
++         .fence = import_info->fence,
++         .flags = import_info->flags,
++         .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++         .handle = dup_handle,
++         .name = NULL,
++      };
++      const VkResult result =
++         dev->ImportFenceWin32HandleKHR(dev->base.handle.device, &win32_info);
++      if (dup_handle != INVALID_HANDLE_VALUE)
++         CloseHandle(dup_handle);
++      return result;
++   }
++#endif
++
++   return vk->ImportFenceFdKHR(dev->base.handle.device, import_info);
++}
++
++VkResult
++vkr_device_import_semaphore_fd(struct vkr_device *dev,
++                               const VkImportSemaphoreFdInfoKHR *import_info)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++#ifdef _WIN32
++   if (import_info->handleType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT &&
++       dev->physical_device->host_external_semaphore_win32 &&
++       dev->ImportSemaphoreWin32HandleKHR) {
++      HANDLE import_handle = INVALID_HANDLE_VALUE;
++      HANDLE dup_handle = INVALID_HANDLE_VALUE;
++
++      if (import_info->fd >= 0) {
++         import_handle = os_get_win32_handle_from_fd(import_info->fd);
++         if (import_handle == INVALID_HANDLE_VALUE)
++            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++
++         if (!DuplicateHandle(GetCurrentProcess(), import_handle, GetCurrentProcess(),
++                              &dup_handle, 0, FALSE, DUPLICATE_SAME_ACCESS))
++            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++      }
++
++      const VkImportSemaphoreWin32HandleInfoKHR win32_info = {
++         .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
++         .semaphore = import_info->semaphore,
++         .flags = import_info->flags,
++         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++         .handle = dup_handle,
++         .name = NULL,
++      };
++      const VkResult result =
++         dev->ImportSemaphoreWin32HandleKHR(dev->base.handle.device, &win32_info);
++      if (dup_handle != INVALID_HANDLE_VALUE)
++         CloseHandle(dup_handle);
++      return result;
++   }
++#endif
++
++   return vk->ImportSemaphoreFdKHR(dev->base.handle.device, import_info);
+ }
+ 
+ static void
+@@ -129,29 +357,104 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+ 
+    /* append extensions for our own use */
+    const char **exts = NULL;
+-   uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
+-   ext_count += physical_dev->KHR_external_memory_fd;
+-   ext_count += physical_dev->EXT_external_memory_dma_buf;
+-   ext_count += physical_dev->KHR_external_fence_fd;
+-   if (ext_count > args->pCreateInfo->enabledExtensionCount) {
+-      exts = malloc(sizeof(*exts) * ext_count);
+-      if (!exts) {
+-         args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+-         return;
++   uint32_t guest_ext_count = args->pCreateInfo->enabledExtensionCount;
++   uint32_t ext_count = guest_ext_count + 6;
++   exts = malloc(sizeof(*exts) * ext_count);
++   if (!exts) {
++      args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++      return;
++   }
++
++   uint32_t host_ext_count = 0;
++   for (uint32_t i = 0; i < guest_ext_count; i++) {
++      const char *host_name = vkr_device_map_guest_ext_to_host(
++         physical_dev, args->pCreateInfo->ppEnabledExtensionNames[i]);
++      if (!vkr_device_has_extension(exts, host_ext_count, host_name))
++         exts[host_ext_count++] = host_name;
++   }
++
++   if (physical_dev->host_external_memory_win32) {
++      if (!vkr_device_has_extension(exts, host_ext_count, "VK_KHR_external_memory_win32"))
++         exts[host_ext_count++] = "VK_KHR_external_memory_win32";
++   } else if (physical_dev->KHR_external_memory_fd) {
++      if (!vkr_device_has_extension(exts, host_ext_count, "VK_KHR_external_memory_fd"))
++         exts[host_ext_count++] = "VK_KHR_external_memory_fd";
++   }
++
++   if (physical_dev->EXT_external_memory_dma_buf &&
++       !vkr_device_has_extension(exts, host_ext_count, "VK_EXT_external_memory_dma_buf"))
++      exts[host_ext_count++] = "VK_EXT_external_memory_dma_buf";
++
++   if (physical_dev->host_external_fence_win32) {
++      if (!vkr_device_has_extension(exts, host_ext_count, "VK_KHR_external_fence_win32"))
++         exts[host_ext_count++] = "VK_KHR_external_fence_win32";
++   } else if (physical_dev->KHR_external_fence_fd) {
++      if (!vkr_device_has_extension(exts, host_ext_count, "VK_KHR_external_fence_fd"))
++         exts[host_ext_count++] = "VK_KHR_external_fence_fd";
++   }
++
++   if (physical_dev->host_external_semaphore_win32) {
++      if (!vkr_device_has_extension(exts, host_ext_count,
++                                    "VK_KHR_external_semaphore_win32"))
++         exts[host_ext_count++] = "VK_KHR_external_semaphore_win32";
++   } else if (physical_dev->KHR_external_semaphore_fd) {
++      if (!vkr_device_has_extension(exts, host_ext_count, "VK_KHR_external_semaphore_fd"))
++         exts[host_ext_count++] = "VK_KHR_external_semaphore_fd";
++   }
++
++   ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;
++   ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = host_ext_count;
++
++   /* Ensure all queue families are requested on the host device.
++    *
++    * The guest may create a device with only a subset of queue families
++    * (e.g. graphics only) but later create command pools for other families
++    * (compute, transfer).  On Linux, some drivers tolerate this, but the
++    * Windows Intel driver does not.  Add any missing queue families with
++    * one queue each so the host device supports all of them.
++    */
++   VkDeviceQueueCreateInfo *all_queue_infos = NULL;
++   float default_priority = 1.0f;
++   {
++      VkDeviceCreateInfo *ci = (VkDeviceCreateInfo *)args->pCreateInfo;
++      const uint32_t family_count = physical_dev->queue_family_property_count;
++      bool *requested = calloc(family_count, sizeof(bool));
++      if (requested) {
++         for (uint32_t i = 0; i < ci->queueCreateInfoCount; i++) {
++            uint32_t idx = ci->pQueueCreateInfos[i].queueFamilyIndex;
++            if (idx < family_count)
++               requested[idx] = true;
++         }
++
++         uint32_t missing = 0;
++         for (uint32_t i = 0; i < family_count; i++) {
++            if (!requested[i])
++               missing++;
++         }
++
++         if (missing) {
++            uint32_t total = ci->queueCreateInfoCount + missing;
++            all_queue_infos = calloc(total, sizeof(VkDeviceQueueCreateInfo));
++            if (all_queue_infos) {
++               memcpy(all_queue_infos, ci->pQueueCreateInfos,
++                      ci->queueCreateInfoCount * sizeof(VkDeviceQueueCreateInfo));
++               uint32_t idx = ci->queueCreateInfoCount;
++               for (uint32_t i = 0; i < family_count; i++) {
++                  if (!requested[i]) {
++                     all_queue_infos[idx++] = (VkDeviceQueueCreateInfo){
++                        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++                        .queueFamilyIndex = i,
++                        .queueCount = 1,
++                        .pQueuePriorities = &default_priority,
++                     };
++                  }
++               }
++               ci->pQueueCreateInfos = all_queue_infos;
++               ci->queueCreateInfoCount = total;
++            }
++         }
++         free(requested);
+       }
+-      for (uint32_t i = 0; i < args->pCreateInfo->enabledExtensionCount; i++)
+-         exts[i] = args->pCreateInfo->ppEnabledExtensionNames[i];
+-
+-      ext_count = args->pCreateInfo->enabledExtensionCount;
+-      if (physical_dev->KHR_external_memory_fd)
+-         exts[ext_count++] = "VK_KHR_external_memory_fd";
+-      if (physical_dev->EXT_external_memory_dma_buf)
+-         exts[ext_count++] = "VK_EXT_external_memory_dma_buf";
+-      if (physical_dev->KHR_external_fence_fd)
+-         exts[ext_count++] = "VK_KHR_external_fence_fd";
+-
+-      ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;
+-      ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = ext_count;
+    }
+ 
+    struct vkr_device *dev =
+@@ -159,14 +462,17 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    if (!dev) {
+       args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+       free(exts);
++      free(all_queue_infos);
+       return;
+    }
+ 
+    vn_replace_vkCreateDevice_args_handle(args);
+    args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo, NULL,
+                                 &dev->base.handle.device);
++
+    if (args->ret != VK_SUCCESS) {
+       free(exts);
++      free(all_queue_infos);
+       free(dev);
+       return;
+    }
+@@ -177,10 +483,15 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+                               args->pCreateInfo->ppEnabledExtensionNames,
+                               args->pCreateInfo->enabledExtensionCount);
+ 
++#ifdef _WIN32
++   vkr_win32_device_install_shim(dev);
++#endif
++
+    free(exts);
+ 
+    args->ret = vkr_device_create_queues(ctx, dev, args->pCreateInfo->queueCreateInfoCount,
+                                         args->pCreateInfo->pQueueCreateInfos);
++   free(all_queue_infos);
+    if (args->ret != VK_SUCCESS) {
+       struct vn_device_proc_table *vk = &dev->proc_table;
+       vk->DestroyDevice(dev->base.handle.device, NULL);
+@@ -194,6 +505,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    mtx_init(&dev->object_mutex, mtx_plain);
+    list_inithead(&dev->objects);
+ 
++   mtx_init(&dev->vk_api_mutex, mtx_plain);
++
+    list_add(&dev->base.track_head, &physical_dev->devices);
+ 
+    vkr_context_add_object(ctx, &dev->base);
+@@ -314,6 +627,10 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
+    struct vn_device_proc_table *vk = &dev->proc_table;
+    VkDevice device = dev->base.handle.device;
+ 
++#ifdef _WIN32
++   vkr_win32_device_remove_shim(dev);
++#endif
++
+    if (!list_is_empty(&dev->objects))
+       vkr_log("destroying device with valid objects");
+ 
+@@ -324,13 +641,26 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
+          vkr_log("vkDeviceWaitIdle(%p) failed(%d)", dev, (int32_t)result);
+    }
+ 
+-   mtx_destroy(&dev->object_mutex);
+-
+    if (!list_is_empty(&dev->objects)) {
+       list_for_each_entry_safe (struct vkr_object, obj, &dev->objects, track_head)
+          vkr_device_object_destroy(ctx, dev, obj);
+    }
+ 
++#ifdef _WIN32
++   /* Flush deferred object destructions.  The shim has been removed (proc
++    * table restored to real functions), DeviceWaitIdle has completed, and
++    * all tracked objects have been destroyed.  Now destroy the handles that
++    * were kept alive to prevent Intel driver handle-reuse crashes.
++    *
++    * Only flush if on the worker thread (matching vkr_device_object_destroy
++    * behavior).  Otherwise DestroyDevice will implicitly clean them up.
++    */
++   if (ctx->on_worker_thread)
++      vkr_win32_flush_deferred_destroys(dev);
++#endif
++
++   mtx_destroy(&dev->object_mutex);
++
+    list_for_each_entry_safe (struct vkr_queue, queue, &dev->queues, base.track_head)
+       vkr_queue_destroy(ctx, queue);
+ 
+@@ -340,6 +670,7 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
+    }
+ 
+    mtx_destroy(&dev->free_sync_mutex);
++   mtx_destroy(&dev->vk_api_mutex);
+ 
+    if (destroy_vk || ctx->on_worker_thread)
+       vk->DestroyDevice(device, NULL);
+diff --git a/src/venus/vkr_device.h b/src/venus/vkr_device.h
+index 189df6f5..e907038b 100644
+--- a/src/venus/vkr_device.h
++++ b/src/venus/vkr_device.h
+@@ -10,6 +10,27 @@
+ 
+ #include "venus-protocol/vn_protocol_renderer_util.h"
+ 
++#ifdef _WIN32
++#include <vulkan/vulkan_win32.h>
++
++/* Entry for deferred Vulkan object destruction on Windows.
++ *
++ * The Intel Windows Vulkan driver crashes when a non-dispatchable handle value
++ * (e.g. VkDescriptorSetLayout) is reused after the previous object with that
++ * value was destroyed.  The driver's internal handle cache retains stale data.
++ *
++ * We work around this by deferring driver-level destruction: when the guest
++ * destroys an object, we remove it from Venus tracking but do NOT call the
++ * driver's vkDestroy*.  The driver handle stays alive, preventing reuse.
++ * All deferred handles are flushed (actually destroyed) at device teardown,
++ * after DeviceWaitIdle guarantees no in-flight work references them.
++ */
++struct vkr_win32_deferred_handle {
++   VkObjectType type;
++   uint64_t handle;
++};
++#endif
++
+ #include "vkr_context.h"
+ 
+ struct vkr_device {
+@@ -19,6 +40,20 @@ struct vkr_device {
+ 
+    struct vn_device_proc_table proc_table;
+ 
++#ifdef _WIN32
++   PFN_vkGetMemoryWin32HandleKHR GetMemoryWin32HandleKHR;
++   PFN_vkGetMemoryWin32HandlePropertiesKHR GetMemoryWin32HandlePropertiesKHR;
++   PFN_vkGetFenceWin32HandleKHR GetFenceWin32HandleKHR;
++   PFN_vkImportFenceWin32HandleKHR ImportFenceWin32HandleKHR;
++   PFN_vkGetSemaphoreWin32HandleKHR GetSemaphoreWin32HandleKHR;
++   PFN_vkImportSemaphoreWin32HandleKHR ImportSemaphoreWin32HandleKHR;
++
++   /* Deferred object destruction — see struct vkr_win32_deferred_handle */
++   struct vkr_win32_deferred_handle *deferred_destroys;
++   uint32_t deferred_destroy_count;
++   uint32_t deferred_destroy_capacity;
++#endif
++
+    struct list_head queues;
+ 
+    mtx_t free_sync_mutex;
+@@ -26,6 +61,8 @@ struct vkr_device {
+ 
+    mtx_t object_mutex;
+    struct list_head objects;
++
++   mtx_t vk_api_mutex;
+ };
+ VKR_DEFINE_OBJECT_CAST(device, VK_OBJECT_TYPE_DEVICE, VkDevice)
+ 
+@@ -35,6 +72,26 @@ vkr_context_init_device_dispatch(struct vkr_context *ctx);
+ void
+ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy_vk);
+ 
++VkResult
++vkr_device_get_fence_fd(struct vkr_device *dev,
++                        VkFence fence,
++                        VkExternalFenceHandleTypeFlagBits handle_type,
++                        int *out_fd);
++
++VkResult
++vkr_device_get_semaphore_fd(struct vkr_device *dev,
++                            VkSemaphore semaphore,
++                            VkExternalSemaphoreHandleTypeFlagBits handle_type,
++                            int *out_fd);
++
++VkResult
++vkr_device_import_fence_fd(struct vkr_device *dev,
++                           const VkImportFenceFdInfoKHR *import_info);
++
++VkResult
++vkr_device_import_semaphore_fd(struct vkr_device *dev,
++                               const VkImportSemaphoreFdInfoKHR *import_info);
++
+ static inline bool
+ vkr_device_should_track_object(const struct vkr_object *obj)
+ {
+@@ -82,4 +139,16 @@ vkr_device_remove_object(struct vkr_context *ctx,
+    vkr_context_remove_object(ctx, obj);
+ }
+ 
++static inline void
++vkr_device_lock_api(struct vkr_device *dev)
++{
++   mtx_lock(&dev->vk_api_mutex);
++}
++
++static inline void
++vkr_device_unlock_api(struct vkr_device *dev)
++{
++   mtx_unlock(&dev->vk_api_mutex);
++}
++
+ #endif /* VKR_DEVICE_H */
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index d0f29419..2cf84436 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -6,16 +6,32 @@
+ #include "vkr_device_memory.h"
+ 
+ #include <math.h>
++#ifdef _WIN32
++#include <windows.h>
++#include <vulkan/vulkan_win32.h>
++static inline int getpagesize(void) {
++   SYSTEM_INFO si;
++   GetSystemInfo(&si);
++   return (int)si.dwPageSize;
++}
++#endif
+ 
+ #include "venus-protocol/vn_protocol_renderer_transport.h"
+ 
++#include "util/os_file.h"
++
+ #include "vkr_device_memory_gen.h"
+ #include "vkr_physical_device.h"
+ 
+ static bool
+ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
++                                   struct vkr_device *dev,
+                                    const VkImportMemoryResourceInfoMESA *res_info,
+-                                   VkImportMemoryFdInfoKHR *out)
++                                   VkImportMemoryFdInfoKHR *out_fd,
++#ifdef _WIN32
++                                   VkImportMemoryWin32HandleInfoKHR *out_win32,
++#endif
++                                   const void **out_import_info)
+ {
+    struct vkr_resource *res = vkr_context_get_resource(ctx, res_info->resourceId);
+    if (!res) {
+@@ -30,6 +46,27 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
+       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+       break;
+    case VIRGL_RESOURCE_FD_OPAQUE:
++#ifdef _WIN32
++      if (dev->physical_device->host_external_memory_win32) {
++         HANDLE handle = os_get_win32_handle_from_fd(res->u.fd);
++         HANDLE dup_handle = NULL;
++         if (handle == INVALID_HANDLE_VALUE ||
++             !DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup_handle,
++                              0, FALSE, DUPLICATE_SAME_ACCESS)) {
++            return false;
++         }
++
++         *out_win32 = (VkImportMemoryWin32HandleInfoKHR){
++            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
++            .pNext = res_info->pNext,
++            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++            .handle = dup_handle,
++            .name = NULL,
++         };
++         *out_import_info = out_win32;
++         return true;
++      }
++#endif
+       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+       break;
+    default:
+@@ -40,12 +77,13 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
+    if (fd < 0)
+       return false;
+ 
+-   *out = (VkImportMemoryFdInfoKHR){
++   *out_fd = (VkImportMemoryFdInfoKHR){
+       .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+       .pNext = res_info->pNext,
+       .fd = fd,
+       .handleType = handle_type,
+    };
++   *out_import_info = out_fd;
+    return true;
+ }
+ 
+@@ -101,7 +139,7 @@ vkr_udmabuf_get_fd_info_from_allocation_info(struct vkr_physical_device *physica
+       goto fail;
+    }
+ 
+-   close(memfd);
++   os_close_fd(memfd);
+ 
+    *out_udmabuf_fd = udmabuf_fd;
+    *out_fd_info = (VkImportMemoryFdInfoKHR){
+@@ -115,9 +153,9 @@ vkr_udmabuf_get_fd_info_from_allocation_info(struct vkr_physical_device *physica
+ 
+ fail:
+    if (udmabuf_fd >= 0)
+-      close(udmabuf_fd);
++      os_close_fd(udmabuf_fd);
+    if (memfd >= 0)
+-      close(memfd);
++      os_close_fd(memfd);
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ }
+ 
+@@ -261,17 +299,27 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+ 
+    /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
+    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
++#ifdef _WIN32
++   VkImportMemoryWin32HandleInfoKHR local_import_win32_info = {
++      .handle = INVALID_HANDLE_VALUE,
++   };
++#endif
++   const void *import_info = NULL;
+    VkImportMemoryResourceInfoMESA *res_info = NULL;
+    VkBaseInStructure *prev_of_res_info = vkr_find_prev_struct(
+       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+    if (prev_of_res_info) {
+       res_info = (VkImportMemoryResourceInfoMESA *)prev_of_res_info->pNext;
+-      if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
++      if (!vkr_get_fd_info_from_resource_info(ctx, dev, res_info, &local_import_info,
++#ifdef _WIN32
++                                              &local_import_win32_info,
++#endif
++                                              &import_info)) {
+          args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+          return;
+       }
+ 
+-      prev_of_res_info->pNext = (const struct VkBaseInStructure *)&local_import_info;
++      prev_of_res_info->pNext = import_info;
+    }
+ 
+    VkExportMemoryAllocateInfo *export_info =
+@@ -294,6 +342,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    const uint32_t property_flags =
+       physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
+    uint32_t valid_fd_types = 0;
++   VkExternalMemoryHandleTypeFlags guest_export_handle_types = 0;
+    int udmabuf_fd = -1;
+    void *gbm_bo = NULL;
+    VkExportMemoryAllocateInfo local_export_info;
+@@ -311,22 +360,30 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+       if (!(force_gbm_import || force_udmabuf_import) &&
+           (physical_dev->is_dma_buf_fd_export_supported ||
+            (physical_dev->is_opaque_fd_export_supported && no_dma_buf_export))) {
+-         const VkExternalMemoryHandleTypeFlagBits handle_type =
++         const VkExternalMemoryHandleTypeFlagBits guest_handle_type =
+             physical_dev->is_dma_buf_fd_export_supported
+                ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+                : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++         VkExternalMemoryHandleTypeFlagBits host_handle_type = guest_handle_type;
++#ifdef _WIN32
++         if (guest_handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
++             physical_dev->host_external_memory_win32) {
++            host_handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++         }
++#endif
++         guest_export_handle_types = guest_handle_type;
+          if (export_info) {
+-            export_info->handleTypes |= handle_type;
++            export_info->handleTypes = host_handle_type;
+          } else {
+             local_export_info = (const VkExportMemoryAllocateInfo){
+                .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+                .pNext = alloc_info->pNext,
+-               .handleTypes = handle_type,
++               .handleTypes = host_handle_type,
+             };
+             export_info = &local_export_info;
+             alloc_info->pNext = &local_export_info;
+ 
+-            if (handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
++            if (guest_handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
+                /* Guest virtgpu kernel aligns up blob mem size to the page boundary. No
+                 * matter dma-buf or opaque fd export allocation, the actual allocation
+                 * in most cases would follow the same padding. For dma-buf, we are able
+@@ -375,17 +432,25 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+       }
+    }
+ 
++   if (!guest_export_handle_types && export_info)
++      guest_export_handle_types = export_info->handleTypes;
++
+    if (export_info) {
+-      if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
++      if (guest_export_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
+          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_OPAQUE;
+-      if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
++      if (guest_export_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_DMABUF;
+    }
+ 
+    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
+    if (!mem) {
+       if (local_import_info.fd >= 0)
+-         close(local_import_info.fd);
++         os_close_fd(local_import_info.fd);
++#ifdef _WIN32
++      if (local_import_win32_info.handle &&
++          local_import_win32_info.handle != INVALID_HANDLE_VALUE)
++         CloseHandle(local_import_win32_info.handle);
++#endif
+       if (gbm_bo)
+          vkr_gbm_bo_destroy(gbm_bo);
+       return;
+@@ -455,26 +520,42 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
+       return;
+    }
+ 
+-   if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF) {
++   vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
++   if (res->fd_type == VIRGL_RESOURCE_FD_DMABUF) {
++      static const VkExternalMemoryHandleTypeFlagBits handle_type =
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++      VkMemoryFdPropertiesKHR mem_fd_props = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
++         .pNext = NULL,
++         .memoryTypeBits = 0,
++      };
++      args->ret =
++         vk->GetMemoryFdPropertiesKHR(args->device, handle_type, res->u.fd, &mem_fd_props);
++      if (args->ret != VK_SUCCESS)
++         return;
++
++      args->pMemoryResourceProperties->memoryTypeBits = mem_fd_props.memoryTypeBits;
++#ifdef _WIN32
++   } else if (res->fd_type == VIRGL_RESOURCE_FD_OPAQUE &&
++              dev->GetMemoryWin32HandlePropertiesKHR) {
++      HANDLE handle = os_get_win32_handle_from_fd(res->u.fd);
++      VkMemoryWin32HandlePropertiesKHR props = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR,
++         .pNext = NULL,
++         .memoryTypeBits = 0,
++      };
++      args->ret = dev->GetMemoryWin32HandlePropertiesKHR(
++         args->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT, handle, &props);
++      if (args->ret != VK_SUCCESS)
++         return;
++
++      args->pMemoryResourceProperties->memoryTypeBits = props.memoryTypeBits;
++#endif
++   } else {
+       args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+       return;
+    }
+ 
+-   static const VkExternalMemoryHandleTypeFlagBits handle_type =
+-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+-   VkMemoryFdPropertiesKHR mem_fd_props = {
+-      .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+-      .pNext = NULL,
+-      .memoryTypeBits = 0,
+-   };
+-   vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
+-   args->ret =
+-      vk->GetMemoryFdPropertiesKHR(args->device, handle_type, res->u.fd, &mem_fd_props);
+-   if (args->ret != VK_SUCCESS)
+-      return;
+-
+-   args->pMemoryResourceProperties->memoryTypeBits = mem_fd_props.memoryTypeBits;
+-
+    VkMemoryResourceAllocationSizePropertiesMESA *alloc_size_props =
+       vkr_find_struct(args->pMemoryResourceProperties->pNext,
+                       VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA);
+@@ -508,7 +589,7 @@ vkr_device_memory_release(struct vkr_device_memory *mem)
+    if (mem->gbm_bo)
+       vkr_gbm_bo_destroy(mem->gbm_bo);
+    if (mem->udmabuf_fd >= 0)
+-      close(mem->udmabuf_fd);
++      os_close_fd(mem->udmabuf_fd);
+ }
+ 
+ bool
+@@ -561,7 +642,13 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+    } else if (can_export_opaque) {
+       /* prefer opaque for performance? */
+       fd_type = VIRGL_RESOURCE_FD_OPAQUE;
+-      handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++      handle_type =
++#ifdef _WIN32
++         mem->device->physical_device->host_external_memory_win32
++            ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
++            :
++#endif
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+ 
+       STATIC_ASSERT(sizeof(vulkan_info.device_uuid) == VK_UUID_SIZE);
+       STATIC_ASSERT(sizeof(vulkan_info.driver_uuid) == VK_UUID_SIZE);
+@@ -596,15 +683,39 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+       }
+    } else {
+       struct vn_device_proc_table *vk = &mem->device->proc_table;
+-      const VkMemoryGetFdInfoKHR fd_info = {
+-         .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+-         .memory = mem->base.handle.device_memory,
+-         .handleType = handle_type,
+-      };
+-      VkResult ret = vk->GetMemoryFdKHR(mem->device->base.handle.device, &fd_info, &fd);
+-      if (ret != VK_SUCCESS) {
+-         vkr_log("mem fd export failed (vk ret %d)", ret);
+-         return false;
++#ifdef _WIN32
++      if (handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT &&
++          mem->device->GetMemoryWin32HandleKHR) {
++         HANDLE handle = INVALID_HANDLE_VALUE;
++         const VkMemoryGetWin32HandleInfoKHR info = {
++            .sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR,
++            .memory = mem->base.handle.device_memory,
++            .handleType = handle_type,
++         };
++         VkResult ret = mem->device->GetMemoryWin32HandleKHR(
++            mem->device->base.handle.device, &info, &handle);
++         if (ret != VK_SUCCESS) {
++            vkr_log("mem win32 handle export failed (vk ret %d)", ret);
++            return false;
++         }
++         fd = os_wrap_win32_handle(handle);
++         if (fd < 0) {
++            CloseHandle(handle);
++            return false;
++         }
++      } else
++#endif
++      {
++         const VkMemoryGetFdInfoKHR fd_info = {
++            .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
++            .memory = mem->base.handle.device_memory,
++            .handleType = handle_type,
++         };
++         VkResult ret = vk->GetMemoryFdKHR(mem->device->base.handle.device, &fd_info, &fd);
++         if (ret != VK_SUCCESS) {
++            vkr_log("mem fd export failed (vk ret %d)", ret);
++            return false;
++         }
+       }
+    }
+ 
+@@ -613,13 +724,12 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+       if (dma_buf_size < 0 || (uint64_t)dma_buf_size < blob_size) {
+          vkr_log("mem dma_buf_size %lld < blob_size %" PRIu64, (long long)dma_buf_size,
+                  blob_size);
+-         close(fd);
++         os_close_fd(fd);
+          return false;
+       }
+    }
+ 
+    mem->exported = true;
+-
+    *out_blob = (struct virgl_context_blob){
+       .type = fd_type,
+       .u.fd = fd,
+diff --git a/src/venus/vkr_library.c b/src/venus/vkr_library.c
+index 5cd39962..34257ab4 100644
+--- a/src/venus/vkr_library.c
++++ b/src/venus/vkr_library.c
+@@ -6,7 +6,11 @@
+ #include "vkr_common.h"
+ #include "vkr_library.h"
+ 
++#ifdef _WIN32
++#include <windows.h>
++#else
+ #include <dlfcn.h>
++#endif
+ 
+ void
+ vkr_library_preload_icd(void)
+@@ -41,6 +45,20 @@ vkr_library_load(struct vulkan_library *lib)
+    if (lib->handle)
+       return true;
+ 
++#ifdef _WIN32
++   lib->handle = LoadLibraryA("vulkan-1.dll");
++   if (lib->handle == NULL) {
++      vkr_log("failed to open vulkan-1.dll: error %lu", GetLastError());
++      return false;
++   }
++
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wpedantic"
++   lib->GetInstanceProcAddr =
++      (PFN_vkGetInstanceProcAddr)GetProcAddress(lib->handle, "vkGetInstanceProcAddr");
++#pragma GCC diagnostic pop
++
++#else /* !_WIN32 */
+    lib->handle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (lib->handle == NULL)
+       lib->handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+@@ -54,7 +72,6 @@ vkr_library_load(struct vulkan_library *lib)
+ 
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wpedantic"
+-   /* ISO C forbids conversion of object pointer to function pointer type */
+    lib->GetInstanceProcAddr =
+       (PFN_vkGetInstanceProcAddr)dlsym(lib->handle, "vkGetInstanceProcAddr");
+ #pragma GCC diagnostic pop
+@@ -64,16 +81,21 @@ vkr_library_load(struct vulkan_library *lib)
+       vkr_log("dlerror: %s", error);
+       goto fail;
+    }
++#endif /* _WIN32 */
+ 
+    if (lib->GetInstanceProcAddr == NULL) {
+-      vkr_log("failed to load vkGetInstanceProcAddr: %s", dlerror());
++      vkr_log("failed to load vkGetInstanceProcAddr");
+       goto fail;
+    }
+ 
+    return true;
+ 
+ fail:
++#ifdef _WIN32
++   FreeLibrary(lib->handle);
++#else
+    dlclose(lib->handle);
++#endif
+    lib->handle = NULL;
+    return false;
+ }
+@@ -82,7 +104,11 @@ void
+ vkr_library_unload(struct vulkan_library *lib)
+ {
+    if (lib->handle) {
++#ifdef _WIN32
++      FreeLibrary(lib->handle);
++#else
+       dlclose(lib->handle);
++#endif
+       lib->GetInstanceProcAddr = NULL;
+       lib->handle = NULL;
+    }
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 043d5845..412ea7d8 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -213,20 +213,26 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
+       info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+       vk->GetPhysicalDeviceExternalBufferProperties(handle, &info, &props);
+       physical_dev->is_dma_buf_fd_export_supported =
+-         (props.externalMemoryProperties.externalMemoryFeatures &
+-          VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
+-         (props.externalMemoryProperties.exportFromImportedHandleTypes &
++          (props.externalMemoryProperties.externalMemoryFeatures &
++           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
++         (props.externalMemoryProperties.compatibleHandleTypes &
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+    }
+ 
+-   if (physical_dev->KHR_external_memory_fd) {
++   if (physical_dev->KHR_external_memory_fd || physical_dev->host_external_memory_win32) {
++#ifdef _WIN32
++      info.handleType = physical_dev->host_external_memory_win32
++                           ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
++                           : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++#else
+       info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
++#endif
+       vk->GetPhysicalDeviceExternalBufferProperties(handle, &info, &props);
+       physical_dev->is_opaque_fd_export_supported =
+-         (props.externalMemoryProperties.externalMemoryFeatures &
+-          VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
+-         (props.externalMemoryProperties.exportFromImportedHandleTypes &
+-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
++          (props.externalMemoryProperties.externalMemoryFeatures &
++           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
++         (props.externalMemoryProperties.compatibleHandleTypes &
++           info.handleType);
+    }
+ 
+    /* fallback to gbm allocation with dma-buf import */
+@@ -249,6 +255,34 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
+    }
+ }
+ 
++static bool
++vkr_physical_device_has_extension(const VkExtensionProperties *exts,
++                                  uint32_t count,
++                                  const char *name)
++{
++   for (uint32_t i = 0; i < count; i++) {
++      if (!strcmp(exts[i].extensionName, name))
++         return true;
++   }
++
++   return false;
++}
++
++static bool
++vkr_physical_device_append_extension(VkExtensionProperties *exts,
++                                     uint32_t capacity,
++                                     uint32_t *count,
++                                     const char *name)
++{
++   if (*count >= capacity)
++      return false;
++
++   snprintf(exts[*count].extensionName, sizeof(exts[*count].extensionName), "%s", name);
++   exts[*count].specVersion = vkr_extension_get_spec_version(name);
++   (*count)++;
++   return true;
++}
++
+ static void
+ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+ {
+@@ -262,7 +296,8 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+    if (result != VK_SUCCESS)
+       return;
+ 
+-   exts = malloc(sizeof(*exts) * count);
++   const uint32_t extra_guest_exts = 4;
++   exts = calloc(count + extra_guest_exts, sizeof(*exts));
+    if (!exts)
+       return;
+ 
+@@ -273,28 +308,104 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+    }
+ 
+    uint32_t advertised_count = 0;
++   bool saw_host_swapchain = false;
++   bool advertised_swapchain = false;
+    for (uint32_t i = 0; i < count; i++) {
+       VkExtensionProperties *props = &exts[i];
+ 
++      if (!strcmp(props->extensionName, "VK_KHR_swapchain"))
++         saw_host_swapchain = true;
++
+       if (!strcmp(props->extensionName, "VK_KHR_external_memory_fd"))
+          physical_dev->KHR_external_memory_fd = true;
+       else if (!strcmp(props->extensionName, "VK_EXT_external_memory_dma_buf"))
+          physical_dev->EXT_external_memory_dma_buf = true;
+       else if (!strcmp(props->extensionName, "VK_KHR_external_fence_fd"))
+          physical_dev->KHR_external_fence_fd = true;
++      else if (!strcmp(props->extensionName, "VK_KHR_external_semaphore_fd"))
++         physical_dev->KHR_external_semaphore_fd = true;
++#ifdef _WIN32
++      else if (!strcmp(props->extensionName, "VK_KHR_external_memory_win32"))
++         physical_dev->host_external_memory_win32 = true;
++      else if (!strcmp(props->extensionName, "VK_KHR_external_fence_win32"))
++         physical_dev->host_external_fence_win32 = true;
++      else if (!strcmp(props->extensionName, "VK_KHR_external_semaphore_win32"))
++         physical_dev->host_external_semaphore_win32 = true;
++#endif
+ 
+       const uint32_t spec_ver = vkr_extension_get_spec_version(props->extensionName);
+       if (spec_ver) {
+          if (props->specVersion > spec_ver)
+             props->specVersion = spec_ver;
+          exts[advertised_count++] = exts[i];
++         if (!strcmp(props->extensionName, "VK_KHR_swapchain"))
++            advertised_swapchain = true;
++      }
++   }
++
++#ifdef _WIN32
++   if (physical_dev->host_external_memory_win32)
++      physical_dev->KHR_external_memory_fd = true;
++   if (physical_dev->host_external_fence_win32)
++      physical_dev->KHR_external_fence_fd = true;
++   if (physical_dev->host_external_semaphore_win32)
++      physical_dev->KHR_external_semaphore_fd = true;
++
++   if (physical_dev->host_external_memory_win32 &&
++       !vkr_physical_device_has_extension(exts, advertised_count,
++                                          "VK_KHR_external_memory_fd")) {
++      if (!vkr_physical_device_append_extension(exts, count + extra_guest_exts,
++                                                &advertised_count,
++                                                "VK_KHR_external_memory_fd")) {
++         free(exts);
++         return;
++      }
++   }
++
++   if (physical_dev->host_external_fence_win32 &&
++       !vkr_physical_device_has_extension(exts, advertised_count,
++                                          "VK_KHR_external_fence_fd")) {
++      if (!vkr_physical_device_append_extension(exts, count + extra_guest_exts,
++                                                &advertised_count,
++                                                "VK_KHR_external_fence_fd")) {
++         free(exts);
++         return;
++      }
++   }
++
++   if (physical_dev->host_external_semaphore_win32 &&
++       !vkr_physical_device_has_extension(exts, advertised_count,
++                                          "VK_KHR_external_semaphore_fd")) {
++      if (!vkr_physical_device_append_extension(exts, count + extra_guest_exts,
++                                                &advertised_count,
++                                                "VK_KHR_external_semaphore_fd")) {
++         free(exts);
++         return;
++      }
++   }
++#endif
++
++   if (saw_host_swapchain &&
++       !vkr_physical_device_has_extension(exts, advertised_count, "VK_KHR_swapchain")) {
++      if (!vkr_physical_device_append_extension(exts, count + extra_guest_exts,
++                                                &advertised_count,
++                                                "VK_KHR_swapchain")) {
++         free(exts);
++         return;
+       }
++      advertised_swapchain = true;
+    }
+ 
+    if (physical_dev->KHR_external_fence_fd) {
+       const VkPhysicalDeviceExternalFenceInfo fence_info = {
+          .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
++#ifdef _WIN32
++         .handleType = physical_dev->host_external_fence_win32
++                          ? VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT
++                          : VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
++#else
+          .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
++#endif
+       };
+       VkExternalFenceProperties fence_props = {
+          .sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES,
+@@ -761,6 +872,36 @@ vkr_dispatch_vkGetPhysicalDeviceExternalSemaphoreProperties(
+       vkr_physical_device_from_handle(args->physicalDevice);
+    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+ 
++#ifdef _WIN32
++   if (physical_dev->host_external_semaphore_win32 &&
++       args->pExternalSemaphoreInfo->handleType ==
++          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT) {
++      const VkPhysicalDeviceExternalSemaphoreInfo host_info = {
++         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
++         .pNext = args->pExternalSemaphoreInfo->pNext,
++         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++      };
++      VkExternalSemaphoreProperties host_props = {
++         .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
++      };
++
++      vn_replace_vkGetPhysicalDeviceExternalSemaphoreProperties_args_handle(args);
++      vk->GetPhysicalDeviceExternalSemaphoreProperties(args->physicalDevice,
++                                                       &host_info, &host_props);
++
++      *args->pExternalSemaphoreProperties = host_props;
++      args->pExternalSemaphoreProperties->exportFromImportedHandleTypes =
++         host_props.exportFromImportedHandleTypes
++            ? VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT
++            : 0;
++      args->pExternalSemaphoreProperties->compatibleHandleTypes =
++         host_props.compatibleHandleTypes
++            ? VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT
++            : 0;
++      return;
++   }
++#endif
++
+    vn_replace_vkGetPhysicalDeviceExternalSemaphoreProperties_args_handle(args);
+    vk->GetPhysicalDeviceExternalSemaphoreProperties(args->physicalDevice,
+                                                     args->pExternalSemaphoreInfo,
+@@ -776,6 +917,35 @@ vkr_dispatch_vkGetPhysicalDeviceExternalFenceProperties(
+       vkr_physical_device_from_handle(args->physicalDevice);
+    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+ 
++#ifdef _WIN32
++   if (physical_dev->host_external_fence_win32 &&
++       args->pExternalFenceInfo->handleType == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT) {
++      const VkPhysicalDeviceExternalFenceInfo host_info = {
++         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
++         .pNext = args->pExternalFenceInfo->pNext,
++         .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++      };
++      VkExternalFenceProperties host_props = {
++         .sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES,
++      };
++
++      vn_replace_vkGetPhysicalDeviceExternalFenceProperties_args_handle(args);
++      vk->GetPhysicalDeviceExternalFenceProperties(args->physicalDevice,
++                                                   &host_info, &host_props);
++
++      *args->pExternalFenceProperties = host_props;
++      args->pExternalFenceProperties->exportFromImportedHandleTypes =
++         host_props.exportFromImportedHandleTypes
++            ? VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT
++            : 0;
++      args->pExternalFenceProperties->compatibleHandleTypes =
++         host_props.compatibleHandleTypes
++            ? VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT
++            : 0;
++      return;
++   }
++#endif
++
+    vn_replace_vkGetPhysicalDeviceExternalFenceProperties_args_handle(args);
+    vk->GetPhysicalDeviceExternalFenceProperties(
+       args->physicalDevice, args->pExternalFenceInfo, args->pExternalFenceProperties);
+diff --git a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
+index b0b66918..e9eaf2bb 100644
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -27,6 +27,10 @@ struct vkr_physical_device {
+    bool KHR_external_fence_fd;
+    bool KHR_external_semaphore_fd;
+ 
++   bool host_external_memory_win32;
++   bool host_external_fence_win32;
++   bool host_external_semaphore_win32;
++
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    VkPhysicalDeviceIDProperties id_properties;
+    bool is_dma_buf_fd_export_supported;
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index 61b94bef..5e076624 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -7,10 +7,66 @@
+ 
+ #include "venus-protocol/vn_protocol_renderer_queue.h"
+ 
++#include "util/os_file.h"
++
+ #include "vkr_context.h"
+ #include "vkr_physical_device.h"
+ #include "vkr_queue_gen.h"
+ 
++static struct vkr_queue *
++vkr_device_get_any_queue(struct vkr_device *dev)
++{
++   if (list_is_empty(&dev->queues))
++      return NULL;
++
++   return LIST_ENTRY(struct vkr_queue, dev->queues.next, base.track_head);
++}
++
++static bool
++vkr_queue_submit_empty(struct vkr_queue *queue,
++                       uint32_t wait_count,
++                       const VkSemaphore *wait_semaphores,
++                       const VkPipelineStageFlags *wait_stages,
++                       uint32_t signal_count,
++                       const VkSemaphore *signal_semaphores,
++                       bool wait_for_completion)
++{
++   struct vkr_device *dev = queue->device;
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   VkFence fence = VK_NULL_HANDLE;
++
++   if (wait_for_completion) {
++      const VkFenceCreateInfo fence_info = {
++         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
++      };
++      if (vk->CreateFence(dev->base.handle.device, &fence_info, NULL, &fence) !=
++          VK_SUCCESS)
++         return false;
++   }
++
++   const VkSubmitInfo submit_info = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .waitSemaphoreCount = wait_count,
++      .pWaitSemaphores = wait_semaphores,
++      .pWaitDstStageMask = wait_stages,
++      .signalSemaphoreCount = signal_count,
++      .pSignalSemaphores = signal_semaphores,
++   };
++
++   mtx_lock(&queue->vk_mutex);
++   VkResult result =
++      vk->QueueSubmit(queue->base.handle.queue, 1, &submit_info, fence);
++   if (result == VK_SUCCESS && wait_for_completion) {
++      result = vk->WaitForFences(dev->base.handle.device, 1, &fence, true, UINT64_MAX);
++   }
++   mtx_unlock(&queue->vk_mutex);
++
++   if (fence != VK_NULL_HANDLE)
++      vk->DestroyFence(dev->base.handle.device, fence, NULL);
++
++   return result == VK_SUCCESS;
++}
++
+ static struct vkr_queue_sync *
+ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+                             uint32_t fence_flags,
+@@ -476,7 +532,6 @@ vkr_dispatch_vkResetFenceResourceMESA(struct vn_dispatch_context *dispatch,
+ {
+    struct vkr_context *ctx = dispatch->data;
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+-   struct vn_device_proc_table *vk = &dev->proc_table;
+    int fd = -1;
+ 
+    vn_replace_vkResetFenceResourceMESA_args_handle(args);
+@@ -486,14 +541,15 @@ vkr_dispatch_vkResetFenceResourceMESA(struct vn_dispatch_context *dispatch,
+       .fence = args->fence,
+       .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+    };
+-   VkResult result = vk->GetFenceFdKHR(args->device, &info, &fd);
++   VkResult result =
++      vkr_device_get_fence_fd(dev, info.fence, info.handleType, &fd);
+    if (result != VK_SUCCESS) {
+       vkr_context_set_fatal(ctx);
+       return;
+    }
+ 
+    if (fd >= 0)
+-      close(fd);
++      os_close_fd(fd);
+ }
+ 
+ static void
+@@ -550,24 +606,36 @@ vkr_dispatch_vkWaitSemaphoreResourceMESA(
+ {
+    struct vkr_context *ctx = dispatch->data;
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+-   struct vn_device_proc_table *vk = &dev->proc_table;
+-   int fd = -1;
+ 
+    vn_replace_vkWaitSemaphoreResourceMESA_args_handle(args);
+ 
++#ifdef _WIN32
++   struct vkr_queue *queue = vkr_device_get_any_queue(dev);
++   const VkSemaphore semaphore = args->semaphore;
++   const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++   if (!queue || !vkr_queue_submit_empty(queue, 1, &semaphore, &wait_stage, 0, NULL,
++                                         true)) {
++      vkr_context_set_fatal(ctx);
++   }
++   return;
++#else
++   int fd = -1;
++
+    const VkSemaphoreGetFdInfoKHR info = {
+       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+       .semaphore = args->semaphore,
+       .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+    };
+-   VkResult result = vk->GetSemaphoreFdKHR(args->device, &info, &fd);
++   VkResult result =
++      vkr_device_get_semaphore_fd(dev, info.semaphore, info.handleType, &fd);
+    if (result != VK_SUCCESS) {
+       vkr_context_set_fatal(ctx);
+       return;
+    }
+ 
+    if (fd >= 0)
+-      close(fd);
++      os_close_fd(fd);
++#endif
+ }
+ 
+ static void
+@@ -577,7 +645,6 @@ vkr_dispatch_vkImportSemaphoreResourceMESA(
+ {
+    struct vkr_context *ctx = dispatch->data;
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+-   struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+    vn_replace_vkImportSemaphoreResourceMESA_args_handle(args);
+ 
+@@ -586,6 +653,12 @@ vkr_dispatch_vkImportSemaphoreResourceMESA(
+    /* resourceId 0 is for importing a signaled payload to sync_fd fence */
+    assert(!res_info->resourceId);
+ 
++#ifdef _WIN32
++   struct vkr_queue *queue = vkr_device_get_any_queue(dev);
++   const VkSemaphore semaphore = res_info->semaphore;
++   if (!queue || !vkr_queue_submit_empty(queue, 0, NULL, NULL, 1, &semaphore, false))
++      vkr_context_set_fatal(ctx);
++#else
+    const VkImportSemaphoreFdInfoKHR import_info = {
+       .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+       .semaphore = res_info->semaphore,
+@@ -593,8 +666,9 @@ vkr_dispatch_vkImportSemaphoreResourceMESA(
+       .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+       .fd = -1,
+    };
+-   if (vk->ImportSemaphoreFdKHR(args->device, &import_info) != VK_SUCCESS)
++   if (vkr_device_import_semaphore_fd(dev, &import_info) != VK_SUCCESS)
+       vkr_context_set_fatal(ctx);
++#endif
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index dc6b5789..cb4be950 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -6,8 +6,12 @@
+ #include "vkr_ring.h"
+ 
+ #include <stdio.h>
+-#include <sys/resource.h>
+ #include <time.h>
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <sys/resource.h>
++#endif
+ 
+ #include "venus-protocol/vn_protocol_renderer_dispatches.h"
+ 
+@@ -254,7 +258,14 @@ vkr_ring_thread(void *arg)
+ 
+    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ring-%d", ctx->ctx_id);
+    u_thread_setname(thread_name);
++#ifdef _WIN32
++   if (ring->prio_valid && !SetThreadPriority(GetCurrentThread(),
++         ring->prio <= -10 ? THREAD_PRIORITY_HIGHEST :
++         ring->prio <= 0   ? THREAD_PRIORITY_ABOVE_NORMAL :
++                             THREAD_PRIORITY_NORMAL)) {
++#else
+    if (ring->prio_valid && setpriority(PRIO_PROCESS, 0, ring->prio)) {
++#endif
+ #ifdef DEBUG
+       /* Currently venus doesn't forward the CAP_SYS_NICE request upon forking, so
+        * requesting a high priority outside of the normal range would be at the best
+@@ -364,7 +375,11 @@ bool
+ vkr_ring_stop(struct vkr_ring *ring)
+ {
+    mtx_lock(&ring->mutex);
++#ifdef _WIN32
++   if (GetThreadId(ring->thread) == GetCurrentThreadId()) {
++#else
+    if (thrd_equal(ring->thread, thrd_current())) {
++#endif
+       mtx_unlock(&ring->mutex);
+       return false;
+    }
+diff --git a/src/venus/vkr_win32_shim.c b/src/venus/vkr_win32_shim.c
+new file mode 100644
+index 00000000..77b10616
+--- /dev/null
++++ b/src/venus/vkr_win32_shim.c
+@@ -0,0 +1,702 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifdef _WIN32
++
++#include "vkr_win32_shim.h"
++
++#include <windows.h>
++#include <vulkan/vulkan.h>
++#include <vulkan/vulkan_win32.h>
++
++#include "util/os_file.h"
++
++#include "vkr_device.h"
++#include "vkr_physical_device.h"
++
++/*
++ * Device map: lookup vkr_device from raw VkDevice handle.
++ *
++ * The shim functions receive raw VkDevice handles (after vn_replace) and
++ * need access to the vkr_device to find Win32 function pointers and the
++ * real (original) proc table entries.  We maintain a small table of
++ * active devices for this purpose.
++ */
++#define VKR_WIN32_MAX_DEVICES 8
++
++struct vkr_win32_device_entry {
++   VkDevice handle;
++   struct vkr_device *dev;
++   /* Full copy of the proc table before any shim replacements.
++    * Used to restore the original entries and for shim functions
++    * that need to call through to the real driver.
++    */
++   struct vn_device_proc_table saved_proc_table;
++};
++
++static struct vkr_win32_device_entry vkr_win32_devices[VKR_WIN32_MAX_DEVICES];
++static int vkr_win32_device_count;
++
++static struct vkr_win32_device_entry *
++vkr_win32_lookup_device(VkDevice device)
++{
++   for (int i = 0; i < vkr_win32_device_count; i++) {
++      if (vkr_win32_devices[i].handle == device)
++         return &vkr_win32_devices[i];
++   }
++   return NULL;
++}
++
++/*
++ * Determine the host external memory handle type for a device.
++ */
++static VkExternalMemoryHandleTypeFlags
++vkr_win32_get_host_handle_type(struct vkr_device *dev)
++{
++   if (dev->physical_device->host_external_memory_win32)
++      return VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++   return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* pNext chain helpers                                                 */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Walk a pNext chain and remap OPAQUE_FD handle types to the host
++ * equivalent (OPAQUE_WIN32).  This is needed because the guest Venus
++ * driver speaks in fd terms but the Windows host driver uses Win32.
++ */
++static void
++vkr_win32_remap_external_handle_types_in_chain(const void *pNext)
++{
++   for (VkBaseOutStructure *iter = (VkBaseOutStructure *)pNext; iter;
++        iter = iter->pNext) {
++      switch (iter->sType) {
++      case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO: {
++         VkExternalMemoryBufferCreateInfo *info =
++            (VkExternalMemoryBufferCreateInfo *)iter;
++         if (info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
++            info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++            info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++         }
++         break;
++      }
++      case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: {
++         VkExternalMemoryImageCreateInfo *info =
++            (VkExternalMemoryImageCreateInfo *)iter;
++         if (info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
++            info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++            info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++         }
++         break;
++      }
++      case VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO: {
++         VkExportMemoryAllocateInfo *info = (VkExportMemoryAllocateInfo *)iter;
++         if (info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
++            info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++            info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++         }
++         break;
++      }
++      case VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO: {
++         VkExportFenceCreateInfo *info = (VkExportFenceCreateInfo *)iter;
++         if (info->handleTypes & VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_FD_BIT) {
++            info->handleTypes &= ~VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_FD_BIT;
++            info->handleTypes |= VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++         }
++         break;
++      }
++      case VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO: {
++         VkExportSemaphoreCreateInfo *info = (VkExportSemaphoreCreateInfo *)iter;
++         if (info->handleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT) {
++            info->handleTypes &= ~VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
++            info->handleTypes |= VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++         }
++         break;
++      }
++      default:
++         break;
++      }
++   }
++}
++
++/* ------------------------------------------------------------------ */
++/* CreateDescriptorSetLayout shim                                      */
++/* ------------------------------------------------------------------ */
++
++static VKAPI_ATTR VkResult VKAPI_CALL
++vkr_win32_CreateDescriptorSetLayout(VkDevice device,
++                                    const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
++                                    const VkAllocationCallbacks *pAllocator,
++                                    VkDescriptorSetLayout *pSetLayout)
++{
++   struct vkr_win32_device_entry *entry = vkr_win32_lookup_device(device);
++   if (!entry)
++      return VK_ERROR_DEVICE_LOST;
++
++   /* Intel's Windows Vulkan driver crashes in CreatePipelineLayout when
++    * a push descriptor DSL has VkDescriptorSetLayoutBindingFlagsCreateInfo
++    * in its pNext chain.  The driver accepts the DSL creation but later
++    * segfaults when the DSL handle is referenced in a pipeline layout.
++    * Strip the binding flags struct from push descriptor layouts.
++    */
++   if (pCreateInfo->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) {
++      VkBaseOutStructure *prev = (VkBaseOutStructure *)pCreateInfo;
++      while (prev->pNext) {
++         if (prev->pNext->sType ==
++             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO) {
++            prev->pNext = prev->pNext->pNext;
++            break;
++         }
++         prev = prev->pNext;
++      }
++   }
++
++   return entry->saved_proc_table.CreateDescriptorSetLayout(
++      device, pCreateInfo, pAllocator, pSetLayout);
++}
++
++/* ------------------------------------------------------------------ */
++/* CreateBuffer shim                                                   */
++/* ------------------------------------------------------------------ */
++
++static VKAPI_ATTR VkResult VKAPI_CALL
++vkr_win32_CreateBuffer(VkDevice device,
++                       const VkBufferCreateInfo *pCreateInfo,
++                       const VkAllocationCallbacks *pAllocator,
++                       VkBuffer *pBuffer)
++{
++   struct vkr_win32_device_entry *entry = vkr_win32_lookup_device(device);
++   if (!entry)
++      return VK_ERROR_DEVICE_LOST;
++
++   const VkExternalMemoryHandleTypeFlags host_type =
++      vkr_win32_get_host_handle_type(entry->dev);
++
++   /* Remap any existing external memory info in the pNext chain */
++   vkr_win32_remap_external_handle_types_in_chain(pCreateInfo->pNext);
++
++   /* If the device uses external memory and the guest didn't chain
++    * VkExternalMemoryBufferCreateInfo, add one.  This is needed because
++    * vkAllocateMemory forces HOST_VISIBLE memory to be external, but the
++    * guest doesn't know this and creates buffers without the matching info.
++    */
++   VkBufferCreateInfo local_info;
++   VkExternalMemoryBufferCreateInfo ext_info;
++   const VkBufferCreateInfo *create_info = pCreateInfo;
++
++   if (host_type) {
++      bool has_external = false;
++      for (const VkBaseInStructure *iter = (const VkBaseInStructure *)pCreateInfo->pNext;
++           iter; iter = iter->pNext) {
++         if (iter->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO) {
++            has_external = true;
++            break;
++         }
++      }
++
++      if (!has_external) {
++         local_info = *pCreateInfo;
++         ext_info = (VkExternalMemoryBufferCreateInfo){
++            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
++            .pNext = (void *)local_info.pNext,
++            .handleTypes = host_type,
++         };
++         local_info.pNext = &ext_info;
++         create_info = &local_info;
++      }
++   }
++
++   return entry->saved_proc_table.CreateBuffer(device, create_info, pAllocator, pBuffer);
++}
++
++/* ------------------------------------------------------------------ */
++/* CreateImage shim                                                    */
++/* ------------------------------------------------------------------ */
++
++static VKAPI_ATTR VkResult VKAPI_CALL
++vkr_win32_CreateImage(VkDevice device,
++                      const VkImageCreateInfo *pCreateInfo,
++                      const VkAllocationCallbacks *pAllocator,
++                      VkImage *pImage)
++{
++   struct vkr_win32_device_entry *entry = vkr_win32_lookup_device(device);
++   if (!entry)
++      return VK_ERROR_DEVICE_LOST;
++
++   const VkExternalMemoryHandleTypeFlags host_type =
++      vkr_win32_get_host_handle_type(entry->dev);
++
++   /* Remap any existing external memory info in the pNext chain */
++   vkr_win32_remap_external_handle_types_in_chain(pCreateInfo->pNext);
++
++   /* Only remap existing external memory info (OPAQUE_FD → OPAQUE_WIN32).
++    *
++    * Unlike buffers, we do NOT force VkExternalMemoryImageCreateInfo onto
++    * images that don't request it.  The Intel Windows driver misbehaves
++    * (hangs, leaks memory) when certain image types are created with
++    * external memory info that they don't support.
++    *
++    * This means images bound to forced-external HOST_VISIBLE memory may
++    * not have matching create info, which is a spec violation.  However,
++    * this matches the upstream Linux behavior where this violation is
++    * tolerated by all drivers.  The rendering correctness issue (blank
++    * output) must be addressed differently — likely by fixing the
++    * swapchain/WSI presentation path rather than image creation.
++    */
++   return entry->saved_proc_table.CreateImage(device, pCreateInfo, pAllocator, pImage);
++}
++
++/* ------------------------------------------------------------------ */
++/* GetMemoryFdKHR shim                                                 */
++/* ------------------------------------------------------------------ */
++
++static VKAPI_ATTR VkResult VKAPI_CALL
++vkr_win32_GetMemoryFdKHR(VkDevice device,
++                         const VkMemoryGetFdInfoKHR *pGetFdInfo,
++                         int *pFd)
++{
++   struct vkr_win32_device_entry *entry = vkr_win32_lookup_device(device);
++   if (!entry || !entry->dev->GetMemoryWin32HandleKHR)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   VkExternalMemoryHandleTypeFlagBits win32_type =
++      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++   if (pGetFdInfo->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
++      win32_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++
++   const VkMemoryGetWin32HandleInfoKHR win32_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR,
++      .memory = pGetFdInfo->memory,
++      .handleType = win32_type,
++   };
++
++   HANDLE handle = INVALID_HANDLE_VALUE;
++   VkResult result =
++      entry->dev->GetMemoryWin32HandleKHR(device, &win32_info, &handle);
++   if (result != VK_SUCCESS)
++      return result;
++
++   int fd = os_wrap_win32_handle(handle);
++   if (fd < 0) {
++      CloseHandle(handle);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   *pFd = fd;
++   return VK_SUCCESS;
++}
++
++/* ------------------------------------------------------------------ */
++/* GetFenceFdKHR shim                                                  */
++/* ------------------------------------------------------------------ */
++
++static VKAPI_ATTR VkResult VKAPI_CALL
++vkr_win32_GetFenceFdKHR(VkDevice device,
++                        const VkFenceGetFdInfoKHR *pGetFdInfo,
++                        int *pFd)
++{
++   struct vkr_win32_device_entry *entry = vkr_win32_lookup_device(device);
++   if (!entry || !entry->dev->GetFenceWin32HandleKHR)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   const VkFenceGetWin32HandleInfoKHR win32_info = {
++      .sType = VK_STRUCTURE_TYPE_FENCE_GET_WIN32_HANDLE_INFO_KHR,
++      .fence = pGetFdInfo->fence,
++      .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++   };
++
++   HANDLE handle = INVALID_HANDLE_VALUE;
++   VkResult result =
++      entry->dev->GetFenceWin32HandleKHR(device, &win32_info, &handle);
++   if (result != VK_SUCCESS)
++      return result;
++
++   int fd = os_wrap_win32_handle(handle);
++   if (fd < 0) {
++      CloseHandle(handle);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   *pFd = fd;
++   return VK_SUCCESS;
++}
++
++/* ------------------------------------------------------------------ */
++/* GetSemaphoreFdKHR shim                                              */
++/* ------------------------------------------------------------------ */
++
++static VKAPI_ATTR VkResult VKAPI_CALL
++vkr_win32_GetSemaphoreFdKHR(VkDevice device,
++                            const VkSemaphoreGetFdInfoKHR *pGetFdInfo,
++                            int *pFd)
++{
++   struct vkr_win32_device_entry *entry = vkr_win32_lookup_device(device);
++   if (!entry || !entry->dev->GetSemaphoreWin32HandleKHR)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   const VkSemaphoreGetWin32HandleInfoKHR win32_info = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR,
++      .semaphore = pGetFdInfo->semaphore,
++      .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++   };
++
++   HANDLE handle = INVALID_HANDLE_VALUE;
++   VkResult result =
++      entry->dev->GetSemaphoreWin32HandleKHR(device, &win32_info, &handle);
++   if (result != VK_SUCCESS)
++      return result;
++
++   int fd = os_wrap_win32_handle(handle);
++   if (fd < 0) {
++      CloseHandle(handle);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   *pFd = fd;
++   return VK_SUCCESS;
++}
++
++/* ------------------------------------------------------------------ */
++/* ImportFenceFdKHR shim                                               */
++/* ------------------------------------------------------------------ */
++
++static VKAPI_ATTR VkResult VKAPI_CALL
++vkr_win32_ImportFenceFdKHR(VkDevice device,
++                           const VkImportFenceFdInfoKHR *pImportFenceFdInfo)
++{
++   struct vkr_win32_device_entry *entry = vkr_win32_lookup_device(device);
++   if (!entry || !entry->dev->ImportFenceWin32HandleKHR)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   HANDLE import_handle = INVALID_HANDLE_VALUE;
++   if (pImportFenceFdInfo->fd >= 0) {
++      import_handle = os_get_win32_handle_from_fd(pImportFenceFdInfo->fd);
++      if (import_handle == INVALID_HANDLE_VALUE)
++         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   HANDLE dup_handle = INVALID_HANDLE_VALUE;
++   if (import_handle != INVALID_HANDLE_VALUE) {
++      if (!DuplicateHandle(GetCurrentProcess(), import_handle,
++                           GetCurrentProcess(), &dup_handle, 0, FALSE,
++                           DUPLICATE_SAME_ACCESS))
++         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   const VkImportFenceWin32HandleInfoKHR win32_info = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_FENCE_WIN32_HANDLE_INFO_KHR,
++      .fence = pImportFenceFdInfo->fence,
++      .flags = pImportFenceFdInfo->flags,
++      .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++      .handle = dup_handle,
++   };
++
++   VkResult result =
++      entry->dev->ImportFenceWin32HandleKHR(device, &win32_info);
++   if (dup_handle != INVALID_HANDLE_VALUE && result != VK_SUCCESS)
++      CloseHandle(dup_handle);
++   return result;
++}
++
++/* ------------------------------------------------------------------ */
++/* ImportSemaphoreFdKHR shim                                           */
++/* ------------------------------------------------------------------ */
++
++static VKAPI_ATTR VkResult VKAPI_CALL
++vkr_win32_ImportSemaphoreFdKHR(
++   VkDevice device,
++   const VkImportSemaphoreFdInfoKHR *pImportSemaphoreFdInfo)
++{
++   struct vkr_win32_device_entry *entry = vkr_win32_lookup_device(device);
++   if (!entry || !entry->dev->ImportSemaphoreWin32HandleKHR)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   HANDLE import_handle = INVALID_HANDLE_VALUE;
++   if (pImportSemaphoreFdInfo->fd >= 0) {
++      import_handle = os_get_win32_handle_from_fd(pImportSemaphoreFdInfo->fd);
++      if (import_handle == INVALID_HANDLE_VALUE)
++         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   HANDLE dup_handle = INVALID_HANDLE_VALUE;
++   if (import_handle != INVALID_HANDLE_VALUE) {
++      if (!DuplicateHandle(GetCurrentProcess(), import_handle,
++                           GetCurrentProcess(), &dup_handle, 0, FALSE,
++                           DUPLICATE_SAME_ACCESS))
++         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   const VkImportSemaphoreWin32HandleInfoKHR win32_info = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
++      .semaphore = pImportSemaphoreFdInfo->semaphore,
++      .flags = pImportSemaphoreFdInfo->flags,
++      .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++      .handle = dup_handle,
++   };
++
++   VkResult result =
++      entry->dev->ImportSemaphoreWin32HandleKHR(device, &win32_info);
++   if (dup_handle != INVALID_HANDLE_VALUE && result != VK_SUCCESS)
++      CloseHandle(dup_handle);
++   return result;
++}
++
++/* ------------------------------------------------------------------ */
++/* Deferred object destruction                                         */
++/*                                                                     */
++/* Intel's Windows Vulkan driver has a handle-caching bug: when a      */
++/* non-dispatchable handle value (e.g. VkDescriptorSetLayout) is       */
++/* recycled after the previous object was destroyed, the driver's      */
++/* internal cache still holds stale metadata for that value.  This     */
++/* causes crashes in vkCreatePipelineLayout and similar calls that     */
++/* reference the "new" handle.                                         */
++/*                                                                     */
++/* The Vulkan validation layer masks this because it wraps every       */
++/* handle in a unique dispatch object, so the driver never sees raw    */
++/* value reuse.                                                        */
++/*                                                                     */
++/* Our fix: when the guest destroys an object, we skip the driver      */
++/* destroy call and keep the driver handle alive.  This prevents the   */
++/* driver from recycling the handle value.  All deferred handles are   */
++/* actually destroyed at device teardown after DeviceWaitIdle.         */
++/* ------------------------------------------------------------------ */
++
++static void
++vkr_win32_defer_destroy(struct vkr_device *dev, VkObjectType type, uint64_t handle)
++{
++   if (dev->deferred_destroy_count >= dev->deferred_destroy_capacity) {
++      uint32_t new_cap = dev->deferred_destroy_capacity
++                            ? dev->deferred_destroy_capacity * 2
++                            : 64;
++      struct vkr_win32_deferred_handle *new_arr =
++         realloc(dev->deferred_destroys, new_cap * sizeof(*new_arr));
++      if (!new_arr) {
++         vkr_log("win32 shim: failed to grow deferred destroy list, leaking handle");
++         return;
++      }
++      dev->deferred_destroys = new_arr;
++      dev->deferred_destroy_capacity = new_cap;
++   }
++   dev->deferred_destroys[dev->deferred_destroy_count++] =
++      (struct vkr_win32_deferred_handle){ .type = type, .handle = handle };
++}
++
++/*
++ * Macro to define a shim that defers destruction instead of calling
++ * the real driver vkDestroy*.  All Vulkan destroy functions for
++ * non-dispatchable handles share the same signature:
++ *   void vkDestroyFoo(VkDevice, VkFoo, const VkAllocationCallbacks*)
++ */
++#define VKR_WIN32_DEFERRED_DESTROY_SHIM(VkType, name, obj_type)                    \
++static VKAPI_ATTR void VKAPI_CALL                                                  \
++vkr_win32_Destroy##name(VkDevice device, VkType object,                             \
++                        UNUSED const VkAllocationCallbacks *pAllocator)              \
++{                                                                                    \
++   if (!(uint64_t)object)                                                            \
++      return;                                                                        \
++   struct vkr_win32_device_entry *entry = vkr_win32_lookup_device(device);           \
++   if (entry)                                                                        \
++      vkr_win32_defer_destroy(entry->dev, obj_type, (uint64_t)object);               \
++}
++
++/* Generate shims for lightweight metadata object types.
++ * Heavy resource types (Buffer, Image, DeviceMemory, Fence, Semaphore)
++ * and pool types (CommandPool, DescriptorPool) are NOT deferred to
++ * avoid exhausting GPU memory or breaking sub-resource management.
++ */
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkDescriptorSetLayout, DescriptorSetLayout, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkPipelineLayout, PipelineLayout, VK_OBJECT_TYPE_PIPELINE_LAYOUT)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkPipeline, Pipeline, VK_OBJECT_TYPE_PIPELINE)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkRenderPass, RenderPass, VK_OBJECT_TYPE_RENDER_PASS)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkShaderModule, ShaderModule, VK_OBJECT_TYPE_SHADER_MODULE)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkFramebuffer, Framebuffer, VK_OBJECT_TYPE_FRAMEBUFFER)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkSampler, Sampler, VK_OBJECT_TYPE_SAMPLER)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkImageView, ImageView, VK_OBJECT_TYPE_IMAGE_VIEW)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkBufferView, BufferView, VK_OBJECT_TYPE_BUFFER_VIEW)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkDescriptorUpdateTemplate, DescriptorUpdateTemplate, VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkSamplerYcbcrConversion, SamplerYcbcrConversion, VK_OBJECT_TYPE_SAMPLER_YCBCR_CONVERSION)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkPipelineCache, PipelineCache, VK_OBJECT_TYPE_PIPELINE_CACHE)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkEvent, Event, VK_OBJECT_TYPE_EVENT)
++VKR_WIN32_DEFERRED_DESTROY_SHIM(VkQueryPool, QueryPool, VK_OBJECT_TYPE_QUERY_POOL)
++
++/* ------------------------------------------------------------------ */
++/* Install / remove                                                    */
++/* ------------------------------------------------------------------ */
++
++void
++vkr_win32_device_install_shim(struct vkr_device *dev)
++{
++   if (vkr_win32_device_count >= VKR_WIN32_MAX_DEVICES) {
++      vkr_log("win32 shim: too many devices, shim not installed");
++      return;
++   }
++
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   struct vkr_win32_device_entry *entry =
++      &vkr_win32_devices[vkr_win32_device_count++];
++
++   entry->handle = dev->base.handle.device;
++   entry->dev = dev;
++
++   /* Save the entire proc table so we can restore it on removal */
++   entry->saved_proc_table = *vk;
++
++   /* --- External memory/sync fd→Win32 translation shims --- */
++   if (dev->physical_device->host_external_memory_win32 ||
++       dev->physical_device->host_external_fence_win32 ||
++       dev->physical_device->host_external_semaphore_win32) {
++      vk->CreateBuffer = vkr_win32_CreateBuffer;
++      vk->CreateImage = vkr_win32_CreateImage;
++
++      if (dev->GetMemoryWin32HandleKHR)
++         vk->GetMemoryFdKHR = vkr_win32_GetMemoryFdKHR;
++      if (dev->GetFenceWin32HandleKHR)
++         vk->GetFenceFdKHR = vkr_win32_GetFenceFdKHR;
++      if (dev->GetSemaphoreWin32HandleKHR)
++         vk->GetSemaphoreFdKHR = vkr_win32_GetSemaphoreFdKHR;
++      if (dev->ImportFenceWin32HandleKHR)
++         vk->ImportFenceFdKHR = vkr_win32_ImportFenceFdKHR;
++      if (dev->ImportSemaphoreWin32HandleKHR)
++         vk->ImportSemaphoreFdKHR = vkr_win32_ImportSemaphoreFdKHR;
++   }
++
++   /* --- Intel driver workaround shims --- */
++   vk->CreateDescriptorSetLayout = vkr_win32_CreateDescriptorSetLayout;
++
++   /* --- Deferred destruction shims ---
++    *
++    * Replace all Destroy/Free functions with shims that record the
++    * handle for later destruction instead of calling the driver
++    * immediately.  This prevents the Intel driver from recycling
++    * handle values and hitting its stale-cache bug.
++    */
++   /* Defer destruction of lightweight metadata objects whose handles
++    * are commonly recycled by the Intel driver.  Heavy resource types
++    * (Buffer, Image, DeviceMemory) are NOT deferred — keeping them
++    * alive would exhaust GPU memory.  Similarly, pool types (CommandPool,
++    * DescriptorPool) manage sub-resources and are left alone.
++    */
++   vk->DestroyDescriptorSetLayout = vkr_win32_DestroyDescriptorSetLayout;
++   vk->DestroyPipelineLayout = vkr_win32_DestroyPipelineLayout;
++   vk->DestroyPipeline = vkr_win32_DestroyPipeline;
++   vk->DestroyRenderPass = vkr_win32_DestroyRenderPass;
++   vk->DestroyShaderModule = vkr_win32_DestroyShaderModule;
++   vk->DestroyFramebuffer = vkr_win32_DestroyFramebuffer;
++   vk->DestroySampler = vkr_win32_DestroySampler;
++   vk->DestroyImageView = vkr_win32_DestroyImageView;
++   vk->DestroyBufferView = vkr_win32_DestroyBufferView;
++   vk->DestroyDescriptorUpdateTemplate = vkr_win32_DestroyDescriptorUpdateTemplate;
++   vk->DestroySamplerYcbcrConversion = vkr_win32_DestroySamplerYcbcrConversion;
++   vk->DestroyPipelineCache = vkr_win32_DestroyPipelineCache;
++   vk->DestroyEvent = vkr_win32_DestroyEvent;
++   vk->DestroyQueryPool = vkr_win32_DestroyQueryPool;
++
++   vkr_log("win32 shim: installed for device %p (mem=%d fence=%d sem=%d, "
++           "deferred-destroy=metadata)",
++           (void *)entry->handle,
++           !!dev->GetMemoryWin32HandleKHR,
++           !!dev->GetFenceWin32HandleKHR,
++           !!dev->GetSemaphoreWin32HandleKHR);
++}
++
++void
++vkr_win32_device_remove_shim(struct vkr_device *dev)
++{
++   for (int i = 0; i < vkr_win32_device_count; i++) {
++      if (vkr_win32_devices[i].dev == dev) {
++         struct vkr_win32_device_entry *entry = &vkr_win32_devices[i];
++
++         /* Restore the entire proc table from the saved copy.
++          * This undoes all shim replacements (create, destroy, export, import).
++          */
++         dev->proc_table = entry->saved_proc_table;
++
++         /* Remove from table by swapping with last */
++         vkr_win32_devices[i] = vkr_win32_devices[--vkr_win32_device_count];
++         return;
++      }
++   }
++}
++
++void
++vkr_win32_flush_deferred_destroys(struct vkr_device *dev)
++{
++   if (!dev->deferred_destroy_count) {
++      free(dev->deferred_destroys);
++      dev->deferred_destroys = NULL;
++      dev->deferred_destroy_capacity = 0;
++      return;
++   }
++
++   vkr_log("win32 shim: flushing %u deferred object destructions",
++           dev->deferred_destroy_count);
++
++   /* At this point the proc table has been restored to real driver
++    * functions (by vkr_win32_device_remove_shim) and DeviceWaitIdle
++    * has completed, so it is safe to destroy these objects.
++    */
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   VkDevice device = dev->base.handle.device;
++
++   for (uint32_t i = 0; i < dev->deferred_destroy_count; i++) {
++      struct vkr_win32_deferred_handle *h = &dev->deferred_destroys[i];
++      switch (h->type) {
++      case VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT:
++         vk->DestroyDescriptorSetLayout(device, (VkDescriptorSetLayout)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_PIPELINE_LAYOUT:
++         vk->DestroyPipelineLayout(device, (VkPipelineLayout)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_PIPELINE:
++         vk->DestroyPipeline(device, (VkPipeline)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_RENDER_PASS:
++         vk->DestroyRenderPass(device, (VkRenderPass)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_SHADER_MODULE:
++         vk->DestroyShaderModule(device, (VkShaderModule)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_FRAMEBUFFER:
++         vk->DestroyFramebuffer(device, (VkFramebuffer)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_SAMPLER:
++         vk->DestroySampler(device, (VkSampler)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_IMAGE_VIEW:
++         vk->DestroyImageView(device, (VkImageView)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_BUFFER_VIEW:
++         vk->DestroyBufferView(device, (VkBufferView)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE:
++         vk->DestroyDescriptorUpdateTemplate(device, (VkDescriptorUpdateTemplate)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_SAMPLER_YCBCR_CONVERSION:
++         vk->DestroySamplerYcbcrConversion(device, (VkSamplerYcbcrConversion)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_PIPELINE_CACHE:
++         vk->DestroyPipelineCache(device, (VkPipelineCache)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_EVENT:
++         vk->DestroyEvent(device, (VkEvent)h->handle, NULL);
++         break;
++      case VK_OBJECT_TYPE_QUERY_POOL:
++         vk->DestroyQueryPool(device, (VkQueryPool)h->handle, NULL);
++         break;
++      default:
++         vkr_log("win32 shim: unexpected deferred type %u", (uint32_t)h->type);
++         break;
++      }
++   }
++
++   free(dev->deferred_destroys);
++   dev->deferred_destroys = NULL;
++   dev->deferred_destroy_count = 0;
++   dev->deferred_destroy_capacity = 0;
++}
++
++#endif /* _WIN32 */
+diff --git a/src/venus/vkr_win32_shim.h b/src/venus/vkr_win32_shim.h
+new file mode 100644
+index 00000000..f80f8f28
+--- /dev/null
++++ b/src/venus/vkr_win32_shim.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ *
++ * Unified Windows external memory/sync translation shim for Venus.
++ *
++ * On Linux, Venus uses fd-based external memory and sync primitives.
++ * On Windows, the host Vulkan driver exposes Win32 handle equivalents.
++ * This shim intercepts the relevant Vulkan API calls at the proc table
++ * level and translates fd semantics to Win32 handles transparently.
++ *
++ * It replaces the piecemeal translations previously scattered across
++ * vkr_buffer.c, vkr_device.c, vkr_queue.c, and vkr_device_memory.c.
++ */
++
++#ifndef VKR_WIN32_SHIM_H
++#define VKR_WIN32_SHIM_H
++
++#ifdef _WIN32
++
++struct vkr_device;
++
++/*
++ * Install Win32 translation shims into the device proc table.
++ * Must be called after vkr_device_init_proc_table and after the
++ * Win32 function pointers (GetMemoryWin32HandleKHR etc.) are loaded.
++ *
++ * Replaces these proc table entries with wrappers:
++ *   - CreateBuffer      (adds VkExternalMemoryBufferCreateInfo)
++ *   - CreateImage       (adds VkExternalMemoryImageCreateInfo)
++ *   - GetMemoryFdKHR    (translates to GetMemoryWin32HandleKHR)
++ *   - GetFenceFdKHR     (translates to GetFenceWin32HandleKHR)
++ *   - GetSemaphoreFdKHR (translates to GetSemaphoreWin32HandleKHR)
++ *   - ImportFenceFdKHR  (translates to ImportFenceWin32HandleKHR)
++ *   - ImportSemaphoreFdKHR (translates to ImportSemaphoreWin32HandleKHR)
++ *
++ * Also installs deferred-destroy shims for all non-dispatchable object
++ * types to prevent Intel driver crashes from handle value reuse.
++ */
++void
++vkr_win32_device_install_shim(struct vkr_device *dev);
++
++/*
++ * Unregister a device from the shim's device map and restore the
++ * original proc table entries.
++ * Must be called before the device is destroyed.
++ */
++void
++vkr_win32_device_remove_shim(struct vkr_device *dev);
++
++/*
++ * Destroy all Vulkan objects whose destruction was deferred by the shim.
++ * Must be called after DeviceWaitIdle (no in-flight work) and after
++ * the shim has been removed (proc table restored to real functions).
++ */
++void
++vkr_win32_flush_deferred_destroys(struct vkr_device *dev);
++
++#endif /* _WIN32 */
++
++#endif /* VKR_WIN32_SHIM_H */
+diff --git a/src/virgl_resource.c b/src/virgl_resource.c
+index 0ee54688..f46700d4 100644
+--- a/src/virgl_resource.c
++++ b/src/virgl_resource.c
+@@ -48,7 +48,7 @@ virgl_resource_destroy_func(void *val)
+       pipe_callbacks.unref(res->pipe_resource, pipe_callbacks.data);
+    if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
+        (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE))
+-      close(res->fd);
++      os_close_fd(res->fd);
+ 
+    free(res);
+ }
+@@ -144,7 +144,7 @@ virgl_resource_create_from_fd(uint32_t res_id,
+ 
+    res = virgl_resource_create(res_id);
+    if (!res) {
+-      close(fd);
++      os_close_fd(fd);
+       return NULL;
+    }
+ 
+diff --git a/src/virgl_util.c b/src/virgl_util.c
+index 81846503..e6f927a0 100644
+--- a/src/virgl_util.c
++++ b/src/virgl_util.c
+@@ -32,7 +32,14 @@
+ #ifdef HAVE_EVENTFD_H
+ #include <sys/eventfd.h>
+ #endif
++#ifdef _WIN32
++#include <windows.h>
++#include <io.h>
++#include <process.h>  /* _getpid */
++#define getpid _getpid
++#else
+ #include <unistd.h>
++#endif
+ 
+ #include "util/os_misc.h"
+ #include "util/u_pointer.h"
+@@ -88,7 +95,7 @@ bool equal_func(const void *key1, const void *key2)
+ 
+ bool has_eventfd(void)
+ {
+-#ifdef HAVE_EVENTFD_H
++#if defined(HAVE_EVENTFD_H) || defined(_WIN32)
+    return true;
+ #else
+    return false;
+@@ -99,6 +106,14 @@ int create_eventfd(unsigned int initval)
+ {
+ #ifdef HAVE_EVENTFD_H
+    return eventfd(initval, EFD_CLOEXEC | EFD_NONBLOCK);
++#elif defined(_WIN32)
++   HANDLE event = CreateEventA(NULL, TRUE, initval ? TRUE : FALSE, NULL);
++   if (!event)
++      return -1;
++   int fd = _open_osfhandle((intptr_t)event, 0);
++   if (fd < 0)
++      CloseHandle(event);
++   return fd;
+ #else
+    (void)initval;
+    return -1;
+@@ -107,6 +122,13 @@ int create_eventfd(unsigned int initval)
+ 
+ int write_eventfd(int fd, uint64_t val)
+ {
++#ifdef _WIN32
++   (void)val;
++   HANDLE event = (HANDLE)_get_osfhandle(fd);
++   if (event == INVALID_HANDLE_VALUE)
++      return -1;
++   return SetEvent(event) ? 0 : -1;
++#else
+    const char *buf = (const char *)&val;
+    size_t count = sizeof(val);
+    ssize_t ret = 0;
+@@ -123,15 +145,22 @@ int write_eventfd(int fd, uint64_t val)
+    }
+ 
+    return count ? -1 : 0;
++#endif
+ }
+ 
+ void flush_eventfd(int fd)
+ {
++#ifdef _WIN32
++   HANDLE event = (HANDLE)_get_osfhandle(fd);
++   if (event != INVALID_HANDLE_VALUE)
++      ResetEvent(event);
++#else
+     ssize_t len;
+     uint64_t value;
+     do {
+        len = read(fd, &value, sizeof(value));
+     } while ((len == -1 && errno == EINTR) || len == sizeof(value));
++#endif
+ }
+ 
+ const struct log_levels_lut {
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 79717fcc..caf3aa34 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -40,7 +40,9 @@
+ #include "pipe/p_state.h"
+ #include "util/u_format.h"
+ #include "util/u_math.h"
++#include "util/os_file.h"
+ #include "vkr_allocator.h"
++#include "vkr_renderer.h"
+ #include "drm_renderer.h"
+ #include "proxy/proxy_renderer.h"
+ #include "vrend/vrend_renderer.h"
+@@ -239,8 +241,9 @@ int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
+       ctx = vrend_renderer_context_create(ctx_id, nlen, name);
+       break;
+    case VIRTGPU_DRM_CAPSET_VENUS:
+-      if (!state.proxy_initialized)
++      if (!state.proxy_initialized) {
+          return EINVAL;
++      }
+       ctx = proxy_context_create(ctx_id, ctx_flags, nlen, name);
+       break;
+    case VIRTGPU_DRM_CAPSET_DRM:
+@@ -570,7 +573,7 @@ void virgl_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
+       break;
+    case VIRTGPU_DRM_CAPSET_VENUS:
+       *max_ver = 0;
+-      *max_size = proxy_get_capset(cap_set, NULL);
++      *max_size = vkr_get_capset(NULL, state.flags);
+       break;
+    case VIRTGPU_DRM_CAPSET_DRM:
+       *max_ver = 0;
+@@ -1281,7 +1284,7 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
+       }
+ 
+       if (export_fd_type != fd_type)
+-         close(fd);
++         os_close_fd(fd);
+    }
+ 
+    if (!map || map == MAP_FAILED)
+@@ -1335,7 +1338,7 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
+    }
+ 
+    if (export_fd_type != fd_type)
+-      close(fd);
++      os_close_fd(fd);
+ 
+    if (!map)
+       return -EOPNOTSUPP;
+diff --git a/src/vrend/vrend_formats.c b/src/vrend/vrend_formats.c
+index 670b3a40..14bb7fc6 100644
+--- a/src/vrend/vrend_formats.c
++++ b/src/vrend/vrend_formats.c
+@@ -713,8 +713,10 @@ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples, struct virg
+    int out_buf_offsets[4] = {0,1,2,4};
+    int lowest_working_ms_count_idx = -1;
+ 
+-   assert(glGetError() == GL_NO_ERROR &&
+-          "Stale error state detected, please check for failures in initialization");
++   /* Drain any stale GL error (e.g. from GL_SMOOTH_POINT_SIZE_RANGE
++    * returning GL_INVALID_ENUM on some Windows GL drivers).
++    */
++   (void)glGetError();
+ 
+    glGenFramebuffers( 1, &fbo );
+    memset(caps->sample_locations, 0, 8 * sizeof(uint32_t));
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 4bf88e09..2791dc91 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -7737,6 +7737,11 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+       if (flags & VREND_USE_ASYNC_FENCE_CB)
+          vrend_state.use_async_fence_cb = true;
+       vrend_renderer_use_threaded_sync();
++      /* If sync thread creation failed, disable async fence mode to avoid
++       * using uninitialized mutexes in vrend_renderer_poll().
++       */
++      if (!vrend_state.sync_thread)
++         vrend_state.use_async_fence_cb = false;
+    }
+    if (flags & VREND_USE_EXTERNAL_BLOB)
+       vrend_state.use_external_blob = true;
+@@ -12377,6 +12382,7 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+    uint32_t video_memory;
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+ 
++
+    /* Count this up when you add a feature flag that is used to set a CAP in
+     * the guest that was set unconditionally before. Then check that flag and
+     * this value to avoid regressions when a guest with a new mesa version is
+@@ -12404,14 +12410,27 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+ 
+    if (gl_ver > 0) {
+       glGetFloatv(GL_SMOOTH_POINT_SIZE_RANGE, range);
++      if (glGetError() != GL_NO_ERROR) {
++         /* Some Windows GL drivers (Intel) return GL_INVALID_ENUM for
++          * GL_SMOOTH_POINT_SIZE_RANGE.  Drain the error to prevent it
++          * from cascading through subsequent operations.
++          */
++         range[0] = 1.0f;
++         range[1] = 1.0f;
++      }
+       caps->v2.min_smooth_point_size = range[0];
+       caps->v2.max_smooth_point_size = range[1];
+ 
+       glGetFloatv(GL_SMOOTH_LINE_WIDTH_RANGE, range);
++      if (glGetError() != GL_NO_ERROR) {
++         range[0] = 1.0f;
++         range[1] = 1.0f;
++      }
+       caps->v2.min_smooth_line_width = range[0];
+       caps->v2.max_smooth_line_width = range[1];
+    }
+ 
++
+    glGetFloatv(GL_MAX_TEXTURE_LOD_BIAS, &caps->v2.max_texture_lod_bias);
+ 
+    caps->v2.max_vertex_attribs = vrend_state.max_vertex_attributes;
+@@ -12451,6 +12470,7 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+ 
+    vrend_state.max_shader_patch_varyings = caps->v2.max_shader_patch_varyings;
+ 
++
+    if (has_feature(feat_texture_gather)) {
+        glGetIntegerv(GL_MIN_PROGRAM_TEXTURE_GATHER_OFFSET, &caps->v2.min_texture_gather_offset);
+        glGetIntegerv(GL_MAX_PROGRAM_TEXTURE_GATHER_OFFSET, &caps->v2.max_texture_gather_offset);
+@@ -12493,6 +12513,7 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+       caps->v2.max_combined_shader_buffers = MIN2(max, VREND_MAX_COMBINED_SSBO_BINDING_POINTS);
+    }
+ 
++
+    if (has_feature(feat_images)) {
+       glGetIntegerv(GL_MAX_VERTEX_IMAGE_UNIFORMS, &max);
+       if (max > PIPE_MAX_SHADER_IMAGES)
+@@ -12503,9 +12524,11 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+          max = PIPE_MAX_SHADER_IMAGES;
+       caps->v2.max_shader_image_frag_compute = max;
+ 
++   
+       if (gl_ver > 0) /* Seems GLES doesn't support multisample images */
+          glGetIntegerv(GL_MAX_IMAGE_SAMPLES, (GLint*)&caps->v2.max_image_samples);
+-   }
++
++      }
+ 
+    if (has_feature(feat_storage_multisample))
+       caps->v1.max_samples = vrend_renderer_query_multisample_caps(caps->v1.max_samples, &caps->v2);
+-- 
+2.55.0
+

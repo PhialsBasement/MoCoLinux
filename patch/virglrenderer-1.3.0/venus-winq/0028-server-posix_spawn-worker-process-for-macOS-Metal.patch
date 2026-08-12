@@ -1,0 +1,164 @@
+From 6bab97aa44fa47ca66ccb9159e4828cac29432e0 Mon Sep 17 00:00:00 2001
+From: Lucas Amaral <lucaaamaral@gmail.com>
+Date: Sat, 7 Mar 2026 10:40:08 -0300
+Subject: [PATCH] server: posix_spawn worker process for macOS Metal
+
+On macOS, Metal shader compilation uses XPC (Mach port-based IPC).
+Pure fork() without exec() inherits stale XPC connections from the
+parent process, causing Metal to fail silently in worker subprocesses.
+
+Use posix_spawn() to create worker processes on macOS.  posix_spawn()
+atomically creates a fresh process image without an intermediate
+forked state, ensuring valid XPC connections for Metal.
+POSIX_SPAWN_CLOEXEC_DEFAULT closes all file descriptors by default;
+only the context fd is explicitly inherited via addinherit_np().
+
+The spawned worker receives its context via command-line arguments
+(--ctx-fd, --ctx-id, --init-flags, --ctx-name) and enters
+render_context_main() directly, bypassing the server socket loop.
+
+Signed-off-by: Lucas Amaral <lucaaamaral@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1601>
+---
+ server/main.c          |  3 ++
+ server/render_client.c |  3 +-
+ server/render_worker.c | 86 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/server/main.c b/server/main.c
+index 83f22bc7..3ef5a937 100644
+--- a/server/main.c
++++ b/server/main.c
+@@ -23,6 +23,9 @@
+  * When a worker is a process,
+  * - On Linux, it's a subprocess forked from the server process. It returns
+  *   from render_server_main and enters render_context_main.
++ * - On macOS, the worker is posix_spawn'd with --worker-context-* args.
++ *   render_server_main parses these, skips the server loop, and returns
++ *   with ctx_args.valid set for render_context_main.
+  */
+ int
+ main(int argc, char **argv)
+diff --git a/server/render_client.c b/server/render_client.c
+index 87bab87e..dbb6e0f7 100644
+--- a/server/render_client.c
++++ b/server/render_client.c
+@@ -131,7 +131,8 @@ render_client_create_context(struct render_client *client,
+    if (rec->worker)
+       ctx_fd = -1; /* ownership transferred */
+ #else
+-   rec->worker = render_worker_create(srv->worker_jail, NULL, NULL, 0);
++   rec->worker = render_worker_create(srv->worker_jail, NULL,
++                                      &ctx_args, sizeof(ctx_args));
+ #endif
+    if (!rec->worker) {
+       render_log("failed to create a context worker");
+diff --git a/server/render_worker.c b/server/render_worker.c
+index 01621cff..b8df351d 100644
+--- a/server/render_worker.c
++++ b/server/render_worker.c
+@@ -432,6 +432,83 @@ render_worker_jail_detach_workers(struct render_worker_jail *jail)
+       render_worker_jail_remove_worker(jail, worker);
+ }
+ 
++#if defined(ENABLE_RENDER_SERVER_WORKER_PROCESS) && defined(__APPLE__)
++
++#include <crt_externs.h>
++#include <spawn.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "render_context.h"
++
++/* On macOS, fork() without exec() inherits stale XPC connections
++ * (Mach port based), breaking Metal shader compilation in worker
++ * subprocesses.  posix_spawn() atomically creates a fresh process
++ * image without an intermediate forked state.
++ *
++ * POSIX_SPAWN_CLOEXEC_DEFAULT closes all fds by default in the child;
++ * only ctx_fd is explicitly inherited via addinherit_np.
++ */
++
++static pid_t
++render_worker_spawn(const struct render_context_args *ctx_args)
++{
++   /* for devenv without installing server */
++   char *const server_path = getenv("RENDER_SERVER_EXEC_PATH");
++   const char *exec_path = server_path ? server_path : RENDER_SERVER_EXEC_PATH;
++
++   char fd_str[16];
++   char id_str[16];
++   char flags_str[16];
++   snprintf(fd_str, sizeof(fd_str), "%d", ctx_args->ctx_fd);
++   snprintf(id_str, sizeof(id_str), "%u", ctx_args->ctx_id);
++   snprintf(flags_str, sizeof(flags_str), "%u", ctx_args->init_flags);
++
++   char *const argv[] = {
++      (char *)exec_path,
++      "--worker-context-fd",
++      fd_str,
++      "--worker-context-id",
++      id_str,
++      "--worker-context-init-flags",
++      flags_str,
++      "--worker-context-name",
++      (char *)ctx_args->ctx_name,
++      NULL,
++   };
++
++   posix_spawnattr_t attr;
++   if (posix_spawnattr_init(&attr) != 0)
++      return -1;
++   posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
++
++   posix_spawn_file_actions_t file_actions;
++   if (posix_spawn_file_actions_init(&file_actions) != 0) {
++      posix_spawnattr_destroy(&attr);
++      return -1;
++   }
++   posix_spawn_file_actions_addinherit_np(&file_actions, STDIN_FILENO);
++   posix_spawn_file_actions_addinherit_np(&file_actions, STDOUT_FILENO);
++   posix_spawn_file_actions_addinherit_np(&file_actions, STDERR_FILENO);
++   posix_spawn_file_actions_addinherit_np(&file_actions, ctx_args->ctx_fd);
++
++   pid_t pid;
++   int ret = posix_spawn(&pid, exec_path, &file_actions, &attr, argv, *_NSGetEnviron());
++
++   posix_spawn_file_actions_destroy(&file_actions);
++   posix_spawnattr_destroy(&attr);
++
++   if (ret != 0) {
++      render_log("posix_spawn failed: %s", strerror(ret));
++      return -1;
++   }
++
++   return pid;
++}
++
++#endif /* ENABLE_RENDER_SERVER_WORKER_PROCESS && __APPLE__ */
++
+ struct render_worker *
+ render_worker_create(struct render_worker_jail *jail,
+                      int (*thread_func)(void *thread_data),
+@@ -451,8 +528,17 @@ render_worker_create(struct render_worker_jail *jail,
+ 
+    bool ok;
+ #if defined(ENABLE_RENDER_SERVER_WORKER_PROCESS)
++#ifdef __APPLE__
++   {
++      const struct render_context_args *ctx_args =
++         (const struct render_context_args *)worker->thread_data;
++      worker->pid = render_worker_spawn(ctx_args);
++      ok = worker->pid >= 0;
++   }
++#else
+    worker->pid = fork();
+    ok = worker->pid >= 0;
++#endif
+    (void)thread_func;
+ #elif defined(ENABLE_RENDER_SERVER_WORKER_THREAD)
+    ok = thrd_create(&worker->thread, thread_func, worker->thread_data) == thrd_success;
+-- 
+2.55.0
+

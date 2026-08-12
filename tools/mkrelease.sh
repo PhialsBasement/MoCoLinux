@@ -121,6 +121,109 @@ done
 [ "$OUT/mocolinux-setup.exe" -nt "$HERE/installer/setup.c" ] ||
 	die "mocolinux-setup.exe is older than setup.c -- rebuild it first"
 
+# The kernel has to be one these daemons can drive.
+#
+# dist-x64/vmlinux is not built by this tree -- it is copied in by hand from
+# whichever build/linux-* directory was last used -- so it goes stale silently
+# while everything beside it is rebuilt. 0.7.0 was assembled that way, with an
+# Aug 9 kernel and Aug 11 daemons, and nothing noticed until the install had
+# copied 35 GB, restarted the machine, loaded the driver and then stopped at
+#
+#   co_colinux_timer_deadline not found -- is the kernel patched?
+#
+# with the guest exiting 0 and Setup able to report only that the guest had
+# gone. The symbol the daemon looks up by name is the cheapest honest test of
+# the pair, and it is the exact one the daemon fails on.
+grep -qa co_colinux_timer_deadline "$OUT/vmlinux" ||
+	die "vmlinux has no co_colinux_timer_deadline -- it predates the timer
+       work and these daemons will refuse it at boot. Copy the kernel from
+       the build/linux-* directory you actually built into dist-x64/vmlinux."
+
+# The builder inside the image, replaced with this tree's copy.
+#
+# The image carries the script that builds the real root filesystem, and until
+# now it carried whatever was baked in whenever the image was last made. That
+# is the one payload nothing here checked, and it is the payload that decides
+# what the installed system IS.
+#
+# 0.7.0 was assembled with an image holding TWO builders: /root/mk.sh from
+# Aug 7 and /usr/local/bin/mkmanjarorootfs.sh from Aug 10. setup.c prefers the
+# first that exists, which is /root/mk.sh -- and that one predates CoPresent,
+# Venus and Vulkan entirely. An install would have run for twenty minutes and
+# produced a Manjaro on stock Mesa: software GL, no Vulkan, none of the GPU
+# stack this project exists for, with nothing anywhere saying so.
+#
+# Both paths are written, because setup.c will take either and a release
+# should not depend on which. The image is the copy in $OUT, so dist-x64's
+# stays as it was.
+mk=$HERE/tools/mkmanjarorootfs.sh
+[ -f "$mk" ] || die "tools/mkmanjarorootfs.sh is missing"
+
+for t in debugfs e2fsck; do
+	command -v $t >/dev/null 2>&1 ||
+		die "$t (e2fsprogs) is needed to put the builder into $image"
+done
+
+debugfs -w -f - "$OUT/$image" >/dev/null 2>&1 <<EOF
+cd /root
+rm mk.sh
+write $mk mk.sh
+cd /usr/local/bin
+rm mkmanjarorootfs.sh
+write $mk mkmanjarorootfs.sh
+EOF
+
+# debugfs unlinks without tidying up after itself; 0 is clean and 1 is
+# "errors corrected", which is the normal outcome here. 4 and above is damage.
+e2fsck -fy "$OUT/$image" >/dev/null 2>&1
+[ $? -lt 4 ] || die "$image did not survive having the builder written into it"
+
+# Read both back and compare, rather than trusting that the write landed --
+# debugfs reports a failed write on stdout and still exits 0.
+check=$(mktemp -d)
+for p in /root/mk.sh /usr/local/bin/mkmanjarorootfs.sh; do
+	debugfs -R "dump $p $check/got" "$OUT/$image" >/dev/null 2>&1
+	cmp -s "$check/got" "$mk" || {
+		rm -rf "$check"
+		die "$p in $image is not tools/mkmanjarorootfs.sh"
+	}
+done
+rm -rf "$check"
+say "  builder written into $image at both paths setup.c looks in"
+
+# The X server with a monitor in it, built here rather than carried.
+#
+# Stock VcXsrv 1.14 answers RandR with no outputs at all, and a client that
+# asks about monitors before opening a window does not degrade -- Steam's
+# client refuses to start. Every install before this one shipped that way: the
+# NSIS installer laid down a stock server and nothing patched it, so the fault
+# reached every user who installed the release rather than only the box it was
+# developed on.
+#
+# Built from the stock binary at assembly time so it cannot drift from the
+# patcher, and the patcher verifies six byte signatures before it writes -- a
+# different VcXsrv build fails here rather than shipping a corrupt server.
+patched=$(sed -n 's/^#define XSERVER_PATCHED[[:space:]]*"\(.*\)"$/\1/p' \
+		"$HERE/installer/setup.c")
+[ -n "$patched" ] || die "could not read XSERVER_PATCHED out of setup.c"
+
+stock=$DIST/vcxsrv-stock.exe
+[ -f "$stock" ] ||
+	die "dist-x64/vcxsrv-stock.exe is missing -- it is the unmodified
+       vcxsrv.exe from the shipped installer, and $patched is built from it"
+
+command -v python3 >/dev/null 2>&1 ||
+	die "python3 is needed to build $patched"
+
+"$HERE/tools/vcxsrv-fakemonitor/patch-vcxsrv.py" "$stock" "$OUT/$patched" \
+	>/dev/null || die "could not build $patched from vcxsrv-stock.exe"
+
+# The patch lands in a section of its own; if it is not there, nothing was done.
+objdump -h "$OUT/$patched" 2>/dev/null | grep -q '\.moco' ||
+	die "$patched has no .moco section -- the monitor patch did not apply"
+
+say "  $patched built from the stock server"
+
 # The driver carries a signature, and it is a signature of THIS driver.
 #
 # Not "Signature verification: ok" and not osslsigncode's exit status: both

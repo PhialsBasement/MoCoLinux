@@ -1,0 +1,29 @@
+From 666abefd56be0b1d4314b361c6ce0fa2aec1e724 Mon Sep 17 00:00:00 2001
+From: Sergi Blanch Torne <sergi.blanch.torne@collabora.com>
+Date: Tue, 3 Mar 2026 10:04:32 +0100
+Subject: [PATCH] ci: Update trace checksums
+
+The same issue happened in Mesa https://gitlab.freedesktop.org/mesa/mesa/-/commit/9f1a4461074f117ed124b1d6086624ac4da0e6a1
+
+Signed-off-by: Sergi Blanch Torne <sergi.blanch.torne@collabora.com>
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1598>
+---
+ .gitlab-ci/expectations/virt/traces-virgl.yml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/.gitlab-ci/expectations/virt/traces-virgl.yml b/.gitlab-ci/expectations/virt/traces-virgl.yml
+index 3675b26b..c50de53a 100644
+--- a/.gitlab-ci/expectations/virt/traces-virgl.yml
++++ b/.gitlab-ci/expectations/virt/traces-virgl.yml
+@@ -9,7 +9,7 @@ traces:
+       checksum: f8eba0fec6e3e0af9cb09844bc73bdc8
+   gputest/furmark-v2.trace:
+     gl-virgl:
+-      checksum: 8b34d61f34f9c98201a8f5947ab4a667
++      checksum: 9fc8c1c66d1ab89f5c91101daaf5573d
+   gputest/triangle-v2.trace:
+     gl-virgl:
+       checksum: b1a1224b949c3ea133e7d2a06b8d294f
+-- 
+2.55.0
+

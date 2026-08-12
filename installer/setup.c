@@ -51,7 +51,7 @@
  * is. The release directory and zip are named from the same string by hand;
  * nothing reads it back, so keep the two in step.
  */
-#define MOCO_VERSION "0.6.1"
+#define MOCO_VERSION "0.7.1"
 
 #define PAYLOAD_MAX 20
 
@@ -132,6 +132,33 @@ static const char *payload[PAYLOAD_MAX] = {
 #define XSERVER_SUBDIR	  "vcxsrv1142"
 
 /*
+ * The X server with a monitor in it, laid over the one the installer above
+ * just wrote.
+ *
+ * VcXsrv 1.14 in multiwindow mode answers RandR with zero outputs, zero CRTCs
+ * and zero modes -- it has a screen and nothing on it. Anything that
+ * enumerates monitors before opening a window therefore finds nothing, and the
+ * ones that matter do not degrade: Steam's client refuses to start at all.
+ * That is not a rendering fault and it does not look like one, which is what
+ * made it expensive to find.
+ *
+ * tools/vcxsrv-fakemonitor patches the shipped binary so the server reports
+ * one connected output covering the screen. The patch is ~265 bytes of code in
+ * a section of its own plus one repointed instruction; everything answering
+ * RandR afterwards is the server's own untouched code. mkrelease builds this
+ * file from the stock binary at assembly time, so it cannot drift from the
+ * patcher.
+ *
+ * Copied over the installed server rather than shipped instead of the NSIS
+ * installer, because that installer also lays down fonts, xkb data and the
+ * MSVCR100 runtime -- the patched exe alone is not an X server.
+ *
+ * Never fatal, and the stock binary is kept beside it: an X server with no
+ * monitor still runs everything that does not ask about monitors.
+ */
+#define XSERVER_PATCHED	  "vcxsrv-fakemonitor.exe"
+
+/*
  * The root image that ships, and why there has to be one.
  *
  * A release cannot be only a kernel and a driver. mkmanjarorootfs.sh needs a
@@ -164,7 +191,32 @@ static char self_dir[MAX_PATH];
 
 static int want_desktop = 1;		/* else the console system */
 static int want_xserver = 1;
-static int disk_gb = 16;
+
+/*
+ * The smallest image a desktop install may be given, and why there is a floor
+ * at all.
+ *
+ * The desktop is 2.5 GB of packages before the user has done anything, and
+ * what people then do with it is install software: this project's own test box
+ * took a Plasma desktop and a Steam client and ran out at 16 GB with a game
+ * still to come. Running out is not a tidy failure either -- it happens weeks
+ * later, inside pacman or inside an application, on a filesystem that then has
+ * no room to recover, and the only way back is to reinstall.
+ *
+ * So the two sizes that cannot hold a desktop are not offered for one. They
+ * remain available for the console system, where 8 GB is genuinely generous:
+ * that install is 250 MB.
+ */
+#define DESKTOP_MIN_GB 32
+
+static int disk_gb = DESKTOP_MIN_GB;
+
+/* Never leave a desktop install pointed at a size that cannot hold it. */
+static void disk_floor(void)
+{
+	if (want_desktop && disk_gb < DESKTOP_MIN_GB)
+		disk_gb = DESKTOP_MIN_GB;
+}
 
 /* Set by --finish: the autostart re-entry, which skips the pages. */
 static int auto_finish;
@@ -590,6 +642,33 @@ static BOOL check_space(const char *dir, int gb, char *why, int n)
 }
 
 /*
+ * Space for what is still to be written, not for what is already there.
+ *
+ * The image is reserved in the first half and the machine then restarts, so by
+ * the resumed run those gigabytes are already ON the disk. Asking for disk_gb
+ * free a second time asks the volume to hold the image twice: a 48 GB disk
+ * given a 32 GB image passes the first run, comes back with 16 GB free, and is
+ * refused on the second -- having done everything right. The larger the image
+ * the likelier it is, because the demand scales with the very thing occupying
+ * the space.
+ *
+ * create_image() already keeps an existing root.img rather than making a
+ * second one, so once that file is there, nothing further has to be reserved.
+ */
+static BOOL check_space_remaining(const char *dir, int gb, char *why, int n)
+{
+	char path[MAX_PATH];
+
+	_snprintf(path, sizeof(path) - 1, "%s\\%s", dir, IMAGE_BUILT);
+	path[sizeof(path) - 1] = 0;
+
+	if (GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES)
+		gb = 0;
+
+	return check_space(dir, gb, why, n);
+}
+
+/*
  * A real coLinux 0.7.9 install is a conflict, not a coexistence.
  *
  * Both want the service name CoLinuxDriver and both create the same device
@@ -874,6 +953,46 @@ static void enable_testsigning(void)
  */
 static void glog(const char *fmt, ...);
 
+/*
+ * Lay the patched server over the stock one, keeping the stock one beside it.
+ *
+ * Done on every install, including one that finds VcXsrv already there: an
+ * existing install is exactly the case where the server is stock and nothing
+ * would otherwise correct it.
+ */
+static void install_xserver_monitor(const char *dir)
+{
+	char src[MAX_PATH], dst[MAX_PATH], keep[MAX_PATH];
+
+	_snprintf(src, sizeof(src) - 1, "%s\\%s", self_dir, XSERVER_PATCHED);
+	_snprintf(dst, sizeof(dst) - 1, "%s\\vcxsrv.exe", dir);
+	_snprintf(keep, sizeof(keep) - 1, "%s\\vcxsrv.exe.stock", dir);
+	src[sizeof(src) - 1] = dst[sizeof(dst) - 1] = keep[sizeof(keep) - 1] = 0;
+
+	if (GetFileAttributes(src) == INVALID_FILE_ATTRIBUTES) {
+		glog("x server: %s is not beside Setup", src);
+		work_say("the X server has no monitor patch; applications that ask"
+			 " for a display before opening a window (Steam) will not"
+			 " start");
+		return;
+	}
+
+	/* Once. A second install must not overwrite the stock copy with a
+	 * patched one and lose the original. */
+	if (GetFileAttributes(keep) == INVALID_FILE_ATTRIBUTES)
+		CopyFile(dst, keep, FALSE);
+
+	if (!CopyFile(src, dst, FALSE)) {
+		glog("x server: could not write %s (error %lu)", dst,
+		     (unsigned long)GetLastError());
+		work_say("could not apply the X server's monitor patch");
+		return;
+	}
+
+	glog("x server: monitor patch applied to %s", dst);
+	work_say("X server reports a monitor");
+}
+
 static void install_xserver(void)
 {
 	char src[MAX_PATH], dst[MAX_PATH], cmd[MAX_PATH * 2];
@@ -899,6 +1018,9 @@ static void install_xserver(void)
 
 	if (GetFileAttributes(dst) != INVALID_FILE_ATTRIBUTES) {
 		work_say("the X server is already installed");
+		/* Still patch it: an install that is already here is precisely
+		 * the one carrying a stock server nobody has corrected. */
+		install_xserver_monitor(dst);
 		return;
 	}
 
@@ -938,6 +1060,8 @@ static void install_xserver(void)
 
 	glog("x server: installed into %s", dst);
 	work_say("X server installed");
+
+	install_xserver_monitor(dst);
 }
 
 /*
@@ -2114,9 +2238,28 @@ static void write_ini(void)
  * genuinely undone the install. It carries the choices too, so the second run
  * does not have to ask again.
  */
+/*
+ * Beside the installed copy of Setup, not beside the images.
+ *
+ * It used to live in dir_linux, which cannot work for an install that is not
+ * in the default place: --finish starts a fresh process, default_paths() puts
+ * dir_linux back to %SystemDrive%\MoCoLinux, and the file is looked for
+ * somewhere the user never chose. Nothing is found, resume_pending() says no,
+ * and the resumed half runs the FIRST half again -- re-copying the payload to
+ * the default program directory and then failing on "root-arch.img is missing
+ * from the Setup folder", because the image lives with the images and never
+ * beside the binaries. Reported on 0.7.0 by an install into F:\mocosetup.
+ *
+ * The program directory is the one path a resumed run can know without having
+ * read anything: autostart_set() copies Setup there and launches THAT copy, so
+ * on the resume run self_dir IS the program directory. Chicken and egg
+ * otherwise -- the file that carries the paths cannot be found by a path it
+ * carries.
+ */
 static void resume_path(char *out, int n)
 {
-	_snprintf(out, n - 1, "%s\\setup-resume.txt", dir_linux);
+	_snprintf(out, n - 1, "%s\\setup-resume.txt",
+		  auto_finish ? self_dir : dir_program);
 	out[n - 1] = 0;
 }
 
@@ -2223,7 +2366,9 @@ static BOOL resume_pending(void)
 
 static void resume_write(void)
 {
-	char path[MAX_PATH], text[256];
+	/* Two MAX_PATH directories and five short fields; 256 bytes held the
+	 * fields alone and would now truncate a deep path. */
+	char path[MAX_PATH], text[MAX_PATH * 2 + 128];
 	HANDLE h;
 	DWORD wrote;
 	int n;
@@ -2234,8 +2379,15 @@ static void resume_write(void)
 	if (h == INVALID_HANDLE_VALUE)
 		return;
 
+	/*
+	 * The directories too, and first, because they are what the resumed run
+	 * cannot work out for itself. Everything below them is a preference;
+	 * these two decide where the install IS.
+	 */
 	n = _snprintf(text, sizeof(text) - 1,
+		      "program=%s\r\nlinux=%s\r\n"
 		      "desktop=%d\r\nxserver=%d\r\ndisk_gb=%d\r\n",
+		      dir_program, dir_linux,
 		      want_desktop, want_xserver, disk_gb);
 	if (n > 0)
 		WriteFile(h, text, n, &wrote, NULL);
@@ -2246,9 +2398,24 @@ static void resume_write(void)
  * The choices, read back on the second run. Without this the resumed half would
  * build a desktop for somebody who asked for the console system.
  */
+/* One "key=value" line, copied out without its line ending. */
+static void resume_field(const char *text, const char *key, char *out, int n)
+{
+	const char *p = StrStrA(text, key);
+	int i = 0;
+
+	if (!p)
+		return;
+	p += lstrlen(key);
+	while (*p && *p != '\r' && *p != '\n' && i < n - 1)
+		out[i++] = *p++;
+	if (i)
+		out[i] = 0;
+}
+
 static void resume_read(void)
 {
-	char path[MAX_PATH], text[256] = {0};
+	char path[MAX_PATH], text[MAX_PATH * 2 + 128] = {0};
 	HANDLE h;
 	DWORD got = 0;
 	char *p;
@@ -2262,6 +2429,14 @@ static void resume_read(void)
 	if (ReadFile(h, text, sizeof(text) - 1, &got, NULL))
 		text[got] = 0;
 	CloseHandle(h);
+
+	/*
+	 * The directories first. Without these the resumed half installs to
+	 * wherever default_paths() guessed, which is not where the first half
+	 * put anything.
+	 */
+	resume_field(text, "program=", dir_program, sizeof(dir_program));
+	resume_field(text, "linux=", dir_linux, sizeof(dir_linux));
 
 	p = StrStrA(text, "desktop=");
 	if (p)
@@ -2278,6 +2453,12 @@ static void resume_read(void)
 		if (v > 0)
 			disk_gb = v;
 	}
+
+	/* An install resumed from a file written by an older Setup can carry a
+	 * desktop and a 16 GB image together. The image is already reserved by
+	 * then, so this cannot resize it -- but it keeps the number this half
+	 * reports honest. */
+	disk_floor();
 }
 
 static void resume_clear(void)
@@ -2304,7 +2485,7 @@ static DWORD WINAPI worker(LPVOID unused)
 	    !check_no_foreign_driver(why, sizeof(why)) ||
 	    !check_nothing_running(why, sizeof(why)) ||
 	    !check_fs(dir_linux, why, sizeof(why)) ||
-	    !check_space(dir_linux, disk_gb, why, sizeof(why))) {
+	    !check_space_remaining(dir_linux, disk_gb, why, sizeof(why))) {
 		work_fatal("%s", why);
 		return 1;
 	}
@@ -2785,7 +2966,7 @@ static void revalidate(void)
 	where_why[0] = 0;
 
 	if (!check_fs(dir_linux, where_why, sizeof(where_why)) ||
-	    !check_space(dir_linux, disk_gb, where_why, sizeof(where_why))) {
+	    !check_space_remaining(dir_linux, disk_gb, where_why, sizeof(where_why))) {
 		where_ok = 0;
 		return;
 	}
@@ -2985,6 +3166,8 @@ static void draw_sizes(HDC dc, RECT area)
 		RECT b;
 		char label[16];
 		int chosen = (disk_gb == gb[i]);
+		/* Too small for what is about to be installed into it. */
+		int barred = (want_desktop && gb[i] < DESKTOP_MIN_GB);
 		HBRUSH br, oldbr;
 		HPEN pen, oldpen;
 
@@ -2993,10 +3176,12 @@ static void draw_sizes(HDC dc, RECT area)
 		b.top = area.top;
 		b.bottom = b.top + S(26);
 
-		br = CreateSolidBrush(chosen ? COL_ACCENT :
+		br = CreateSolidBrush(barred ? RGB(0xf1, 0xf2, 0xf4) :
+				      chosen ? COL_ACCENT :
 				      (hit_over == id[i] ? RGB(0xf4, 0xf5, 0xf7)
 							 : COL_BG));
-		pen = CreatePen(PS_SOLID, 1, chosen ? COL_ACCENT : COL_LINE);
+		pen = CreatePen(PS_SOLID, 1, (chosen && !barred) ? COL_ACCENT
+								 : COL_LINE);
 		oldbr = (HBRUSH)SelectObject(dc, br);
 		oldpen = (HPEN)SelectObject(dc, pen);
 		Rectangle(dc, b.left, b.top, b.right, b.bottom);
@@ -3007,9 +3192,20 @@ static void draw_sizes(HDC dc, RECT area)
 
 		_snprintf(label, sizeof(label) - 1, "%d GB", gb[i]);
 		label[sizeof(label) - 1] = 0;
-		draw_text(dc, f_small, chosen ? COL_ON_ACCENT : COL_TEXT, &b, label,
+		draw_text(dc, f_small,
+			  barred ? RGB(0xa8, 0xad, 0xb5) :
+			  chosen ? COL_ON_ACCENT : COL_TEXT, &b, label,
 			  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-		add_hit(b, id[i]);
+
+		/*
+		 * No hit region when barred, so a click lands on nothing at all
+		 * rather than on a choice that is silently corrected afterwards.
+		 * Drawn greyed rather than hidden: a size that vanishes when the
+		 * desktop is picked reads as a bug, and one that is visibly
+		 * unavailable says there is a rule.
+		 */
+		if (!barred)
+			add_hit(b, id[i]);
 	}
 }
 
@@ -3020,11 +3216,26 @@ static void draw_sizes(HDC dc, RECT area)
  * shape of what is about to happen rather than discovering it one Next at a
  * time. doc/installer section 3 names these.
  */
+/*
+ * What to install comes BEFORE where to put it, because the first answer
+ * constrains the second.
+ *
+ * It was the other way round, and that put the disk size on a page reached
+ * before the desktop-or-console choice that decides which sizes are legal --
+ * so the size buttons had to be drawn against a choice the user had not been
+ * asked for yet, and picking the desktop afterwards silently rewrote a size
+ * already chosen. Asking in dependency order removes the problem instead of
+ * compensating for it: by the time the sizes are drawn, the answer that bars
+ * 8 and 16 GB is already given.
+ *
+ * The rail shows this list in order, so the swap is visible to the user as
+ * well: they are asked what they want, then where it goes.
+ */
 enum {
 	PG_WELCOME,
 	PG_LICENCE,
-	PG_WHERE,
 	PG_WHAT,
+	PG_WHERE,
 	PG_INSTALL,
 	PG_SETUP,
 	PG_DONE,
@@ -3034,8 +3245,8 @@ enum {
 static const char *page_name[PG_COUNT] = {
 	"Welcome",
 	"Licence",
-	"Where to put it",
 	"What to install",
+	"Where to put it",
 	"Installing",
 	"Setting up Linux",
 	"Finished",
@@ -3395,7 +3606,10 @@ static void draw_page(HDC dc, RECT *client)
 
 		row.top = row.top + S(60);
 		row.bottom = row.top + S(16);
-		draw_text(dc, f_small, COL_DIM, &row, "Disk image size",
+		draw_text(dc, f_small, COL_DIM, &row,
+			  want_desktop ? "Disk image size \x97 the desktop needs"
+					 " at least 32 GB"
+				       : "Disk image size",
 			  DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
 
 		row.top += S(18);
@@ -3910,11 +4124,22 @@ static LRESULT CALLBACK proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 				pick_folder(dir_linux,
 					    "Where should the Linux system go?");
 				break;
-			case H_SIZE_8:  disk_gb = 8;  revalidate(); break;
-			case H_SIZE_16: disk_gb = 16; revalidate(); break;
+			case H_SIZE_8:  disk_gb = 8;  disk_floor();
+					revalidate(); break;
+			case H_SIZE_16: disk_gb = 16; disk_floor();
+					revalidate(); break;
 			case H_SIZE_32: disk_gb = 32; revalidate(); break;
 			case H_SIZE_64: disk_gb = 64; revalidate(); break;
-			case H_DESKTOP: want_desktop = 1; break;
+			/*
+			 * This page is answered before the size is chosen, so
+			 * normally there is nothing to correct. The exception is
+			 * Back: choose the console, pick 8 GB, then come back here
+			 * and choose the desktop, and the size is already illegal.
+			 * Raise it and re-run the free-space check, which was made
+			 * against the smaller number.
+			 */
+			case H_DESKTOP: want_desktop = 1; disk_floor();
+					revalidate(); break;
 			case H_CONSOLE: want_desktop = 0; break;
 			case H_XSERVER: want_xserver = !want_xserver; break;
 			default:
@@ -4056,9 +4281,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 	 * through a wizard they have already completed.
 	 */
 	if (cmd && StrStrIA(cmd, "--finish")) {
-		resume_read();
-		page = PG_INSTALL;
+		/* Before resume_read(), which is what tells resume_path() to
+		 * look beside this executable rather than in a default
+		 * directory this install may never have used. */
 		auto_finish = 1;
+		resume_read();
+		/* The paths just changed; the page's verdict was computed from
+		 * the defaults. */
+		revalidate();
+		page = PG_INSTALL;
 	}
 
 	screen = GetDC(NULL);

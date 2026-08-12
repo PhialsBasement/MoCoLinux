@@ -63,6 +63,10 @@ typedef enum {
 	CO_MANAGER_IOCTL_KMAP_RANGE,
 	CO_MANAGER_IOCTL_TEST_SMP,
 	CO_MANAGER_IOCTL_KVCPU_RUN,
+	CO_MANAGER_IOCTL_KWINDOW,
+	CO_MANAGER_IOCTL_KUNWINDOW,
+	CO_MANAGER_IOCTL_KWINDOW_AT,
+	CO_MANAGER_IOCTL_KMAP_UNMAP_RANGE,
 } co_manager_ioctl_t;
 
 /*
@@ -377,6 +381,17 @@ typedef struct {
 	unsigned long long min_va;
 	unsigned long long max_va;
 	unsigned long long ram_bytes;	/* p2m capacity needed by a boot */
+	/*
+	 * Section-backed guest RAM. ram_user_va is the caller's view of the
+	 * shared section guest RAM lives in; ram_user_bytes its committed
+	 * size. The driver locks blocks of it and builds the p2m from their
+	 * frames, mapping each block once at KERNEL mode for its own use --
+	 * a call that returns NULL on failure instead of raising, which is
+	 * the property the whole arrangement exists for. Zero keeps the
+	 * legacy nonpaged-pool backing.
+	 */
+	unsigned long long ram_user_va;
+	unsigned long long ram_user_bytes;
 } co_manager_ioctl_kload_begin_t;
 
 typedef struct {
@@ -426,6 +441,15 @@ typedef struct {
  * may be called repeatedly on the same handle. The driver keeps every returned
  * address alive until KUNMAP/handle cleanup, so callers can cache pointers and
  * the amount passed to --mem never determines their mapping footprint.
+ *
+ * CO_MANAGER_IOCTL_KMAP_UNMAP_RANGE releases ONE slice by its exact base pa,
+ * so a long-running caller can bound its concurrent mappings by evicting cold
+ * slices and re-requesting them on demand. The caller owns the hard part of
+ * that contract: nothing in its process may still dereference the slice's
+ * user_va after this returns. It exists because the mapping path has no
+ * working exception guard -- a mapping request past the host's limit is a
+ * bugcheck, not an error, so the only safe policy is to stay far below the
+ * limit, and that requires being able to let go of one slice at a time.
  */
 #define CO_KMAP_SLICE_BYTES	(12ULL << 20)
 #define CO_KMAP_MAX_RANGES	256
@@ -456,6 +480,58 @@ typedef struct {
 	unsigned long	   released;	/* out: slices unmapped */
 } co_manager_ioctl_kunmap_t;
 
+/* interface for CO_MANAGER_IOCTL_KMAP_UNMAP_RANGE: */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long pa;		/* in: the slice's exact base pa */
+	unsigned long long bytes;	/* out: what the slice covered */
+} co_manager_ioctl_kmap_unmap_range_t;
+
+/*
+ * KMAP's mirror: host memory made visible to the GUEST.
+ *
+ * KMAP gives a host process a window onto guest RAM. This gives the guest a
+ * window onto host memory, which is what Venus needs -- Vulkan requires the
+ * application to write into memory the GPU reads, and the application is in
+ * the guest while the GPU allocation is on the host.
+ *
+ * The caller passes its own virtual range; the driver locks those pages and
+ * publishes their machine frames in the guest's p2m, returning the pseudo-
+ * physical address at which the guest will find them. The pages stay locked
+ * until KUNWINDOW, because the guest is handed page-table entries naming them
+ * and a page that moved underneath would be silent corruption of whatever
+ * took its place.
+ *
+ * Nothing is reserved: a window is taken when asked for and returned on
+ * release, so a refusal here is ordinary and the caller is expected to cope.
+ */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long va;		/* in: caller's virtual address */
+	unsigned long long bytes;	/* in: length, page multiples only */
+	unsigned long long pseudo_pa;	/* out: where the guest sees it */
+} co_manager_ioctl_kwindow_t;
+
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long pseudo_pa;	/* in: as returned by KWINDOW */
+	unsigned long long bytes;	/* in: the same length */
+} co_manager_ioctl_kunwindow_t;
+
+/*
+ * interface for CO_MANAGER_IOCTL_KWINDOW_AT: a window at an address the
+ * caller chose. RESOURCE_MAP_BLOB works this way round -- the guest's drm_mm
+ * picks the offset inside the advertised region -- so the driver validates
+ * (inside the arena, all slots vacant) instead of allocating. Released with
+ * KUNWINDOW like any other window.
+ */
+typedef struct {
+	co_rc_t		   rc;
+	unsigned long long va;		/* in: caller's virtual address */
+	unsigned long long bytes;	/* in: length, page multiples only */
+	unsigned long long pseudo_pa;	/* in: where the guest asked for it */
+} co_manager_ioctl_kwindow_at_t;
+
 /*
  * interface for CO_MANAGER_IOCTL_VGPU: where the guest's transport structure
  * is, and what a guest virtual address resolves to.
@@ -471,6 +547,25 @@ typedef struct {
 	unsigned long long va;		/* out: co_colinux_vgpu_io, guest virtual */
 	unsigned long long query_va;	/* in:  a guest virtual address, or 0 */
 	unsigned long long query_pa;	/* out: what it resolves to */
+	/*
+	 * The window arena, for MAP_BLOB offset arithmetic: a mapped blob's
+	 * shm offset is pseudo_pa - window_base, and the base is stated by
+	 * the driver rather than re-derived from the e820 top, which merely
+	 * happens to coincide with it.
+	 */
+	unsigned long long window_base;	/* out: guest pa, arena start */
+	unsigned long long window_top;	/* out: guest pa, arena end */
+	/*
+	 * What the guest's timer-deadline array resolves to in host space --
+	 * the same lookup the vCPU idle wait performs. Zero means the wait
+	 * is running blind at tick granularity, which is a bug to see in a
+	 * log line, not to infer from latency scatter.
+	 */
+	unsigned long long timer_deadline_host;	/* out: loop's own value */
+	unsigned long long tdl_branch;		/* out: deadline-branch runs */
+	unsigned long long tdl_spins;		/* out: tail spins entered */
+	unsigned long long tdl_paths_a;		/* out: tick<<32 | far */
+	unsigned long long tdl_paths_b;		/* out: mid<<32 | due */
 } co_manager_ioctl_vgpu_t;
 
 /*
@@ -658,6 +753,8 @@ typedef struct {
 	unsigned long long total_usable;/* out: usable bytes across all ranges */
 	unsigned long long p2m_pages;	/* out: dense p2m entries in use */
 	unsigned long long m2p_mask;	/* out: reverse-hash slot mask */
+	unsigned long long window_base;	/* out: guest pa, window arena start */
+	unsigned long long window_top;	/* out: guest pa, window arena end */
 	int		   range_count;	/* out */
 	struct {
 		unsigned long long pa;		/* guest pseudo-physical base */
@@ -689,6 +786,13 @@ typedef struct {
 	unsigned long long tick_entry_va;
 	unsigned long long virtual_if_va;
 	unsigned long long ipi_pending_va;
+	/*
+	 * co_colinux_timer_deadline: when each vCPU's next clock event falls
+	 * due, host monotonic 100 ns, zero for none. The idle wait is bounded
+	 * by it, which is what makes a guest nanosleep precise instead of
+	 * tick-quantized.
+	 */
+	unsigned long long timer_deadline_va;
 	int		   max_switches;
 	int		   step;
 	int		   batch;

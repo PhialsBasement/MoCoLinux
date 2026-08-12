@@ -27,6 +27,7 @@
 #include <colinux/os/kernel/alloc.h>
 #include <colinux/os/kernel/misc.h>
 #include <colinux/os/kernel/mutex.h>
+#include <colinux/os/kernel/user.h>	/* block lock+map, for section-backed RAM */
 #include <colinux/os/timer.h>		/* co_os_msleep, for the deferred-free wait */
 #include <colinux/arch/mmu.h>
 #include <colinux/arch/space.h>
@@ -63,11 +64,28 @@ typedef struct {
 	void*		   va;
 	unsigned long long pseudo_base;
 	unsigned long long bytes;
+	/* Non-NULL for a section-backed block: the MDL holding the caller's
+	 * pages locked, whose kernel mapping is `va`. NULL for pool blocks. */
+	void*		   mdl;
 } co_kload_block_t;
 
 static co_kload_block_t	      kload_block[CO_KLOAD_MAX_BLOCKS];
 static int		      kload_block_count;
 static int		      kload_last_hit;
+
+/*
+ * Section-backed guest RAM. When the boot daemon passes a view of the shared
+ * section at KLOAD_BEGIN, blocks are carved from it sequentially -- so a
+ * block's pseudo base IS its section offset, which is what lets the GPU
+ * daemon compute a pointer from a pseudo address with one add. Blocks are
+ * locked with MmProbeAndLockPages and kernel-mapped for the driver's own
+ * readers; the UserMode mapping path, whose failure is a raise no guard in
+ * this tree has ever caught, is not involved anywhere.
+ */
+static unsigned long long     kload_user_ram_va;
+static unsigned long long     kload_user_ram_bytes;
+/* One MDL describes at most 4089 pages; 8 MB divides guest RAM evenly. */
+#define CO_KLOAD_USER_BLOCK_BYTES (8ULL << 20)
 
 static co_pfn_t*	      kload_p2m;
 static unsigned int*	      kload_m2p;
@@ -132,6 +150,19 @@ static bool_t		      kload_ram_ready;
 
 #define CO_KLOAD_MIN_TABLE_BYTES (4ULL << 20)
 
+/*
+ * Address space above guest RAM in which host memory windows may appear.
+ *
+ * Sizing capacity to exactly RAM + tables gave the downward window allocator
+ * zero pages to hand out: kload_window_next started level with the top of
+ * backed RAM and the first KWINDOW met the allocators-meet check immediately.
+ * The arena is address space, not memory -- its p2m slots stay zero until a
+ * window fills them, nothing appears in the guest's e820, and the only real
+ * cost is metadata: 4 GB of arena is 8 MB of p2m slots (plus the m2p hash
+ * sized from capacity, which windows deliberately never populate).
+ */
+#define CO_KLOAD_WINDOW_ARENA_BYTES (4ULL << 30)
+
 static unsigned long kload_m2p_hash(co_pfn_t mfn)
 {
 	return (unsigned long)((mfn * 11400714819323198485ULL)
@@ -167,11 +198,188 @@ static bool_t kload_machine_to_pseudo_pfn(co_pfn_t mfn, co_pfn_t* ppfn_out)
 
 static bool_t kload_pseudo_to_machine_pfn(co_pfn_t ppfn, co_pfn_t* mfn_out)
 {
-	if (kload_p2m == NULL || ppfn >= kload_backed_pages)
+	if (kload_p2m == NULL || ppfn >= kload_p2m_capacity)
+		return PFALSE;
+
+	/*
+	 * Pages above backed RAM are host windows (see the window allocator
+	 * below), and only the ones actually mapped may translate. The array is
+	 * zeroed at allocation and machine frame zero is never a guest page, so
+	 * a zero entry is exactly "nothing is mapped here" -- which is the same
+	 * answer this used to give for every address above guest RAM, only now
+	 * it is a fact about the entry rather than about the boundary.
+	 */
+	if (ppfn >= kload_backed_pages && kload_p2m[ppfn] == 0)
 		return PFALSE;
 
 	*mfn_out = kload_p2m[ppfn];
 	return PTRUE;
+}
+
+/*
+ * Host memory windows in the guest's address space.
+ *
+ * Vulkan's contract is that the application writes into memory the GPU reads,
+ * so a guest running Venus needs host GPU-visible memory to appear in its own
+ * physical address space. The p2m already performs exactly that translation
+ * for guest RAM; a window is the same mechanism pointed at frames the host
+ * obtained from somewhere else.
+ *
+ * Nothing is reserved. QEMU's Windows Venus port pins a fixed multi-gigabyte
+ * region up front because WHPX makes it establish guest-physical ranges in
+ * advance, whether or not anything ever uses them. We own the p2m, so we can
+ * do what the rest of this file already does with guest RAM: take what the
+ * host can give, at the moment something asks for it, and give it back on
+ * release. A refusal is an ordinary outcome and the caller is expected to
+ * cope -- the same contract as kload_block_alloc returning NULL.
+ *
+ * Windows are allocated downward from the top of p2m capacity while guest RAM
+ * grows upward from zero, so neither has to predict how much the other will
+ * want; they simply must not meet.
+ *
+ * m2p is deliberately NOT populated. The reverse map answers "which guest page
+ * is this machine frame", and these frames are not guest pages -- they belong
+ * to a host allocation that merely appears in the guest's address space. A
+ * reverse entry would let a page-table walk mistake GPU memory for guest RAM.
+ */
+static unsigned long kload_window_next;	/* lowest window PFN handed out */
+/* First PFN above the RAM ceiling; the arena is [this, capacity). Pinned in
+ * kload_begin -- see the comment there for why backed_pages must not be it. */
+static unsigned long kload_window_base_pages;
+
+co_rc_t co_kload_window_map(const co_pfn_t* mfns, unsigned long count,
+			    co_pa_t* pseudo_out)
+{
+	unsigned long first, i;
+
+	if (mfns == NULL || pseudo_out == NULL || count == 0)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(kload_lock);
+
+	if (kload_p2m == NULL) {
+		co_os_mutex_release(kload_lock);
+		return CO_RC(ERROR);
+	}
+
+	/* The two allocators meet in the middle; whoever asks second loses. */
+	if (kload_window_next < count ||
+	    kload_window_next - count < kload_window_base_pages) {
+		co_os_mutex_release(kload_lock);
+		return CO_RC(OUT_OF_MEMORY);
+	}
+
+	first = kload_window_next - count;
+	for (i = 0; i < count; i++) {
+		/*
+		 * Frame zero would be indistinguishable from an unmapped entry
+		 * and would silently punch a hole in the middle of a window.
+		 */
+		if (mfns[i] == 0) {
+			while (i-- > 0)
+				kload_p2m[first + i] = 0;
+			co_os_mutex_release(kload_lock);
+			return CO_RC(INVALID_PARAMETER);
+		}
+		kload_p2m[first + i] = mfns[i];
+	}
+
+	kload_window_next = first;
+	*pseudo_out = ((co_pa_t)first) << CO_ARCH_PAGE_SHIFT;
+
+	co_os_mutex_release(kload_lock);
+	return CO_RC(OK);
+}
+
+/*
+ * A window at an address the CALLER chose. RESOURCE_MAP_BLOB works this way
+ * round: the guest's drm_mm picks the offset inside the advertised region and
+ * the host is told, not asked. So this side validates rather than allocates --
+ * the range must lie inside the arena and every slot must be vacant. The
+ * downward allocator above and the guest's bottom-up drm_mm share the arena
+ * without coordination; whoever asks for an occupied slot is refused, which
+ * both sides treat as an ordinary answer.
+ */
+co_rc_t co_kload_window_map_at(const co_pfn_t* mfns, unsigned long count,
+			       co_pa_t pseudo)
+{
+	unsigned long first = (unsigned long)(pseudo >> CO_ARCH_PAGE_SHIFT);
+	unsigned long i;
+
+	if (mfns == NULL || count == 0 ||
+	    (pseudo & (CO_ARCH_PAGE_SIZE - 1)) != 0)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(kload_lock);
+
+	if (kload_p2m == NULL) {
+		co_os_mutex_release(kload_lock);
+		return CO_RC(ERROR);
+	}
+
+	if (first < kload_window_base_pages ||
+	    count > kload_p2m_capacity - first) {
+		co_os_mutex_release(kload_lock);
+		return CO_RC(INVALID_PARAMETER);
+	}
+
+	for (i = 0; i < count; i++) {
+		if (kload_p2m[first + i] != 0) {
+			co_os_mutex_release(kload_lock);
+			return CO_RC(OUT_OF_MEMORY);
+		}
+	}
+
+	for (i = 0; i < count; i++) {
+		if (mfns[i] == 0) {
+			while (i-- > 0)
+				kload_p2m[first + i] = 0;
+			co_os_mutex_release(kload_lock);
+			return CO_RC(INVALID_PARAMETER);
+		}
+		kload_p2m[first + i] = mfns[i];
+	}
+
+	co_os_mutex_release(kload_lock);
+	return CO_RC(OK);
+}
+
+void co_kload_window_unmap(co_pa_t pseudo, unsigned long count)
+{
+	unsigned long first = (unsigned long)(pseudo >> CO_ARCH_PAGE_SHIFT);
+	unsigned long i;
+
+	if (count == 0)
+		return;
+
+	co_os_mutex_acquire(kload_lock);
+
+	/*
+	 * No watermark refusal here: caller-placed windows (map_at) live below
+	 * kload_window_next by design. What userspace may free is already
+	 * gated by the per-handle exact match in co_manager_window_release;
+	 * this check is only against corrupting RAM's entries.
+	 */
+	if (kload_p2m == NULL || first < kload_window_base_pages ||
+	    count > kload_p2m_capacity - first) {
+		co_os_mutex_release(kload_lock);
+		return;
+	}
+
+	for (i = 0; i < count; i++)
+		kload_p2m[first + i] = 0;
+
+	/*
+	 * Address space comes back only when the most recent window is the one
+	 * released; anything else leaves a hole that later windows skip over.
+	 * Windows are few and long-lived, so a free list would be bookkeeping
+	 * for a case that does not arise -- and the entries are cleared either
+	 * way, which is what stops the guest from reaching the memory.
+	 */
+	if (first == kload_window_next)
+		kload_window_next += count;
+
+	co_os_mutex_release(kload_lock);
 }
 
 static co_pa_t kload_pseudo_to_machine_pa(co_pa_t pseudo)
@@ -301,19 +509,38 @@ static co_kload_block_t* kload_block_alloc(unsigned long long bytes)
 {
 	co_kload_block_t* b;
 	void* va;
+	void* mdl = NULL;
 	unsigned long pages, i;
 	unsigned long first;
 
 	if (kload_block_count >= CO_KLOAD_MAX_BLOCKS)
 		return NULL;
 
+	if (kload_user_ram_va && bytes > CO_KLOAD_USER_BLOCK_BYTES)
+		bytes = CO_KLOAD_USER_BLOCK_BYTES;
+
 	pages = (unsigned long)(bytes >> CO_ARCH_PAGE_SHIFT);
 	if (pages == 0 || pages > kload_p2m_capacity - kload_backed_pages)
 		return NULL;
 
-	va = co_os_alloc_cached_pages((unsigned int)pages);
-	if (va == NULL)
-		return NULL;
+	if (kload_user_ram_va) {
+		/* The section offset of this block is exactly the pseudo
+		 * base it will get -- both advance in lockstep from zero. */
+		unsigned long long offset =
+			((unsigned long long)kload_backed_pages)
+			<< CO_ARCH_PAGE_SHIFT;
+
+		if (offset + bytes > kload_user_ram_bytes)
+			return NULL;
+		if (!CO_OK(co_os_user_block_map(
+				(void*)(size_t)(kload_user_ram_va + offset),
+				(unsigned long)bytes, &va, &mdl)))
+			return NULL;
+	} else {
+		va = co_os_alloc_cached_pages((unsigned int)pages);
+		if (va == NULL)
+			return NULL;
+	}
 
 	co_memset(va, 0, (long)(pages << CO_ARCH_PAGE_SHIFT));
 	first = kload_backed_pages;
@@ -333,9 +560,15 @@ static co_kload_block_t* kload_block_alloc(unsigned long long bytes)
 	b->va		= va;
 	b->pseudo_base = ((unsigned long long)first) << CO_ARCH_PAGE_SHIFT;
 	b->bytes	= ((unsigned long long)pages) << CO_ARCH_PAGE_SHIFT;
+	b->mdl		= mdl;
 	kload_backed_pages += pages;
 
 	return b;
+}
+
+bool_t co_kload_user_backed(void)
+{
+	return kload_user_ram_va != 0 ? PTRUE : PFALSE;
 }
 
 static bool_t kload_grow_to(unsigned long long end)
@@ -437,6 +670,7 @@ static void kload_release_pages(co_manager_t* manager)
 
 	for (i = 0; i < count; i++) {
 		void*		   va    = kload_block[i].va;
+		void*		   mdl   = kload_block[i].mdl;
 		unsigned long long bytes = kload_block[i].bytes;
 
 		if (va == NULL)
@@ -451,8 +685,12 @@ static void kload_release_pages(co_manager_t* manager)
 		kload_block[i].va	  = NULL;
 		kload_block[i].pseudo_base = 0;
 		kload_block[i].bytes	  = 0;
+		kload_block[i].mdl	  = NULL;
 
-		co_os_free_cached_pages(va,
+		if (mdl != NULL)
+			co_os_user_block_unmap(va, mdl);
+		else
+			co_os_free_cached_pages(va,
 					(unsigned int)(bytes >> CO_ARCH_PAGE_SHIFT));
 	}
 
@@ -467,6 +705,8 @@ static void kload_release_pages(co_manager_t* manager)
 	kload_m2p_alloc_pages = 0;
 	kload_p2m_capacity	= 0;
 	kload_backed_pages	= 0;
+	kload_window_next	= 0;
+	kload_window_base_pages = 0;
 	kload_m2p_slots	= 0;
 	kload_m2p_mask_value	= 0;
 	kload_ram_ready	= PFALSE;
@@ -475,6 +715,8 @@ static void kload_release_pages(co_manager_t* manager)
 	kload_table_start = 0;
 	kload_table_end   = 0;
 	kload_table_top	  = 0;
+	kload_user_ram_va    = 0;
+	kload_user_ram_bytes = 0;
 }
 
 void co_kload_free(co_manager_t* manager)
@@ -818,6 +1060,8 @@ static co_rc_t kload_translation_alloc(unsigned long capacity_pages)
 	co_memset(kload_m2p, 0,
 		  (long)(kload_m2p_alloc_pages << CO_ARCH_PAGE_SHIFT));
 	kload_p2m_capacity = capacity_pages;
+	/* Windows grow down from the top; guest RAM grows up from zero. */
+	kload_window_next = capacity_pages;
 	return CO_RC(OK);
 }
 
@@ -851,7 +1095,9 @@ static co_rc_t kload_map_translation_pages(co_manager_t* manager)
 }
 
 co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
-		       unsigned long long max_va, unsigned long long ram_bytes)
+		       unsigned long long max_va, unsigned long long ram_bytes,
+		       unsigned long long ram_user_va,
+		       unsigned long long ram_user_bytes)
 {
 	unsigned long long image_hi, table_bytes, capacity_end, sizing_bytes;
 	co_rc_t rc;
@@ -866,6 +1112,16 @@ co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 	 */
 	if (!kload_wait_for_deferred_free())
 		return CO_RC(ERROR);
+
+	/* Section-backed RAM, if the caller offered a view. Page alignment is
+	 * the MDL's requirement; a misaligned offer degrades to pool. */
+	if (ram_user_va && ram_user_bytes &&
+	    (ram_user_va & ~CO_ARCH_PAGE_MASK) == 0) {
+		kload_user_ram_va    = ram_user_va;
+		kload_user_ram_bytes = ram_user_bytes & CO_ARCH_PAGE_MASK;
+		co_debug("kload: guest RAM is section-backed: view 0x%llx,"
+			 " %llu MB", ram_user_va, kload_user_ram_bytes >> 20);
+	}
 
 	if (min_va >= max_va || !CO_ARCH_VA_CANONICAL(min_va) || !CO_ARCH_VA_CANONICAL(max_va - 1))
 		return CO_RC(INVALID_PARAMETER);
@@ -904,6 +1160,21 @@ co_rc_t co_kload_begin(co_manager_t* manager, unsigned long long min_va,
 	if (capacity_end < kload_table_end)
 		capacity_end = kload_table_end;
 	capacity_end = (capacity_end + CO_ARCH_PAGE_SIZE - 1) & CO_ARCH_PAGE_MASK;
+
+	/*
+	 * The arena base, pinned NOW and never derived from kload_backed_pages:
+	 * RAM backs lazily, so backed_pages grows for the machine's whole
+	 * life. The loader read bounds at boot and the daemon read them
+	 * seconds later; they got different answers, the guest's drm_mm and
+	 * the daemon's KWINDOW_AT disagreed by the difference, and the first
+	 * real MAP_BLOB landed inside RAM's address space and was refused.
+	 * The base is the RAM CEILING -- address space RAM may someday back --
+	 * not the RAM currently backed.
+	 */
+	kload_window_base_pages =
+		(unsigned long)(capacity_end >> CO_ARCH_PAGE_SHIFT);
+
+	capacity_end += CO_KLOAD_WINDOW_ARENA_BYTES;
 
 	rc = kload_translation_alloc(
 		(unsigned long)(capacity_end >> CO_ARCH_PAGE_SHIFT));
@@ -1153,6 +1424,23 @@ co_rc_t co_kload_write_cr3(co_manager_t* manager, unsigned long long cr3,
  *
  * Single page: a caller wanting more must resolve each page, because nothing
  * guarantees two guest-virtual neighbours are host-physical neighbours.
+ */
+/*
+ * BEACON -- grep bait for the next person, by request, after this function
+ * ate its second engineer:
+ *
+ *   LOAD-TIME ROOT ONLY. DEAD MAP AFTER adopt_kernel_tables. NOT_FOUND
+ *   QUIETLY. kernel .bss NOT RESOLVABLE HERE. guest symbol read fails
+ *   silently. timer deadline bug 2026-08-11. cooperative timer refused
+ *   (space.c). USE co_kload_read_cr3 WITH pp->linuxvm_state.cr3 FOR
+ *   ANYTHING THE LIVE GUEST OWNS.
+ *
+ * This walks the address space the LOADER built. The guest replaces those
+ * tables with its own mid-boot and lives there; a kernel symbol that is
+ * mapped for the running guest can be absent here, and the failure is a
+ * quiet NULL. Both times this was hit, the caller's code was correct, ran
+ * at the right moment, and read nothing, while a probe somewhere luckier
+ * reported the mechanism healthy.
  */
 void* co_kload_host_ptr(co_manager_t* manager, unsigned long long va)
 {
@@ -1710,9 +1998,31 @@ unsigned long co_kload_ram_pages(void)
 	return kload_ram_pages;
 }
 
+/*
+ * The window arena, stated by its owner. The guest transport advertises this
+ * range as the virtio-gpu host-visible shm region and the daemon computes
+ * MAP_BLOB offsets against its base; both read it from here so there is no
+ * second party deriving the same numbers from adjacent facts (the e820 top
+ * happens to equal the arena base today, and relying on that would be an
+ * implicit contract).
+ */
+void co_kload_window_bounds(unsigned long long* base, unsigned long long* top)
+{
+	*base = ((unsigned long long)kload_window_base_pages) << CO_ARCH_PAGE_SHIFT;
+	*top  = ((unsigned long long)kload_p2m_capacity) << CO_ARCH_PAGE_SHIFT;
+}
+
 unsigned long co_kload_p2m_pages(void)
 {
-	return kload_backed_pages;
+	/*
+	 * Capacity, not backed RAM: this value becomes the guest's
+	 * co_colinux_p2m_pages, below which pseudo_to_machine consults the
+	 * p2m and above which it falls back to identity. Host memory windows
+	 * live between backed RAM and capacity -- report only backed pages
+	 * and a guest PTE naming a window identity-maps to a machine address
+	 * that does not exist, which reads as all-ones and swallows writes.
+	 */
+	return kload_p2m_capacity;
 }
 
 unsigned long long co_kload_m2p_mask(void)

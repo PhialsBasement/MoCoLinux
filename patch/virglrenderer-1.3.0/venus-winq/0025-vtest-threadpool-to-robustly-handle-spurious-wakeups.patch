@@ -1,0 +1,35 @@
+From fa334ca1288e6a40c917d2e6562562a780d91422 Mon Sep 17 00:00:00 2001
+From: Yiwei Zhang <zzyiwei@chromium.org>
+Date: Wed, 25 Mar 2026 20:44:33 -0700
+Subject: [PATCH] vtest: threadpool to robustly handle spurious wakeups
+
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1610>
+---
+ vtest/threadpool.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/vtest/threadpool.c b/vtest/threadpool.c
+index 412a3c42..87c23a08 100644
+--- a/vtest/threadpool.c
++++ b/vtest/threadpool.c
+@@ -37,7 +37,7 @@ worker_main(void *arg)
+    mtx_lock(&w->tp->lock);
+ 
+    do {
+-      if (!w->work)
++      while (!w->work)
+          cnd_wait(&w->cnd, &w->tp->lock);
+ 
+       if (w->work == exit_work)
+@@ -129,7 +129,7 @@ threadpool_fini(struct threadpool *tp)
+       int ret;
+ 
+       /* Wait for an idle worker: */
+-      if (list_is_empty(&tp->idle_workers))
++      while (list_is_empty(&tp->idle_workers))
+          cnd_wait(&tp->cnd, &tp->lock);
+ 
+       /* Kick exit job to notify the worker to shut down: */
+-- 
+2.55.0
+

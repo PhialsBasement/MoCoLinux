@@ -56,6 +56,7 @@
 #include <linux/platform_device.h>
 #include <linux/delay.h>
 #include <linux/kthread.h>
+#include <asm/cooperative.h>	/* the window arena bounds, for shm_region */
 #include <linux/console.h>	/* co_vgpu_drain's prototype lives with the
 					 * other cooperative hooks */
 
@@ -222,6 +223,19 @@ static int co_vgpu_finalize_features(struct virtio_device *vdev)
 /* ---------------------------------------------------------------- the kick */
 
 /*
+ * Set while the host may still be working on a submitted GPU request.  The
+ * original idle-polling experiment is no longer used, but keeping the state
+ * accurate leaves the transport safe for a future monitor-side wakeup policy.
+ */
+static atomic_t co_vgpu_inflight = ATOMIC_INIT(0);
+
+bool co_vgpu_busy(void)
+{
+	return atomic_read(&co_vgpu_inflight) != 0;
+}
+EXPORT_SYMBOL(co_vgpu_busy);
+
+/*
  * The entire notification mechanism.
  *
  * A store. The daemon is spinning on this word on another physical core, sees
@@ -238,6 +252,7 @@ static bool co_vgpu_notify(struct virtqueue *vq)
 	 * advertises them. */
 	smp_wmb();
 	WRITE_ONCE(shared->kick, READ_ONCE(shared->kick) + 1);
+	atomic_set(&co_vgpu_inflight, 1);
 	return true;
 }
 
@@ -324,6 +339,35 @@ static const char *co_vgpu_bus_name(struct virtio_device *vdev)
 	return "colinux";
 }
 
+/*
+ * The host-visible shm region: the window arena, pseudo-physical space above
+ * RAM where host allocations appear on request (RESOURCE_MAP_BLOB). It is an
+ * ADVERTISEMENT -- nothing is backed until a mapping lands, the arena is in
+ * no e820 range (which is also why request_mem_region on it succeeds), and a
+ * guest that never maps a blob never touches it.
+ *
+ * The id is virtio-gpu's VIRTIO_GPU_SHM_ID_HOST_VISIBLE. Interpreting a
+ * device-specific id in a transport is normally wrong; this transport carries
+ * exactly one device, so there is no other device the id could belong to.
+ *
+ * Bounds are published by the loader like the p2m bounds. Under a loader too
+ * old to know them they stay zero and the region is refused, so virtio-gpu
+ * runs without host_visible exactly as it did before this function existed.
+ */
+static bool co_vgpu_get_shm_region(struct virtio_device *vdev,
+				   struct virtio_shm_region *region, u8 id)
+{
+	if (id != 1 /* VIRTIO_GPU_SHM_ID_HOST_VISIBLE */)
+		return false;
+
+	if (co_colinux_window_top <= co_colinux_window_base)
+		return false;
+
+	region->addr = co_colinux_window_base;
+	region->len  = co_colinux_window_top - co_colinux_window_base;
+	return true;
+}
+
 static const struct virtio_config_ops co_vgpu_config_ops = {
 	.get			= co_vgpu_get,
 	.set			= co_vgpu_set,
@@ -335,6 +379,7 @@ static const struct virtio_config_ops co_vgpu_config_ops = {
 	.get_features		= co_vgpu_get_features,
 	.finalize_features	= co_vgpu_finalize_features,
 	.bus_name		= co_vgpu_bus_name,
+	.get_shm_region		= co_vgpu_get_shm_region,
 };
 
 /* ------------------------------------------------------------ completions */
@@ -362,15 +407,22 @@ void co_vgpu_drain(void)
 	WRITE_ONCE(co_colinux_vgpu_io.guest_heartbeat,
 		   READ_ONCE(co_colinux_vgpu_io.guest_heartbeat) + 1);
 
-	if (pending == READ_ONCE(co_colinux_vgpu_io.reaped))
-		return;
-
-	WRITE_ONCE(co_colinux_vgpu_io.reaped, pending);
+	/*
+	 * vring_interrupt() only schedules the virtio-gpu work item; the queue
+	 * itself serialises consumption.  Every vCPU may therefore poke both
+	 * rings, and publishing reaped only afterwards avoids losing a drain in
+	 * the window between bookkeeping and the poke.
+	 */
 	smp_rmb();
 
 	for (i = 0; i < CO_VGPU_NUM_VQS; i++) {
 		if (co_vgpu->vqs[i])
 			vring_interrupt(0, co_vgpu->vqs[i]);
+	}
+
+	if (pending != READ_ONCE(co_colinux_vgpu_io.reaped)) {
+		WRITE_ONCE(co_colinux_vgpu_io.reaped, pending);
+		atomic_set(&co_vgpu_inflight, 0);
 	}
 }
 EXPORT_SYMBOL(co_vgpu_drain);

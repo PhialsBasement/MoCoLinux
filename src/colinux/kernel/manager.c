@@ -17,6 +17,7 @@
 #include <colinux/os/kernel/manager.h>
 #include <colinux/os/kernel/misc.h>
 #include <colinux/os/kernel/mutex.h>
+#include <colinux/os/kernel/user.h>	/* page locking, for KWINDOW */
 #include <colinux/os/timer.h>
 #include <colinux/arch/mmu.h>
 #include <colinux/arch/probe.h>
@@ -40,6 +41,19 @@
 #endif
 
 co_manager_t* co_global_manager = NULL;
+
+/* The guest's timer-deadline array VA, stashed at KBOOT so the VGPU ioctl
+ * can report what it resolves to -- diagnosis surface, not a mechanism. */
+static unsigned long long manager_timer_deadline_va;
+
+/* Loop truth from the vCPU run loop -- see arch/x86_64/switch.c. */
+extern unsigned long long co_arch_tdl_loop_ptr;
+extern unsigned long long co_arch_tdl_branch_taken;
+extern unsigned long long co_arch_tdl_spins;
+extern unsigned long long co_arch_tdl_path_tick;
+extern unsigned long long co_arch_tdl_path_far;
+extern unsigned long long co_arch_tdl_path_mid;
+extern unsigned long long co_arch_tdl_path_due;
 
 static void set_hostmem_usage_limit(co_manager_t* manager)
 {
@@ -543,6 +557,12 @@ static co_rc_t co_manager_kmap(co_manager_t* manager,
 		slice_bytes = CO_KMAP_SLICE_BYTES;
 	slice_bytes &= CO_ARCH_PAGE_MASK;
 
+	/* Section-backed blocks are kernel mappings of user pages, not pool;
+	 * MmBuildMdlForNonPagedPool over them is a lie the memory manager
+	 * acts on. Consumers reach section-backed RAM through the section. */
+	if (co_kload_user_backed())
+		return CO_RC(ERROR);
+
 	co_os_mutex_acquire(opened->lock);
 	if (opened->kmap_reserved || opened->kmap_slices != 0) {
 		co_os_mutex_release(opened->lock);
@@ -639,6 +659,10 @@ static co_rc_t co_manager_kmap_range(co_manager_t* manager,
 	co_memset(&params->range, 0, sizeof(params->range));
 	if (!opened)
 		return CO_RC(INVALID_PARAMETER);
+	/* See the guard in co_manager_kmap: pool MDLs cannot describe
+	 * section-backed blocks. The section is the access path. */
+	if (co_kload_user_backed())
+		return CO_RC(ERROR);
 
 	co_os_mutex_acquire(opened->lock);
 	if (!opened->kmap_reserved) {
@@ -695,6 +719,146 @@ out:
 	return rc;
 }
 
+/*
+ * Release ONE slice by its exact base pa -- the eviction half of KMAP_RANGE.
+ *
+ * The caller promises nothing in its process still dereferences the slice's
+ * user_va; the driver's half is to unlink under the lock and unmap in the
+ * caller's process context, which an ioctl already is. The kmap reservation is
+ * deliberately NOT dropped even if this was the last slice: the reservation
+ * stands for the handle's intent to keep mapping guest RAM, and an eviction is
+ * the opposite of letting go of that intent.
+ */
+static co_rc_t co_manager_kmap_unmap_range(co_manager_open_desc_t opened,
+					   co_manager_ioctl_kmap_unmap_range_t* params)
+{
+	co_manager_kmap_slice_t*  slice = NULL;
+	co_manager_kmap_slice_t** link;
+
+	params->bytes = 0;
+	if (!opened)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(opened->lock);
+	for (link = &opened->kmap_slice; *link != NULL; link = &(*link)->next) {
+		if ((*link)->pa == params->pa) {
+			slice = *link;
+			*link = slice->next;
+			opened->kmap_slices--;
+			break;
+		}
+	}
+	co_os_mutex_release(opened->lock);
+
+	if (slice == NULL)
+		return CO_RC(NOT_FOUND);
+
+	params->bytes = slice->bytes;
+	if (slice->handle)
+		co_os_userspace_unmap(slice->user_va, slice->handle,
+				      slice->pages);
+	co_os_free(slice);
+	co_debug("kmap-unmap: pa 0x%llx, %llu KB released",
+		 params->pa, params->bytes >> 10);
+	return CO_RC(OK);
+}
+
+/*
+ * Host-memory windows published into the guest.
+ *
+ * The order in release is not arbitrary and is the whole point of tracking
+ * them: the p2m entries go first, so the guest can no longer reach the pages,
+ * and only then are the pages unlocked. Unlocking first would leave a window
+ * in which the guest's page tables name frames Windows has already taken back.
+ */
+void co_manager_window_track(co_manager_open_desc_t opened, void* handle,
+			     unsigned long long pseudo_pa, unsigned long pages)
+{
+	co_manager_window_t* node;
+
+	if (!opened)
+		return;
+
+	node = (co_manager_window_t*)co_os_malloc(sizeof(*node));
+	if (node == NULL) {
+		/*
+		 * Untracked would mean leaked on close, which is the failure
+		 * this list exists to prevent. Undo instead.
+		 */
+		co_kload_window_unmap((co_pa_t)pseudo_pa, pages);
+		co_os_user_unlock_pages(handle);
+		return;
+	}
+
+	node->handle	= handle;
+	node->pages	= pages;
+	node->pseudo_pa = pseudo_pa;
+
+	co_os_mutex_acquire(opened->lock);
+	node->next	= opened->window;
+	opened->window	= node;
+	opened->windows++;
+	co_os_mutex_release(opened->lock);
+}
+
+co_rc_t co_manager_window_release(co_manager_open_desc_t opened,
+				  unsigned long long pseudo_pa,
+				  unsigned long pages)
+{
+	co_manager_window_t* node = NULL;
+	co_manager_window_t** link;
+
+	if (!opened)
+		return CO_RC(INVALID_PARAMETER);
+
+	co_os_mutex_acquire(opened->lock);
+	for (link = &opened->window; *link != NULL; link = &(*link)->next) {
+		if ((*link)->pseudo_pa == pseudo_pa && (*link)->pages == pages) {
+			node  = *link;
+			*link = node->next;
+			opened->windows--;
+			break;
+		}
+	}
+	co_os_mutex_release(opened->lock);
+
+	if (node == NULL)
+		return CO_RC(NOT_FOUND);
+
+	co_kload_window_unmap((co_pa_t)node->pseudo_pa, node->pages);
+	co_os_user_unlock_pages(node->handle);
+	co_os_free(node);
+	return CO_RC(OK);
+}
+
+void co_manager_window_release_all(co_manager_open_desc_t opened)
+{
+	co_manager_window_t* list;
+	unsigned long count = 0;
+
+	if (!opened)
+		return;
+
+	co_os_mutex_acquire(opened->lock);
+	list		= opened->window;
+	opened->window	= NULL;
+	opened->windows = 0;
+	co_os_mutex_release(opened->lock);
+
+	while (list != NULL) {
+		co_manager_window_t* next = list->next;
+
+		co_kload_window_unmap((co_pa_t)list->pseudo_pa, list->pages);
+		co_os_user_unlock_pages(list->handle);
+		co_os_free(list);
+		list = next;
+		count++;
+	}
+
+	if (count)
+		co_debug("kwindow: released %lu host window(s)", count);
+}
+
 void co_manager_kmap_release(co_manager_t* manager, co_manager_open_desc_t opened)
 {
 	co_manager_kmap_slice_t* list;
@@ -703,6 +867,8 @@ void co_manager_kmap_release(co_manager_t* manager, co_manager_open_desc_t opene
 
 	if (!opened)
 		return;
+
+	co_manager_window_release_all(opened);
 
 	co_os_mutex_acquire(opened->lock);
 	list = opened->kmap_slice;
@@ -946,7 +1112,9 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		}
 
 		params->rc = co_kload_begin(manager, params->min_va, params->max_va,
-					    params->ram_bytes);
+					    params->ram_bytes,
+					    params->ram_user_va,
+					    params->ram_user_bytes);
 		*return_size = sizeof(*params);
 		return CO_RC(OK);
 	}
@@ -1025,6 +1193,90 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		return CO_RC(OK);
 	}
 
+	case CO_MANAGER_IOCTL_KMAP_UNMAP_RANGE: {
+		co_manager_ioctl_kmap_unmap_range_t* params =
+			(typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_manager_kmap_unmap_range(opened, params);
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	/*
+	 * KMAP's mirror: host memory published into the guest's address space,
+	 * for Venus, where the guest writes into memory the host's GPU reads.
+	 * The pages are locked here and stay locked until KUNWINDOW, because
+	 * the guest is given page-table entries naming their machine frames.
+	 */
+	case CO_MANAGER_IOCTL_KWINDOW: {
+		co_manager_ioctl_kwindow_t* params = (typeof(params))(io_buffer);
+		co_pfn_t* pfns	= NULL;
+		void*	  handle = NULL;
+		unsigned long count = 0;
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->pseudo_pa = 0;
+		params->rc = co_os_user_lock_pages((void*)(uintptr_t)params->va,
+						   (unsigned long)params->bytes,
+						   &handle, &pfns, &count);
+		if (CO_OK(params->rc)) {
+			params->rc = co_kload_window_map(pfns, count,
+							 (co_pa_t*)&params->pseudo_pa);
+			if (!CO_OK(params->rc))
+				co_os_user_unlock_pages(handle);
+			else
+				co_manager_window_track(opened, handle,
+							params->pseudo_pa, count);
+			co_os_free(pfns);
+		}
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KWINDOW_AT: {
+		co_manager_ioctl_kwindow_at_t* params = (typeof(params))(io_buffer);
+		co_pfn_t* pfns	= NULL;
+		void*	  handle = NULL;
+		unsigned long count = 0;
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_os_user_lock_pages((void*)(uintptr_t)params->va,
+						   (unsigned long)params->bytes,
+						   &handle, &pfns, &count);
+		if (CO_OK(params->rc)) {
+			params->rc = co_kload_window_map_at(pfns, count,
+							    (co_pa_t)params->pseudo_pa);
+			if (!CO_OK(params->rc))
+				co_os_user_unlock_pages(handle);
+			else
+				co_manager_window_track(opened, handle,
+							params->pseudo_pa, count);
+			co_os_free(pfns);
+		}
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
+	case CO_MANAGER_IOCTL_KUNWINDOW: {
+		co_manager_ioctl_kunwindow_t* params = (typeof(params))(io_buffer);
+
+		if (in_size < sizeof(*params) || out_size < sizeof(*params))
+			return CO_RC(INVALID_PARAMETER);
+
+		params->rc = co_manager_window_release(opened, params->pseudo_pa,
+						       (unsigned long)(params->bytes
+							>> CO_ARCH_PAGE_SHIFT));
+		*return_size = sizeof(*params);
+		return CO_RC(OK);
+	}
+
 	case CO_MANAGER_IOCTL_KUNMAP: {
 		co_manager_ioctl_kunmap_t* params = (typeof(params))(io_buffer);
 
@@ -1047,6 +1299,39 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->va	 = co_vgpu_address();
 		params->query_pa = 0;
 		params->rc	 = CO_RC(OK);
+		co_kload_window_bounds(&params->window_base,
+				       &params->window_top);
+		/*
+		 * LOOP truth, not a fresh lookup: what the vCPU loop itself
+		 * resolved and how often each branch ran. A fresh lookup here
+		 * once succeeded while the loop's own had failed at an
+		 * earlier moment, and the healthy-looking log line cost two
+		 * blind rebuild cycles.
+		 */
+		params->timer_deadline_host = co_arch_tdl_loop_ptr;
+		/*
+		 * tdl_branch doubles as the transmission probe: high 32 bits
+		 * carry the KBOOT-time stash's low bits and the driver's own
+		 * sizeof(kboot struct), so one log line splits "value never
+		 * left userspace" from "lost between manager and the loop".
+		 */
+		{
+			unsigned long long st = co_os_idle_hires_selftest();
+
+			if (st > 0xffffULL)
+				st = 0xffffULL;
+			params->tdl_branch =
+				(co_arch_tdl_branch_taken & 0xffffffffULL)
+				| ((manager_timer_deadline_va & 0xffffULL) << 32)
+				| (st << 48);
+		}
+		params->tdl_spins  = (co_arch_tdl_spins & 0x7fffffffffffffffULL)
+			| (co_os_idle_hires_available()
+				? 0x8000000000000000ULL : 0);
+		params->tdl_paths_a = ((co_arch_tdl_path_tick & 0xffffffffULL) << 32)
+			| (co_arch_tdl_path_far & 0xffffffffULL);
+		params->tdl_paths_b = ((co_arch_tdl_path_mid & 0xffffffffULL) << 32)
+			| (co_arch_tdl_path_due & 0xffffffffULL);
 
 		/*
 		 * One guest virtual address translated, if asked. The daemon's
@@ -1233,6 +1518,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		params->phys_base    = co_kload_phys_base();
 		params->p2m_pages    = co_kload_p2m_pages();
 		params->m2p_mask     = co_kload_m2p_mask();
+		co_kload_window_bounds(&params->window_base,
+				       &params->window_top);
 		params->range_count  = co_kload_range_count();
 		if (params->range_count > CO_KRAM_MAX_RANGES)
 			params->range_count = CO_KRAM_MAX_RANGES;
@@ -1330,6 +1617,8 @@ co_rc_t co_manager_ioctl(co_manager_t* 		manager,
 		in.tick_entry_va      = params->tick_entry_va;
 		in.virtual_if_va      = params->virtual_if_va;
 		in.ipi_pending_va     = params->ipi_pending_va;
+		in.timer_deadline_va  = params->timer_deadline_va;
+		manager_timer_deadline_va = params->timer_deadline_va;
 		in.step               = params->step;
 		in.batch              = params->batch;
 		in.kernel_table_count = params->kernel_table_count;

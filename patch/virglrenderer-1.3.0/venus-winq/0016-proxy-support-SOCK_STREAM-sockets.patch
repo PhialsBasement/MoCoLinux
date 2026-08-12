@@ -1,0 +1,462 @@
+From 644f263afabef297abffcc50e9448022d6978450 Mon Sep 17 00:00:00 2001
+From: osy <osy@turing.llc>
+Date: Sat, 20 Dec 2025 05:35:06 -0800
+Subject: [PATCH] proxy: support SOCK_STREAM sockets
+
+macOS does not support SOCK_SEQPACKET so we have to make use of SOCK_STREAM.
+That means we have to take care of framing. Thankfully, the SCM_RIGHTS
+buffer will always be complete and ordered so we send that with a header
+indicating the number of bytes for the packet followed by the packet.
+
+Co-authored-by: Lucas Amaral <lucaaamaral@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1600>
+---
+ server/render_protocol.h |  13 ++++
+ server/render_server.c   |   6 +-
+ server/render_socket.c   | 138 ++++++++++++++++++++++++++++++++++++++-
+ src/proxy/proxy_client.c |   2 +
+ src/proxy/proxy_server.c |   2 +
+ src/proxy/proxy_socket.c | 134 ++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 292 insertions(+), 3 deletions(-)
+
+diff --git a/server/render_protocol.h b/server/render_protocol.h
+index 7e38ac0c..cae94a05 100644
+--- a/server/render_protocol.h
++++ b/server/render_protocol.h
+@@ -219,4 +219,17 @@ union render_context_op_request {
+    struct render_context_op_submit_fence_request submit_fence;
+ };
+ 
++#ifdef __APPLE__
++/**
++ * When we do not have SOCK_SEQPACKET support, we need to manage framing.
++ * This will be sent as the header of each packet when necessary.
++ */
++struct render_context_socket_header {
++   union {
++      uint32_t length;
++      uint8_t b[sizeof(uint32_t)];
++   };
++};
++#endif /* __APPLE__ */
++
+ #endif /* RENDER_PROTOCOL_H */
+diff --git a/server/render_server.c b/server/render_server.c
+index 6b129e4f..ec2f4a37 100644
+--- a/server/render_server.c
++++ b/server/render_server.c
+@@ -148,7 +148,11 @@ render_server_parse_options(struct render_server *srv, int argc, char **argv)
+       return false;
+    }
+ 
+-   if (srv->client_fd < 0 || !render_socket_is_seqpacket(srv->client_fd)) {
++   if (srv->client_fd < 0
++#ifndef __APPLE__
++       || !render_socket_is_seqpacket(srv->client_fd)
++#endif
++   ) {
+       render_log("no valid client fd specified");
+       return false;
+    }
+diff --git a/server/render_socket.c b/server/render_socket.c
+index 9891010a..e801cd8f 100644
+--- a/server/render_socket.c
++++ b/server/render_socket.c
+@@ -37,7 +37,11 @@
+ bool
+ render_socket_pair(int out_fds[static 2])
+ {
+-   int ret = socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, out_fds);
++   int type = SOCK_SEQPACKET;
++#ifdef __APPLE__
++   type = SOCK_STREAM;
++#endif
++   int ret = socketpair(AF_UNIX, type | SOCK_CLOEXEC, 0, out_fds);
+    if (ret) {
+       render_log("failed to create socket pair");
+       return false;
+@@ -85,9 +89,86 @@ get_received_fds(const struct msghdr *msg, int *out_count)
+    return (const int *)CMSG_DATA(cmsg);
+ }
+ 
++#ifdef __APPLE__
++enum socket_state {
++   SOCKET_STATE_FIRST_MSG,
++   SOCKET_STATE_HEADER,
++   SOCKET_STATE_DATA,
++};
++#endif
++
+ static bool
+ render_socket_recvmsg(struct render_socket *socket, struct msghdr *msg, size_t *out_size)
+ {
++#ifdef __APPLE__
++   enum socket_state state = SOCKET_STATE_FIRST_MSG;
++   struct render_context_socket_header hdr = {0};
++   ssize_t want = sizeof(hdr);
++   struct msghdr _msg = {
++      .msg_iov =
++         &(struct iovec){
++            .iov_base = &hdr,
++            .iov_len = want,
++         },
++      .msg_iovlen = 1,
++      .msg_control = msg->msg_control,
++      .msg_controllen = msg->msg_controllen,
++   };
++   socklen_t _msg_controllen;
++
++   assert(msg->msg_iovlen == 1);
++
++   *out_size = 0;
++   do {
++      const ssize_t s = recvmsg(socket->fd, &_msg, MSG_CMSG_CLOEXEC);
++      if (unlikely(s < 0)) {
++         if (errno == EAGAIN || errno == EINTR)
++            continue;
++
++         render_log("failed to receive message: %s", strerror(errno));
++         return false;
++      }
++
++      if (state == SOCKET_STATE_FIRST_MSG) {
++         _msg_controllen = _msg.msg_controllen;
++         state = SOCKET_STATE_HEADER;
++      } else {
++         /* retain the cmsg from first message */
++         assert(_msg.msg_controllen == 0);
++      }
++
++      if (unlikely(_msg.msg_flags & MSG_CTRUNC)) {
++         render_log("failed to receive message: truncated");
++
++         int fd_count;
++         const int *fds = get_received_fds(&_msg, &fd_count);
++         for (int i = 0; i < fd_count; i++)
++            close(fds[i]);
++
++         return false;
++      }
++
++      if (s <= want) {
++         _msg.msg_iov[0].iov_base = (char *)_msg.msg_iov[0].iov_base + s;
++         _msg.msg_iov[0].iov_len -= s;
++         want -= s;
++      }
++
++      if (state == SOCKET_STATE_DATA) {
++         *out_size += s;
++      }
++
++      if (!want && state == SOCKET_STATE_HEADER) {
++         want = ntohl(hdr.length);
++         _msg.msg_iov[0].iov_base = msg->msg_iov[0].iov_base;
++         _msg.msg_iov[0].iov_len = want;
++         state = SOCKET_STATE_DATA;
++      } else if (!want && state == SOCKET_STATE_DATA) {
++         msg->msg_controllen = _msg_controllen;
++         break;
++      }
++   } while (true);
++#else
+    do {
+       const ssize_t s = recvmsg(socket->fd, msg, MSG_CMSG_CLOEXEC);
+       if (unlikely(s <= 0)) {
+@@ -115,6 +196,9 @@ render_socket_recvmsg(struct render_socket *socket, struct msghdr *msg, size_t *
+       *out_size = s;
+       return true;
+    } while (true);
++#endif
++
++   return true;
+ }
+ 
+ static bool
+@@ -205,6 +289,57 @@ render_socket_receive_data(struct render_socket *socket, void *data, size_t size
+ static bool
+ render_socket_sendmsg(struct render_socket *socket, const struct msghdr *msg)
+ {
++#ifdef __APPLE__
++   enum socket_state state = SOCKET_STATE_FIRST_MSG;
++   struct render_context_socket_header hdr = {
++      .length = htonl(msg->msg_iov[0].iov_len),
++   };
++   ssize_t want = sizeof(hdr);
++   struct msghdr _msg = {
++      .msg_iov =
++         &(struct iovec){
++            .iov_base = &hdr,
++            .iov_len = want,
++         },
++      .msg_iovlen = 1,
++      .msg_control = msg->msg_control,
++      .msg_controllen = msg->msg_controllen,
++   };
++
++   assert(msg->msg_iovlen == 1);
++
++   do {
++      const ssize_t s = sendmsg(socket->fd, &_msg, MSG_NOSIGNAL);
++      if (unlikely(s < 0)) {
++         if (errno == EAGAIN || errno == EINTR)
++            continue;
++
++         render_log("failed to send message: %s", strerror(errno));
++         return false;
++      }
++
++      if (state == SOCKET_STATE_FIRST_MSG) {
++         _msg.msg_controllen = 0;
++         _msg.msg_control = NULL;
++         state = SOCKET_STATE_HEADER;
++      }
++
++      if (s <= want) {
++         _msg.msg_iov[0].iov_base = (char *)_msg.msg_iov[0].iov_base + s;
++         _msg.msg_iov[0].iov_len -= s;
++         want -= s;
++      }
++
++      if (!want && state == SOCKET_STATE_HEADER) {
++         want = ntohl(hdr.length);
++         _msg.msg_iov[0].iov_base = msg->msg_iov[0].iov_base;
++         _msg.msg_iov[0].iov_len = want;
++         state = SOCKET_STATE_DATA;
++      } else if (!want && state == SOCKET_STATE_DATA) {
++         return true;
++      }
++   } while (true);
++#else
+    do {
+       const ssize_t s = sendmsg(socket->fd, msg, MSG_NOSIGNAL);
+       if (unlikely(s < 0)) {
+@@ -219,6 +354,7 @@ render_socket_sendmsg(struct render_socket *socket, const struct msghdr *msg)
+       assert(msg->msg_iovlen == 1 && msg->msg_iov[0].iov_len == (size_t)s);
+       return true;
+    } while (true);
++#endif
+ }
+ 
+ static inline bool
+diff --git a/src/proxy/proxy_client.c b/src/proxy/proxy_client.c
+index 97e025fd..7a7ba539 100644
+--- a/src/proxy/proxy_client.c
++++ b/src/proxy/proxy_client.c
+@@ -55,10 +55,12 @@ proxy_client_create_context(struct proxy_client *client,
+       return false;
+    }
+ 
++#ifndef __APPLE__
+    if (!proxy_socket_is_seqpacket(ctx_fd)) {
+       close(ctx_fd);
+       return false;
+    }
++#endif
+ 
+    *out_ctx_fd = ctx_fd;
+    return true;
+diff --git a/src/proxy/proxy_server.c b/src/proxy/proxy_server.c
+index c9ea27e1..7ccddb9c 100644
+--- a/src/proxy/proxy_server.c
++++ b/src/proxy/proxy_server.c
+@@ -114,12 +114,14 @@ proxy_server_create(void)
+       }
+    }
+ 
++#ifndef __APPLE__
+    if (!proxy_socket_is_seqpacket(srv->client_fd)) {
+       proxy_log("invalid client fd type");
+       close(srv->client_fd);
+       free(srv);
+       return NULL;
+    }
++#endif
+ 
+    proxy_log("proxy server with pid %d", srv->pid);
+ 
+diff --git a/src/proxy/proxy_socket.c b/src/proxy/proxy_socket.c
+index 146f0650..d3f4906c 100644
+--- a/src/proxy/proxy_socket.c
++++ b/src/proxy/proxy_socket.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "proxy_socket.h"
++#include "server/render_protocol.h"
+ 
+ #include <poll.h>
+ #include <sys/socket.h>
+@@ -23,7 +24,11 @@
+ bool
+ proxy_socket_pair(int out_fds[static 2])
+ {
+-   int ret = socketpair(AF_UNIX, SOCK_SEQPACKET, 0, out_fds);
++   int type = SOCK_SEQPACKET;
++#ifdef __APPLE__
++   type = SOCK_STREAM;
++#endif
++   int ret = socketpair(AF_UNIX, type, 0, out_fds);
+    if (ret) {
+       proxy_log("failed to create socket pair");
+       return false;
+@@ -102,9 +107,81 @@ get_received_fds(const struct msghdr *msg, int *out_count)
+    return (const int *)CMSG_DATA(cmsg);
+ }
+ 
++#ifdef __APPLE__
++enum socket_state {
++   SOCKET_STATE_FIRST_MSG,
++   SOCKET_STATE_HEADER,
++   SOCKET_STATE_DATA,
++};
++#endif
++
+ static bool
+ proxy_socket_recvmsg(struct proxy_socket *socket, struct msghdr *msg)
+ {
++#ifdef __APPLE__
++   enum socket_state state = SOCKET_STATE_FIRST_MSG;
++   struct render_context_socket_header hdr = {0};
++   ssize_t want = sizeof(hdr);
++   struct msghdr _msg = {
++      .msg_iov =
++         &(struct iovec){
++            .iov_base = &hdr,
++            .iov_len = want,
++         },
++      .msg_iovlen = 1,
++      .msg_control = msg->msg_control,
++      .msg_controllen = msg->msg_controllen,
++   };
++   socklen_t _msg_controllen;
++
++   assert(msg->msg_iovlen == 1);
++
++   do {
++      const ssize_t s = recvmsg(socket->fd, &_msg, MSG_CMSG_CLOEXEC);
++      if (unlikely(s < 0)) {
++         if (errno == EAGAIN || errno == EINTR)
++            continue;
++
++         proxy_log("failed to receive message: %s", strerror(errno));
++         return false;
++      }
++
++      if (state == SOCKET_STATE_FIRST_MSG) {
++         _msg_controllen = _msg.msg_controllen;
++         state = SOCKET_STATE_HEADER;
++      } else {
++         /* retain the cmsg from first message */
++         assert(_msg.msg_controllen == 0);
++      }
++
++      if (unlikely(_msg.msg_flags & MSG_CTRUNC)) {
++         proxy_log("failed to receive message: truncated");
++
++         int fd_count;
++         const int *fds = get_received_fds(&_msg, &fd_count);
++         for (int i = 0; i < fd_count; i++)
++            close(fds[i]);
++
++         return false;
++      }
++
++      if (s <= want) {
++         _msg.msg_iov[0].iov_base = (char *)_msg.msg_iov[0].iov_base + s;
++         _msg.msg_iov[0].iov_len -= s;
++         want -= s;
++      }
++
++      if (!want && state == SOCKET_STATE_HEADER) {
++         want = ntohl(hdr.length);
++         _msg.msg_iov[0].iov_base = msg->msg_iov[0].iov_base;
++         _msg.msg_iov[0].iov_len = want;
++         state = SOCKET_STATE_DATA;
++      } else if (!want && state == SOCKET_STATE_DATA) {
++         msg->msg_controllen = _msg_controllen;
++         break;
++      }
++   } while (true);
++#else
+    do {
+       const ssize_t s = recvmsg(socket->fd, msg, MSG_CMSG_CLOEXEC);
+       if (unlikely(s < 0)) {
+@@ -130,6 +207,9 @@ proxy_socket_recvmsg(struct proxy_socket *socket, struct msghdr *msg)
+ 
+       return true;
+    } while (true);
++#endif
++
++   return true;
+ }
+ 
+ static bool
+@@ -198,6 +278,57 @@ proxy_socket_receive_reply_with_fds(struct proxy_socket *socket,
+ static bool
+ proxy_socket_sendmsg(struct proxy_socket *socket, const struct msghdr *msg)
+ {
++#ifdef __APPLE__
++   enum socket_state state = SOCKET_STATE_FIRST_MSG;
++   struct render_context_socket_header hdr = {
++      .length = htonl(msg->msg_iov[0].iov_len),
++   };
++   ssize_t want = sizeof(hdr);
++   struct msghdr _msg = {
++      .msg_iov =
++         &(struct iovec){
++            .iov_base = &hdr,
++            .iov_len = want,
++         },
++      .msg_iovlen = 1,
++      .msg_control = msg->msg_control,
++      .msg_controllen = msg->msg_controllen,
++   };
++
++   assert(msg->msg_iovlen == 1);
++
++   do {
++      const ssize_t s = sendmsg(socket->fd, &_msg, MSG_NOSIGNAL);
++      if (unlikely(s < 0)) {
++         if (errno == EAGAIN || errno == EINTR)
++            continue;
++
++         proxy_log("failed to send message: %s", strerror(errno));
++         return false;
++      }
++
++      if (state == SOCKET_STATE_FIRST_MSG) {
++         _msg.msg_controllen = 0;
++         _msg.msg_control = NULL;
++         state = SOCKET_STATE_HEADER;
++      }
++
++      if (s <= want) {
++         _msg.msg_iov[0].iov_base = (char *)_msg.msg_iov[0].iov_base + s;
++         _msg.msg_iov[0].iov_len -= s;
++         want -= s;
++      }
++
++      if (!want && state == SOCKET_STATE_HEADER) {
++         want = ntohl(hdr.length);
++         _msg.msg_iov[0].iov_base = msg->msg_iov[0].iov_base;
++         _msg.msg_iov[0].iov_len = want;
++         state = SOCKET_STATE_DATA;
++      } else if (!want && state == SOCKET_STATE_DATA) {
++         return true;
++      }
++   } while (true);
++#else
+    do {
+       const ssize_t s = sendmsg(socket->fd, msg, MSG_NOSIGNAL);
+       if (unlikely(s < 0)) {
+@@ -212,6 +343,7 @@ proxy_socket_sendmsg(struct proxy_socket *socket, const struct msghdr *msg)
+       assert(msg->msg_iovlen == 1 && msg->msg_iov[0].iov_len == (size_t)s);
+       return true;
+    } while (true);
++#endif
+ }
+ 
+ static bool
+-- 
+2.55.0
+

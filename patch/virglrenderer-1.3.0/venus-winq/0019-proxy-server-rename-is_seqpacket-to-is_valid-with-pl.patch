@@ -1,0 +1,155 @@
+From 1530ee48aff9da4c9a4c3945163db1253fe56f27 Mon Sep 17 00:00:00 2001
+From: Lucas Amaral <lucaaamaral@gmail.com>
+Date: Tue, 17 Mar 2026 11:18:54 -0300
+Subject: [PATCH] proxy/server: rename is_seqpacket to is_valid with platform
+ checks
+
+Rename proxy_socket_is_seqpacket and render_socket_is_seqpacket to
+proxy_socket_is_valid and render_socket_is_valid. The functions now
+validate the expected socket type per platform: SOCK_STREAM on macOS,
+SOCK_SEQPACKET elsewhere. This removes the #ifndef __APPLE__ guards
+at every call site.
+
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1600>
+---
+ server/render_server.c   | 6 +-----
+ server/render_socket.c   | 6 +++++-
+ server/render_socket.h   | 2 +-
+ src/proxy/proxy_client.c | 4 +---
+ src/proxy/proxy_server.c | 4 +---
+ src/proxy/proxy_socket.c | 6 +++++-
+ src/proxy/proxy_socket.h | 2 +-
+ 7 files changed, 15 insertions(+), 15 deletions(-)
+
+diff --git a/server/render_server.c b/server/render_server.c
+index ec2f4a37..0563bc54 100644
+--- a/server/render_server.c
++++ b/server/render_server.c
+@@ -148,11 +148,7 @@ render_server_parse_options(struct render_server *srv, int argc, char **argv)
+       return false;
+    }
+ 
+-   if (srv->client_fd < 0
+-#ifndef __APPLE__
+-       || !render_socket_is_seqpacket(srv->client_fd)
+-#endif
+-   ) {
++   if (srv->client_fd < 0 || !render_socket_is_valid(srv->client_fd)) {
+       render_log("no valid client fd specified");
+       return false;
+    }
+diff --git a/server/render_socket.c b/server/render_socket.c
+index 24b565e7..464b24f6 100644
+--- a/server/render_socket.c
++++ b/server/render_socket.c
+@@ -51,13 +51,17 @@ render_socket_pair(int out_fds[static 2])
+ }
+ 
+ bool
+-render_socket_is_seqpacket(int fd)
++render_socket_is_valid(int fd)
+ {
+    int type;
+    socklen_t len = sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len))
+       return false;
++#ifdef __APPLE__
++   return type == SOCK_STREAM;
++#else
+    return type == SOCK_SEQPACKET;
++#endif
+ }
+ 
+ void
+diff --git a/server/render_socket.h b/server/render_socket.h
+index ead1f8cc..1f4ae431 100644
+--- a/server/render_socket.h
++++ b/server/render_socket.h
+@@ -16,7 +16,7 @@ bool
+ render_socket_pair(int out_fds[static 2]);
+ 
+ bool
+-render_socket_is_seqpacket(int fd);
++render_socket_is_valid(int fd);
+ 
+ void
+ render_socket_init(struct render_socket *socket, int fd);
+diff --git a/src/proxy/proxy_client.c b/src/proxy/proxy_client.c
+index 7a7ba539..ad79be95 100644
+--- a/src/proxy/proxy_client.c
++++ b/src/proxy/proxy_client.c
+@@ -55,12 +55,10 @@ proxy_client_create_context(struct proxy_client *client,
+       return false;
+    }
+ 
+-#ifndef __APPLE__
+-   if (!proxy_socket_is_seqpacket(ctx_fd)) {
++   if (!proxy_socket_is_valid(ctx_fd)) {
+       close(ctx_fd);
+       return false;
+    }
+-#endif
+ 
+    *out_ctx_fd = ctx_fd;
+    return true;
+diff --git a/src/proxy/proxy_server.c b/src/proxy/proxy_server.c
+index 7ccddb9c..c643f74d 100644
+--- a/src/proxy/proxy_server.c
++++ b/src/proxy/proxy_server.c
+@@ -114,14 +114,12 @@ proxy_server_create(void)
+       }
+    }
+ 
+-#ifndef __APPLE__
+-   if (!proxy_socket_is_seqpacket(srv->client_fd)) {
++   if (!proxy_socket_is_valid(srv->client_fd)) {
+       proxy_log("invalid client fd type");
+       close(srv->client_fd);
+       free(srv);
+       return NULL;
+    }
+-#endif
+ 
+    proxy_log("proxy server with pid %d", srv->pid);
+ 
+diff --git a/src/proxy/proxy_socket.c b/src/proxy/proxy_socket.c
+index 625de051..dd30b112 100644
+--- a/src/proxy/proxy_socket.c
++++ b/src/proxy/proxy_socket.c
+@@ -38,7 +38,7 @@ proxy_socket_pair(int out_fds[static 2])
+ }
+ 
+ bool
+-proxy_socket_is_seqpacket(int fd)
++proxy_socket_is_valid(int fd)
+ {
+    int type;
+    socklen_t len = sizeof(type);
+@@ -46,7 +46,11 @@ proxy_socket_is_seqpacket(int fd)
+       proxy_log("fd %d err %s", fd, strerror(errno));
+       return false;
+    }
++#ifdef __APPLE__
++   return type == SOCK_STREAM;
++#else
+    return type == SOCK_SEQPACKET;
++#endif
+ }
+ 
+ void
+diff --git a/src/proxy/proxy_socket.h b/src/proxy/proxy_socket.h
+index 04e2f543..1e313cc8 100644
+--- a/src/proxy/proxy_socket.h
++++ b/src/proxy/proxy_socket.h
+@@ -16,7 +16,7 @@ bool
+ proxy_socket_pair(int out_fds[static 2]);
+ 
+ bool
+-proxy_socket_is_seqpacket(int fd);
++proxy_socket_is_valid(int fd);
+ 
+ void
+ proxy_socket_init(struct proxy_socket *socket, int fd);
+-- 
+2.55.0
+

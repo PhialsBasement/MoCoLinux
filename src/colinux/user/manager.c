@@ -113,7 +113,9 @@ co_rc_t co_manager_save_state(co_manager_handle_t handle,
 
 co_rc_t co_manager_kload_begin(co_manager_handle_t handle,
 			       unsigned long long min_va, unsigned long long max_va,
-			       unsigned long long ram_bytes)
+			       unsigned long long ram_bytes,
+			       unsigned long long ram_user_va,
+			       unsigned long long ram_user_bytes)
 {
 	co_manager_ioctl_kload_begin_t params = {0, };
 	unsigned long returned = 0;
@@ -122,6 +124,8 @@ co_rc_t co_manager_kload_begin(co_manager_handle_t handle,
 	params.min_va = min_va;
 	params.max_va = max_va;
 	params.ram_bytes = ram_bytes;
+	params.ram_user_va = ram_user_va;
+	params.ram_user_bytes = ram_user_bytes;
 
 	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KLOAD_BEGIN,
 				 &params, sizeof(params), &params, sizeof(params), &returned);
@@ -354,6 +358,22 @@ co_rc_t co_manager_kmap_range(co_manager_handle_t handle,
 	return rc;
 }
 
+/* Release one slice by its exact base pa; the eviction half of KMAP_RANGE. */
+co_rc_t co_manager_kunmap_range(co_manager_handle_t handle, unsigned long long pa)
+{
+	co_manager_ioctl_kmap_unmap_range_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	params.pa = pa;
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KMAP_UNMAP_RANGE,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	return rc;
+}
+
 co_rc_t co_manager_kunmap(co_manager_handle_t handle, unsigned long* released_out)
 {
 	co_manager_ioctl_kunmap_t params = {0, };
@@ -425,6 +445,108 @@ co_rc_t co_manager_kvirt_to_phys(co_manager_handle_t handle,
 		rc = params.rc;
 	if (CO_OK(rc))
 		*pa_out = params.query_pa;
+
+	return rc;
+}
+
+co_rc_t co_manager_kwindow(co_manager_handle_t handle,
+			   const void* va, unsigned long long bytes,
+			   unsigned long long* pseudo_pa_out)
+{
+	co_manager_ioctl_kwindow_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	params.va = (unsigned long long)va;
+	params.bytes = bytes;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KWINDOW,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (CO_OK(rc))
+		*pseudo_pa_out = params.pseudo_pa;
+
+	return rc;
+}
+
+co_rc_t co_manager_kwindow_at(co_manager_handle_t handle,
+			      const void* va, unsigned long long bytes,
+			      unsigned long long pseudo_pa)
+{
+	co_manager_ioctl_kwindow_at_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	params.va = (unsigned long long)va;
+	params.bytes = bytes;
+	params.pseudo_pa = pseudo_pa;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KWINDOW_AT,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+
+	return rc;
+}
+
+co_rc_t co_manager_window_bounds(co_manager_handle_t handle,
+				 unsigned long long* base,
+				 unsigned long long* top)
+{
+	co_manager_ioctl_vgpu_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_VGPU,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (CO_OK(rc)) {
+		*base = params.window_base;
+		*top  = params.window_top;
+	}
+
+	return rc;
+}
+
+co_rc_t co_manager_timer_deadline_host(co_manager_handle_t handle,
+				       unsigned long long* host_out)
+{
+	co_manager_ioctl_vgpu_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_VGPU,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
+	if (CO_OK(rc))
+		*host_out = params.timer_deadline_host;
+
+	return rc;
+}
+
+co_rc_t co_manager_kunwindow(co_manager_handle_t handle,
+			     unsigned long long pseudo_pa,
+			     unsigned long long bytes)
+{
+	co_manager_ioctl_kunwindow_t params = {0, };
+	unsigned long returned = 0;
+	co_rc_t rc;
+
+	params.pseudo_pa = pseudo_pa;
+	params.bytes = bytes;
+
+	rc = co_os_manager_ioctl(handle, CO_MANAGER_IOCTL_KUNWINDOW,
+				 &params, sizeof(params), &params, sizeof(params),
+				 &returned);
+	if (CO_OK(rc))
+		rc = params.rc;
 
 	return rc;
 }

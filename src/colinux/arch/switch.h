@@ -170,6 +170,8 @@ typedef struct {
 	unsigned long long tick_entry_va;
 	unsigned long long virtual_if_va;
 	unsigned long long ipi_pending_va;
+	/* Per-vCPU next-clock-event deadlines; the idle wait's bound. */
+	unsigned long long timer_deadline_va;
 	int		   max_switches;
 	int		   step;
 	/*

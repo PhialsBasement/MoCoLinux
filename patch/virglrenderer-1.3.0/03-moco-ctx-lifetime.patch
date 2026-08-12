@@ -1,0 +1,141 @@
+diff --color -ru a/src/virglrenderer.c b/src/virglrenderer.c
+--- a/src/virglrenderer.c	2026-08-11 18:23:50.061344425 +1000
++++ b/src/virglrenderer.c	2026-08-11 18:22:45.975905011 +1000
+@@ -232,6 +232,9 @@
+ 
+    ctx = virgl_context_lookup(ctx_id);
+    if (ctx) {
++      virgl_error("ctx_create: %d already present with capset %u, asked for %u -> %s\n",
++                  ctx_id, ctx->capset_id, capset_id,
++                  ctx->capset_id == capset_id ? "reused" : "REFUSED");
+       return ctx->capset_id == capset_id ? 0 : EINVAL;
+    }
+ 
+@@ -289,6 +292,33 @@
+ {
+    TRACE_FUNC();
+    virgl_context_remove(handle);
++
++   /*
++    * MoCoLinux: forget whatever GL context vrend thinks is current.
++    *
++    * vrend_destroy_context() clears vrend_state.current_ctx when the context
++    * being destroyed is a vrend one -- but a VENUS context is torn down
++    * through the proxy instead, and that path never touches vrend's
++    * bookkeeping or the GL context the proxy worker left bound. virtio-gpu
++    * then hands the freed id straight to the next client, so a GL context
++    * arrives on an id whose Venus predecessor has just exited, vrend's fast
++    * path in vrend_hw_switch_context() believes the right context is already
++    * current, and the real make_current never happens.
++    *
++    * What that looks like is the first framebuffer command of the new context
++    * failing with GL_INVALID_OPERATION: on this box, ctx 3 went Venus -> GL,
++    * "proxy: server worker: exiting ctx 3" was immediately followed by
++    * "context error reported 3 steamwebhelper Unknown 1282" and
++    * "failed to dispatch SET_FRAMEBUFFER_STATE: 22". That error latches
++    * ctx->in_error, which nothing ever clears, so every later submit is
++    * refused by vrend_hw_switch_context() before reaching the decoder --
++    * hundreds of thousands of them, and a black window.
++    *
++    * Forcing ctx0 here makes the next switch a real one. It costs one context
++    * switch on a path that runs a handful of times per client.
++    */
++   if (state.vrend_initialized)
++      vrend_renderer_force_ctx_0();
+ }
+ 
+ int virgl_renderer_submit_cmd(void *buffer,
+@@ -297,16 +327,27 @@
+ {
+    TRACE_FUNC();
+    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
+-   if (!ctx)
++   if (!ctx) {
++      virgl_error("submit_cmd: no context %d in the table\n", ctx_id);
+       return EINVAL;
++   }
+ 
+-   if (ndw < 0 || (unsigned)ndw > UINT32_MAX / sizeof(uint32_t))
++   if (ndw < 0 || (unsigned)ndw > UINT32_MAX / sizeof(uint32_t)) {
++      virgl_error("submit_cmd: ctx %d bad ndw %d\n", ctx_id, ndw);
+       return EINVAL;
++   }
+ 
+    if (((uintptr_t)buffer & 3) != 0)
+       return EFAULT;
+ 
+-   return ctx->submit_cmd(ctx, buffer, (uint32_t)ndw * sizeof(uint32_t));
++   {
++      int r = ctx->submit_cmd(ctx, buffer, (uint32_t)ndw * sizeof(uint32_t));
++
++      if (r)
++         virgl_error("submit_cmd: ctx %d capset %u returned %d\n",
++                     ctx_id, ctx->capset_id, r);
++      return r;
++   }
+ }
+ 
+ int virgl_renderer_transfer_write_iov(uint32_t handle,
+diff --color -ru a/src/virgl_util.c b/src/virgl_util.c
+--- a/src/virgl_util.c	2026-08-11 18:24:02.361171016 +1000
++++ b/src/virgl_util.c	2026-08-11 18:22:45.976915998 +1000
+@@ -270,13 +270,39 @@
+ {
+    char *str = NULL;
+ 
+-   if (!virgl_log_data.log_cb)
+-      return;
+-
+    if (vasprintf(&str, fmt, va) < 0)
+       return;
+ 
+-   virgl_log_data.log_cb(log_level, str, virgl_log_data.user_data);
++   /*
++    * MoCoLinux: the renderer writes its own file, from inside the renderer.
++    *
++    * Every other route out of this DLL is a dead end. The host daemon
++    * freopen()s its stderr to cogpu-vrend.log and that file has been 0 bytes
++    * through every failure it was meant to explain, because this is a DLL
++    * with its own C runtime and its stderr is a different stream. The
++    * documented log callback is no better: virgl_set_debug_callback()
++    * replaces the handler with a legacy wrapper defaulting to
++    * virgl_null_logger, so messages can start reaching a callback and then
++    * silently stop.
++    *
++    * Neither the daemon nor anything else gets to decide whether the renderer
++    * can speak. This file is opened here, with this DLL's fopen, unbuffered,
++    * and written before any callback is consulted.
++    */
++   {
++      static FILE *own;
++
++      if (!own) {
++         own = fopen("C:\\MoCoLinux\\virgl-direct.log", "w");
++         if (own)
++            setvbuf(own, NULL, _IONBF, 0);
++      }
++      if (own)
++         fputs(str, own);
++   }
++
++   if (virgl_log_data.log_cb)
++      virgl_log_data.log_cb(log_level, str, virgl_log_data.user_data);
+    free (str);
+ }
+ 
+diff --color -ru a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
+--- a/src/vrend/vrend_decode.c	2026-08-11 18:24:02.361063958 +1000
++++ b/src/vrend/vrend_decode.c	2026-08-11 18:22:45.977934720 +1000
+@@ -2099,8 +2099,11 @@
+ #define TRANSFER_HEADER_SIZE 4096
+ 
+    bret = vrend_hw_switch_context(gdctx->grctx, true);
+-   if (bret == false)
++   if (bret == false) {
++      virgl_error("submit_cmd: ctx %d cannot be made current (grctx %p)\n",
++                  gdctx->base.ctx_id, (void *)gdctx->grctx);
+       return EINVAL;
++   }
+ 
+    if (VREND_DEBUG_ENABLED &&
+        vrend_debug(gdctx->grctx, dbg_dump_cmd_streams) &&

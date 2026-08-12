@@ -30,7 +30,13 @@ appear on the test box.
     the release directory       tools/mkrelease.sh VERSION   release/MoCoLinux-VERSION
 
 The X server is not built. VcXsrv 1.14.2.1 ships as its stock installer and is
-deliberately never patched or rebuilt.
+never rebuilt -- the 2013 MSVC toolchain it needs is not something we have.
+
+Its binary is patched after installation, once, by
+tools/vcxsrv-fakemonitor/patch-vcxsrv.py: stock VcXsrv reports no monitor at
+all, and clients that enumerate displays before opening a window fail on that.
+The patch refuses to touch anything but the exact 1.14.2.1 build it was written
+against, so a reinstall silently reverts it and it has to be reapplied.
 
 
 1. Build host prerequisites
@@ -62,7 +68,11 @@ Build these first: `cogpu-daemon` includes `<virgl/virglrenderer.h>` and
 them.
 
 virglrenderer is the pristine 1.3.0 release tarball plus the patches in
-`download/virgl-patches/`, applied in order:
+`patch/virglrenderer-1.3.0/`, applied in order. They used to live only in
+`download/virgl-patches/`, which is outside this repository -- so every
+virglrenderer fix this project has ever made existed on exactly one disk and
+in no history. `download/virgl-patches/` is now a working copy of the
+tracked directory; change the tracked one.
 
     01-drm-h-windows-no-ioccom.patch   supplies the fixed-width types and
                                        collapses the ioctl encoders, because
@@ -72,6 +82,13 @@ virglrenderer is the pristine 1.3.0 release tarball plus the patches in
                                        VIRGL_CCMD_MOCO_PRESENT command and its
                                        decoder, the v5 present callback, and
                                        two shader-emission fixes
+    03-moco-ctx-lifetime.patch         forces ctx0 when any context is
+                                       destroyed, so tearing down a Venus
+                                       context cannot leave vrend believing a
+                                       freed GL context is still current; and
+                                       gives the renderer its own log file,
+                                       because neither the daemon's stderr nor
+                                       the log callback ever reached us
 
 Then, from `download/virglrenderer-1.3.0`:
 

@@ -12,6 +12,7 @@
 
 #include <colinux/os/alloc.h>
 #include <colinux/os/timer.h>
+#include <colinux/os/kernel/time.h>
 
 struct co_os_timer {
 	KDPC dpc;
@@ -107,6 +108,61 @@ static KTIMER co_vcpu_preempt_timer[CO_MAX_VCPUS];
 static KDPC   co_vcpu_preempt_dpc[CO_MAX_VCPUS];
 static int    co_idle_wake_ready;
 
+/*
+ * High-resolution deadline wakes, when the OS has them (Win 8.1+). A KTIMER
+ * timeout rounds to the system clock interrupt -- one millisecond at best --
+ * and the guest's oneshot timers were measured landing 1.1-1.5 ms late
+ * through exactly that rounding. ExAllocateTimer with the high-resolution
+ * flag is the kernel sibling of the CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+ * trick and wakes within ~50 us. Resolved at runtime; a host without it
+ * falls back to the millisecond wait and simply keeps the coarser floor.
+ */
+typedef PVOID (NTAPI *co_ex_alloc_timer_t)(PVOID callback, PVOID ctx,
+					   ULONG attributes);
+typedef BOOLEAN (NTAPI *co_ex_set_timer_t)(PVOID timer, LONGLONG duetime,
+					   LONGLONG period, PVOID params);
+typedef BOOLEAN (NTAPI *co_ex_cancel_timer_t)(PVOID timer, PVOID params);
+#define CO_EX_TIMER_HIGH_RESOLUTION 0x4
+
+/*
+ * EXT_SET_PARAMETERS, spelled out: NULL parameters to ExSetTimer leaves the
+ * system free to coalesce the expiry onto the clock grid, which measured as
+ * a 100 us arm waking at 678 us -- a high-resolution timer in name only.
+ * Zero tolerance is the whole point of the exercise.
+ */
+struct co_ext_set_parameters {
+	ULONG	 version;	/* EXT_SET_PARAMETERS_VERSION_0 = 0 */
+	ULONG	 reserved;
+	LONGLONG no_wake_tolerance;	/* 0: fire exactly on time */
+};
+
+static co_ex_alloc_timer_t  co_ex_alloc_timer;
+static co_ex_set_timer_t    co_ex_set_timer;
+static co_ex_cancel_timer_t co_ex_cancel_timer;
+static PVOID  co_idle_hires_timer[CO_MAX_VCPUS];
+/*
+ * The timer's OWN event, never the doorbell's. Sharing the doorbell event
+ * looked economical and was a self-amplifying wake storm: a stale timer
+ * fire leaves the auto-reset event set, the next wait returns instantly,
+ * re-arms, and the census read 47k spurious passes in 30 idle seconds.
+ * The doorbell event must never be cleared (a clear can eat a completion
+ * wake -- the set-with-no-waiter-arms-the-next-wait contract in timer.h is
+ * load-bearing); a private event may be cleared freely because only the
+ * timer sets it. Waits take WaitAny over the pair.
+ */
+static KEVENT co_idle_hires_event[CO_MAX_VCPUS];
+
+static VOID NTAPI co_idle_hires_callback(PVOID timer, PVOID ctx)
+{
+	unsigned long vcpu = (unsigned long)(ULONG_PTR)ctx;
+
+	(void)timer;
+	if (vcpu < CO_MAX_VCPUS)
+		KeSetEvent(&co_idle_hires_event[vcpu], 1, FALSE);
+}
+
+static void co_os_idle_hires_measure(void);
+
 static VOID DDKAPI co_os_vcpu_kick_dpc_routine(
 	IN PKDPC Dpc,
 	IN PVOID DeferredContext,
@@ -151,6 +207,7 @@ void co_os_idle_wake_init(void)
 
 	for (i = 0; i < CO_MAX_VCPUS; i++) {
 		KeInitializeEvent(&co_idle_wake_event[i], SynchronizationEvent, FALSE);
+		KeInitializeEvent(&co_idle_hires_event[i], SynchronizationEvent, FALSE);
 		KeInitializeDpc(&co_vcpu_kick_dpc[i],
 				&co_os_vcpu_kick_dpc_routine, NULL);
 		KeSetImportanceDpc(&co_vcpu_kick_dpc[i], HighImportance);
@@ -161,6 +218,31 @@ void co_os_idle_wake_init(void)
 				&co_os_vcpu_preempt_dpc_routine, NULL);
 		KeSetImportanceDpc(&co_vcpu_preempt_dpc[i], HighImportance);
 	}
+
+	{
+		UNICODE_STRING name;
+
+		RtlInitUnicodeString(&name, L"ExAllocateTimer");
+		co_ex_alloc_timer = (co_ex_alloc_timer_t)
+			MmGetSystemRoutineAddress(&name);
+		RtlInitUnicodeString(&name, L"ExSetTimer");
+		co_ex_set_timer = (co_ex_set_timer_t)
+			MmGetSystemRoutineAddress(&name);
+		RtlInitUnicodeString(&name, L"ExCancelTimer");
+		co_ex_cancel_timer = (co_ex_cancel_timer_t)
+			MmGetSystemRoutineAddress(&name);
+
+		if (co_ex_alloc_timer && co_ex_set_timer && co_ex_cancel_timer) {
+			for (i = 0; i < CO_MAX_VCPUS; i++)
+				co_idle_hires_timer[i] = co_ex_alloc_timer(
+					(PVOID)co_idle_hires_callback,
+					(PVOID)(ULONG_PTR)i,
+					CO_EX_TIMER_HIGH_RESOLUTION);
+		}
+	}
+
+	co_os_idle_hires_measure();
+
 	co_idle_wake_ready = 1;
 }
 
@@ -334,6 +416,112 @@ bool_t co_os_idle_wait(unsigned long vcpu, unsigned int msecs)
 	status = KeWaitForSingleObject(&co_idle_wake_event[vcpu], Executive,
 				       KernelMode, FALSE, &DueTime);
 	return status == STATUS_SUCCESS ? PTRUE : PFALSE;
+}
+
+/*
+ * Wait until an ABSOLUTE host-monotonic deadline (100 ns units), waking
+ * within ~50 us of it when the OS has high-resolution timers -- the wake the
+ * guest's oneshot clockevents are only as good as. Doorbells cut it short
+ * exactly as they cut the millisecond wait short: same event, one waiter.
+ * Returns PTRUE when woken by the doorbell rather than the deadline.
+ *
+ * Falls back to the millisecond wait when high-resolution timers are absent
+ * (XP): the guest still gets its event, one clock interrupt late.
+ */
+/* One bit for the log: did the high-resolution timers actually allocate. */
+int co_os_idle_hires_available(void)
+{
+	return co_idle_hires_timer[0] != NULL;
+}
+
+/*
+ * The timer measured against itself, at init: arm 100 us, clock the actual
+ * wake. Every layer above has now been rewritten twice on the ASSUMPTION
+ * that this primitive is precise; this number replaces the assumption. In
+ * 100 ns units; 0 = never ran, ~1000 = the promise kept, ~10000 = it is a
+ * millisecond timer wearing a flag.
+ */
+static unsigned long long co_idle_hires_selftest;
+
+unsigned long long co_os_idle_hires_selftest(void)
+{
+	return co_idle_hires_selftest;
+}
+
+static void co_os_idle_hires_measure(void)
+{
+	struct co_ext_set_parameters p = { 0, 0, 0 };
+	unsigned long long best = ~0ULL;
+	int i;
+
+	if (!co_idle_hires_timer[0])
+		return;
+
+	/*
+	 * Min of three: the first arm can pay a one-time clock ramp while
+	 * the kernel raises the interrupt rate for the high-res window.
+	 */
+	for (i = 0; i < 3; i++) {
+		unsigned long long t0, dt;
+		LARGE_INTEGER backstop;
+
+		KeClearEvent(&co_idle_hires_event[0]);
+		t0 = co_os_monotonic_100ns();
+		co_ex_set_timer(co_idle_hires_timer[0], -1000LL /* 100 us */,
+				0, &p);
+		backstop.QuadPart = -100000LL;	/* 10 ms: never fires = bug */
+		KeWaitForSingleObject(&co_idle_hires_event[0], Executive,
+				      KernelMode, FALSE, &backstop);
+		dt = co_os_monotonic_100ns() - t0;
+		if (dt < best)
+			best = dt;
+		co_ex_cancel_timer(co_idle_hires_timer[0], NULL);
+	}
+	KeClearEvent(&co_idle_hires_event[0]);
+	co_idle_hires_selftest = best;
+}
+
+bool_t co_os_idle_wait_until(unsigned long vcpu, unsigned long long abs_100ns)
+{
+	unsigned long long now;
+	NTSTATUS status;
+
+	if (!co_idle_wake_ready || vcpu >= CO_MAX_VCPUS) {
+		co_os_msleep(1);
+		return PFALSE;
+	}
+
+	now = co_os_monotonic_100ns();
+	if (abs_100ns <= now)
+		return PFALSE;
+
+	if (!co_idle_hires_timer[vcpu]) {
+		unsigned int ms = (unsigned int)((abs_100ns - now) / 10000ULL);
+
+		return co_os_idle_wait(vcpu, ms ? ms : 1);
+	}
+
+	{
+		struct co_ext_set_parameters p = { 0, 0, 0 };
+		PVOID objs[2];
+		LARGE_INTEGER backstop;
+
+		KeClearEvent(&co_idle_hires_event[vcpu]);
+		co_ex_set_timer(co_idle_hires_timer[vcpu],
+				-(LONGLONG)(abs_100ns - now), 0, &p);
+
+		objs[0] = &co_idle_wake_event[vcpu];
+		objs[1] = &co_idle_hires_event[vcpu];
+		/* Backstop so a lost timer can never hang a vCPU forever. */
+		backstop.QuadPart = -(LONGLONG)(abs_100ns - now) - 100000LL;
+		status = KeWaitForMultipleObjects(2, objs, WaitAny, Executive,
+						  KernelMode, FALSE, &backstop,
+						  NULL);
+		co_ex_cancel_timer(co_idle_hires_timer[vcpu], NULL);
+		KeClearEvent(&co_idle_hires_event[vcpu]);
+	}
+	/* STATUS_WAIT_0 = doorbell: tell the caller something happened. */
+	return status == STATUS_WAIT_0 ? PTRUE : PFALSE;
 }
 
 /*

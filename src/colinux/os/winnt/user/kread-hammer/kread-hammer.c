@@ -96,6 +96,26 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/*
+	 * --seconds 0: one read, dumped as u64s. A post-mortem probe --
+	 * point it at a symbol while the guest is wedged and see what the
+	 * kernel actually wrote there. Born diagnosing the oneshot freeze.
+	 */
+	if (seconds == 0) {
+		co_rc_t rc = co_manager_kread(handle, va, buf, size);
+		unsigned long i;
+
+		if (!CO_OK(rc)) {
+			printf("KREAD refused: rc %08x\n", (int)rc);
+			return 1;
+		}
+		for (i = 0; i + 8 <= size; i += 8)
+			printf("  +0x%03lx: 0x%016llx\n", i,
+			       *(unsigned long long *)((char *)buf + i));
+		co_os_manager_close(handle);
+		return 0;
+	}
+
 	printf("hammering KREAD: va 0x%llx, %lu bytes, %.0f s\n",
 	       (unsigned long long)va, size, seconds);
 	printf("start the guest and stop it while this runs.\n\n");

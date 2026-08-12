@@ -142,9 +142,30 @@ build_abi() {
 	done
 }
 
+# Venus for both ABIs: -Dvulkan-drivers=virtio builds Mesa's Venus ICD
+# (libvulkan_virtio.so), which encodes Vulkan for the host's vkr. 32-bit
+# matters as much as 64 -- DXVK's library is substantially 32-bit Windows
+# games under Wine, and skipping it guarantees a return trip.
+install_venus_icd() {
+	# $1 = build dir, $2 = output dir, $3 = icd arch tag
+	# The json is its own custom target, not a byproduct of the .so.
+	PYTHONPATH=$VENV_SITE ninja -C "$1" -j "$JOBS" \
+		src/virtio/vulkan/libvulkan_virtio.so \
+		"src/virtio/vulkan/virtio_icd.$3.json"
+	install -m 0755 "$1/src/virtio/vulkan/libvulkan_virtio.so" \
+		"$2/libvulkan_virtio.so"
+	strip --strip-unneeded "$2/libvulkan_virtio.so"
+	# The loader finds the driver through this json; the path inside must
+	# match where the guest installs the .so.
+	install -m 0644 "$1/src/virtio/vulkan/virtio_icd.$3.json" \
+		"$2/virtio_icd.$3.json"
+}
+
 say "configuring Mesa $VERSION (64-bit)"
-mesa_configure "$BUILD"
+mesa_configure "$BUILD" -Dvulkan-drivers=virtio
 build_abi "$BUILD" "$OUT64" "the 64-bit stack"
+say "building the 64-bit Venus ICD"
+install_venus_icd "$BUILD" "$OUT64" x86_64
 
 # The 32-bit half. Skipped rather than fatal when the build host has no
 # multilib: a 64-bit-only stack is still useful, and failing the whole build
@@ -157,11 +178,14 @@ if [ "$WANT32" = 1 ]; then
 	then
 		say "configuring Mesa $VERSION (32-bit)"
 		# xlib-lease is a Vulkan display-lease feature needing 32-bit
-		# libXrandr, which multilib installs do not always carry; no
-		# Vulkan driver is built here, so it has nothing to serve.
+		# libXrandr, which multilib installs do not always carry;
+		# leases are for direct-display, which this stack never does,
+		# so the Venus driver loses nothing by its absence.
 		mesa_configure "$BUILD32" --cross-file="$HERE/tools/i686-cross.ini" \
-			-Dxlib-lease=disabled
+			-Dxlib-lease=disabled -Dvulkan-drivers=virtio
 		build_abi "$BUILD32" "$OUT32" "the 32-bit stack"
+		say "building the 32-bit Venus ICD"
+		install_venus_icd "$BUILD32" "$OUT32" i686
 	else
 		say "skipping the 32-bit stack: no multilib toolchain or i686 -dev libraries"
 		say "  (Steam's client is i386 and will render in software without it)"

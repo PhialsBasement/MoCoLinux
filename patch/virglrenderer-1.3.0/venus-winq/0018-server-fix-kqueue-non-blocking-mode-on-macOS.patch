@@ -1,0 +1,42 @@
+From a0317db62ae0d312e4f2c8d6185c7ec26bacbf04 Mon Sep 17 00:00:00 2001
+From: Lucas Amaral <lucaaamaral@gmail.com>
+Date: Sat, 7 Mar 2026 10:37:18 -0300
+Subject: [PATCH] server: fix kqueue non-blocking mode on macOS
+
+kqueue file descriptors do not support fcntl(F_SETFL, O_NONBLOCK)
+on macOS.  The kqueue code added in "server: add support for building
+on macOS" attempted to set O_NONBLOCK this way, which failed silently.
+
+Remove the broken fcntl call.  Non-blocking behavior is already
+achieved in render_worker_jail_drain_sigchld_fd() via kevent() with
+a zero timeout, which is the correct approach for kqueue.
+
+Fixes: eb2b98b4 ("server: add support for building on macOS")
+Signed-off-by: Lucas Amaral <lucaaamaral@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1600>
+---
+ server/render_worker.c | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/server/render_worker.c b/server/render_worker.c
+index a26d88e6..01621cff 100644
+--- a/server/render_worker.c
++++ b/server/render_worker.c
+@@ -199,14 +199,6 @@ create_sigchld_fd(void)
+       return -1;
+    }
+ 
+-   /* Set kqueue to non-blocking mode */
+-   int flags = fcntl(kq, F_GETFL);
+-   if (flags == -1 || fcntl(kq, F_SETFL, flags | O_NONBLOCK) == -1) {
+-      render_log("failed to set kqueue non-blocking");
+-      close(kq);
+-      return -1;
+-   }
+-
+    return kq;
+ }
+ #else
+-- 
+2.55.0
+

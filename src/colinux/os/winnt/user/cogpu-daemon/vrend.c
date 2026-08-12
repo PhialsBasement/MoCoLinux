@@ -206,14 +206,74 @@ static void vrend_present_flush(void)
 				      vrend_present_request.damage_height);
 }
 
+/*
+ * Venus fences retire on vkr's ring threads, NOT on the thread that
+ * submitted -- that is the point of ASYNC_FENCE_CB. This forwards to the
+ * daemon, which must treat it as a cross-thread signal and do nothing to the
+ * vrings here.
+ */
+static cogpu_ctx_fence_fn vrend_ctx_fence_cb;
+
+static void vrend_write_context_fence(void *cookie, uint32_t ctx_id,
+				      uint32_t ring_idx, uint64_t fence_id)
+{
+	(void)cookie;
+	if (vrend_ctx_fence_cb)
+		vrend_ctx_fence_cb(ctx_id, ring_idx, fence_id);
+}
+
+void cogpu_vrend_set_ctx_fence_cb(cogpu_ctx_fence_fn fn)
+{
+	vrend_ctx_fence_cb = fn;
+}
+
+static int vrend_venus;
+
+int cogpu_vrend_has_venus(void)
+{
+	return vrend_venus;
+}
+
 static struct virgl_renderer_callbacks vrend_cbs = {
 	.version	   = 5,
 	.write_fence	   = vrend_write_fence,
 	.create_gl_context = wgl_create_context,
 	.destroy_gl_context = wgl_destroy_context,
 	.make_current	   = wgl_make_current,
+	.write_context_fence = vrend_write_context_fence,
 	.moco_present	   = vrend_moco_present,
 };
+
+/*
+ * virglrenderer's own voice, brought into our log.
+ *
+ * The renderer explains every refusal it makes -- the decoder prints
+ * "context N failed to dispatch <COMMAND>: <err>" naming the exact command,
+ * which is the one fact a rejected command stream does not otherwise carry.
+ * That message goes to virgl_error(), and until now nothing was listening.
+ *
+ * cogpu-daemon.c freopen()s its own stderr to cogpu-vrend.log, and that
+ * quietly does not work: virglrenderer lives in libvirglrenderer-1.dll with
+ * its own C runtime, so the DLL's stderr is a different stream from the
+ * exe's. The file has been 0 bytes through every failure it was meant to
+ * explain, which is worse than having no log at all -- an empty one reads as
+ * "the renderer had nothing to say".
+ *
+ * This is the library's documented way in, and it crosses the DLL boundary as
+ * a function pointer rather than a FILE*, so the runtime split cannot break
+ * it.
+ */
+void logline(const char *fmt, ...);
+
+static void vrend_log_cb(enum virgl_log_level_flags level, const char *message,
+			 void *user_data)
+{
+	(void)level;
+	(void)user_data;
+
+	/* Messages arrive with their own newline. */
+	logline("vrend: %s", message ? message : "(null)\n");
+}
 
 int cogpu_vrend_init(cogpu_fence_fn fence_cb, void *fence_ctx)
 {
@@ -221,6 +281,9 @@ int cogpu_vrend_init(cogpu_fence_fn fence_cb, void *fence_ctx)
 
 	vrend_fence_cb	= fence_cb;
 	vrend_fence_ctx	= fence_ctx;
+
+	/* Before init, so anything the bring-up itself reports is captured. */
+	virgl_set_log_callback(vrend_log_cb, NULL, NULL);
 
 	if (wgl_winsys_init() != 0)
 		return -1;
@@ -231,13 +294,50 @@ int cogpu_vrend_init(cogpu_fence_fn fence_cb, void *fence_ctx)
 	 * above are the alternative the library documents, and the cookie must
 	 * be non-NULL -- virgl_renderer_init checks `!cookie || !cbs` and
 	 * returns -1, which cost an hour the first time.
+	 *
+	 * Venus first, GL alone as the fallback. The DLL does not import
+	 * vulkan-1.dll -- it loads it at runtime -- so on a machine with no
+	 * Vulkan the VENUS init fails cleanly and the retry without it is
+	 * the machine's honest capability, not an error.
+	 *
+	 * RENDER_SERVER is not optional and not a separate process here:
+	 * upstream removed in-process venus, so venus contexts exist only
+	 * behind the proxy, and the WINQ port runs that "server" as
+	 * in-process worker threads over localhost sockets. VENUS alone
+	 * initialises nothing venus at all -- it only flips vrend's buffer
+	 * layout, which is how an earlier build logged "venus: up" while
+	 * serving a zeroed capset.
 	 */
-	rc = virgl_renderer_init(&vrend_cbs, 0, &vrend_cbs);
-	if (rc != 0)
-		return rc;
+	rc = virgl_renderer_init(&vrend_cbs,
+				 VIRGL_RENDERER_VENUS |
+				 VIRGL_RENDERER_RENDER_SERVER |
+				 VIRGL_RENDERER_ASYNC_FENCE_CB,
+				 &vrend_cbs);
+	if (rc == 0) {
+		vrend_venus = 1;
+	} else {
+		rc = virgl_renderer_init(&vrend_cbs, 0, &vrend_cbs);
+		if (rc != 0)
+			return rc;
+	}
 
 	vrend_ready = 1;
 	return 0;
+}
+
+/*
+ * A per-context fence for a Venus ring. The completion arrives later on
+ * vrend_write_context_fence; fences on one ring retire in submission order,
+ * which is what lets the daemon publish every parked request up to the
+ * signalled id.
+ */
+int cogpu_vrend_ctx_fence(uint32_t ctx_id, uint32_t ring_idx,
+			  uint64_t fence_id)
+{
+	if (!vrend_ready)
+		return -1;
+	return virgl_renderer_context_create_fence(ctx_id, 0, ring_idx,
+						   fence_id);
 }
 
 const char *cogpu_vrend_renderer(void)
@@ -428,6 +528,31 @@ int cogpu_vrend_submit(uint32_t ctx_id, const void *cmds, uint32_t bytes,
 	}
 }
 
+/*
+ * Upload host-memory pixels into a virgl resource with an explicit iovec --
+ * the bridge that lets a Venus frame (a vkr blob, host memory, no GL name)
+ * become a REAL virgl texture and ride the one presenter this project
+ * trusts: the GL stream path, overlay lifecycle and teardown included.
+ */
+int cogpu_vrend_upload(uint32_t res_id, uint32_t stride,
+		       uint32_t w, uint32_t h,
+		       const void *pixels, uint64_t bytes)
+{
+	struct virgl_box box;
+	struct iovec iov;
+
+	if (!vrend_ready)
+		return -1;
+
+	box.x = 0; box.y = 0; box.z = 0;
+	box.w = w; box.h = h; box.d = 1;
+	iov.iov_base = (void *)pixels;
+	iov.iov_len  = (size_t)bytes;
+
+	return virgl_renderer_transfer_write_iov(res_id, 0, 0, stride, 0,
+						 &box, 0, &iov, 1);
+}
+
 int cogpu_vrend_resource_create(struct virgl_renderer_resource_create_args *args)
 {
 	int rc;
@@ -515,6 +640,68 @@ int cogpu_vrend_attach_iov(uint32_t res_id, struct iovec *iov, int niov)
 		return -1;
 	}
 	return 0;
+}
+
+/*
+ * Blob resources. The GUEST kind carries mem entries exactly like
+ * ATTACH_BACKING, and the same ownership rule applies: virglrenderer keeps
+ * the iovec pointer, so the caller passes an array this function copies.
+ * HOST3D carries none.
+ */
+int cogpu_vrend_create_blob(uint32_t ctx_id, uint32_t res_id,
+			    uint32_t blob_mem, uint32_t blob_flags,
+			    uint64_t blob_id, uint64_t size,
+			    struct iovec *iov, int niov)
+{
+	struct virgl_renderer_resource_create_blob_args args;
+	struct iovec *own = NULL;
+	int rc;
+
+	if (!vrend_ready)
+		return -1;
+
+	if (niov > 0) {
+		own = malloc((size_t)niov * sizeof(*own));
+		if (!own)
+			return -1;
+		memcpy(own, iov, (size_t)niov * sizeof(*own));
+	}
+
+	memset(&args, 0, sizeof(args));
+	args.res_handle = res_id;
+	args.ctx_id	= ctx_id;
+	args.blob_mem	= blob_mem;
+	args.blob_flags = blob_flags;
+	args.blob_id	= blob_id;
+	args.size	= size;
+	args.iovecs	= own;
+	args.num_iovs	= (uint32_t)(niov > 0 ? niov : 0);
+
+	rc = virgl_renderer_resource_create_blob(&args);
+	if (rc != 0)
+		free(own);
+	return rc;
+}
+
+int cogpu_vrend_resource_map(uint32_t res_id, void **va, uint64_t *size)
+{
+	if (!vrend_ready)
+		return -1;
+	return virgl_renderer_resource_map(res_id, va, size);
+}
+
+int cogpu_vrend_resource_unmap(uint32_t res_id)
+{
+	if (!vrend_ready)
+		return -1;
+	return virgl_renderer_resource_unmap(res_id);
+}
+
+int cogpu_vrend_map_info(uint32_t res_id, uint32_t *map_info)
+{
+	if (!vrend_ready)
+		return -1;
+	return virgl_renderer_resource_get_map_info(res_id, map_info);
 }
 
 /*

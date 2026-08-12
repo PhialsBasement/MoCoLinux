@@ -73,6 +73,16 @@ extern void   co_os_vcpu_preempt_start(unsigned long vcpu,
 				       unsigned int period_msec);
 extern void   co_os_vcpu_preempt_stop(unsigned long vcpu);
 extern bool_t co_os_idle_wait(unsigned long vcpu, unsigned int msecs);
+/*
+ * Wait until an absolute host-monotonic deadline (100 ns units), waking
+ * within ~50 us when the OS has high-resolution timers, one clock interrupt
+ * late when it does not (XP). Doorbells cut it short like the ms wait.
+ */
+extern bool_t co_os_idle_wait_until(unsigned long vcpu,
+				    unsigned long long abs_100ns);
+extern int co_os_idle_hires_available(void);
+/* Init-time self-measurement of a 100 us hires arm, in 100 ns units. */
+extern unsigned long long co_os_idle_hires_selftest(void);
 
 typedef struct {
 	union {

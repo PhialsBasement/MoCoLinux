@@ -93,6 +93,28 @@ extern unsigned long co_os_active_cpu_count(void);
  */
 extern unsigned int co_os_terminate_process_by_name(const char* image_name);
 
+/*
+ * The shared section guest RAM lives in.
+ *
+ * The boot daemon CREATES it before KLOAD_BEGIN and passes its view to the
+ * driver, which locks the pages and builds the p2m from their frames. The
+ * GPU daemon OPENS it and maps a view of its own: every byte of guest RAM is
+ * then ordinary shared process memory in both daemons -- no per-slice MDL
+ * user mappings, no working-set locking, none of the accounting that made
+ * large mappings raise inside the kernel with a guard that could not catch
+ * it. A section view is the one way Windows happily shows one process
+ * gigabytes of another allocation's memory, because it is the mechanism the
+ * OS itself uses for shared memory.
+ *
+ * Returns the view base, NULL on failure (create falls back to the legacy
+ * pool backing; open means no zero-copy fast path). The handle is
+ * deliberately leaked -- the section must live exactly as long as the
+ * process, and process teardown closes it.
+ */
+extern void* co_os_guest_ram_section_create(unsigned long long bytes,
+					    unsigned long long* actual_out);
+extern void* co_os_guest_ram_section_open(unsigned long long* bytes_out);
+
 extern int co_udp_socket_connect(const char* addr, unsigned short int port);
 extern int co_udp_socket_send(int sock, const char* buffer, unsigned long size);
 extern void co_udp_socket_close(int sock);

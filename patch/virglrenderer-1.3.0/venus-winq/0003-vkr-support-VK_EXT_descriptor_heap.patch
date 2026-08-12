@@ -1,0 +1,272 @@
+From b5ece3f9915887e1739d13d7bd2d7ab9f349c7b9 Mon Sep 17 00:00:00 2001
+From: Yiwei Zhang <zzyiwei@chromium.org>
+Date: Sat, 7 Feb 2026 21:01:03 -0800
+Subject: [PATCH] vkr: support VK_EXT_descriptor_heap
+
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1593>
+---
+ src/meson.build                 |   1 +
+ src/venus/vkr_command_buffer.c  |  26 ++++++++
+ src/venus/vkr_common.c          |   1 +
+ src/venus/vkr_context.c         |   2 +
+ src/venus/vkr_descriptor_heap.c | 105 ++++++++++++++++++++++++++++++++
+ src/venus/vkr_descriptor_heap.h |  14 +++++
+ src/venus/vkr_physical_device.c |  18 ++++++
+ 7 files changed, 167 insertions(+)
+ create mode 100644 src/venus/vkr_descriptor_heap.c
+ create mode 100644 src/venus/vkr_descriptor_heap.h
+
+diff --git a/src/meson.build b/src/meson.build
+index 138301c5..ed677f38 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -68,6 +68,7 @@ venus_sources = [
+    'venus/vkr_common.c',
+    'venus/vkr_context.c',
+    'venus/vkr_cs.c',
++   'venus/vkr_descriptor_heap.c',
+    'venus/vkr_descriptor_set.c',
+    'venus/vkr_device.c',
+    'venus/vkr_device_memory.c',
+diff --git a/src/venus/vkr_command_buffer.c b/src/venus/vkr_command_buffer.c
+index 95a6be9d..dc42c5a1 100644
+--- a/src/venus/vkr_command_buffer.c
++++ b/src/venus/vkr_command_buffer.c
+@@ -1246,6 +1246,27 @@ vkr_dispatch_vkCmdDrawMeshTasksIndirectCountEXT(
+                 args->stride);
+ }
+ 
++static void
++vkr_dispatch_vkCmdBindSamplerHeapEXT(UNUSED struct vn_dispatch_context *dispatch,
++                                     struct vn_command_vkCmdBindSamplerHeapEXT *args)
++{
++   VKR_CMD_CALL(CmdBindSamplerHeapEXT, args, args->pBindInfo);
++}
++
++static void
++vkr_dispatch_vkCmdBindResourceHeapEXT(UNUSED struct vn_dispatch_context *dispatch,
++                                      struct vn_command_vkCmdBindResourceHeapEXT *args)
++{
++   VKR_CMD_CALL(CmdBindResourceHeapEXT, args, args->pBindInfo);
++}
++
++static void
++vkr_dispatch_vkCmdPushDataEXT(UNUSED struct vn_dispatch_context *dispatch,
++                              struct vn_command_vkCmdPushDataEXT *args)
++{
++   VKR_CMD_CALL(CmdPushDataEXT, args, args->pPushDataInfo);
++}
++
+ void
+ vkr_context_init_command_pool_dispatch(struct vkr_context *ctx)
+ {
+@@ -1501,4 +1522,9 @@ vkr_context_init_command_buffer_dispatch(struct vkr_context *ctx)
+       vkr_dispatch_vkCmdDrawMeshTasksIndirectEXT;
+    dispatch->dispatch_vkCmdDrawMeshTasksIndirectCountEXT =
+       vkr_dispatch_vkCmdDrawMeshTasksIndirectCountEXT;
++
++   /* VK_EXT_descriptor_heap */
++   dispatch->dispatch_vkCmdBindSamplerHeapEXT = vkr_dispatch_vkCmdBindSamplerHeapEXT;
++   dispatch->dispatch_vkCmdBindResourceHeapEXT = vkr_dispatch_vkCmdBindResourceHeapEXT;
++   dispatch->dispatch_vkCmdPushDataEXT = vkr_dispatch_vkCmdPushDataEXT;
+ }
+diff --git a/src/venus/vkr_common.c b/src/venus/vkr_common.c
+index 34f8ced9..0e4f3ce7 100644
+--- a/src/venus/vkr_common.c
++++ b/src/venus/vkr_common.c
+@@ -153,6 +153,7 @@ static const struct vn_info_extension_table vkr_extension_table = {
+    .EXT_depth_clip_control = true,
+    .EXT_depth_clip_enable = true,
+    .EXT_depth_range_unrestricted = true,
++   .EXT_descriptor_heap = true,
+    .EXT_dynamic_rendering_unused_attachments = true,
+    .EXT_extended_dynamic_state3 = true,
+    .EXT_external_memory_acquire_unmodified = true,
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index 4bf526a9..7c82e7c7 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -20,6 +20,7 @@
+ #include "vkr_command_buffer.h"
+ #include "vkr_context.h"
+ #include "vkr_cs.h"
++#include "vkr_descriptor_heap.h"
+ #include "vkr_descriptor_set.h"
+ #include "vkr_device.h"
+ #include "vkr_device_memory.h"
+@@ -102,6 +103,7 @@ vkr_context_init_dispatch(struct vkr_context *ctx)
+    vkr_context_init_sampler_dispatch(ctx);
+    vkr_context_init_sampler_ycbcr_conversion_dispatch(ctx);
+ 
++   vkr_context_init_descriptor_heap_dispatch(ctx);
+    vkr_context_init_descriptor_set_layout_dispatch(ctx);
+    vkr_context_init_descriptor_pool_dispatch(ctx);
+    vkr_context_init_descriptor_set_dispatch(ctx);
+diff --git a/src/venus/vkr_descriptor_heap.c b/src/venus/vkr_descriptor_heap.c
+new file mode 100644
+index 00000000..3d3b57be
+--- /dev/null
++++ b/src/venus/vkr_descriptor_heap.c
+@@ -0,0 +1,105 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "vkr_descriptor_heap.h"
++
++#include "venus-protocol/vn_protocol_renderer_descriptor_heap.h"
++
++#include "vkr_context.h"
++#include "vkr_device.h"
++
++static void
++vkr_dispatch_vkWriteSamplerDescriptorMESA(
++   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_command_vkWriteSamplerDescriptorMESA *args)
++{
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++   vn_replace_vkWriteSamplerDescriptorMESA_args_handle(args);
++
++   VkHostAddressRangeEXT descriptor = {
++      .address = args->pData,
++      .size = args->dataSize,
++   };
++   args->ret =
++      vk->WriteSamplerDescriptorsEXT(args->device, 1, args->pSampler, &descriptor);
++}
++
++static void
++vkr_dispatch_vkWriteResourceDescriptorMESA(
++   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_command_vkWriteResourceDescriptorMESA *args)
++{
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++   vn_replace_vkWriteResourceDescriptorMESA_args_handle(args);
++
++   VkHostAddressRangeEXT descriptor = {
++      .address = args->pData,
++      .size = args->dataSize,
++   };
++   args->ret =
++      vk->WriteResourceDescriptorsEXT(args->device, 1, args->pResource, &descriptor);
++}
++
++static void
++vkr_dispatch_vkGetImageOpaqueCaptureDataEXT(
++   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_command_vkGetImageOpaqueCaptureDataEXT *args)
++{
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++   vn_replace_vkGetImageOpaqueCaptureDataEXT_args_handle(args);
++   args->ret = vk->GetImageOpaqueCaptureDataEXT(args->device, args->imageCount,
++                                                args->pImages, args->pDatas);
++}
++
++static void
++vkr_dispatch_vkRegisterCustomBorderColorEXT(
++   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_command_vkRegisterCustomBorderColorEXT *args)
++{
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++   vn_replace_vkRegisterCustomBorderColorEXT_args_handle(args);
++   args->ret = vk->RegisterCustomBorderColorEXT(args->device, args->pBorderColor,
++                                                args->requestIndex, args->pIndex);
++}
++
++static void
++vkr_dispatch_vkUnregisterCustomBorderColorEXT(
++   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_command_vkUnregisterCustomBorderColorEXT *args)
++{
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++   vn_replace_vkUnregisterCustomBorderColorEXT_args_handle(args);
++   vk->UnregisterCustomBorderColorEXT(args->device, args->index);
++}
++
++void
++vkr_context_init_descriptor_heap_dispatch(struct vkr_context *ctx)
++{
++   struct vn_dispatch_context *dispatch = &ctx->dispatch;
++
++   dispatch->dispatch_vkWriteSamplerDescriptorMESA =
++      vkr_dispatch_vkWriteSamplerDescriptorMESA;
++   dispatch->dispatch_vkWriteResourceDescriptorMESA =
++      vkr_dispatch_vkWriteResourceDescriptorMESA;
++   dispatch->dispatch_vkGetImageOpaqueCaptureDataEXT =
++      vkr_dispatch_vkGetImageOpaqueCaptureDataEXT;
++   dispatch->dispatch_vkRegisterCustomBorderColorEXT =
++      vkr_dispatch_vkRegisterCustomBorderColorEXT;
++   dispatch->dispatch_vkUnregisterCustomBorderColorEXT =
++      vkr_dispatch_vkUnregisterCustomBorderColorEXT;
++
++   dispatch->dispatch_vkWriteSamplerDescriptorsEXT = NULL;
++   dispatch->dispatch_vkWriteResourceDescriptorsEXT = NULL;
++}
+diff --git a/src/venus/vkr_descriptor_heap.h b/src/venus/vkr_descriptor_heap.h
+new file mode 100644
+index 00000000..05c97e6d
+--- /dev/null
++++ b/src/venus/vkr_descriptor_heap.h
+@@ -0,0 +1,14 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef VKR_DESCRIPTOR_HEAP_H
++#define VKR_DESCRIPTOR_HEAP_H
++
++#include "vkr_common.h"
++
++void
++vkr_context_init_descriptor_heap_dispatch(struct vkr_context *ctx);
++
++#endif /* VKR_DESCRIPTOR_HEAP_H */
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index e2c3baa5..da41c9b1 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -830,6 +830,20 @@ vkr_dispatch_vkGetPhysicalDeviceMultisamplePropertiesEXT(
+                                                  args->pMultisampleProperties);
+ }
+ 
++static void
++vkr_dispatch_vkGetPhysicalDeviceDescriptorSizeEXT(
++   UNUSED struct vn_dispatch_context *ctx,
++   struct vn_command_vkGetPhysicalDeviceDescriptorSizeEXT *args)
++{
++   struct vkr_physical_device *physical_dev =
++      vkr_physical_device_from_handle(args->physicalDevice);
++   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
++
++   vn_replace_vkGetPhysicalDeviceDescriptorSizeEXT_args_handle(args);
++   args->ret =
++      vk->GetPhysicalDeviceDescriptorSizeEXT(args->physicalDevice, args->descriptorType);
++}
++
+ void
+ vkr_context_init_physical_device_dispatch(struct vkr_context *ctx)
+ {
+@@ -893,4 +907,8 @@ vkr_context_init_physical_device_dispatch(struct vkr_context *ctx)
+    /* VK_EXT_sample_locations */
+    dispatch->dispatch_vkGetPhysicalDeviceMultisamplePropertiesEXT =
+       vkr_dispatch_vkGetPhysicalDeviceMultisamplePropertiesEXT;
++
++   /* VK_EXT_descriptor_heap */
++   dispatch->dispatch_vkGetPhysicalDeviceDescriptorSizeEXT =
++      vkr_dispatch_vkGetPhysicalDeviceDescriptorSizeEXT;
+ }
+-- 
+2.55.0
+

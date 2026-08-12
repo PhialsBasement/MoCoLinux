@@ -1454,7 +1454,45 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		return CO_RC(ERROR_MONITOR_NOT_LOADED);
 	}
 
-	rc = co_manager_kload_begin(handle, lo, hi, ram_bytes);
+	/*
+	 * The shared section guest RAM will live in, created before the
+	 * driver is asked to back anything. Sized for RAM plus the reserved
+	 * page-table region with slack; the driver stops carving at whatever
+	 * it actually needs. If the section cannot be made the driver falls
+	 * back to the legacy pool backing and the GPU daemon to its windows
+	 * -- slower, never wrong.
+	 */
+	{
+		unsigned long long section_bytes = ram_bytes + (256ULL << 20);
+		unsigned long long actual_bytes = 0;
+		void* view = co_os_guest_ram_section_create(section_bytes,
+							    &actual_bytes);
+
+		if (view != NULL && actual_bytes != 0) {
+			/* actual, not requested: an existing object keeps its
+			 * old size, and the driver must never be told more
+			 * than the view can prove. */
+			if (actual_bytes < section_bytes)
+				co_terminal_print("  guest RAM section is a"
+						  " stale %llu MB object (asked"
+						  " %llu MB); close the old GPU"
+						  " daemon to renew it\n",
+						  actual_bytes >> 20,
+						  section_bytes >> 20);
+			else
+				co_terminal_print("  guest RAM section: %llu MB"
+						  " shared, view %p\n",
+						  actual_bytes >> 20, view);
+		} else {
+			co_terminal_print("  guest RAM section unavailable;"
+					  " using the legacy pool backing\n");
+			actual_bytes = 0;
+		}
+
+		rc = co_manager_kload_begin(handle, lo, hi, ram_bytes,
+					    (unsigned long long)(size_t)view,
+					    actual_bytes);
+	}
 	if (!CO_OK(rc)) {
 		co_terminal_print("kload begin failed (rc %x)\n", (int)rc);
 		goto out;
@@ -1711,8 +1749,17 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 					       */
 					      "asm_sysvec_co_timer",
 					      "co_colinux_virtual_if",
-					      "co_colinux_ipi_pending", NULL };
-		unsigned long long addr[10];
+					      "co_colinux_ipi_pending",
+					      /*
+					       * Where each vCPU's next clock
+					       * event falls due. The host
+					       * bounds its idle wait by it;
+					       * that is the whole difference
+					       * between 2 ms sleeps and
+					       * precise ones.
+					       */
+					      "co_colinux_timer_deadline", NULL };
+		unsigned long long addr[11];
 		int i;
 
 		for (i = 0; want[i]; i++) {
@@ -1785,6 +1832,37 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		}
 		co_terminal_print("    p2m: %llu pages, reverse-map mask 0x%llx\n",
 				  m.p2m_pages, m.m2p_mask);
+
+		/*
+		 * The window arena, for the virtio transport's shm region. An
+		 * older kernel without the symbols simply never advertises a
+		 * host-visible region, which is the correct degradation --
+		 * so unlike the p2m bounds, absence is not an error.
+		 */
+		{
+			co_elf_symbol_t* s_base =
+				co_get_symbol_by_name(pl, "co_colinux_window_base");
+			co_elf_symbol_t* s_top =
+				co_get_symbol_by_name(pl, "co_colinux_window_top");
+
+			if (s_base && s_top) {
+				rc = co_manager_kload_chunk(handle,
+					co_elf_get_symbol_value(s_base),
+					&m.window_base, sizeof(m.window_base), 0);
+				if (CO_OK(rc))
+					rc = co_manager_kload_chunk(handle,
+						co_elf_get_symbol_value(s_top),
+						&m.window_top, sizeof(m.window_top), 0);
+				if (!CO_OK(rc)) {
+					co_terminal_print("  publishing window bounds failed (rc %x)\n",
+							  (int)rc);
+					goto out_end;
+				}
+				co_terminal_print("    window arena: 0x%llx..0x%llx (%llu MB)\n",
+						  m.window_base, m.window_top,
+						  (m.window_top - m.window_base) >> 20);
+			}
+		}
 
 		/*
 		 * The root device, attached before the guest runs so that the
@@ -2230,6 +2308,7 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 		b.tick_entry_va      = no_copic ? 0 : addr[7];
 		b.virtual_if_va      = addr[8];
 		b.ipi_pending_va     = addr[9];
+		b.timer_deadline_va  = addr[10];
 		if (no_copic)
 			co_terminal_print("    cooperative timer disabled (--no-copic):"
 					  " a running guest will not be interrupted\n");
@@ -2431,7 +2510,14 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 					 * is advertised is what the host GL
 					 * can actually do.
 					 */
-					hdr.num_capsets	  = 2;
+					/*
+					 * Index 2 is Venus. If the daemon's
+					 * renderer came up GL-only, the capset
+					 * answers version 0 and Mesa skips it
+					 * -- the count can be honest either
+					 * way.
+					 */
+					hdr.num_capsets	  = 3;
 					/*
 					 * VERSION_1 (bit 32), VIRGL (bit 0) and
 					 * CONTEXT_INIT (bit 4).
@@ -2447,29 +2533,26 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 					 * anyone would guess from the symptom.
 					 */
 /*
-					 * RESOURCE_BLOB and RESOURCE_UUID are
-					 * deliberately absent.
+					 * RESOURCE_UUID stays deliberately absent.
 					 *
-					 * A feature bit is a promise. The daemon
-					 * has no RESOURCE_CREATE_BLOB, so
+					 * A feature bit is a promise. When the
+					 * daemon had no RESOURCE_CREATE_BLOB,
 					 * advertising blobs told the guest to
 					 * allocate that way, and every such
 					 * resource then existed only in the
 					 * guest's bookkeeping: each later transfer
 					 * naming one failed, as an endless
 					 * "response 0x1200 (command 0x207)" over a
-					 * blank screen.
-					 *
-					 * Nothing in that pointed at blobs -- the
-					 * failing command was a transfer, the
-					 * context was valid and the command stream
-					 * parsed. It took decoding a rejected
-					 * stream by hand to see it named a
-					 * resource id never created on this side.
+					 * blank screen. RESOURCE_BLOB is offered
+					 * now because the daemon services
+					 * CREATE/MAP/UNMAP_BLOB against the window
+					 * arena -- the promise is kept, not
+					 * repeated.
 					 */
-					hdr.host_features = (1ULL << 32) |	/* VERSION_1    */
-							    (1ULL << 0)  |	/* VIRGL        */
-							    (1ULL << 4);	/* CONTEXT_INIT */
+					hdr.host_features = (1ULL << 32) |	/* VERSION_1     */
+							    (1ULL << 0)  |	/* VIRGL         */
+							    (1ULL << 3)  |	/* RESOURCE_BLOB */
+							    (1ULL << 4);	/* CONTEXT_INIT  */
 
 					/*
 					 * The same path every other byte of the

@@ -1,0 +1,81 @@
+vcxsrv-fakemonitor -- make the X server report one monitor
+==========================================================
+
+Stock VcXsrv 1.14.2.1 answers RandR with nothing at all:
+
+    $ xrandr
+    Screen 0: minimum 0 x 0, current 1600 x 900, maximum 4096 x 4096
+
+No output, no CRTC, no mode, no monitor. Clients that look for a display before
+opening a window have nothing to find.
+
+After patching:
+
+    $ xrandr
+    Screen 0: minimum 1600 x 900, current 1600 x 900, maximum 1600 x 900
+    default connected 1600x900+0+0 0mm x 0mm
+       1600x900      60.00*
+
+Why this is a patch and not a proxy or a library shim
+-----------------------------------------------------
+
+Outputs are created by the server, in C, at screen init. The protocol has no
+request that makes one, so nothing outside the process can add a monitor --
+not a client, not an X proxy, not a faked libXrandr. A proxy that rewrites
+RandR replies has to reimplement the extension and only fools whoever is
+pointed at it; a faked libXrandr misses everything speaking xcb-randr directly,
+which includes Chromium/CEF. Patching the server fixes it for every client at
+once, which is the only place the fix is universal.
+
+And it is a small patch, because the server nearly does this already. See
+fakemonitor.S: xorg-server contains a routine that manufactures exactly one
+CRTC and one connected output for drivers that only speak RandR 1.0, and XWin
+never reaches it because its rrGetInfo hook forgets to register a screen size.
+The patch replaces that hook with one that registers it. Everything after --
+creating the output, marking it connected, building the mode, lighting the
+CRTC, answering every query -- is the server's own untouched code.
+
+Applying it
+-----------
+
+    ./patch-vcxsrv.py vcxsrv.exe vcxsrv-patched.exe
+
+Needs gcc, ld and objcopy (any host binutils; the output is raw machine code,
+not an ELF). It verifies six byte signatures in the input first and refuses to
+write anything if the binary is not the 1.14.2.1 build the addresses were read
+out of, so it cannot quietly corrupt a different server.
+
+The edit is two things: a `.moco` section holding the 265-byte replacement
+hook, and one displacement inside winRandRInit() repointed at it. The image is
+byte-identical everywhere else.
+
+Installing it on a box
+----------------------
+
+Back up the original, stop the server, swap, restart:
+
+    copy /y %D%\vcxsrv.exe %D%\vcxsrv.exe.orig
+    taskkill /f /im vcxsrv.exe
+    copy /y vcxsrv-patched.exe %D%\vcxsrv.exe
+    call xstart1142.bat C:\PROGRA~1\MoCoLinux
+
+where %D% is ...\MoCoLinux\vcxsrv1142. Restarting the X server kills the
+guest's existing X clients but nothing else: the wire opens a fresh connection
+to 127.0.0.1:6000 per client, so new ones simply reconnect and neither the
+guest nor any daemon needs restarting.
+
+Reinstalling VcXsrv reverts this. Reapply it after any reinstall.
+
+Known cosmetic wart
+-------------------
+
+    xrandr: Failed to get size of gamma for output default
+
+The CRTC has no gamma ramp, because the routine that creates it never sets one.
+That is stock upstream behaviour for this code path, not something the patch
+introduced, and xrandr carries on regardless.
+
+`xrandr --listmonitors` still fails with "RandR 1.5 not supported". That is the
+server's version, unrelated to outputs -- 1.14 implements RandR 1.4, and the
+monitor list is a 1.5 request. Plain `xrandr` and every client that enumerates
+outputs works.

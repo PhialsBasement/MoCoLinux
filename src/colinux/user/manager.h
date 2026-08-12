@@ -42,7 +42,9 @@ extern co_rc_t co_manager_save_state(co_manager_handle_t handle,
 
 extern co_rc_t co_manager_kload_begin(co_manager_handle_t handle,
 				      unsigned long long min_va, unsigned long long max_va,
-				      unsigned long long ram_bytes);
+				      unsigned long long ram_bytes,
+				      unsigned long long ram_user_va,
+				      unsigned long long ram_user_bytes);
 extern co_rc_t co_manager_kload_chunk(co_manager_handle_t handle, unsigned long long va,
 				      const void* data, unsigned long size, int zero);
 extern co_rc_t co_manager_kload_verify(co_manager_handle_t handle,
@@ -78,12 +80,38 @@ extern co_rc_t co_manager_kmap_range(co_manager_handle_t handle,
 				     int* reused_out);
 extern co_rc_t co_manager_kunmap(co_manager_handle_t handle,
 				 unsigned long* released_out);
+/*
+ * Release one slice by its exact base pa (as returned in co_kmap_range_t.pa).
+ * The caller certifies nothing in this process still uses the slice's
+ * user_va; see the eviction contract in ioctl.h.
+ */
+extern co_rc_t co_manager_kunmap_range(co_manager_handle_t handle,
+				       unsigned long long pa);
 extern co_rc_t co_manager_vgpu_address(co_manager_handle_t handle,
 				       unsigned long long* va_out);
 extern co_rc_t co_manager_vgpu_wake(co_manager_handle_t handle);
 extern co_rc_t co_manager_kvirt_to_phys(co_manager_handle_t handle,
 					unsigned long long va,
 					unsigned long long* pa_out);
+/*
+ * A window: this process's pages, appearing in the guest's physical address
+ * space. KMAP's mirror -- see ioctl.h. Pages stay MDL-locked until the
+ * matching kunwindow or the handle closes.
+ */
+extern co_rc_t co_manager_kwindow(co_manager_handle_t handle,
+				  const void* va, unsigned long long bytes,
+				  unsigned long long* pseudo_pa_out);
+extern co_rc_t co_manager_kwindow_at(co_manager_handle_t handle,
+				     const void* va, unsigned long long bytes,
+				     unsigned long long pseudo_pa);
+extern co_rc_t co_manager_kunwindow(co_manager_handle_t handle,
+				    unsigned long long pseudo_pa,
+				    unsigned long long bytes);
+extern co_rc_t co_manager_window_bounds(co_manager_handle_t handle,
+					unsigned long long* base,
+					unsigned long long* top);
+extern co_rc_t co_manager_timer_deadline_host(co_manager_handle_t handle,
+					      unsigned long long* host_out);
 extern co_rc_t co_manager_kload_enter(co_manager_handle_t handle,
 				      co_manager_ioctl_test_switch_t* out);
 extern co_rc_t co_manager_kcall(co_manager_handle_t handle,

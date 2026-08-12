@@ -1,0 +1,265 @@
+The speed ledger. One row block per milestone, appended, never rewritten.
+A milestone without a number here is not done. Run tools/vkbench.py in the
+guest (root), copy the rows, note date / commit / box. Compare against the
+block above yours before committing anything: a drop you cannot explain is a
+regression you are about to hide in mountains of code.
+
+================================================================
+2026-08-10  d497171c  M92p GT730 Win10  (ad-hoc, 2 MB working set)
+  CACHE-SCALE numbers -- 2 MB fits L3; kept because they prove the
+  window adds no overhead even cache-hot, NOT as bandwidth claims:
+  window-write 15034.9 / anon-write 14941.7 MiB/s   (parity)
+  window-read  16055.2 / anon-read  16168.7 MiB/s   (parity)
+
+2026-08-10  73e1323f  M92p GT730 Win10  (ad-hoc, pre-vkbench)
+  transfer-to-host      738.2 MiB/s   (16 MB tex x16, TRANSFER+WAIT)
+  guest-blob create: 16 MB / 18 iovecs OK; mapped+written
+  glxgears (X, CoPresent): 679 FPS -- GL path unregressed
+
+2026-08-10  73e1323f  M92p GT730 Win10  (vkbench, 256 MB total, DRAM scale)
+  anon-write           4439.4 MiB/s   <- the box's memory bus, the ceiling
+  anon-read            4933.1 MiB/s
+  blob-write           4916.2 MiB/s   <- PARITY with anon: mapping is free
+  blob-read            5012.8 MiB/s
+  transfer-to-host     1029.4 MiB/s   <- staged path: ~4.8x under the blob
+  Lesson recorded: the first ledger row compared cache-scale to DRAM-scale
+  and read as 20x. Honest gap is ~4.8x. The instrument caught its author.
+
+2026-08-10  9aa0e2a6  M92p GT730 Win10  (native control, host python)
+  native memmove       4667.6 MiB/s   <- confirms the ceiling: guest range
+                                         4439-4933 brackets it; the guest
+                                         copies at native speed
+  native 2MB cache     9957.0 MiB/s
+
+2026-08-10  952f7caa  M92p GT730 Win10  (same rambench.py, run IN GUEST)
+  guest memmove        4865.7 MiB/s   <- native 4667.6: parity, DRAM scale
+  guest 2MB cache     10081.2 MiB/s   <- native 9957.0: parity, cache scale
+  Verdict: guest == host within ~1% at BOTH scales with one instrument.
+  The 15 GiB/s guest row above used a different instrument (mmap slice
+  assignment, hotter glibc path than ctypes.memmove) -- an instrument
+  difference, not a machine one. Rule: rows are only comparable when the
+  code that produced them is the same. Second catch of the evening.
+
+2026-08-10  e4270515  M92p GT730 Win10  (Venus renderer live, GL gate)
+  glxgears x4: 579 / 707 / 721 / 605 FPS -- pre-Venus 679 sits mid-band.
+  Single gears runs vary ~10% (first run after boot is the low tail);
+  never compare single runs. GL unregressed under the Venus DLL + the
+  async-fence rework. "venus: up", capset id 4 = v0/160 bytes on GT730.
+
+2026-08-11  25ffffe1  M92p GT730 Win10  (VENUS ENUMERATES; vkbench-venus)
+  vulkaninfo: "Virtio-GPU Venus (NVIDIA GeForce GT 730)", DISCRETE_GPU.
+  vkMapMemory 64 MB, NV memory type 9 (HOST_VISIBLE|COHERENT):
+  map-write            4619.0 MiB/s   <- DRAM ceiling (native 4668): the
+                                         zero-copy claim holds for REAL
+                                         Vulkan memory end to end
+  map-read              223.4 MiB/s   <- NV backs type 9 with WC pages;
+                                         reads this slow are native-
+                                         correct, apps never read maps
+  submit-rtt           1428.4 us      <- empty submit+fence round trip;
+                                         OPTIMIZATION TARGET (completion
+                                         path: vkr signal -> queue ->
+                                         publish -> doorbell). Native is
+                                         tens of us. Watch this number.
+  GL gate: gears 608 FPS, in band.
+================================================================
+
+2026-08-11  (fence-only fix)  M92p GT730 Win10  (vkbench-venus rerun)
+  map-write            3797.8 MiB/s   (single run; 4619 seen -- band TBD)
+  map-read              209.2 MiB/s
+  submit-rtt           1512.7 us      <- ~unchanged though fences now
+                                         REALLY cross vkr + parking: the
+                                         1.4 ms is delivery (doorbell ->
+                                         guest drain), not vkr. dmesg: 0
+                                         errors (was: 0x1200 per empty
+                                         submit, fence signalled by an
+                                         ERROR response, renderer never
+                                         asked).
+
+2026-08-11  (timer surgery)  M92p GT730 Win10  (oneshot clockevents)
+  Guest sleep accuracy, python perf_counter, 100-200 samples:
+                        BEFORE          WINDOWS OWN     GUEST AFTER
+                        (blind tick)    (user floor)    (final)
+  sleep(50us)   p50     1937            529             567
+  sleep(1000us) p50     ~2000           1996            1580
+  sleep(5000us) p50     ~6000           5996            5687
+  The guest now sleeps AT OR BETTER than native Windows userland.
+  Constants that matter, all measured on this box:
+    Windows interrupt-wake floor: 487-586 us (user probe, hires
+    waitable timer, zero tolerance; tools/timerfloor.c reproduces).
+    Kernel ExTimer selftest: 517 us min-of-3 at driver load; the
+    driver measures it every load and reports it in the cogpu
+    verdict line.
+  Design: guest oneshot clockevent publishes per-vCPU deadlines
+  (host-mono 100ns, level-triggered -- edge-triggered froze: the
+  tick core skip-reprogram cache assumes hardware stays armed);
+  host reads them through the guest CR3 (LOAD-TIME ROOT IS A DEAD
+  MAP -- see the beacon at co_kload_host_ptr); deadlines outrank
+  the housekeeping tick; <900us deadlines get a kernel hires timer
+  aimed AT the deadline (undershoot+spin beat Windows by 470us/
+  sleep and burned a core for a flex nobody needed -- removed);
+  >=900us take the plain ms wait rounded UP (housekeeping lands
+  past its deadline, its decades-old contract; rounding down fed
+  every tick to the precise band: 80k spurious passes/30s).
+  Event hygiene: the hires timer signals its OWN event; sharing
+  the doorbell event self-amplified into a wake storm.
+  CPU: TM calm at idle; under sleep load, honest syscall cost only.
+  One host CLOCK_WATCHDOG_TIMEOUT bugcheck during bring-up -- box
+  has priors, but hires timers raise clock interrupt rates; if it
+  recurs under load, rate-limit the arms and suspect us first.
+================================================================
+
+2026-08-11  d8f9a37c+  M92p GT730 Win10  (Venus after timer surgery)
+  vkbench-venus: map-write 4822 MiB/s (ceiling), submit 10.8us,
+  spin-rtt 136us, sleep-rtt 2133 -> 1058us (two Windows wake floors:
+  vn backoff nap + wake -- native parity for the same pattern).
+  vkbench-frames, overshoot per frame (before -> after):
+    8ms/120fps class: 2.62 -> 1.50 ms   124 -> 144 fps (ideal 184)
+    16ms/60fps class: 2.48 -> 1.18 ms   53.3 -> 57.3  (ideal 61.5)
+    33ms/30fps class: 2.41 -> 1.51 ms   28.6 -> 29.4  (ideal 30.7)
+  HITCHES: 60fps-class p99 25.99 -> 18.41 ms (within 1ms of median;
+  the every-3-seconds micro-stutter is gone). 8ms p99 9.0 -> 7.9.
+  Frame pacing is now shippable; remaining overshoot ~= one Windows
+  wake floor + vn backoff, the physics-parity endpoint.
+================================================================
+
+2026-08-11  (first pixels)  M92p GT730 Win10  (vkclear)
+  512x512 RGBA8 cleared on the GPU (0.25/0.5/0.75/1.0), copied to a
+  host-visible buffer, read back through the window path: 262144
+  pixels, 0 wrong. Green is 127 not 128 -- 127.5 is a UNORM tie and
+  NVIDIA rounds it down; spec-legal, and the first checker failed
+  every pixel over it.
+  FOUND ON THE WAY (robustness debt, not fixed): a guest app that
+  violates valid-usage (an image bound to a memory type outside its
+  memoryTypeBits) crashes the host vkr worker SILENTLY inside the
+  NVIDIA driver; venus then refuses all device creation (-3) until
+  the daemon restarts, and the guest's vn aborts (SIGABRT) on its
+  ring timeout. vkr feeds guest UB straight into the driver -- a
+  hostile or buggy guest app can poison the GPU service. Options
+  when it matters: host-side validation layer, per-context worker
+  isolation, or a worker-death watchdog that recycles venus.
+================================================================
+
+2026-08-11  858de931+  M92p GT730 Win10  (gears record post-surgery)
+  glxgears (MoCo GL): 973 FPS -- the pre-surgery band was 579-721.
+  The timer surgery sped the GL path ~35%: every wait in the stack
+  (fences, presents, sleeps) sharpened from ms-quantized to precise.
+  Zink-over-Venus gears: BLOCKED on Vulkan presentation (zink needs
+  Vulkan WSI; VcXsrv offers no DRI3 -- same wall as vkcube's black
+  square). That is the CoPresent-for-Vulkan workstream: a present
+  ioctl on renderD128, per the sandbox-flaw design note.
+================================================================
+
+2026-08-11  (VULKAN PRESENTS)  M92p GT730 Win10  (vkcube on screen)
+  vkcube --present_mode 0: 368 FPS steady (6000 frames/16.33s; 3000
+  frames gave 316, 600 gave 152 -- startup dominates short runs).
+  A SPINNING CUBE, host-presented, X owning the window.
+  Coexistence matrix, dmesg "response 0x1200" errors in each:
+    GL alone (gears 855 FPS)                  0
+    VK alone (cube 368 FPS)                   0
+    GL + VK together (both render)            0
+    VK + VK together (both render)            0
+    VK + VK, staggered exit (survivor fine)   0
+  Per-window bridges proven: slot 0 res 0x4d4f4300 XID 0x200000
+  500x500 and slot 1 XID 0x280000 800x600 live at once, each created
+  once (no per-frame churn).
+  TWO ROOT CAUSES, both found by measurement after hours of wrong
+  theories -- the record is in the message of this commit:
+  1. Mesa's x11 WSI calls a Present-extension stub. VcXsrv has no
+     Present, and libxcb SHUTS THE CONNECTION DOWN on a stub call for
+     a missing extension (conn_err 2 = EXT_NOTSUPPORTED). Named by
+     shimming xcb_get_extension_data: "Present present=0" immediately
+     before the failure.
+  2. That killed GetGeometry, which the present tail reads as
+     VK_ERROR_SURFACE_LOST_KHR and LATCHES into the swapchain: every
+     later acquire returns it instantly, vkcube spins at 85% CPU with
+     ZERO syscalls, and exactly one frame is ever displayed. A frozen
+     picture for hours, from one extension call.
+  Red herring for the record: 9350 "SUBMIT_3D refused (22)" lines in
+  the daemon log were all ctx 2 = Firefox's GPU process after its
+  5000-fish WebGL aquarium died. The count did not move under VK or
+  GL afterwards. Firefox's crash was its own GL context, not Vulkan.
+  Known property, matching the GL path: presents are fire-and-forget,
+  so there is no vsync throttle and FIFO is not honoured -- vkcube
+  spins framerate-independently, by design, like gears at 973.
+================================================================
+
+2026-08-11  (X stays alive)  M92p GT730 Win10  (input, resize, close)
+  One ungated xcb_present_query_capabilities() at swapchain creation was
+  killing the X connection on every Vulkan client: VcXsrv has no Present
+  extension, and libxcb answers a stub call for a missing extension by
+  shutting the connection down (XCB_CONN_CLOSED_EXT_NOTSUPPORTED).
+  Frames still rendered, which is why it read as a presentation bug for
+  hours. Everything else was dead: title never reached the server, no
+  event ever reached the client, no resize, no keyboard, no mouse, and
+  the window manager's close request went nowhere.
+  Syscall census of vkcube over 4 s, before -> after the gate:
+    read/write/recvmsg/poll on the X socket    0 -> poll 687, recvmsg
+                                               597, writev 347
+    total syscalls                             13447 -> 16478
+  Present is now fire-and-forget AND pumped: flush the connection, read
+  one geometry reply to service it, DISCARD the answer (acting on it is
+  what latched SURFACE_LOST and froze the picture). Cost measured: 368
+  -> 293 FPS on vkcube, ~20%, for a window that can be resized, typed
+  into, clicked and closed. Verified by hand on the box: all of them
+  work.
+  Also: the drawable's TOP-LEVEL is what the host is told about, found
+  by walking the ancestor chain exactly as moco_dri3_present_create
+  does -- the host matches XIDs against a property VcXsrv sets on
+  top-level windows only, and a child XID makes it decorate some other
+  window of the same size.
+================================================================
+
+2026-08-11  (DIRECT3D 11)  M92p GT730 Win10  (Wine 11.14 + DXVK 1.10.3)
+  tools/d3dbench.c (clear+present, no geometry): 3040 frames in 10.00 s
+  = 304 FPS. D3D11 -> DXVK -> Vulkan -> Venus -> the host's NVIDIA driver
+  -> GT 730 -> MOCO_PRESENT -> a native window.
+  Unigine Heaven 4.0, a real 2013 D3D11 benchmark: 26 FPS at 1024x768,
+  quality low, tessellation off, no AA. exit 0, zero DRM errors.
+  NO NATIVE REFERENCE YET, so 26 means little on its own. The one figure
+  the web offers for this card is 10.3 FPS / score 260 at Ultra + Extreme
+  tessellation + 1600x900 + 8xAA (AnandTech's scores thread) -- much
+  heavier settings, so ours being 2.5x that is directionally sane and
+  nothing more. The fair pair (same binary through wined3d) and a
+  host-side run are what would settle it.
+  VERSION FACTS, each one a diagnosis:
+    DXVK 1.10.3, not 2.x/3.x -- NVIDIA caps Kepler at Vulkan 1.2, Venus
+      reports 1.2.175, and DXVK >= 2.0 demands 1.3: it enumerated the GT
+      730, skipped it as unsupported, then failed with no adapters.
+    d3dcompiler_42 via winetricks -- the DLL Heaven actually imports.
+      Wine's builtin HLSL compiler rejects its `half` types: 2396 E5017
+      "not yet implemented" errors, which look like a black scene with a
+      working HUD because only the simple shaders survive. With the real
+      compiler: 0 errors.
+    Every Present-extension call gated. The last one was
+      xcb_register_for_special_xge, which does not match a grep for
+      xcb_present_* and killed each client one frame after its swapchain.
+
+2026-08-11  (blob table)  M92p GT730 Win10  (found by Heaven, not by us)
+  cogpu's blob tracking table was a fixed 1024 entries, sized by what
+  vkcube needed. Heaven holds more than that mapped at once, so:
+    tracking table full         164
+    guest DRM errors            164 in matched pairs --
+      response 0x1200 (command 0x208)  MAP_BLOB refused
+      response 0x1200 (command 0x209)  UNMAP_BLOB of an untracked res
+    maps/unmaps over the run    3806 / 3806
+  The table now doubles on demand (1024 -> 2048 under Heaven). After:
+  exit 0, ZERO DRM errors. A capacity bug that only a real workload was
+  ever going to find.
+================================================================
+
+2026-08-12  (section-backed guest RAM)  M92p GT730 Win10  --mem 2048
+  Guest RAM moved from nonpaged pool to a shared section; cogpu reaches
+  all of it through one view (pseudo-pa == offset, resolve is one add).
+  MmMapLockedPages(UserMode) is gone from the GPU path; its raise was the
+  whole 0x1E family (three bugchecks this day alone) and the SEH guard
+  never worked (bound mingw's user-mode __C_specific_handler).
+    anon-write/read        3605 / 4083 MiB/s   (concurrent with vkcube)
+    blob-write/read        4162 / 4047 MiB/s   (~= anon: still zero-copy)
+    transfer-to-host        770 MiB/s
+    glxgears                954 fps            (baseline 840-855)
+    vkcube                  420 fps            (baseline 368)
+  Steam soak: 88028 requests, 4842 ATTACH_BACKING -- every one exactly
+  1 iovec (the view is linear in guest-physical) -- zero kmap traffic,
+  zero refusals, zero evictions, no bugcheck. Guest allocated and touched
+  1800 MB in one process mid-soak; free(1) total 1973 MB as always.
+================================================================

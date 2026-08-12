@@ -24,6 +24,44 @@
 
 #if defined(__x86_64__)
 
+/*
+ * The handler must be NTOSKRNL's __C_specific_handler, and naming the symbol
+ * in .seh_handler does not get it.
+ *
+ * mingw's static CRT carries its own __C_specific_handler for user-mode SEH,
+ * and the linker resolved the .pdata handler RVA to THAT copy -- a user-mode
+ * scope-table walker, linked into the driver, invoked in kernel mode. It
+ * faults instead of dispatching, the original exception stays unhandled, and
+ * the machine dies 0x1E with co_os_map_locked_pages_user_safe on the stack:
+ * a guard that was perfectly formed and aimed at the wrong function for its
+ * entire life. Confirmed from the 2026-08-12 minidump plus `nm` on the built
+ * image (T __C_specific_handler beside the ntoskrnl import of the same name).
+ *
+ * So the scope table names this trampoline instead, and the trampoline calls
+ * the real kernel dispatcher, resolved by name at first use. Exception
+ * dispatch for the mapping call runs at PASSIVE_LEVEL on the faulting
+ * thread, where MmGetSystemRoutineAddress is legal. If resolution ever
+ * fails, ExceptionContinueSearch preserves today's behaviour rather than
+ * inventing a new one.
+ */
+typedef LONG (NTAPI *co_c_handler_t)(void*, void*, void*, void*);
+static co_c_handler_t co_ntos_c_handler;
+
+LONG NTAPI co_seh_dispatch(void* record, void* frame, void* context,
+			   void* dispatch)
+{
+	if (!co_ntos_c_handler) {
+		UNICODE_STRING name;
+
+		RtlInitUnicodeString(&name, L"__C_specific_handler");
+		co_ntos_c_handler = (co_c_handler_t)(size_t)
+			MmGetSystemRoutineAddress(&name);
+	}
+	if (!co_ntos_c_handler)
+		return 1;	/* ExceptionContinueSearch */
+	return co_ntos_c_handler(record, frame, context, dispatch);
+}
+
 extern PVOID co_os_map_locked_pages_user_safe(PMDL mdl);
 
 asm(
@@ -57,7 +95,7 @@ asm(
 "addq $48, %rsp\n"
 "popq %rbp\n"
 "ret\n"
-".seh_handler __C_specific_handler, @unwind, @except\n"
+".seh_handler co_seh_dispatch, @unwind, @except\n"
 ".seh_handlerdata\n"
 ".long 1\n"                         /* one protected scope */
 ".rva .Lco_map_try_begin, .Lco_map_try_end\n"

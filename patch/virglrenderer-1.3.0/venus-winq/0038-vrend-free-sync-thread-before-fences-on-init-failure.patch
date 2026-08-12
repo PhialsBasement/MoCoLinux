@@ -1,0 +1,37 @@
+From 4eec05b274e8bb00bd76f3b32607bb464832e6ab Mon Sep 17 00:00:00 2001
+From: Julia Zhang <julia.zhang@amd.com>
+Date: Fri, 17 Apr 2026 18:01:22 +0800
+Subject: [PATCH] vrend: free sync thread before fences on init failure
+
+When vrend_renderer_init() hits cleanup_and_fail, it calls
+vrend_renderer_fini(), which in turn calls vrend_free_fences().
+vrend_free_fences() asserts that the sync thread has already been freed:
+
+qemu-system-i386: ../src/vrend/vrend_renderer.c:7268: vrend_free_fences:
+Assertion `!vrend_state.sync_thread' failed.
+
+This tear sync thread down to avoid above misleading error log.
+
+Signed-off-by: Julia Zhang <Julia.Zhang@amd.com>
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1613>
+---
+ src/vrend/vrend_renderer.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index dc124c30..9938fa74 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -7805,6 +7805,9 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+ 
+    return 0;
+ cleanup_and_fail:
++   if (flags & VREND_USE_THREAD_SYNC)
++      vrend_free_sync_thread();
++
+    vrend_renderer_fini();
+ fail:
+    return EINVAL;
+-- 
+2.55.0
+

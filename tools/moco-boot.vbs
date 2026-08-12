@@ -143,10 +143,13 @@ Else
 	        .ExpandEnvironmentStrings("%SystemDrive%") & "\MoCoLinux"
 End If
 
-' Direct presentation is ON by default. It is how the guest's OpenGL reaches
-' the screen: the patched Mesa in the root filesystem emits its presentation
-' request inside the virgl command stream, and cogpu-daemon only acts on that
-' request when it was started with --present-r2.
+' Direct presentation is ON by default. It is how the guest's OpenGL AND its
+' Vulkan reach the screen: the patched Mesa in the root filesystem emits its
+' presentation request inside the virgl command stream, Venus emits the same
+' request through a MOCO_PRESENT ioctl on the render node, and cogpu-daemon
+' acts on either only when it was started with --present-r2. One flag, both
+' APIs, one presenter -- which is why a Vulkan client and an OpenGL client can
+' hold their own overlays at the same time.
 '
 ' This defaulted to OFF while the protocol was being proved, and leaving it
 ' that way would ship the GPU stack inert -- worse than inert, because the
@@ -155,7 +158,9 @@ End If
 ' halves ship together, so they are configured together.
 '
 ' --no-present is the way back to software rendering, for a host whose driver
-' or card cannot do it. --present-r1 selects the older prototype rung.
+' or card cannot do it. It now silences Vulkan as well as OpenGL: a Vulkan
+' client will run and render but nothing will appear, exactly as its GL
+' counterpart does. --present-r1 selects the older prototype rung.
 cogpu_extra = " --present-r2"
 If argc >= 3 Then
 	If argv(2) = "--present-r1" Then cogpu_extra = " --present-r1"
@@ -238,10 +243,24 @@ guest_up = Running("colinux-daemon.exe")
 ' This is the default because a second processor is the point of the SMP work,
 ' not an option to opt into. Drop it back to 1 if a guest ever has to be
 ' compared against the uniprocessor build.
+'
+' 2048 MB, up from the built-in default that left the guest with 966 MB
+' usable. That default is fine for a shell and a browser and is not fine for
+' Steam: nineteen processes, four of them Chromium helpers holding 60-280 MB
+' each, put the guest into permanent reclaim -- measured at 25 MB/s of swap
+' and block I/O through cobd, kswapd resident, and 78% of the CPU in SYSTEM
+' time rather than in the application. Nothing was refusing any work and the
+' GPU path was clean; the machine was simply thrashing.
+'
+' The host has 4 GB, so this is a real bite out of it. Guest RAM is
+' contiguous and non-paged, so the allocation either succeeds at boot or the
+' daemon says so immediately -- if a host cannot spare it, lower this rather
+' than discovering it as a failure to start.
 If Not guest_up Then
 	shell.Run """" & moco & "\colinux-daemon.exe"" --boot-kernel vmlinux" & _
 		" --max-switches none" & _
 		" --cpus 2" & _
+		" --mem 2048" & _
 		" --cobd0 \DosDevices\" & linux & "\root.img" & _
 		" --cobd1 \DosDevices\" & linux & "\root-arch.img" & _
 		" --init /sbin/init", SHOWN, NOWAIT
