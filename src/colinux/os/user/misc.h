@@ -111,7 +111,8 @@ extern unsigned int co_os_terminate_process_by_name(const char* image_name);
  * deliberately leaked -- the section must live exactly as long as the
  * process, and process teardown closes it.
  */
-extern void* co_os_guest_ram_section_create(unsigned long long bytes);
+extern void* co_os_guest_ram_section_create(unsigned long long bytes,
+					    unsigned long long* actual_out);
 extern void* co_os_guest_ram_section_open(unsigned long long* bytes_out);
 
 extern int co_udp_socket_connect(const char* addr, unsigned short int port);

@@ -1464,20 +1464,34 @@ co_rc_t co_elf_load_into_guest(const char* filename, int enter,
 	 */
 	{
 		unsigned long long section_bytes = ram_bytes + (256ULL << 20);
-		void* view = co_os_guest_ram_section_create(section_bytes);
+		unsigned long long actual_bytes = 0;
+		void* view = co_os_guest_ram_section_create(section_bytes,
+							    &actual_bytes);
 
-		if (view != NULL)
-			co_terminal_print("  guest RAM section: %llu MB shared,"
-					  " view %p\n", section_bytes >> 20, view);
-		else {
+		if (view != NULL && actual_bytes != 0) {
+			/* actual, not requested: an existing object keeps its
+			 * old size, and the driver must never be told more
+			 * than the view can prove. */
+			if (actual_bytes < section_bytes)
+				co_terminal_print("  guest RAM section is a"
+						  " stale %llu MB object (asked"
+						  " %llu MB); close the old GPU"
+						  " daemon to renew it\n",
+						  actual_bytes >> 20,
+						  section_bytes >> 20);
+			else
+				co_terminal_print("  guest RAM section: %llu MB"
+						  " shared, view %p\n",
+						  actual_bytes >> 20, view);
+		} else {
 			co_terminal_print("  guest RAM section unavailable;"
 					  " using the legacy pool backing\n");
-			section_bytes = 0;
+			actual_bytes = 0;
 		}
 
 		rc = co_manager_kload_begin(handle, lo, hi, ram_bytes,
 					    (unsigned long long)(size_t)view,
-					    view ? section_bytes : 0);
+					    actual_bytes);
 	}
 	if (!CO_OK(rc)) {
 		co_terminal_print("kload begin failed (rc %x)\n", (int)rc);

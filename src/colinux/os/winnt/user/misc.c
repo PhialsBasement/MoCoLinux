@@ -364,10 +364,15 @@ unsigned int co_os_terminate_process_by_name(const char* image_name)
  */
 #define CO_OS_GUEST_RAM_SECTION "Global\\MoCoLinuxGuestRAM"
 
-void* co_os_guest_ram_section_create(unsigned long long bytes)
+void* co_os_guest_ram_section_create(unsigned long long bytes,
+				     unsigned long long* actual_out)
 {
 	HANDLE section;
 	void* view;
+	MEMORY_BASIC_INFORMATION mbi;
+
+	if (actual_out)
+		*actual_out = 0;
 
 	section = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
 				     PAGE_READWRITE | SEC_COMMIT,
@@ -382,6 +387,21 @@ void* co_os_guest_ram_section_create(unsigned long long bytes)
 		CloseHandle(section);
 		return NULL;
 	}
+
+	/*
+	 * The size the OBJECT actually has, not the size that was asked for.
+	 *
+	 * CreateFileMapping on an existing name returns the existing object
+	 * "with its current size, not the specified size" (MSDN) -- and a
+	 * stale GPU daemon from a crashed run can be holding last boot's
+	 * object. If --mem grew between the runs, reporting the requested
+	 * size would send the driver probing past the view's real end, and
+	 * MmProbeAndLockPages answers that with a raise, not an error. The
+	 * driver is told what VirtualQuery can prove instead.
+	 */
+	memset(&mbi, 0, sizeof(mbi));
+	if (VirtualQuery(view, &mbi, sizeof(mbi)) == sizeof(mbi) && actual_out)
+		*actual_out = (unsigned long long)mbi.RegionSize;
 	return view;
 }
 
