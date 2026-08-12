@@ -51,7 +51,7 @@
  * is. The release directory and zip are named from the same string by hand;
  * nothing reads it back, so keep the two in step.
  */
-#define MOCO_VERSION "0.7.0"
+#define MOCO_VERSION "0.7.1"
 
 #define PAYLOAD_MAX 20
 
